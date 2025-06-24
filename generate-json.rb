@@ -15,10 +15,10 @@ end
 
 cmd = "pkl eval %s --format json  > dist/%s.%s.json"
 
-`find apps -type f -name "*.pkl"`.strip.split("\n").each do |file|
-    parts = file.split("/").drop(1)
+`find ../env/apps -type f -name "*.pkl"`.strip.split("\n").each do |file|
+    parts = file.split("/").drop(3)
     if parts.length > 2
-        raise "Script needs to be modified to handle nested directories"
+        raise "Script needs to be modified to handle nested directories. parts: #{parts.inspect}"
     end
     app = parts[0]
     name = parts[1].gsub(/\.pkl$/, "")
