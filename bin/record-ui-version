@@ -1,0 +1,138 @@
+#!/usr/bin/env ruby
+
+# Run this file from the project root directory
+
+dir = File.dirname(__FILE__)
+load File.join(dir, "../lib/common.rb")
+
+args = Args.parse(ARGV, ["app"])
+config = Config.load(args.app)
+if !config.elm
+  Util.exit_with_error("Script is only supported for elm apps")
+end
+
+api_host = if args.app == "acumen-ui"
+  "https://api.trueacumen.com"
+else
+  Util.exit_with_error("Need to provide hostname for app #{args.app}")
+end
+
+TOKEN_FILE = "~/.devops/#{args.app}"
+candidate = File.expand_path(TOKEN_FILE)
+
+class TokenFile
+  attr_reader :session_id
+  def initialize(session_id)
+    @session_id = session_id
+  end
+
+  def TokenFile.read(path)
+    session_id = nil
+    IO.readlines(path).each do |line|
+      l = line.strip
+      next if l.empty?
+      next if l.match(/^#/)
+      key, value = l.split(":", 2)
+      k = key.to_s.strip
+      v = value.to_s.strip
+      if k.empty?
+        Util.exit_with_error("File #{path}: Invalid line: #{line}")
+      end
+      if v.empty?
+        Util.exit_with_error("File #{path}: Missing value for key: #{key}")
+      end
+      if k == "session_id"
+        session_id = v
+      else
+        Util.exit_with_error("File #{path}: Unknown key: #{key}")
+      end
+    end
+
+    if session_id.nil?
+      Util.exit_with_error("File #{path}: Missing session_id")
+    end
+    TokenFile.new(session_id)
+  end
+
+  def write!(path)
+    full_path = File.expand_path(path)
+    dir = File.dirname(full_path)
+    if !File.exist?(dir)
+      Util.run("mkdir -p #{dir}")
+    end
+    File.open(full_path, "w") do |f|
+      f << "session_id: #{session_id}"
+    end
+  end
+end
+
+tf = if File.exist?(candidate)
+  TokenFile.read(candidate)
+else
+  puts ""
+  puts "Expecting Session ID for #{args.app} in #{candidate} which currently does not exists."
+  puts "We will help you create this file."
+  puts ""
+  session_id = Ask.for_string("Please enter the session id: ", :hide_input => true)
+  file = TokenFile.new(session_id)
+  file.write!(TOKEN_FILE)
+  puts ""
+  puts "Created File: #{TOKEN_FILE}"
+  file
+end
+
+release_version_file = "../#{args.app}-release/version.txt"
+
+if !File.exist?(release_version_file)
+  Util.exit_with_error("Release version file #{release_version_file} not found")
+end
+
+version = IO.read(release_version_file).strip
+if version.empty?
+  Util.exit_with_error("Release version file #{release_version_file} is empty")
+end
+
+class HttpResponse
+  attr_reader :status, :body
+  def initialize(status, body)
+    @status = status
+    @body = body
+  end
+end
+
+def parse_http(response)
+  status, body = response.split("\n\n", 2)
+  status = status.split(" ", 2)[1].to_i
+  HttpResponse.new(status, body)
+end
+
+def put_version(host, session_id, version, retryCount = 1)
+  url = "#{host}/ui/version"
+  cmd = "curl -i -s -X PUT #{host}/ui/version -H 'acumen_session_id: #{session_id}' -H 'content-type: application/json' -d '{\"version\": \"#{version}\"}'"
+  http = parse_http(`#{cmd}`)
+  puts ""
+  if http.status == 200
+    return
+
+  elsif http.status == 401
+    puts "Received Not Authorized."
+    if retryCount % 10 == 0
+      puts ""
+      puts "Please create a new session id and enter it below."
+      session_id = Ask.for_string("", :hide_input => true)
+      file = TokenFile.new(session_id)
+      file.write!(TOKEN_FILE)
+    else
+      sleep(500)
+      puts "Retrying..."
+    end
+    put_version(host, session_id, version, retryCount + 1)
+
+  else
+    Util.exit_with_error("ERROR: Received HTTP Status #{http.status}")
+  end
+end
+
+put_version(api_host, tf.session_id, version)
+puts "Version for #{args.app} successfully set to #{version}"
+puts ""

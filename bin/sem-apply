@@ -1,0 +1,15 @@
+#!/usr/bin/env ruby
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+env = Config.load(args.app)
+scala_config = env.scala    
+if scala_config.nil?
+    Util.exit_with_error("App #{args.app} does not have a scala config")
+end
+db = scala_config.send(args.env).database
+
+pwd = args.env == "development" ? "" : " --password"
+
+Util.run("sem-apply --set sslmode=require --host #{db.host} --port #{db.port} --user #{db.user} --name #{db.name}#{pwd}")

@@ -1,0 +1,60 @@
+#!/usr/bin/env ruby
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+def find_install_inscript(app)
+  candidate = File.join(`pwd`.strip, "install.sh")
+  if File.exist?(candidate)
+    return candidate
+  end
+  Util.exit_with_error("No install script found for #{app}. Expected at ./install.sh - run this script inside the -postgresql directory")
+end
+
+args = Args.parse(ARGV, ["app", "env"])
+install_script = find_install_inscript(args.app)
+dbname = Config.load_scala_env(args.app, args.env).database.name
+path = "#{dbname}*.sql"
+
+if !File.exist?(install_script)
+  Util.exit_with_error("No install script found for #{args.app}. Expected at #{install_script}")
+end
+
+puts ""
+puts "Reinstalling #{dbname} database"
+puts ""
+
+all = `find ~/Downloads -name "#{path}"`.split("\n")
+if all.empty?
+  puts "No SQL files found matching ~/Downloads/#{path}"
+
+else
+  file = if all.size == 1
+           puts "Found snapshot file: #{all.first} (#{File.ctime(all.first)})"
+           puts ""
+           if !Ask.for_boolean("Proceed?")
+             exit()
+           end
+           all.first
+         else
+           puts "Multiple SQL files found matching ~/Downloads/#{path}"
+           sorted = all.sort_by { |f| File.ctime(f) }.reverse  # newest first
+           with_times = sorted.map { |f| "#{f} (#{File.ctime(f)})" }
+           f = Ask.select_from_list("Select file to use", with_times, :default => 1)
+           f.split(" ").first
+         end
+
+  puts ""
+  puts "Reinstalling #{dbname} database using #{file}"
+  puts ""
+  Util.run("dropdb #{dbname}", :ignore_error => true)
+
+  IO.readlines(install_script).each do |l|
+    next unless l.strip.start_with?("psql ")
+    Util.run(l, :ignore_error => true)
+  end
+
+  Util.run("psql -U api -f #{file} #{dbname}")
+end
+
+puts ""

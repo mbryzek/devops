@@ -1,0 +1,249 @@
+#!/usr/bin/env ruby
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb') # only load here as pulls in droplet_kit
+
+SKIP_UPLOAD = false
+if SKIP_UPLOAD
+    puts Util.warning("Skipping network operations")
+end
+
+args = Args.parse(ARGV, ["app", "file"])
+config = Config.load(args.app)
+scala_config = config.scala
+if scala_config.nil?
+    Util.exit_with_error("App #{args.app} does not have a scala config")
+end
+
+env = scala_config.send(args.env)
+file = args.file
+vars = EnvironmentVariables.load(args.app, args.env)
+start = Time.now
+
+RUN_SCRIPT = "#{args.app}-#{config.scala.artifact_name}-run.sh"
+
+do_client = DigitalOcean::Client.new(args.app)
+
+if !file.match (/\.tar\.gz$/)
+    Util.exit_with_error("Release file must end with .tar.gz")
+end
+if !File.exist?(file)
+    Util.exit_with_error("File #{file} does not exist")
+end
+
+def read_first_n_lines(file, n=20)
+    IO.read(file).split.reverse.take(n).reverse.join("\n")
+end
+
+class DeploymentNode
+    attr_reader :node, :status, :index
+    def initialize(config, node, index)
+        @config = config
+        @node = node
+        @index = index.to_i
+        @status = Healthcheck::UNKNOWN
+    end
+
+    def healthy?
+        @status.healthy?
+    end
+
+    def job_server?
+        @status.job_server?
+    end
+
+    def update_status
+        output = execute("curl -s http://localhost:#{@config.port}/_internal_/healthcheck")
+        @status = Healthcheck.from_json(output)
+        nil
+    end
+
+    def localhost?
+        @node.uri == "localhost"
+    end
+
+    def download_logfile
+        download_file("#{@config.name}.log")
+    end
+
+    def execute(cmd)
+        if localhost?
+            `#{cmd}`.strip
+        else
+            tmp = "/tmp/deployment_node.%s.tmp" % @node.uri
+            cmd = "ssh root@#{@node.uri} 'rm -f #{tmp}; #{cmd} > #{tmp}'"
+            # puts "Executing command: #{cmd}"
+            `#{cmd}`
+            begin
+                file = download_file(tmp)
+                IO.read(file).strip
+            ensure
+                File.delete(tmp) if File.exist?(tmp)
+            end
+        end
+    end
+
+    def download_file(file)
+        if localhost?
+            file
+        else
+            tmp = "/tmp/#{File.basename(file)}"
+            Util.run("scp -q root@#{@node.uri}:#{file} #{tmp}", :quiet => true)
+            tmp
+        end
+    end
+
+    def upload_file(file)
+        if localhost?
+            # No op
+        else
+            puts "uploading #{file} to #{node.uri}"
+            Util.run("scp -q #{file} root@#{@node.uri}:~/", :quiet => true)
+        end
+    end
+end
+
+def wait_until_up(dn, iteration=0, max=15)
+    sleep 1
+    dn.update_status
+
+    if !dn.healthy? && iteration < max
+        puts " - Waiting for node #{dn.node.uri} to become healthy. Current status: #{dn.status.status}"
+        wait_until_up(dn, iteration + 1, max)
+    end
+end
+
+def deployment_dir(file)
+  File.basename(file).sub(/\.tar\.gz$/, "")
+end
+
+def create_deploy_script(config, file)
+    name = "deploy.#{config.name}.sh"
+    logfile = "#{config.name}.log"
+    dir = deployment_dir(file)
+
+    script = <<~EOS
+    #!/bin/sh
+    ./deploy/delete-old-deploys.rb --app #{config.name}
+    rm -rf #{dir}
+    tar xfz #{File.basename(file)}
+    cp #{RUN_SCRIPT} #{dir}/
+    touch #{logfile}
+    mv -f #{logfile} #{logfile}.last
+    ./deploy/kill.rb --app #{config.name}
+    cd #{dir} && nohup ./#{RUN_SCRIPT} > ../#{logfile} 2>&1 &
+    EOS
+
+    File.open(name, "w") do |f|
+        f << script
+    end
+
+    Util.run("chmod +x #{name}")
+
+    name
+end
+
+def create_tarball(config, files)
+    name = "/tmp/deployment.#{config.name}.tar.gz"
+    local_files = files.map do |file|
+        if !File.exist?(File.basename(file))
+            Util.run("cp #{file} .")
+        end
+        File.basename(file)
+    end
+    Util.run("tar --no-mac-metadata -czf #{name} lib deploy bin dist #{local_files.join(" ")}")
+    Util.run("rm -f #{local_files.join(" ")}")
+    name
+end
+
+nodes = if args.node
+            env.nodes.filter { |n| args.node == n.uri }
+        else
+            env.nodes
+        end
+
+if nodes.empty?
+    if node.to_s.empty?
+        Util.exit_with_error("No nodes configured for #{config.name}")
+    else
+        Util.exit_with_error("Node URI #{node} not found for #{config.name}")
+    end
+end
+deployment_nodes = nodes.each_with_index.map { |n, i| DeploymentNode.new(config, n, i) }
+
+deploy_script = create_deploy_script(config, file)
+tarball = create_tarball(config, [file, deploy_script])
+
+puts ""
+puts Util.underline("Uploading tarball to all nodes and checking node status")
+threads = deployment_nodes.map do |dn|
+  [
+    Thread.new do
+      if !SKIP_UPLOAD
+        dn.upload_file(tarball)
+      end
+    end,
+    Thread.new do
+        dn.update_status
+    end
+  ]
+end.flatten
+threads.each(&:join)
+
+deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.each do |dn|
+    puts ""
+    puts Util.underline("Starting deployment to node #{dn.node.uri} [status: #{dn.status.status}]")
+    RunScript.new(config, file, vars, dn.index).to_file(RUN_SCRIPT, dn.index)
+    dn.upload_file(RUN_SCRIPT)
+    dn.execute("rm -rf lib deploy bin")
+    dn.execute("tar xfz #{File.basename(tarball)}")
+    puts "Removing node #{dn.node.uri} from load balancer"
+    #do_client.remove_droplet_by_ip_address(dn.node.uri)
+    dn.execute("./#{deploy_script}")
+    wait_until_up(dn)
+    puts "Adding node #{dn.node.uri} to load balancer"
+    #do_client.add_droplet_by_ip_address(dn.node.uri)
+    puts "Done. Node status is #{dn.status.status}"
+    if !dn.healthy?
+        Util.exit_with_error("Aborting release as node failed to become healthy")
+    end
+end
+
+healthy = deployment_nodes.filter { |dn| dn.healthy? }
+not_healthy = deployment_nodes.filter { |dn| !dn.healthy? }
+
+puts ""
+if not_healthy.empty?
+  job_servers = deployment_nodes.filter { |dn| dn.job_server? }
+  if job_servers.length == 0
+    puts Util.underline("No job servers")
+    puts "Deployment is complete. There is no job server."
+
+  elsif job_servers.length > 1
+    puts Util.underline("Multiple job servers")
+    puts "Deployment is complete. We expected a single job server but found multiple:"
+    job_servers.each do |dn|
+      puts " - #{dn.node.uri}"
+    end
+
+  else
+    js = job_servers.first
+    puts "Deployment successful. All nodes are healthy and there is exactly 1 job server [#{js.node.uri}]"
+  end
+
+elsif healthy.empty?
+    puts Util.underline("SERVICE OUTAGE")
+    puts "No nodes are healthy"
+
+else
+    puts Util.underline("The following nodes are not healthy")
+    not_healthy.each do |n|
+        puts " - %s" % n.node.uri
+    end
+
+end
+
+puts ""
+duration = (Time.now - start).to_i
+puts "Deploy duration: #{duration} seconds"
+puts ""

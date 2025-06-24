@@ -1,0 +1,93 @@
+#!/usr/bin/env ruby
+
+DIR = File.dirname(__FILE__)
+TEMPLATE = File.join(DIR, "../scaffolding/elm/NewPage.elm")
+PREFIX = "src/Page/"
+SUFFIX = ".elm"
+
+load File.join(DIR, '../lib/common.rb')
+
+args = Args.parse(ARGV, ["path"])
+path = args.path
+if !path.start_with?(PREFIX)
+  Util.exit_with_error("Invalid path '#{path}': Must start with #{PREFIX}")
+end
+if !path.end_with?(SUFFIX)
+  Util.exit_with_error("Invalid path '#{path}': Must end with #{SUFFIX}")
+end
+
+end_index = path.length - SUFFIX.length - 1
+stripped = path[PREFIX.length..end_index]
+
+name = stripped.split("/").join(".")
+module_name = "Page." ++ name
+
+class ScaffoldingTemplate
+  def initialize(template, variables)
+    @template = template
+    @variables = variables.map(&:to_sym)
+  end
+
+  def interpolate(values)
+    missing = @variables.select { |v| !values[v] }
+      if !missing.empty?
+        Util.exit_with_error("Missing 1 or more variables: " + missing.join(", "))
+      end
+      interpolate_variables(@template.dup, values, @variables)
+  end 
+
+  def ScaffoldingTemplate.parse(path)
+    if !File.exist?(path)
+      Util.exit_with_error "Template not found: #{path}"
+    end
+    
+    contents = IO.read(path)
+    variables = ScaffoldingTemplate.read_variables(contents, [])
+    ScaffoldingTemplate.new(contents, variables)
+  end
+
+  private
+
+  def interpolate_variables(content, values, remaining)
+    if remaining.empty?
+      content
+    else
+      variable = remaining.shift
+      value = values[variable].to_s.strip
+      if value.empty?
+        Util.exit_with_error "Missing variable: #{variable}"
+      end
+      new_content = content.gsub(/\{var:#{variable}}/, value)
+      interpolate_variables(new_content, values, remaining)
+    end
+  end
+
+  def ScaffoldingTemplate.read_variables(contents, all=[])
+    if i = contents.rindex('{var:')
+      part = contents[i+5..-1]
+      j = part.index("}")
+      if j.nil?
+        raise "Missing ending brace at index[#{i}]"
+      end
+      varname = part[0, j]
+      ScaffoldingTemplate.read_variables(contents[0, i-1], [varname] + all)
+    else
+      all
+    end
+  end
+end
+
+contents = ScaffoldingTemplate.parse(TEMPLATE).interpolate({
+  :name => name,
+  :module_name => module_name
+})
+
+puts ""
+puts "Creating scaffolding file: #{path}"
+File.open(path, "w") do |f|
+  f << contents
+end
+
+puts ""
+puts "Running ELM Codegen"
+system("codegen-elm.rb")

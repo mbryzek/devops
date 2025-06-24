@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+
+# Run this file from the project root directory
+
+dir = File.dirname(__FILE__)
+load File.join(dir, "../lib/common.rb")
+
+args = Args.parse(ARGV, ["app"])
+
+config = Config.load(args.app)
+
+files = if config.scala
+  ["release-scala"]
+elsif config.elm
+  if args.app == "acumen-ui"
+    ["release-elm", "record-ui-version"]
+  else
+    ["release-elm"]
+  end
+else
+  Util.exit_with_error("Do not know how to release app that is not scala and not elm")
+end
+
+files.each do |file|
+  cmd = File.join(dir, file) + " --app #{args.app}"
+  Util.run cmd
+end

@@ -1,0 +1,29 @@
+#!/usr/bin/env ruby
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+config = Config.load(args.app)
+scala_config = config.scala
+if scala_config.nil?
+    Util.exit_with_error("App #{args.app} does not have a scala config")
+end
+env = scala_config.send(args.env)
+db = env.database
+
+node = env.nodes.first
+if node.nil?
+    Util.exit_with_error("No nodes found")
+end
+
+puts ""
+puts Util.underline("Login to #{db.name}:")
+puts "ssh root@#{node.uri}"
+puts "psql --set=sslmode=require -h #{db.host} -p #{db.port} --u #{db.user} #{db.name}"
+env_var_script = Util.cleanpath(File.join(DIR, 'db-password'))
+if !File.exist?(env_var_script)
+    Util.exit_with_error("Could not find env var script: #{env_var_script}")
+end
+puts "#{env_var_script} --app #{args.app}"
+puts ""

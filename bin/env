@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+format = args.format || 'sh'
+
+vars = EnvironmentVariables.load(args.app, args.env)
+all = RunScript.with_deployment_node_index(vars, 0)
+puts all.serialize(format)

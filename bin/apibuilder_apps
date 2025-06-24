@@ -1,0 +1,175 @@
+#!/usr/bin/env ruby
+
+# Uploads all of the API Json files in this repo to API Builder. By default,
+# we upload the json files in the 'spec' directory
+#
+# Usage:
+#
+#  Upload latest development versions based on git tag. This works by
+#  finding the next version (using sem-info tag next),
+#
+#    upload
+#
+#  Upload specific specifications
+#
+#    upload --app organization --app user
+#
+#  Upload a specific tag
+#
+#    upload --tag 0.0.2-dev
+#
+#  Upload using a specific apibuilder profile
+#
+#    upload --profile localhost
+#
+#  Upload using a specific apibuilder profile
+#
+#    upload --profile localhost
+#
+#  Upload json files in 'examples' directory
+#
+#    upload --dir examples
+#
+#  Skip apibuilder update
+#
+#    upload --no_download
+#
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, [], { "app" => "list" })
+
+Util.assert_installed("apibuilder", "https://github.com/apicollective/apibuilder-cli")
+Util.assert_installed("sem-info", "https://github.com/mbryzek/schema-evolution-manager")
+
+organization = DevopsConfigFile.load.apibuilder_organization
+
+def calculate_next_tag
+  Util.assert_installed("sem-info", "https://github.com/mbryzek/schema-evolution-manager")
+  `sem-info tag next micro`.strip
+end
+
+# Resolves dependencies of the specifications, returning the specs in
+# an order in which their internal dependencies will resolve.
+#
+# @param remaining List of Spec instances
+def resolve_dependencies(remaining, ordered=[])
+  if next_spec = remaining.find { |spec| resolved?(ordered, spec) }
+    resolve_dependencies(remaining - [next_spec], ordered + [next_spec])
+  else
+    ordered + remaining
+  end
+end
+
+# @param specs is a list of specifications that have already been fully
+# resolved
+# @param spec is a specification that we want to see if we can now
+# process (e.g. all of its dependencies are in specs)
+
+def resolved?(specs, spec)
+  spec.dependencies.all? { |dep|
+    specs.find { |s|
+      s.organization == dep.organization && s.application == dep.application
+    }
+  }
+end
+
+tag = args.tag || calculate_next_tag
+spec_dir = args.dir || Pathname.new(File.join(`pwd`.strip, "spec")).cleanpath
+if !File.directory?(spec_dir)
+  Util.exit_with_error "Cannot find directory containing specs. Expected at: #{spec_dir}"
+end
+
+class Dependency
+  
+  attr_reader :organization, :application
+  def initialize(organization, application)
+    @organization = organization
+    @application = application
+  end
+
+  def Dependency.from_uri(uri)
+    if md = uri.match(/^https?:\/\/app.apibuilder.io\/([^\/]+)\/([^\/]+)/)
+      Dependency.new(md[1], md[2])
+    elsif md = uri.match(/^https?:\/\/www.apibuilder.io\/([^\/]+)\/([^\/]+)/)
+      Dependency.new(md[1], md[2])
+    else
+      Util.exit_with_error("Could not parse import uri[%s]" % uri)
+    end
+  end
+
+end
+
+class Spec
+
+  attr_reader :organization, :application, :dependencies
+
+  def initialize(organization, application, path)
+    @organization = organization
+    @application = application
+    @path = path
+    @dependencies = parse_dependencies
+  end
+
+  def parse_dependencies
+    contents = IO.read(@path)
+    json = begin
+             JSON.parse(contents)
+           rescue JSON::ParserError
+             puts "** WARNING: File is not valid json: %s" % @path
+             {}
+           end
+
+    (json['imports'] || []).map { |imp| Dependency.from_uri(imp['uri']) }
+  end
+  
+  def upload_command(org, tag, profile=nil)
+    cmds = []
+    if profile
+      cmds << "PROFILE=%s" % profile
+    end
+    cmds << "apibuilder upload %s %s %s --version %s" % [org, @application, @path, tag]
+    cmds.join(" ")
+  end
+
+  def download_command(profile=nil)
+    cmds = []
+    if profile
+      cmds << "PROFILE=%s" % profile
+    end
+    cmds << "apibuilder update --app %s" % @application
+    cmds.join(" ")
+  end
+
+end
+
+specs = Dir.glob("#{spec_dir}/*.json").map do |path|
+  name = File.basename(path).sub(/\.json$/, '')
+  Spec.new(organization, name, path)
+end
+
+ordered = resolve_dependencies(specs.sort_by { |s| [s.organization, s.application] })
+filtered = args.app.nil? ? ordered : ordered.select { |spec| args.app.include?(spec.application) }
+
+if args.app && filtered.size != args.app.size
+  missing = args.app.select { |n| !filtered.map(&:application).include?(n) }
+
+  if missing.size == 1
+    msg = "** ERROR: Did not find spec: %s\n" % missing.join(", ")
+  else
+    msg = "** ERROR: Did not find specs: %s\n" % missing.join(", ")
+  end
+  msg << "  Available specs:\n"
+  msg << "    " + specs.map(&:application).join("\n    ")
+  Util.exit_with_error msg
+end
+
+filtered.each do |spec|
+  Util.run(spec.upload_command(spec.organization, tag, args.profile))
+end
+
+if !args.no_download
+  filtered.each do |spec|
+    Util.run(spec.download_command(args.profile))
+  end
+end

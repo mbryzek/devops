@@ -1,0 +1,554 @@
+#!/usr/bin/env ruby
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+load File.join(DIR, '../lib/codegen/all.rb')
+
+MAIN_FILE = "src/Main.elm"
+GLOBAL_FILE = "src/Global.elm"
+
+all = `find src/Page -type f -name "*elm"`.strip.split("\n").sort
+
+files = all.map do |f|
+    ElmFile.parse(f)
+end
+
+project_name = `pwd`.strip.split("/").last
+config = CodegenConfig.new(project_name)
+
+def assert_unique_modules(files)
+  files.group_by { |f| f.module.name }.select { |m, files| files.length > 1 }.each do |m, files|
+    Util.exit_with_error("Multiple files define the same module #{m}:\n" + (
+      files.map { |f| "  - #{f.path}"}.join("\n")
+    ))
+  end
+end
+
+def indent(n, str)
+  spaces = " " * n
+  str.split("\n").map { |l| spaces + l }.join("\n")
+end
+
+def replace_imports(contents, files)
+  tmp = []
+  found = 0
+  contents.split(/\n/).each do |l|
+    stripped = l.strip
+
+    if found == 0
+      found = 1 if stripped.match(/^import\s+/)
+
+    elsif found == 1
+      found = 2 if !stripped.empty? && !stripped.match(/^import\s+/)
+      if found == 2
+        tmp = remove_trailing_empty_lines(tmp)
+        files.map do |f|
+          tmp << "import #{f.module.name} as #{f.module.alias}"
+        end
+        tmp << "\n"
+      end
+    end
+
+    next if stripped.match(/^import\s+Page\./)
+    tmp << l
+  end
+
+  if found <= 1
+    raise "Could not find imports in file #{MAIN_FILE}"
+  end
+  tmp.join("\n")
+end
+
+def remove_trailing_empty_lines(lines)
+  lines.reverse.drop_while { |l| l.strip.empty? }.reverse
+end
+
+def build_subscription_param(f, args, code=[])
+  if args.empty?
+    code.empty? ? "" : " " + code.join(" ")
+  else
+    a = args.first
+    case args.first
+    when "Model"
+      code << "pageModel"
+    else
+      raise "Unknown subscription param: #{a}"
+    end
+    build_subscription_param(f, args.drop(1), code)
+  end
+end
+
+def generate_page_subscriptions(files)
+  sub_code = []
+  i = 0
+  files.filter { |f| f.subscriptions }.each_with_index do |f, i|
+    sub_code << "" if i > 0
+    name = f.module.alias
+    msg_name = f.msg ? f.msg.name : nil
+    if msg_name.nil?
+      raise "Page #{f.path} must define a Msg type to support subscriptions"
+    end
+    param = build_subscription_param(f, f.subscriptions.args)
+
+    if param.empty?
+      sub_code << "#{name} _ ->"
+      sub_code << "    Sub.map #{msg_name} #{name}.subscriptions"
+    else
+      sub_code << "#{name}#{param} ->"
+      sub_code << "    Sub.map #{msg_name} (#{name}.subscriptions#{param})"
+    end
+  end
+
+  all = []
+  if sub_code.empty?
+    all << "pageSubscriptions : Sub PageMsg"
+    all << "pageSubscriptions ="
+    all << "    Sub.none"
+  else
+    all << "pageSubscriptions : ReadyModel -> Sub PageMsg"
+    all << "pageSubscriptions model ="
+    all << "    case model.page of"
+    sub_code.each { |l|
+      all << "        #{l}"
+    }
+    all << ""
+    all << "        _ ->"
+    all << "            Sub.none"
+  end
+
+  all
+end
+
+def special_pages
+  ['NotFound', 'NotAuthorized'].filter { |p| File.exist?("src/#{p}.elm") }
+end
+
+def generate_type_page(files)
+    content = ["type Page"]
+    files.each_with_index { |f, i|
+        sep = i == 0 ? "=" : "|"
+        name = f.module.alias
+        if model = f.model
+          content << "    #{sep} #{name} #{name}.#{model.name}"
+        else
+          content << "    #{sep} #{name}"
+        end
+    }
+    special_pages.each { |p|    
+        content << "    | Page#{p}"
+    }
+    content
+end
+
+def generate_type_page_msg(files)
+    content = ["type PageMsg"]
+    files.filter { |f| f.msg }.each_with_index { |f, i|
+        sep = i == 0 ? "=" : "|"
+        content << "    #{sep} #{f.module.alias}Msg #{f.module.alias}.Msg"
+    }
+    content
+end
+
+# We want to parse the list of args and identify one of 3 possible scenarios:
+# 1. No args
+# 2. The first arg optionally refers to some sort of global state (Name will start with GlobalState).
+# 3. The next arg, if specified, will be a generic arg named "params"
+# 4. There can be no more than 2 args
+def build_init_param(f, args, code=[])
+  global_param_name = args.first == "GlobalState" ? "global" : "g"
+  page_param_name = "params"
+
+  if args.empty?
+    ""
+  elsif args.length == 1
+    if args[0].start_with?("GlobalState")
+      " #{global_param_name}"
+    else
+      " #{page_param_name}"
+    end
+
+  elsif args.length == 2
+    if !args[0].start_with?("GlobalState") && !args[0] == "GameGlobalState"
+      raise "File #{f.path}: Invalid arguments for init.  When two args are provided, the first must start with GlobalState: #{args.inspect}"
+    end
+    " #{global_param_name} #{page_param_name}"
+
+  else
+    raise "File #{f.path}: Invalid arguments for init. #{args.inspect}"
+  end
+end
+
+def filters(f)
+  if f.filters.empty?
+    ""
+  else
+    f.filters.map { |name| "RequestFilter#{name}" }.join(", ")
+  end
+end
+
+def wrap_get_page(f, wrapper_method, global_var, method)
+  code = []
+  code << indent(12, "#{wrapper_method}WithFilters global [#{filters f}] (\\#{global_var} ->")
+  code << indent(16, method)
+  code << indent(12, ")")
+  code.join("\n")
+end
+
+def generate_get_page_from_route(global_state_info, files)
+  (global_decl, global_var) = (global_state_info.n > 1) ? ["GlobalState -> ", "global "] : ["", ""]
+
+  all = []
+  all << "getPageFromRoute : #{global_decl}Maybe Route -> ( Page, Cmd PageMsg )"
+  all << "getPageFromRoute #{global_var}maybeRoute ="
+  all << "    case maybeRoute of"
+  spaces = " " * 8
+  files.filter { |f| f.init }.each_with_index { |f, i|
+        sep = i == 0 ? "" : "\n"
+        args = f.init.args
+        if args.last.to_s.include?("params") || args.last.to_s.include?("Params")
+          all << "#{sep}#{spaces}Just (Route.#{f.route.name} params)->"
+        else
+          all << "#{sep}#{spaces}Just Route.#{f.route.name} ->"
+        end
+        name = f.module.alias
+
+        param = build_init_param(f, args)
+        method = nil
+        msg_name = f.msg ? f.msg.name : nil
+        if returns_tuple?(f.init)
+          if msg_name.nil?
+            raise "Page #{f.path} must define a Msg type to support init that returns a Cmd"
+          end
+
+          parts = []
+          parts << "#{name}.init#{param}"
+          parts << "    |> Tuple.mapFirst #{name}"
+          parts << "    |> Tuple.mapSecond (Cmd.map #{msg_name})"
+          method = parts.join("\n")
+
+        elsif returns_model?(f.init)
+          method = "( #{name}.init#{param} |> #{name}, Cmd.none)"
+
+        elsif returns_cmd?(f.init)
+          if msg_name.nil?
+            raise "Page #{f.path} must define a Msg type to support init that returns a Cmd"
+          end
+          method = "( #{name}, #{name}.init#{param} |> Cmd.map #{msg_name})"
+
+        else
+          raise "File #{f.path}: Unsupported init return: #{f.init.returns.inspect}"
+        end
+
+        global_var = args_contain_global_state?(args) ? "g" : "_"
+        if f.requires_admin?
+          all << wrap_get_page(f, "pageAdminData", global_var, method)
+
+        elsif f.requires_subscriber?
+          all << wrap_get_page("pageSubscriberData", global_var, method)
+
+        elsif f.requires_group?
+          all << wrap_get_page(f, "pageGroupData", global_var, method)
+
+        elsif f.requires_login?
+          all << wrap_get_page(f, "pageAuthenticatedData", global_var, method)
+
+        elsif f.requires_game?
+          all << wrap_get_page(f, "pageGame", global_var, method)
+
+        else
+          all << indent(12, method)
+        end
+    }
+    files.filter { |f| f.init.nil? }.each { |f|
+      all << "#{spaces}Just Route.#{f.route.name} ->"
+      all << "#{spaces}    ( #{f.module.alias}, Cmd.none )"
+    }
+
+    all << "\n#{spaces}Nothing ->"
+    all << "#{spaces}    ( PageNotFound, Cmd.none )"
+  all
+end
+
+def build_view_param(f, msg_name, args, code=[])
+  if args.empty?
+    code.empty? ? "" : " " + code.join(" ")
+  else
+    a = args.first
+    if a == "Model"
+      code << "pageModel"
+
+    elsif a.start_with?("MainViewProps ")
+      if msg_name.nil?
+        raise "ERROR: Page #{f.path} must either define a Msg type or changed view to remove MainViewProps"
+      end
+      code << "(mainViewProps model.global #{msg_name})"
+
+    elsif a == "GlobalState"
+      code << "model.global"
+
+    elsif a.start_with?("GlobalState")
+      code << "g"
+
+    elsif a.start_with?("Shell.ViewProps ")
+      code << "(shellViewProps model)"
+
+    elsif a.start_with?("Splash.ViewProps ")
+      code << "(splashViewProps model)"
+
+    else
+      raise "File #{f.path}: Unsupported view param: #{a}"
+    end      
+    build_view_param(f, msg_name, args.drop(1), code)
+  end
+end
+
+def generate_view_ready(files)
+  all = []
+  all << "viewReady : ReadyModel -> Browser.Document Msg"
+  all << "viewReady model ="
+  all << "    case model.page of"
+  spaces = " " * 8
+  files.each_with_index { |f, i|
+        sep = i == 0 ? "" : "\n"
+        name = f.module.alias
+        msg_name = f.msg ? f.msg.name : nil
+        args = f.view ? f.view.args : []
+        param = build_view_param(f, msg_name, args)
+        model_var = f.model ? param.include?("pageModel") ? " pageModel" : " _" : ""
+        suffix = (msg_name && !param.include?("ViewProps")) ? " |> mapDoc #{msg_name}" : ""
+        all << "#{sep}#{spaces}#{name}#{model_var} ->"
+
+        takes_global = args_contain_global_state?(args)
+        method = "#{name}.view#{param}#{suffix}"
+        if takes_global && f.requires_group?
+          all << indent(12, "viewGroupDataWithFilters model.global [#{filters f}] (\\g ->")
+          all << indent(16, method)
+          all << indent(12, ")")
+
+        elsif takes_global && f.requires_login?
+          all << indent(12, "viewAuthenticatedData model.global (\\g ->")
+          all << indent(16, method)
+          all << indent(12, ")")
+
+        else
+          all << indent(12, method)
+        end
+    }
+    special_pages.each { |p|    
+        all << "\n#{spaces}Page#{p} ->"
+        all << "#{spaces}    #{p}.view"
+    }
+    all
+end
+
+def build_update_param(f, msg_name, args, code=[])
+  if args.empty?
+    code.empty? ? "" : " " + code.join(" ")
+  else
+    a = args.first
+    if a == "Model"
+      code << "pageModel"
+
+    elsif a == "Msg"
+        code << "pageMsg"
+
+    elsif a.start_with?("MainUpdatePropsWithSession ")
+      code << "(updatePropsWithSessionUpdate #{msg_name})"
+
+    elsif a.start_with?("MainUpdatePropsWithLoggedIn ")
+      code << "(updatePropsWithLoggedIn #{msg_name})"
+
+    elsif a.start_with?("MainUpdatePropsWithLoggedOut ")
+      code << "(updatePropsWithLoggedOut #{msg_name})"
+
+    elsif a.start_with?("MainUpdatePropsWithGroup ")
+      code << "(updatePropsWithGroup #{msg_name})"
+
+    elsif a.start_with?("MainUpdateRefreshNotifications ")
+      code << "(updatePropsWithRefreshNotifications #{msg_name})"
+
+    elsif a == "GlobalState"
+      code << "model.global"
+
+    elsif a.start_with?("GlobalState") && a.end_with?("Data")
+      code << "g"
+
+    elsif a == "GameGlobalState"
+      code << "g"
+
+    else
+      raise "File #{f.path}: Unsupported update param: #{a}"
+    end
+    build_update_param(f, msg_name, args.drop(1), code)
+  end
+end
+
+def generate_update_page(files)
+  all = []
+  all << "updatePage : ReadyModel -> PageMsg -> ( Page, Cmd Msg )"
+  all << "updatePage model msg ="
+  all << "    case ( model.page, msg ) of"
+  spaces = " " * 8
+  files.filter { |f| f.update }.each_with_index { |f, i|
+        sep = i == 0 ? "" : "\n"
+        name = f.module.alias
+        msg_name = f.msg ? f.msg.name : nil
+        raise "Page #{f.path} must define a Msg type to support update" if msg_name.nil?
+        args = f.update ? f.update.args : []
+        if args.empty?
+          raise "Page #{f.path} must define at least one argument for update"
+        end
+
+        param = build_update_param(f, msg_name, args)
+        if f.model
+          all << "#{sep}#{spaces}( #{name} pageModel, #{msg_name} pageMsg ) ->"
+        else
+          all << "#{sep}#{spaces}( #{name}, #{msg_name} pageMsg ) ->"
+        end
+
+        map_cmd = !param.include?("updateProp") && msg_name
+
+        method = []
+        method << "#{name}.update#{param}"
+        if returns_tuple?(f.update)
+          method << "    |> Tuple.mapFirst #{name}"
+          if map_cmd
+            method << "    |> Tuple.mapSecond (Cmd.map (ReadyMsg << ChangedPage << #{msg_name}))"
+          end
+  
+        elsif returns_model?(f.update)
+          method << "    |> \\m -> (#{name} m, Cmd.none)"
+
+        elsif returns_cmd?(f.update)
+          if map_cmd
+            method << "    |> \\c -> (model.page, Cmd.map (ReadyMsg << ChangedPage << #{msg_name}) c)"
+          else
+            method << "    |> \\c -> (model.page, c)"
+          end
+
+        else
+          raise "File #{f.path}: Unsupported update return: #{f.update.returns.inspect}"
+        end
+
+        m = method.join("\n")
+
+        takes_global = args_contain_global_state?(args)
+
+        if takes_global && f.update.global_state && f.update.global_state.requires_group?
+          all << indent(12, "updateGroupDataWithFilters model.global [#{filters f}] (\\g ->")
+          all << indent(16, m)
+          all << indent(12, ")")
+
+        elsif takes_global && f.update.global_state && f.update.global_state.requires_login?
+          all << indent(12, "updateAuthenticatedData model.global (\\g ->")
+          all << indent(16, m)
+          all << indent(12, ")")
+
+        elsif takes_global && f.update.global_state && f.update.global_state.requires_game?
+          all << indent(12, "updateGame model.global (\\g ->")
+          all << indent(16, m)
+          all << indent(12, ")")
+
+        else
+          if takes_global && f.path.start_with?("src/Page/Game")
+            raise "#{f.update.global_state.inspect}"
+          end
+          all << indent(12, m)
+        end
+
+  }
+  all << "\n#{spaces}( page, _ ) ->"
+  all << "#{spaces}    ( page, Cmd.none )"
+  all            
+end
+
+def args_contain_global_state?(args)
+  args.any? { |a| a.start_with?("GlobalState") || a == "GameGlobalState" }
+end
+
+def returns_tuple?(decl)
+  returns = decl ? decl.returns : []
+  returns.length > 1
+end
+
+def returns_model?(decl)
+  returns = decl ? decl.returns : []
+  returns.include?("Model")
+end
+
+def returns_cmd?(decl)
+  returns = decl ? decl.returns : []
+  returns.any? { |r| r.start_with?("Cmd") }
+end
+
+
+CODEGEN_START = "-- CODEGEN START"
+def read_file_until_codegen(file)
+  all = []
+  found = false
+  IO.readlines(file).each do |l|
+    all << l.chomp
+    if l.strip == CODEGEN_START
+      found = true
+      break
+    end
+  end
+  if !found
+    all << "\n\n#{CODEGEN_START}\n\n"
+  end
+    all
+end
+
+class GlobalStateInfo
+  attr_reader :n
+  def initialize(n)
+    @n = n
+  end
+end
+
+def get_global_state_info(file)
+  if !File.exist?(file)
+    return GlobalStateInfo.new(0)
+  end
+
+  n = 0
+  IO.readlines(file).each do |l|
+    if l.strip.match(/^type\s+alias\s+GlobalState/)
+      n += 1
+    elsif l.strip.match(/^type\s+GlobalState/)
+      n += 1
+    end
+  end
+  GlobalStateInfo.new(n)
+end
+
+assert_unique_modules(files)
+
+global_state_info = get_global_state_info(GLOBAL_FILE)
+
+if !File.exist?(MAIN_FILE)
+  Util.exit_with_error("File #{MAIN_FILE} does not exist")
+end
+
+all = read_file_until_codegen(MAIN_FILE)
+all << generate_page_subscriptions(files) << "\n"
+all << generate_type_page(files) << "\n"
+all << generate_type_page_msg(files) << "\n"
+all << generate_get_page_from_route(global_state_info, files) << "\n"
+all << generate_view_ready(files) << "\n"
+all << generate_update_page(files) << "\n"
+
+new_contents = replace_imports(all.join("\n"), files)
+
+original_contents = IO.read(MAIN_FILE).strip
+
+puts ""
+if new_contents == original_contents
+  puts "No changes made to #{MAIN_FILE}"
+else
+  File.open(MAIN_FILE, "w") do |f|
+    f << new_contents
+  end
+  puts "Look at #{MAIN_FILE}"
+end
+puts ""
