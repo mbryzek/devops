@@ -58,7 +58,7 @@ EOF
     end
 
     def EnvironmentVariables.from_file(app_name, filename)
-        path = File.join(DIR, "../apps/#{app_name}/env/#{filename}.env")
+        path = File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env")
         if !File.exist?(path)
             Util.exit_with_error("Environment file '#{path}' not found")
         end
