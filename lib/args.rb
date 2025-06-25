@@ -65,7 +65,7 @@ class Args
 
     def Args.list_apps
         valid_apps = []
-        dir = Util.cleanpath(File.join(File.dirname(__FILE__), "../apps"))
+        dir = Util.cleanpath(File.join(File.dirname(__FILE__), "../../env/apps"))
         Dir.glob("#{dir}/*").each do |path|
             if File.directory?(path)
                 valid_apps << File.basename(path)
