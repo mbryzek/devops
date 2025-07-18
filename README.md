@@ -39,7 +39,7 @@ Generate a new one at https://cloud.digitalocean.com/account/api/tokens?i=65dbae
 
 Release file hoa-backend-0.1.4.tar.gz copied to 167.99.120.79
 Next Steps
-~/code/mbryzek/devops/hoa/ssh-backend.sh
+~/code/devops/hoa/ssh-backend.sh
 rm -rf hoa-backend-0.1.4
 tar xfz hoa-backend-0.1.4.tar.gz
 mv hoa-backend.log hoa-backend.log.last

@@ -51,7 +51,7 @@ class ReleaseManager
   end
 
   def deploy_release
-    deploy_cmd = "cd ~/code/mbryzek/devops && ./bin/deploy --app #{@app} --file #{File.expand_path(@tarfile)}"
+    deploy_cmd = "cd ~/code/devops && ./bin/deploy --app #{@app} --file #{File.expand_path(@tarfile)}"
     puts "Starting deployment"
     puts deploy_cmd
     Util.run(deploy_cmd)
