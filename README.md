@@ -34,22 +34,3 @@ Digital ocean token is expected at
 
 Generate a new one at https://cloud.digitalocean.com/account/api/tokens?i=65dbae
   - we gave it read on droplets and read/update on load balancer
-
-```
-
-Release file hoa-backend-0.1.4.tar.gz copied to 167.99.120.79
-Next Steps
-~/code/devops/hoa/ssh-backend.sh
-rm -rf hoa-backend-0.1.4
-tar xfz hoa-backend-0.1.4.tar.gz
-mv hoa-backend.log hoa-backend.log.last
-cd hoa-backend-0.1.4
-../kill.rb hoa-backend
-nohup ./run.sh > ../hoa-backend.log &
-cd ..
-./delete-old-deploys.rb
-sleep 1
-tail -f hoa-backend.log
-
-# curl localhost:9100/_internal_/healthcheck
-```
