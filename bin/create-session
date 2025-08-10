@@ -1,0 +1,82 @@
+#!/usr/bin/env ruby
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+require 'net/http'
+require 'uri'
+require 'json'
+
+def get_default_email
+  begin
+    email = `git config --get user.email`.strip
+    return email unless email.empty?
+  rescue
+    # If git command fails, return nil
+  end
+  nil
+end
+
+def create_session(email, password)
+  uri = URI('https://api.trueacumen.com/sessions/login')
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+
+  request = Net::HTTP::Post.new(uri)
+  request['Content-Type'] = 'application/json'
+  request.body = {
+    email: email,
+    password: password
+  }.to_json
+
+  response = http.request(request)
+
+  if response.code.to_i == 200 || response.code.to_i == 201
+    begin
+      json_response = JSON.parse(response.body)
+      if json_response['session_id']
+        return json_response['session_id']
+      elsif json_response['id']
+        return json_response['id']
+      else
+        puts "Warning: Could not find session ID in response"
+        return nil
+      end
+    rescue JSON::ParserError
+      puts "Warning: Could not parse JSON response"
+      return nil
+    end
+  else
+    puts "Error: Login failed with status #{response.code}: #{response.body}"
+    return nil
+  end
+end
+
+# Get default email from git config
+default_email = get_default_email
+
+# Ask for email address
+if default_email
+  email = Ask.for_string("Enter email address:", default: default_email)
+else
+  email = Ask.for_string("Enter email address:")
+end
+
+# Ask for password
+password = Ask.for_string("Enter password:", hide_input: true)
+
+puts ""
+puts "Creating session for #{email}..."
+puts ""
+
+session_id = create_session(email, password)
+
+if session_id
+  puts ""
+  puts "✓ Session created successfully!"
+  puts "Session ID: #{session_id}"
+  puts ""
+else
+  puts ""
+  puts "✗ Failed to create session"
+  puts ""
+  exit 1
+end
