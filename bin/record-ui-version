@@ -72,8 +72,8 @@ end
 def create_session
     tmpfile = "/tmp/record-ui-version.#{Process.pid}.tmp"
     begin
-        system("#{CREATE_SESSION_SCRIPT} > #{tmpfile}")
-        session_id = IO.read(tmpfile)
+        system("#{CREATE_SESSION_SCRIPT} --output-file #{tmpfile}")
+        session_id = IO.read(tmpfile).strip
     ensure
         `rm -f #{tmpfile}`
     end

@@ -4,6 +4,7 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'net/http'
 require 'uri'
 require 'json'
+require 'optparse'
 
 def get_default_email
   begin
@@ -13,24 +14,6 @@ def get_default_email
     # If git command fails, return nil
   end
   nil
-end
-
-def prompt_for_string(msg, opts={})
-  default = opts.has_key?(:default) ? opts[:default].to_s.strip : nil
-  prompt = default.nil? || msg.include?("[#{default}]")? msg : "#{msg} [#{default}]"
-  hide_input = opts.has_key?(:hide_input) ? opts[:hide_input] : false
-  value = ""
-  while value.empty?
-    STDERR.puts prompt
-    system("stty -echo") if hide_input
-    value = STDIN.gets
-    system("stty echo") if hide_input
-    value.strip!
-    if value.empty? && default
-      value = default
-    end
-  end
-  value
 end
 
 def create_session(email, password)
@@ -55,43 +38,63 @@ def create_session(email, password)
       elsif json_response['id']
         return json_response['id']
       else
-        STDERR.puts "Warning: Could not find session ID in response"
+        puts "Warning: Could not find session ID in response"
         return nil
       end
     rescue JSON::ParserError
-      STDERR.puts "Warning: Could not parse JSON response"
+      puts "Warning: Could not parse JSON response"
       return nil
     end
   else
-    STDERR.puts "Error: Login failed with status #{response.code}: #{response.body}"
+    puts "Error: Login failed with status #{response.code}: #{response.body}"
     return nil
   end
 end
+
+# Parse command line options
+output_file = nil
+OptionParser.new do |opts|
+  opts.banner = "Usage: create-session [options]"
+
+  opts.on("-o", "--output-file FILE", "Write session ID to file") do |file|
+    output_file = file
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end.parse!
 
 # Get default email from git config
 default_email = get_default_email
 
 # Ask for email address
 if default_email
-  email = prompt_for_string("Enter email address:", default: default_email)
+  email = Ask.for_string("Enter email address:", default: default_email)
 else
-  email = prompt_for_string("Enter email address:")
+  email = Ask.for_string("Enter email address:")
 end
 
 # Ask for password
-password = prompt_for_string("Enter password:", hide_input: true)
+password = Ask.for_string("Enter password:", hide_input: true)
 
-STDERR.puts ""
-STDERR.puts "Creating session for #{email}..."
-STDERR.puts ""
+puts ""
+puts "Creating session for #{email}..."
+puts ""
 
 session_id = create_session(email, password)
 
 if session_id
-  puts session_id
+  if output_file
+    File.write(output_file, session_id)
+    puts "Session ID written to #{output_file}"
+  else
+    puts session_id
+  end
 else
-  STDERR.puts ""
-  STDERR.puts "✗ Failed to create session"
-  STDERR.puts ""
+  puts ""
+  puts "✗ Failed to create session"
+  puts ""
   exit 1
 end
