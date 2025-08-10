@@ -70,7 +70,8 @@ class TokenFile
 end
 
 def create_session
-    tmpfile = "/tmp/record-ui-version.#{Process.pid}.tmp"
+    tmpfile = "/tmp/record-ui-version.create_session.#{Process.pid}.tmp"
+    session_id = ""
     begin
         system("#{CREATE_SESSION_SCRIPT} --output-file #{tmpfile}")
         session_id = IO.read(tmpfile).strip

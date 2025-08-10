@@ -6,6 +6,8 @@ require 'uri'
 require 'json'
 require 'optparse'
 
+BRYZEK_GROUP_KEY = "bryzek"
+
 def get_default_email
   begin
     email = `git config --get user.email`.strip
@@ -25,7 +27,8 @@ def create_session(email, password)
   request['Content-Type'] = 'application/json'
   request.body = {
     email: email,
-    password: password
+    password: password,
+    group_key: BRYZEK_GROUP_KEY
   }.to_json
 
   response = http.request(request)
