@@ -4,6 +4,10 @@
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
+CREATE_SESSION_SCRIPT = File.join(dir, "create-session")
+if !File.exist?(CREATE_SESSION_SCRIPT)
+  Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} does not exist")
+end
 
 args = Args.parse(ARGV, ["app"])
 config = Config.load(args.app)
@@ -66,14 +70,22 @@ class TokenFile
   end
 end
 
+def create_session
+    session_id = system(CREATE_SESSION_SCRIPT).to_s.strip
+    if session_id.empty?
+      Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} failed to create session")
+    end
+    session_id
+end
+
 tf = if File.exist?(candidate)
   TokenFile.read(candidate)
 else
   puts ""
   puts "Expecting Session ID for #{args.app} in #{candidate} which currently does not exists."
-  puts "We will help you create this file."
+  puts "We will help you create this file by creating a session:"
   puts ""
-  session_id = Ask.for_string("Please enter the session id: ", :hide_input => true)
+  session_id = create_session
   file = TokenFile.new(session_id)
   file.write!(TOKEN_FILE)
   puts ""
@@ -118,8 +130,8 @@ def put_version(host, session_id, version, retryCount = 1)
     puts "Received Not Authorized."
     if retryCount >= 2
       puts ""
-      puts "Please create a new session id and enter it below."
-      session_id = Ask.for_string("", :hide_input => true)
+      puts "Please create a new session:"
+      session_id = create_session
       file = TokenFile.new(session_id)
       file.write!(TOKEN_FILE)
     else

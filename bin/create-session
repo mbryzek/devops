@@ -70,10 +70,7 @@ puts ""
 session_id = create_session(email, password)
 
 if session_id
-  puts ""
-  puts "✓ Session created successfully!"
-  puts "Session ID: #{session_id}"
-  puts ""
+  puts session_id
 else
   puts ""
   puts "✗ Failed to create session"
