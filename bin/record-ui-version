@@ -116,15 +116,16 @@ def put_version(host, session_id, version, retryCount = 1)
 
   elsif http.status == 401
     puts "Received Not Authorized."
-    if retryCount % 10 == 0
+    if retryCount >= 2
       puts ""
       puts "Please create a new session id and enter it below."
       session_id = Ask.for_string("", :hide_input => true)
       file = TokenFile.new(session_id)
       file.write!(TOKEN_FILE)
     else
-      sleep(500)
+      puts ""
       puts "Retrying..."
+      sleep(1)
     end
     put_version(host, session_id, version, retryCount + 1)
 
