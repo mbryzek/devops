@@ -15,6 +15,24 @@ def get_default_email
   nil
 end
 
+def prompt_for_string(msg, opts={})
+  default = opts.has_key?(:default) ? opts[:default].to_s.strip : nil
+  prompt = default.nil? || msg.include?("[#{default}]")? msg : "#{msg} [#{default}]"
+  hide_input = opts.has_key?(:hide_input) ? opts[:hide_input] : false
+  value = ""
+  while value.empty?
+    STDERR.puts prompt
+    system("stty -echo") if hide_input
+    value = STDIN.gets
+    system("stty echo") if hide_input
+    value.strip!
+    if value.empty? && default
+      value = default
+    end
+  end
+  value
+end
+
 def create_session(email, password)
   uri = URI('https://api.trueacumen.com/sessions/login')
   http = Net::HTTP.new(uri.host, uri.port)
@@ -37,15 +55,15 @@ def create_session(email, password)
       elsif json_response['id']
         return json_response['id']
       else
-        puts "Warning: Could not find session ID in response"
+        STDERR.puts "Warning: Could not find session ID in response"
         return nil
       end
     rescue JSON::ParserError
-      puts "Warning: Could not parse JSON response"
+      STDERR.puts "Warning: Could not parse JSON response"
       return nil
     end
   else
-    puts "Error: Login failed with status #{response.code}: #{response.body}"
+    STDERR.puts "Error: Login failed with status #{response.code}: #{response.body}"
     return nil
   end
 end
@@ -55,25 +73,25 @@ default_email = get_default_email
 
 # Ask for email address
 if default_email
-  email = Ask.for_string("Enter email address:", default: default_email)
+  email = prompt_for_string("Enter email address:", default: default_email)
 else
-  email = Ask.for_string("Enter email address:")
+  email = prompt_for_string("Enter email address:")
 end
 
 # Ask for password
-password = Ask.for_string("Enter password:", hide_input: true)
+password = prompt_for_string("Enter password:", hide_input: true)
 
-puts ""
-puts "Creating session for #{email}..."
-puts ""
+STDERR.puts ""
+STDERR.puts "Creating session for #{email}..."
+STDERR.puts ""
 
 session_id = create_session(email, password)
 
 if session_id
   puts session_id
 else
-  puts ""
-  puts "✗ Failed to create session"
-  puts ""
+  STDERR.puts ""
+  STDERR.puts "✗ Failed to create session"
+  STDERR.puts ""
   exit 1
 end

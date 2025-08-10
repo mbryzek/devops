@@ -1,5 +1,4 @@
 #!/usr/bin/env ruby
-
 # Run this file from the project root directory
 
 dir = File.dirname(__FILE__)
@@ -71,7 +70,13 @@ class TokenFile
 end
 
 def create_session
-    session_id = system(CREATE_SESSION_SCRIPT).to_s.strip
+    tmpfile = "/tmp/record-ui-version.#{Process.pid}.tmp"
+    begin
+        system("#{CREATE_SESSION_SCRIPT} > #{tmpfile}")
+        session_id = IO.read(tmpfile)
+    ensure
+        `rm -f #{tmpfile}`
+    end
     if session_id.empty?
       Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} failed to create session")
     end
@@ -118,7 +123,7 @@ def parse_http(response)
   HttpResponse.new(status, body)
 end
 
-def put_version(host, session_id, version, retryCount = 1)
+def put_version(host, session_id, version)
   url = "#{host}/ui/version"
   cmd = "curl -i -s -X PUT #{host}/ui/version -H 'acumen_session_id: #{session_id}' -H 'content-type: application/json' -d '{\"version\": \"#{version}\"}'"
   http = parse_http(`#{cmd}`)
@@ -128,18 +133,12 @@ def put_version(host, session_id, version, retryCount = 1)
 
   elsif http.status == 401
     puts "Received Not Authorized."
-    if retryCount >= 2
-      puts ""
-      puts "Please create a new session:"
-      session_id = create_session
-      file = TokenFile.new(session_id)
-      file.write!(TOKEN_FILE)
-    else
-      puts ""
-      puts "Retrying..."
-      sleep(1)
-    end
-    put_version(host, session_id, version, retryCount + 1)
+    puts ""
+    puts "Please create a new session:"
+    session_id = create_session
+    file = TokenFile.new(session_id)
+    file.write!(TOKEN_FILE)
+    put_version(host, session_id, version)
 
   else
     Util.exit_with_error("ERROR: Received HTTP Status #{http.status}")
