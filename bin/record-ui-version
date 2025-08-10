@@ -1,9 +1,12 @@
 #!/usr/bin/env ruby
-
 # Run this file from the project root directory
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
+CREATE_SESSION_SCRIPT = File.join(dir, "create-session")
+if !File.exist?(CREATE_SESSION_SCRIPT)
+  Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} does not exist")
+end
 
 args = Args.parse(ARGV, ["app"])
 config = Config.load(args.app)
@@ -66,14 +69,29 @@ class TokenFile
   end
 end
 
+def create_session
+    tmpfile = "/tmp/record-ui-version.create_session.#{Process.pid}.tmp"
+    session_id = ""
+    begin
+        system("#{CREATE_SESSION_SCRIPT} --output-file #{tmpfile}")
+        session_id = IO.read(tmpfile).strip
+    ensure
+        `rm -f #{tmpfile}`
+    end
+    if session_id.empty?
+      Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} failed to create session")
+    end
+    session_id
+end
+
 tf = if File.exist?(candidate)
   TokenFile.read(candidate)
 else
   puts ""
   puts "Expecting Session ID for #{args.app} in #{candidate} which currently does not exists."
-  puts "We will help you create this file."
+  puts "We will help you create this file by creating a session:"
   puts ""
-  session_id = Ask.for_string("Please enter the session id: ", :hide_input => true)
+  session_id = create_session
   file = TokenFile.new(session_id)
   file.write!(TOKEN_FILE)
   puts ""
@@ -106,7 +124,7 @@ def parse_http(response)
   HttpResponse.new(status, body)
 end
 
-def put_version(host, session_id, version, retryCount = 1)
+def put_version(host, session_id, version)
   url = "#{host}/ui/version"
   cmd = "curl -i -s -X PUT #{host}/ui/version -H 'acumen_session_id: #{session_id}' -H 'content-type: application/json' -d '{\"version\": \"#{version}\"}'"
   http = parse_http(`#{cmd}`)
@@ -116,17 +134,12 @@ def put_version(host, session_id, version, retryCount = 1)
 
   elsif http.status == 401
     puts "Received Not Authorized."
-    if retryCount % 10 == 0
-      puts ""
-      puts "Please create a new session id and enter it below."
-      session_id = Ask.for_string("", :hide_input => true)
-      file = TokenFile.new(session_id)
-      file.write!(TOKEN_FILE)
-    else
-      sleep(500)
-      puts "Retrying..."
-    end
-    put_version(host, session_id, version, retryCount + 1)
+    puts ""
+    puts "Please create a new session:"
+    session_id = create_session
+    file = TokenFile.new(session_id)
+    file.write!(TOKEN_FILE)
+    put_version(host, session_id, version)
 
   else
     Util.exit_with_error("ERROR: Received HTTP Status #{http.status}")
