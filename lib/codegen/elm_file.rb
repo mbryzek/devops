@@ -110,9 +110,14 @@ class ElmMsg
     end
 
     def ElmMsg.from_module_name(lines)
-        name = ElmFile.parse_module_name(lines).gsub(/\./, '') + "Msg"
-        ElmMsg.new(name)
-    end
+      name = ElmFile.parse_module_name(lines).gsub(/\./, '') + "Msg"
+      ElmMsg.new(name)
+  end
+
+  def ElmMsg.from_module_name_alias(lines)
+    name = ElmFile.parse_module_name(lines).gsub(/\./, '') + "Msg"
+    ElmMsg.new(name)
+end
 
 end
 
@@ -208,6 +213,7 @@ class ElmFile
         subscriptions = ElmDeclaration.parse(f, lines, "subscriptions")
         model = contents.include?("type alias Model") ? ElmModel.new("Model") : nil
         msg = contents.include?("type Msg") ? ElmMsg.from_module_name(lines) : nil
+        msg ||= contents.include?("type alias Msg") ? ElmMsg.from_module_name_alias(lines) : nil
         ElmFile.new(f, module_name, model, msg, init, update, view, subscriptions)
     end
 
