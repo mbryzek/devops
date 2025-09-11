@@ -103,7 +103,7 @@ class DeploymentNode
     end
 end
 
-def wait_until_up(dn, iteration=0, max=15)
+def wait_until_up(dn, iteration=0, max=25)
     sleep 1
     dn.update_status
 
