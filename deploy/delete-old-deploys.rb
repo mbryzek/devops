@@ -55,8 +55,9 @@ def delete_old(app)
   all = Dir.glob("#{app}*").map { |f|
     name = File.basename(f).sub(/\.tar.gz$/, '').sub(/\.tar$/, '')
     next if IGNORED.include?(name)
-    app, tag = name.sub(/\-postgresql/, '').split(/-/, 2)
-    if app.nil? || tag.nil?
+    n = name.sub(/\-postgresql/, '')
+    tag = n.slice(app.length + 1, n.length)
+    if tag.nil?
       nil
     elsif v = Version.parse(tag)
       Release.new(f, app, v)
