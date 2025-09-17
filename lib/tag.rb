@@ -1,9 +1,6 @@
 class Tag
   def Tag.ask
-    Util.assert_sem_installed
-
-    next_standard_tag = `sem-info tag next`.strip
-    next_tag = replace_hundreds(next_standard_tag)
+    next_tag = Tag.next_tag
     puts ""
     if Ask.for_boolean("Create new tag #{next_tag}?")
       Util.run("git tag -a -m #{next_tag} #{next_tag}")
@@ -11,6 +8,12 @@ class Tag
     end
 
     `sem-info tag latest`.strip
+  end
+
+  def Tag.next_tag
+    Util.assert_sem_installed
+    next_standard_tag = `sem-info tag next`.strip
+    replace_hundreds(next_standard_tag)
   end
 
   def Tag.replace_hundreds(tag)

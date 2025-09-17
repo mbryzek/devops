@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+
+# Run this file from the project root directory
+
+dir = File.dirname(__FILE__)
+load File.join(dir, "../lib/common.rb")
+
+name = `pwd`.strip.split("/").last
+if !name.start_with?("lib-")
+  Util.exit_with_error("Do not know how to release library that does not start with lib-")
+end
+
+puts ""
+tag = Tag.next_tag
+if Ask.for_boolean("Create new release [#{tag}]?")
+  Util.run("git tag -a -m #{tag} #{tag}")
+  Util.run("git push --tags origin")
+  puts ""
+  puts "Version #{tag} released"
+  puts ""
+end
+
