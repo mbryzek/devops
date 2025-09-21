@@ -135,7 +135,7 @@ def put_version(host, session_id, version)
   elsif http.status == 401
     puts "Received Not Authorized."
     puts ""
-    puts "Please create a new session:"
+    puts "Please create a new session by logging into #{host}:"
     session_id = create_session
     file = TokenFile.new(session_id)
     file.write!(TOKEN_FILE)
