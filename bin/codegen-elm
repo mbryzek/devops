@@ -134,18 +134,23 @@ def generate_type_page(files)
           content << "    #{sep} #{name}"
         end
     }
-    special_pages.each { |p|    
+    special_pages.each { |p|
         content << "    | Page#{p}"
     }
     content
 end
 
 def generate_type_page_msg(files)
+    files_with_messages = files.filter { |f| f.msg }
     content = ["type PageMsg"]
-    files.filter { |f| f.msg }.each_with_index { |f, i|
-        sep = i == 0 ? "=" : "|"
-        content << "    #{sep} #{f.module.alias}Msg #{f.module.alias}.Msg"
-    }
+    if files_with_messages.empty?
+        content << " = PlaceholderMsg"
+    else
+        files_with_messages.each_with_index { |f, i|
+            sep = i == 0 ? "=" : "|"
+            content << "    #{sep} #{f.module.alias}Msg #{f.module.alias}.Msg"
+        }
+    end
     content
 end
 
@@ -297,7 +302,7 @@ def build_view_param(f, msg_name, args, code=[])
 
     else
       raise "File #{f.path}: Unsupported view param: #{a}"
-    end      
+    end
     build_view_param(f, msg_name, args.drop(1), code)
   end
 end
@@ -334,7 +339,7 @@ def generate_view_ready(files)
           all << indent(12, method)
         end
     }
-    special_pages.each { |p|    
+    special_pages.each { |p|
         all << "\n#{spaces}Page#{p} ->"
         all << "#{spaces}    #{p}.view"
     }
@@ -415,7 +420,7 @@ def generate_update_page(files)
           if map_cmd
             method << "    |> Tuple.mapSecond (Cmd.map (ReadyMsg << ChangedPage << #{msg_name}))"
           end
-  
+
         elsif returns_model?(f.update)
           method << "    |> \\m -> (#{name} m, Cmd.none)"
 
@@ -459,7 +464,7 @@ def generate_update_page(files)
   }
   all << "\n#{spaces}( page, _ ) ->"
   all << "#{spaces}    ( page, Cmd.none )"
-  all            
+  all
 end
 
 def args_contain_global_state?(args)
