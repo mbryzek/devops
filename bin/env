@@ -2,9 +2,17 @@
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
-args = Args.parse(ARGV, ["app"])
+args = Args.parse(ARGV, ["app", "file"])
 format = args.format || 'sh'
+config = Config.load(args.app)
+scala_config = config.scala
+if scala_config.nil?
+  Util.exit_with_error("App #{args.app} does not have a scala config")
+end
 
+env = scala_config.send(args.env)
+file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
-all = RunScript.with_deployment_node_index(vars, 0)
+
+all = RunScript.new(config, file, vars, env.nodes, 0)
 puts all.serialize(format)
