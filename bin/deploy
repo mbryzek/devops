@@ -193,15 +193,15 @@ threads.each(&:join)
 deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.each do |dn|
     puts ""
     puts Util.underline("Starting deployment to node #{dn.node.uri} [status: #{dn.status.status}]")
-    RunScript.new(config, file, vars, dn.index).to_file(RUN_SCRIPT, dn.index)
+    RunScript.new(config, file, vars, env.nodes, dn.index).to_file(RUN_SCRIPT)
     dn.upload_file(RUN_SCRIPT)
     dn.execute("rm -rf lib deploy bin")
     dn.execute("tar xfz #{File.basename(tarball)}")
-    puts "Removing node #{dn.node.uri} from load balancer"
+    #puts "Removing node #{dn.node.uri} from load balancer"
     #do_client.remove_droplet_by_ip_address(dn.node.uri)
     dn.execute("./#{deploy_script}")
     wait_until_up(dn)
-    puts "Adding node #{dn.node.uri} to load balancer"
+    #puts "Adding node #{dn.node.uri} to load balancer"
     #do_client.add_droplet_by_ip_address(dn.node.uri)
     puts "Done. Node status is #{dn.status.status}"
     if !dn.healthy?
