@@ -5,7 +5,8 @@ class RunScript
   def initialize(config, file, vars, nodes, index)
     @config = config
     @file = file
-    @vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", index.to_s).with_variable("DEPLOYMENT_NODES", nodes.join(","))
+    all_nodes = nodes.map { |n| "#{n.uri}" }
+    @vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", index.to_s).with_variable("DEPLOYMENT_NODES", all_nodes.join(","))
   end
 
   def to_file(name)
