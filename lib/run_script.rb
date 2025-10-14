@@ -1,9 +1,11 @@
 class RunScript
 
+  attr_reader :vars
+
     def initialize(config, file, vars, nodes, index)
         @config = config
         @file = file
-        @vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", index.to_s).withVariable("DEPLOYMENT_NODES", nodes.join(","))
+        @vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", index.to_s).with_variable("DEPLOYMENT_NODES", nodes.join(","))
     end
 
     def to_file(name)

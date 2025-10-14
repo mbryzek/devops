@@ -2,7 +2,7 @@
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
-args = Args.parse(ARGV, ["app", "file"])
+args = Args.parse(ARGV, ["app"])
 format = args.format || 'sh'
 config = Config.load(args.app)
 scala_config = config.scala
@@ -14,5 +14,5 @@ env = scala_config.send(args.env)
 file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
 
-all = RunScript.new(config, file, vars, env.nodes, 0)
+all = RunScript.new(config, file, vars, env.nodes, 0).vars
 puts all.serialize(format)
