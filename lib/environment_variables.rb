@@ -35,10 +35,10 @@ class EnvironmentVariables
         case format
         when "sh"
           then format_for_sh(all)
-        when "run"
-        then run_sh(all)
+        when "env"
+          then dotenv(all)
         when "json"
-        then all.to_json
+          then all.to_json
         else
           Util.exit_with_error("Unsupported format '#{format}'")
         end
@@ -48,13 +48,9 @@ class EnvironmentVariables
     def format_for_sh(all)
       all.keys.sort.map { |k| "%s='%s'" % [k.strip, all[k].to_s.strip] }.join(" ")
     end
-    def run_sh(all)
-      env = format_for_sh(all)
-      <<-EOF
-#!/bin/sh
 
-#{env} sbt -no-share
-EOF
+    def dotenv(all)
+      all.keys.sort.map { |k| "export #{k.strip}=\"#{all[k].to_s.strip}\"" }.join("\n")
     end
 
     def EnvironmentVariables.from_file(app_name, filename)

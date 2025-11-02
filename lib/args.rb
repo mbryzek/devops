@@ -83,7 +83,7 @@ class Args
     end
 
     class ArgumentValue
- 
+
         def initialize(options)
             @options = options.map { |k, v| [k.to_sym, v] }.to_h
             @found = {}
@@ -176,7 +176,7 @@ class Args
 
     def Args.valid_args
         {
-            "format" => ['json', 'sh', 'run'],
+            "format" => ['json', 'sh', 'env'],
             "env" => ['production', 'development']
         }
     end
