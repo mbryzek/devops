@@ -43,6 +43,10 @@ class GlobalState
   def requires_game?
     @name == GAME
   end
+
+  def requires_anonymous?
+    @name == ANONYMOUS
+  end
 end
 
 # Parse the init function for the page
@@ -198,6 +202,10 @@ class ElmFile
 
     def requires_game?
       @global_state.requires_game?
+    end
+
+    def requires_anonymous?
+      @global_state.requires_anonymous?
     end
 
     def ElmFile.parse(f)

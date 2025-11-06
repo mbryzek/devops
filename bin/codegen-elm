@@ -257,6 +257,9 @@ def generate_get_page_from_route(global_state_info, files)
         elsif f.requires_login?
           all << wrap_get_page(f, "pageAuthenticatedData", global_var, method)
 
+        elsif f.requires_anonymous?
+          all << wrap_get_page(f, "pageAnonymousData", global_var, method)
+
         elsif f.requires_game?
           all << wrap_get_page(f, "pageGame", global_var, method)
 
