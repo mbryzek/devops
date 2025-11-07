@@ -1,5 +1,7 @@
 class ReleaseHelper
-  attr_reader :config, :release_dir
+
+  attr_reader :config, :release_dir, :pwd
+
   def initialize(app_type)
     @log_file = "/tmp/devops.release.log"
     if File.exist?(@log_file)
@@ -7,13 +9,13 @@ class ReleaseHelper
     end
 
     @pwd = `pwd`.strip
-    @app = pwd.strip.split("/").last
+    @app = @pwd.strip.split("/").last
     @release_dir = File.join("../", @app + "-release")
     if !Dir.exist?(@release_dir)
       Util.exit_with_error("Release directory #{@release_dir} does not exist")
     end
-    @config = Config.load(app)
-    t = helper.config.send(app_type.to_sym)
+    @config = Config.load(@app)
+    t = @config.send(app_type.to_sym)
     if t.nil?
       Util.exit_with_error("No #{app_type} config found for app '#{@app}'")
     end
