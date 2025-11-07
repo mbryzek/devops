@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+
+# Run this script from the project root directory
+
+dir = File.dirname(__FILE__)
+load File.join(dir, "../lib/common.rb")
+
+Util.assert_installed("hugo")
+
+helper = ReleaseHelper.new("hugo")
+
+helper.run "rm -rf public"
+puts "Building"
+helper.run "build.sh"
+tag = Tag.ask
+
+Dir.chdir(helper.release_dir) do |dir|
+  helper.run "rm -rf *"
+  helper.run "git reset --hard"
+  helper.run "git clean -fdx"
+  helper.run "cp -R #{pwd}/public ."
+  helper.write_to_file("version.txt", tag)
+  helper.run "git add public version.txt"
+  helper.maybe_tag_and_push
+end
+
+puts ""
