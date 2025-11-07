@@ -18,10 +18,10 @@ Dir.chdir(helper.release_dir) do |dir|
   helper.run "rm -rf *"
   helper.run "git reset --hard"
   helper.run "git clean -fdx"
-  helper.run "cp -R #{pwd}/public ."
+  helper.run "cp -R #{helper.pwd}/public ."
   helper.write_to_file("version.txt", tag)
   helper.run "git add public version.txt"
-  helper.maybe_tag_and_push
+  helper.maybe_tag_and_push(tag)
 end
 
 puts ""
