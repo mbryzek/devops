@@ -17,8 +17,10 @@ elsif config.elm
   else
     ["release-elm"]
   end
+elsif config.hugo
+  ["release-hugo"]
 else
-  Util.exit_with_error("Do not know how to release app that is not scala and not elm")
+  Util.exit_with_error("Do not know how to release app that is not scala, elm, or hugo")
 end
 
 files.each do |file|

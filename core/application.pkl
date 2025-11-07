@@ -5,7 +5,10 @@ class Application {
     port: Int(isBetween(0, 100000))
     scala: ScalaConfig?
     elm: ElmConfig?
+    hugo: HugoConfig?
 }
+
+class HugoConfig {}
 
 class ElmConfig {
     rewrites: Listing<ElmRewrite>?
