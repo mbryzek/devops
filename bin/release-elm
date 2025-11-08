@@ -7,24 +7,7 @@ LOG = "/tmp/release-elm.log"
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
 
-pwd = `pwd`.strip
-app = pwd.strip.split("/").last
-config = Config.load(app)
-elm = config.elm
-if elm.nil?
-  Util.exit_with_error("No Elm config found for app '#{app}'")
-end
-
-release_dir = File.join("../", app + "-release")
-if !Dir.exist?(release_dir)
-  Util.exit_with_error("Release directory #{release_dir} does not exist") 
-end
-
-def run(cmd)
-  File.open(LOG, "a") { |o| o << "\n#{cmd}" }
-  Util.run(cmd + ">> #{LOG}")
-  puts ""
-end
+helper = ReleaseHelper.new("elm")
 
 # Turn elm.js -> elm.min.js
 def add_suffix(filename, suffix)
@@ -44,14 +27,6 @@ def ensure_elm_review
     puts ""
     exit(1)
   end
-end
-
-def compile
-  Util.assert_installed("elm")
-  puts "Compiling"
-  file = "elm.js"
-  run "elm make src/Main.elm --optimize --output=#{file}"
-  file
 end
 
 def rewrite_constants(file, rewrites)
@@ -87,10 +62,10 @@ def rewrite_version(file, version)
   file
 end
 
-def minify(js)
+def minify(helper, js)
   Util.assert_installed("uglifyjs", "https://github.com/mishoo/UglifyJS")
   file = add_suffix(js, "min")
-  run "uglifyjs #{js} --compress 'pure_funcs=[F2,F3,F4,F5,F6,F7,F8,F9,A2,A3,A4,A5,A6,A7,A8,A9],pure_getters,keep_fargs=false,unsafe_comps,unsafe' | uglifyjs --mangle --output #{file}"
+  helper.run "uglifyjs #{js} --compress 'pure_funcs=[F2,F3,F4,F5,F6,F7,F8,F9,A2,A3,A4,A5,A6,A7,A8,A9],pure_getters,keep_fargs=false,unsafe_comps,unsafe' | uglifyjs --mangle --output #{file}"
   file
 end
 
@@ -101,7 +76,6 @@ def extract_file(l, tag)
       f = url[1..-1]
       if !File.exist?(f)
         raise "Failed to find file '#{f} from the following line in index.html:\n#{l}"
-
       end
       f
     else
@@ -112,29 +86,17 @@ def extract_file(l, tag)
   end
 end
 
-if File.exist?(LOG)
-  File.delete(LOG)
-end
-
-def have_changes?
-  diff = `git status --porcelain`.strip
-  !diff.empty?
-end
-
-def write_to_file(path, contents)
-  File.open(path, "w") { |out| out << contents }
-end
-
+Util.assert_installed("elm")
 ensure_elm_review
-a = compile
+puts "Compiling"
+a = "elm.js"
+helper.run "elm make src/Main.elm --optimize --output=#{a}"
 tag = Tag.ask
 
-puts a
-b = rewrite_constants(a, elm.rewrites)
-puts b
-c = minify(b)
-run "rm -f #{b}"
-run "mv #{c} elm.js"
+b = rewrite_constants(a, helper.app_config.rewrites)
+c = minify(helper, b)
+helper.run "rm -f #{b}"
+helper.run "mv #{c} elm.js"
 
 files = ["index.html"]
 File.readlines("index.html").each do |l|
@@ -146,29 +108,21 @@ File.readlines("index.html").each do |l|
   end
 end
 
-Dir.chdir(release_dir) do |dir|
-  run "git rm -f *"
-  run "git reset --hard"
-  run "git clean -fdx"
-  write_to_file("version.txt", tag)
+Dir.chdir(helper.release_dir) do |dir|
+  helper.run "rm -rf *"
+  helper.run "git reset --hard"
+  helper.run "git clean -fdx"
+  helper.write_to_file("version.txt", tag)
   files.each do |f|
-    run "cp #{File.join(pwd, f)} ."
+    helper.run "cp #{File.join(helper.pwd, f)} ."
   end
-  ni = rewrite_constants("index.html", elm.rewrites)
+  ni = rewrite_constants("index.html", helper.app_config.rewrites)
   ni2 = rewrite_version(ni, File.read("version.txt").strip)
-  run "rm -f index.html"
-  run "mv #{ni2} index.html"
-  run "git add #{files.join(" ")} version.txt"
+  helper.run "rm -f index.html"
+  helper.run "mv #{ni2} index.html"
+  helper.run "git add #{files.join(" ")} version.txt"
 
-  if have_changes?
-    run "git commit -a -m 'Release version #{tag}'"
-    run "git push"
-    puts ""
-    puts "#{app} Application Deployed"
-  else
-    puts ""
-    puts "No changes to deploy"
-  end
+  helper.maybe_tag_and_push(tag)
 end
 
 puts ""
