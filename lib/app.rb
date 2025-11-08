@@ -3,7 +3,7 @@
 require 'json'
 
 class App
-  attr_accessor :name, :scala, :port, :elm, :hugo
+  attr_accessor :name, :scala, :port, :elm, :hugo, :flutter
 
   def initialize(json_data)
     @name = json_data['name']
@@ -11,13 +11,18 @@ class App
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
     @hugo = json_data['hugo'] ? HugoConfig.new(json_data['hugo']) : nil
+    @flutter = json_data['flutter'] ? FlutterConfig.new(json_data['flutter']) : nil
   end
 end
 
 class HugoConfig
   def initialize(json_data)
   end
+end
 
+class FlutterConfig
+  def initialize(json_data)
+  end
 end
 
 class ElmConfig

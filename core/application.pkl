@@ -6,9 +6,11 @@ class Application {
     scala: ScalaConfig?
     elm: ElmConfig?
     hugo: HugoConfig?
+    flutter: FlutterConfig?
 }
 
 class HugoConfig {}
+class FlutterConfig {}
 
 class ElmConfig {
     rewrites: Listing<ElmRewrite>?
