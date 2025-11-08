@@ -5,22 +5,21 @@
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
 
-Util.assert_installed("hugo")
-
 helper = ReleaseHelper.new("flutter")
 
-helper.run "rm -rf public"
 puts "Building"
-helper.run "build.sh"
+helper.run "rm -rf build"
+helper.run "./scripts/build-prod.sh"
+helper.run "./scripts/fix-sourcemaps.sh"
 tag = Tag.ask
 
 Dir.chdir(helper.release_dir) do |dir|
   helper.run "rm -rf *"
   helper.run "git reset --hard"
   helper.run "git clean -fdx"
-  helper.run "cp -R #{helper.pwd}/public ."
+  helper.run "cp -R #{helper.pwd}/build/web/* ."
   helper.write_to_file("version.txt", tag)
-  helper.run "git add public version.txt"
+  helper.run "git add *"
   helper.maybe_tag_and_push(tag)
 end
 

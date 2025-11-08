@@ -3,7 +3,7 @@
 require 'json'
 
 class App
-  attr_accessor :name, :scala, :port, :elm, :hugo
+  attr_accessor :name, :scala, :port, :elm, :hugo, :flutter
 
   def initialize(json_data)
     @name = json_data['name']
