@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+
+# Run this script from the project root directory
+
+dir = File.dirname(__FILE__)
+load File.join(dir, "../lib/common.rb")
+
+helper = ReleaseHelper.new("sveltekit")
+
+# Check if wrangler is installed
+unless system('which wrangler > /dev/null 2>&1')
+  puts "Error: wrangler CLI not found"
+  exit 1
+end
+
+# Check if logged in
+unless system('wrangler whoami > /dev/null 2>&1')
+  helper.run "wrangler login"
+  exit 1
+end
+
+helper.run "rm -rf .svelte-kit/cloudflare"
+tag = Tag.ask
+helper.maybe_tag_and_push(tag)
+helper.run_system("npm run build")
+helper.run_system("wrangler pages deploy .svelte-kit/cloudflare")

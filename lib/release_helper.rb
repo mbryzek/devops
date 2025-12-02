@@ -10,9 +10,13 @@ class ReleaseHelper
 
     @pwd = `pwd`.strip
     @app = @pwd.strip.split("/").last
-    @release_dir = File.join("../", @app + "-release")
-    if !Dir.exist?(@release_dir)
-      Util.exit_with_error("Release directory #{@release_dir} does not exist")
+    if app_type == "sveltekit"
+      @release_dir = nil
+    else
+      @release_dir = File.join("../", @app + "-release")
+      if !Dir.exist?(@release_dir)
+        Util.exit_with_error("Release directory #{@release_dir} does not exist")
+      end
     end
     @config = Config.load(@app)
     @app_config = @config.send(app_type.to_sym)
@@ -26,6 +30,16 @@ class ReleaseHelper
     File.open(@log_file, "a") { |o| o << "\n#{cmd}" }
     Util.run(cmd + ">> #{@log_file}")
     puts ""
+  end
+
+  def run_system(cmd)
+    puts cmd
+    if !system(cmd)
+      puts ""
+      puts "ERROR: Command #{cmd} exited with non zero status"
+      puts ""
+      exit(1)
+    end
   end
 
   def write_to_file(path, contents)

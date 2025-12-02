@@ -19,8 +19,8 @@ elsif config.elm
   end
 elsif config.hugo
   ["release-hugo"]
-elsif config.flutter
-  ["release-flutter"]
+elsif config.sveltekit
+  ["release-sveltekit"]
 else
   Util.exit_with_error("Do not know how to release app that is not scala, elm, or hugo")
 end
