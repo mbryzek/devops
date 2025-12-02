@@ -61,6 +61,8 @@ class ReleaseHelper
   private
   def have_changes?
     diff = `git status --porcelain`.strip
-    !diff.empty?
+    # Filter out untracked files (lines starting with ??)
+    tracked_changes = diff.lines.reject { |line| line.start_with?('??') }.join
+    !tracked_changes.strip.empty?
   end
 end
