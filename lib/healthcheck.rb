@@ -28,7 +28,16 @@ class Healthcheck
             # Handle both array and object responses
             data = parsed.is_a?(Array) ? parsed.first : parsed
             if data.is_a?(Hash)
-                Healthcheck.new(data)
+                # Check if this is an error response (has discriminator but no status)
+                if data['status']
+                    Healthcheck.new(data)
+                elsif data['discriminator'] == 'validation'
+                    # Error response from healthcheck endpoint
+                    puts "WARNING: Healthcheck error: #{data['message']}"
+                    DOWN
+                else
+                    DOWN
+                end
             else
                 DOWN
             end
