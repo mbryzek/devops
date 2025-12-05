@@ -20,12 +20,20 @@ class Healthcheck
   end
 
   def Healthcheck.from_json(json)
-    if json.empty?
+    if json.nil? || json.empty?
         DOWN
     else
         begin
-            Healthcheck.new(JSON.parse(json))
-        rescue JSON::ParserError
+            parsed = JSON.parse(json)
+            # Handle both array and object responses
+            data = parsed.is_a?(Array) ? parsed.first : parsed
+            if data.is_a?(Hash)
+                Healthcheck.new(data)
+            else
+                DOWN
+            end
+        rescue JSON::ParserError => e
+            puts "WARNING: Failed to parse healthcheck response: #{json.inspect}"
             DOWN
         end
     end
