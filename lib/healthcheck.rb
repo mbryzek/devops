@@ -35,11 +35,12 @@ class Healthcheck
                     puts "Healthcheck validation error: #{data['message']}"
                     DOWN
                 else
-                puts "WARNING: Unknown Healthcheck response: #{data.inspect}"
+                    puts "WARNING: Unknown Healthcheck response: #{data.inspect}"
                     DOWN
                 end
             else
-                DOWN
+              puts "WARNING: Unknown Healthcheck response (expected a hash): #{data.inspect}"
+              DOWN
             end
         rescue JSON::ParserError => e
             puts "WARNING: Failed to parse healthcheck response: #{json.inspect}"
