@@ -32,10 +32,10 @@ class Healthcheck
                 if data['status']
                     Healthcheck.new(data)
                 elsif data['discriminator'] == 'validation'
-                    # Error response from healthcheck endpoint
-                    puts "WARNING: Healthcheck error: #{data['message']}"
+                    puts "Healthcheck validation error: #{data['message']}"
                     DOWN
                 else
+                puts "WARNING: Unknown Healthcheck response: #{data.inspect}"
                     DOWN
                 end
             else
