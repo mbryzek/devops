@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 # Run this file from the project root directory
+BUILD_FILE = "build.sbt"
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
@@ -10,13 +11,27 @@ if !name.start_with?("lib-")
   Util.exit_with_error("Do not know how to release library that does not start with lib-")
 end
 
+def put_version_in_build_file(version)
+  if !File.exist?(BUILD_FILE)
+    Util.exit_with_error("#{BUILD_FILE} does not exist")
+  end
+  build_file_content = File.read(BUILD_FILE)
+  new_content = build_file_content.gsub(/version\s*:=\s*['"]([^'"]+)['"]/) { "version := \"#{version}\"" }
+  File.write(BUILD_FILE, new_content)
+end
+
 puts ""
 tag = Tag.next_tag
 if Ask.for_boolean("Create new release [#{tag}]?")
+  put_version_in_build_file(tag)
+  Util.run("git commit --allow-empty -m 'Update version' #{BUILD_FILE}")
+  Util.run("git push")
   Util.run("git tag -a -m #{tag} #{tag}")
   Util.run("git push --tags origin")
+  Util.run("sbt +publishM2")
+  Util.run("sbt clean +publishSigned sonatypeBundleRelease")
+
   puts ""
   puts "Version #{tag} released"
   puts ""
 end
-
