@@ -54,12 +54,19 @@ class EnvironmentVariables
     end
 
     def EnvironmentVariables.from_file(app_name, filename)
-        path = File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env")
-        if !File.exist?(path)
-            Util.exit_with_error("Environment file '#{path}' not found")
+        tpl_path = File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env.tpl")
+        if !File.exist?(tpl_path)
+            Util.exit_with_error("Environment template file '#{tpl_path}' not found")
         end
+
+        # Use 1Password CLI to inject secrets from the template
+        output = `op inject -i "#{tpl_path}" 2>&1`
+        if !$?.success?
+            Util.exit_with_error("Failed to inject secrets from '#{tpl_path}': #{output}")
+        end
+
         data = {}
-        IO.readlines(path).each do |l|
+        output.each_line do |l|
             key, value = l.strip.split("=", 2)
             next if key.to_s.strip.empty?
             data[key] = value
