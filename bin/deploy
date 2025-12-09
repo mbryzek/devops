@@ -151,7 +151,7 @@ def create_tarball(config, files)
         end
         File.basename(file)
     end
-    Util.run("tar --no-mac-metadata -czf #{name} lib deploy bin dist #{local_files.join(" ")}")
+    Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{name} lib deploy bin dist #{local_files.join(" ")}")
     Util.run("rm -f #{local_files.join(" ")}")
     name
 end

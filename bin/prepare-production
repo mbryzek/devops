@@ -41,7 +41,7 @@ Dir.chdir(workdir) do
 end
 
 Dir.chdir(base_workdir) do
-  Util.run("tar --no-mac-metadata -czf #{target} #{version_name}")
+  Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{target} #{version_name}")
   Util.run("mv #{target} #{pwd}")
 end
 #Util.run("rm -rf #{base_workdir}")
