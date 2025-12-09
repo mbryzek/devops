@@ -39,6 +39,7 @@ Dir.chdir(workdir) do
   Util.run("mv */* .")
   Util.run("rm bin/*bat")
 end
+Util.run("xattr -cr #{workdir}")
 
 Dir.chdir(base_workdir) do
   Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{target} #{version_name}")

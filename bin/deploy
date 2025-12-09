@@ -126,7 +126,7 @@ def create_deploy_script(config, file)
     #!/bin/sh
     ./deploy/delete-old-deploys.rb --app #{config.name}
     rm -rf #{dir}
-    tar xfz #{File.basename(file)}
+    tar --warning=no-unknown-keyword -xzf #{File.basename(file)}
     cp #{RUN_SCRIPT} #{dir}/
     touch #{logfile}
     mv -f #{logfile} #{logfile}.last
@@ -151,6 +151,7 @@ def create_tarball(config, files)
         end
         File.basename(file)
     end
+    Util.run("xattr -cr lib deploy bin dist #{local_files.join(" ")}")
     Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{name} lib deploy bin dist #{local_files.join(" ")}")
     Util.run("rm -f #{local_files.join(" ")}")
     name
@@ -196,7 +197,7 @@ deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.eac
     RunScript.new(config, file, vars, env.nodes, dn.index).to_file(RUN_SCRIPT)
     dn.upload_file(RUN_SCRIPT)
     dn.execute("rm -rf lib deploy bin")
-    dn.execute("tar xfz #{File.basename(tarball)}")
+    dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
     #puts "Removing node #{dn.node.uri} from load balancer"
     #do_client.remove_droplet_by_ip_address(dn.node.uri)
     dn.execute("./#{deploy_script}")
