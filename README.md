@@ -5,7 +5,7 @@ We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configura
 ## Deploying a release
 
 ```
-./bin/deploy.rb --app hoa-backend --file ~/code/hoa/hoa-backend/hoa-backend-0.1.4.tar.gz --env development
+./bin/deploy.rb --app platform --file ~/code/platform/platform-0.1.4.tar.gz --env development
 ```
 
 ## Generate JSON of configuration
@@ -21,7 +21,7 @@ We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configura
 ```
 
 brew install pkl
-pkl eval hoa/config.pkl --format json
+pkl eval platform/config.pkl --format json
 
 ```
 
