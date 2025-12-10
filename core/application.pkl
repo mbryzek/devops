@@ -24,8 +24,14 @@ class ElmRewrite {
 class ScalaConfig {
     artifactName: String(!isEmpty)
     distRunScriptName: String(!isEmpty)
+    memory: MemoryConfig
     production : ScalaEnvironment
     development : ScalaEnvironment
+}
+
+class MemoryConfig {
+    default: String(!isEmpty)
+    jobServer: String(!isEmpty)
 }
 
 class ScalaEnvironment {
@@ -42,4 +48,5 @@ class Database {
 
 class Node {
   uri: String(!isEmpty)
+  isJobServer: Boolean = false
 }

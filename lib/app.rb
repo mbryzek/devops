@@ -43,13 +43,23 @@ class ElmRewrite
 end
 
 class ScalaConfig
-  attr_accessor :artifact_name, :dist_run_script_name, :production, :development
+  attr_accessor :artifact_name, :dist_run_script_name, :memory, :production, :development
 
   def initialize(json_data)
     @artifact_name = json_data['artifactName']
     @dist_run_script_name = json_data['distRunScriptName']
+    @memory = MemoryConfig.new(json_data['memory'])
     @production = ScalaEnvironment.new(json_data['production'])
     @development = ScalaEnvironment.new(json_data['development'])
+  end
+end
+
+class MemoryConfig
+  attr_accessor :default, :job_server
+
+  def initialize(json_data)
+    @default = json_data['default']
+    @job_server = json_data['jobServer']
   end
 end
 
@@ -74,9 +84,14 @@ class Database
 end
 
 class Node
-  attr_accessor :uri
+  attr_accessor :uri, :is_job_server
 
   def initialize(json_data)
     @uri = json_data['uri']
+    @is_job_server = json_data['isJobServer'] == true
+  end
+
+  def job_server?
+    @is_job_server
   end
 end
