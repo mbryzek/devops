@@ -217,18 +217,29 @@ threads = deployment_nodes.map do |dn|
 end.flatten
 threads.each(&:join)
 
+use_load_balancer = deployment_nodes.length > 1
+if !use_load_balancer
+    puts Util.warning("Single node deployment - skipping load balancer drain (brief downtime expected)")
+end
+
 deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.each do |dn|
     puts ""
     puts Util.underline("Starting deployment to node #{dn.node.uri}")
     tarball = dn.instance_variable_get(:@tarball)
     dn.execute("rm -rf lib deploy bin")
     dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
-    #puts "Removing node #{dn.node.uri} from load balancer"
-    #do_client.remove_droplet_by_ip_address(dn.node.uri)
+    if use_load_balancer
+        puts "Removing node #{dn.node.uri} from load balancer"
+        do_client.remove_droplet_by_ip_address(dn.node.uri)
+        puts "Waiting 10 seconds for connections to drain..."
+        sleep 10
+    end
     dn.execute("./#{File.basename(deploy_script)}")
     wait_until_up(dn)
-    #puts "Adding node #{dn.node.uri} to load balancer"
-    #do_client.add_droplet_by_ip_address(dn.node.uri)
+    if use_load_balancer
+        puts "Adding node #{dn.node.uri} to load balancer"
+        do_client.add_droplet_by_ip_address(dn.node.uri)
+    end
     puts "Done. Node status is #{dn.status.status}"
     if !dn.healthy?
         Util.exit_with_error("Aborting release as node failed to become healthy")
