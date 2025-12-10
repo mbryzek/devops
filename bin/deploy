@@ -154,18 +154,18 @@ def create_deploy_script(config, file)
     name
 end
 
-def create_tarball(config, files)
-    tarball = File.join(TMP_DIR, "deployment.#{config.name}.tar.gz")
-    local_files = files.map do |file|
-        basename = File.basename(file)
-        local_path = File.join(TMP_DIR, basename)
-        if file != local_path
-            Util.run("cp #{file} #{local_path}")
-        end
-        basename
-    end
+def create_tarball(config, release_file, deploy_script, run_script, node_suffix)
+    tarball = File.join(TMP_DIR, "deployment.#{config.name}.#{node_suffix}.tar.gz")
+
+    # Copy files to TMP_DIR
+    release_basename = File.basename(release_file)
+    deploy_basename = File.basename(deploy_script)
+    run_basename = File.basename(run_script)
+
+    Util.run("cp #{release_file} #{TMP_DIR}/") if release_file != File.join(TMP_DIR, release_basename)
+
     # Build tarball with files from TMP_DIR
-    tar_files = local_files.map { |f| "-C #{TMP_DIR} #{f}" }.join(" ")
+    tar_files = [release_basename, deploy_basename, run_basename].map { |f| "-C #{TMP_DIR} #{f}" }.join(" ")
     Util.run("xattr -cr lib deploy bin dist")
     Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{tarball} lib deploy bin dist #{tar_files}")
     tarball
@@ -187,15 +187,27 @@ end
 deployment_nodes = nodes.each_with_index.map { |n, i| DeploymentNode.new(config, n, i) }
 
 deploy_script = create_deploy_script(config, file)
-tarball = create_tarball(config, [file, deploy_script])
+
+# Create per-node tarballs with node-specific run scripts
+node_tarballs = {}
+deployment_nodes.each do |dn|
+    run_script = File.join(TMP_DIR, RUN_SCRIPT_NAME)
+    RunScript.new(config, file, vars, env.nodes, dn.index).to_file(run_script)
+    node_suffix = dn.node.job_server? ? "jobs" : "default"
+    # Reuse tarball if same type already created
+    if !node_tarballs[node_suffix]
+        node_tarballs[node_suffix] = create_tarball(config, file, deploy_script, run_script, node_suffix)
+    end
+    dn.instance_variable_set(:@tarball, node_tarballs[node_suffix])
+end
 
 puts ""
-puts Util.underline("Uploading tarball to all nodes and checking node status")
+puts Util.underline("Uploading tarballs to all nodes and checking node status")
 threads = deployment_nodes.map do |dn|
   [
     Thread.new do
       if !SKIP_UPLOAD
-        dn.upload_file(tarball)
+        dn.upload_file(dn.instance_variable_get(:@tarball))
       end
     end,
     Thread.new do
@@ -207,9 +219,8 @@ threads.each(&:join)
 
 deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.each do |dn|
     puts ""
-    puts Util.underline("Starting deployment to node #{dn.node.uri} [status: #{dn.status.status}]")
-    RunScript.new(config, file, vars, env.nodes, dn.index).to_file(RUN_SCRIPT)
-    dn.upload_file(RUN_SCRIPT)
+    puts Util.underline("Starting deployment to node #{dn.node.uri}")
+    tarball = dn.instance_variable_get(:@tarball)
     dn.execute("rm -rf lib deploy bin")
     dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
     #puts "Removing node #{dn.node.uri} from load balancer"
@@ -262,5 +273,3 @@ puts ""
 duration = (Time.now - start).to_i
 puts "Deploy duration: #{duration} seconds"
 puts ""
-
-FileUtils.rm_f(RUN_SCRIPT)
