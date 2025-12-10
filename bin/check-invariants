@@ -4,73 +4,24 @@ require 'json'
 require 'open3'
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
+load File.join(File.dirname(__FILE__), '../lib/generated/bryzek_platform_invariants_v0_client.rb')
 
 ENDPOINTS = [
-  { name: "Acumen", url: "https://api.trueacumen.com/_internal_/invariants.json" },
-  { name: "Platform", url: "https://idempotent.io/_internal_/invariants.json" }
+  { name: "Acumen", url: "https://api.trueacumen.com" },
+  { name: "Platform", url: "https://idempotent.io" }
 ]
 
-class InvariantResult
-  attr_reader :name, :count, :execution_time_ms, :query, :examples, :error
-
-  def initialize(data)
-    @name = data['name']
-    @count = data['count'].to_i
-    @execution_time_ms = data['execution_time_ms'].to_i
-    @query = data['query']
-    @examples = data['examples'] || []
-    @error = data['error']
-  end
-
-  def success?
-    @count == 0 && @error.nil?
-  end
-end
-
-class InvariantResponse
-  attr_reader :service_name, :succeeded, :failed_with_count, :failed_with_error
-
-  def initialize(service_name, data)
-    @service_name = service_name
-    @succeeded = (data['invariants_that_succeeded'] || []).map { |d| InvariantResult.new(d) }
-    @failed_with_count = (data['invariants_with_count_greater_than_zero'] || []).map { |d| InvariantResult.new(d) }
-    @failed_with_error = (data['invariants_that_failed_due_to_error'] || []).map { |d| InvariantResult.new(d) }
-  end
-
-  def all_passed?
-    @failed_with_count.empty? && @failed_with_error.empty?
-  end
-
-  def total_count
-    @succeeded.length + @failed_with_count.length + @failed_with_error.length
-  end
-
-  def failure_count
-    @failed_with_count.length + @failed_with_error.length
-  end
-end
-
 def fetch_invariants(endpoint)
-  cmd = "curl -s --max-time 120 '#{endpoint[:url]}'"
-  stdout, stderr, status = Open3.capture3(cmd)
-
-  if !status.success?
-    raise "curl failed: #{stderr}"
-  end
-
-  if stdout.strip.empty?
-    raise "Empty response"
-  end
-
-  data = JSON.parse(stdout)
-  InvariantResponse.new(endpoint[:name], data)
+  client = Com::Bryzek::Platform::Invariants::V0::Client.new(endpoint[:url])
+  result = client.invariant_results.get_json
+  { service_name: endpoint[:name], result: result }
 rescue => e
   puts "  ERROR: #{e.message}"
   nil
 end
 
-def print_failures(response)
-  response.failed_with_count.each do |inv|
+def print_failures(result)
+  result.non_zero.each do |inv|
     puts "  - #{inv.name}"
     puts "    Count: #{inv.count}"
     if inv.examples && !inv.examples.empty?
@@ -84,7 +35,7 @@ def print_failures(response)
     end
   end
 
-  response.failed_with_error.each do |inv|
+  result.error.each do |inv|
     puts "  - #{inv.name}"
     puts "    Error: #{inv.error || 'Unknown error'}"
   end
@@ -98,9 +49,9 @@ results = ENDPOINTS.map do |endpoint|
   Thread.new do
     print "Fetching #{endpoint[:name]}..."
     $stdout.flush
-    result = fetch_invariants(endpoint)
+    data = fetch_invariants(endpoint)
     puts " done"
-    { endpoint: endpoint, result: result }
+    { endpoint: endpoint, data: data }
   end
 end.map(&:value)
 
@@ -109,17 +60,23 @@ puts ""
 all_passed = true
 results.sort_by { |r| r[:endpoint][:name] }.each do |r|
   endpoint = r[:endpoint]
-  response = r[:result]
+  data = r[:data]
 
-  if response.nil?
+  if data.nil?
     puts Util.underline("#{endpoint[:name]}: UNREACHABLE")
     all_passed = false
-  elsif response.all_passed?
-    puts "#{endpoint[:name]}: #{response.total_count} invariants passed"
   else
-    puts Util.underline("#{endpoint[:name]}: #{response.failure_count} FAILURES (#{response.total_count} total)")
-    print_failures(response)
-    all_passed = false
+    result = data[:result]
+    total_count = result.success.length + result.non_zero.length + result.error.length
+    failure_count = result.non_zero.length + result.error.length
+
+    if failure_count == 0
+      puts "#{endpoint[:name]}: #{total_count} invariants passed"
+    else
+      puts Util.underline("#{endpoint[:name]}: #{failure_count} FAILURES (#{total_count} total)")
+      print_failures(result)
+      all_passed = false
+    end
   end
   puts ""
 end
