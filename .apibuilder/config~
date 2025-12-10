@@ -1,0 +1,6 @@
+code:
+  bryzek:
+    platform-invariants:
+      version: latest
+      generators:
+        ruby_client: ./
