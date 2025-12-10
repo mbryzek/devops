@@ -7,12 +7,13 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 load File.join(File.dirname(__FILE__), '../lib/generated/bryzek_platform_invariants_v0_client.rb')
 
 ENDPOINTS = [
-  { name: "Acumen", url: "https://api.trueacumen.com" },
-  { name: "Platform", url: "https://idempotent.io" }
+  { name: "Acumen", url: "https://api.trueacumen.com", app: "acumen" },
+  { name: "Platform", url: "https://idempotent.io", app: "platform" }
 ]
 
-def fetch_invariants(endpoint)
-  client = Com::Bryzek::Platform::Invariants::V0::Client.new(endpoint[:url])
+def fetch_invariants(endpoint, devops_token)
+  headers = { "X-Devops-Token" => devops_token }
+  client = Com::Bryzek::Platform::Invariants::V0::Client.new(endpoint[:url], default_headers: headers)
   result = client.invariant_results.get_json
   { service_name: endpoint[:name], result: result }
 rescue => e
@@ -49,9 +50,16 @@ results = ENDPOINTS.map do |endpoint|
   Thread.new do
     print "Fetching #{endpoint[:name]}..."
     $stdout.flush
-    data = fetch_invariants(endpoint)
-    puts " done"
-    { endpoint: endpoint, data: data }
+    vars = EnvironmentVariables.load(endpoint[:app], "production")
+    devops_token = vars["DEVOPS_TOKEN"]
+    if devops_token.nil? || devops_token.empty?
+      puts " ERROR: DEVOPS_TOKEN not configured for #{endpoint[:app]}"
+      { endpoint: endpoint, data: nil }
+    else
+      data = fetch_invariants(endpoint, devops_token)
+      puts " done"
+      { endpoint: endpoint, data: data }
+    end
   end
 end.map(&:value)
 
