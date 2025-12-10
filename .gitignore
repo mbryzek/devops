@@ -1,6 +1,4 @@
 dist
-bin/.bsp
-bin/.scala-build
 .bsp/
 .metals/
 .scala-build/
