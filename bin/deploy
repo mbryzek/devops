@@ -104,12 +104,14 @@ class DeploymentNode
 end
 
 def wait_until_up(dn, iteration=0, max=25)
+    dots = iteration % 3 + 1
+    dot_display = "." * dots + " " * (3 - dots)
+    print "\r - Waiting for node #{dn.node.uri} to become healthy#{dot_display}"
+    $stdout.flush
     sleep 1
     dn.update_status
 
     if !dn.healthy? && iteration < max
-        print "\r - Waiting for node #{dn.node.uri} to become healthy. Current status: #{dn.status.status}   "
-        $stdout.flush
         wait_until_up(dn, iteration + 1, max)
     elsif iteration > 0
         # Clear the waiting line when done
