@@ -8,6 +8,12 @@ We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configura
 ./bin/deploy.rb --app platform --file ~/code/platform/platform-0.1.4.tar.gz --env development
 ```
 
+## Measure uptime
+
+```
+uptime-checker.sc https://idempotent.io/_internal_/healthcheck
+```
+
 ## Generate JSON of configuration
 
 ```
