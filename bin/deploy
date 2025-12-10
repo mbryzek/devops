@@ -20,7 +20,11 @@ file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
 start = Time.now
 
-RUN_SCRIPT = "#{args.app}-#{config.scala.artifact_name}-run.sh"
+TMP_DIR = "/tmp/devops"
+FileUtils.mkdir_p(TMP_DIR)
+
+RUN_SCRIPT_NAME = "#{args.app}-#{config.scala.artifact_name}-run.sh"
+RUN_SCRIPT = File.join(TMP_DIR, RUN_SCRIPT_NAME)
 
 do_client = DigitalOcean::Client.new(args.app)
 
@@ -125,7 +129,7 @@ def deployment_dir(file)
 end
 
 def create_deploy_script(config, file)
-    name = "deploy.#{config.name}.sh"
+    name = File.join(TMP_DIR, "deploy.#{config.name}.sh")
     logfile = "#{config.name}.log"
     dir = deployment_dir(file)
 
@@ -134,11 +138,11 @@ def create_deploy_script(config, file)
     ./deploy/delete-old-deploys.rb --app #{config.name}
     rm -rf #{dir}
     tar --warning=no-unknown-keyword -xzf #{File.basename(file)}
-    cp #{RUN_SCRIPT} #{dir}/
+    cp #{RUN_SCRIPT_NAME} #{dir}/
     touch #{logfile}
     mv -f #{logfile} #{logfile}.last
     ./deploy/kill.rb --app #{config.name}
-    cd #{dir} && nohup ./#{RUN_SCRIPT} > ../#{logfile} 2>&1 &
+    cd #{dir} && nohup ./#{RUN_SCRIPT_NAME} > ../#{logfile} 2>&1 &
     EOS
 
     File.open(name, "w") do |f|
@@ -151,17 +155,20 @@ def create_deploy_script(config, file)
 end
 
 def create_tarball(config, files)
-    name = "/tmp/deployment.#{config.name}.tar.gz"
+    tarball = File.join(TMP_DIR, "deployment.#{config.name}.tar.gz")
     local_files = files.map do |file|
-        if !File.exist?(File.basename(file))
-            Util.run("cp #{file} .")
+        basename = File.basename(file)
+        local_path = File.join(TMP_DIR, basename)
+        if file != local_path
+            Util.run("cp #{file} #{local_path}")
         end
-        File.basename(file)
+        basename
     end
-    Util.run("xattr -cr lib deploy bin dist #{local_files.join(" ")}")
-    Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{name} lib deploy bin dist #{local_files.join(" ")}")
-    Util.run("rm -f #{local_files.join(" ")}")
-    name
+    # Build tarball with files from TMP_DIR
+    tar_files = local_files.map { |f| "-C #{TMP_DIR} #{f}" }.join(" ")
+    Util.run("xattr -cr lib deploy bin dist")
+    Util.run("COPYFILE_DISABLE=1 tar --no-mac-metadata -czf #{tarball} lib deploy bin dist #{tar_files}")
+    tarball
 end
 
 nodes = if args.node
@@ -207,7 +214,7 @@ deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.eac
     dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
     #puts "Removing node #{dn.node.uri} from load balancer"
     #do_client.remove_droplet_by_ip_address(dn.node.uri)
-    dn.execute("./#{deploy_script}")
+    dn.execute("./#{File.basename(deploy_script)}")
     wait_until_up(dn)
     #puts "Adding node #{dn.node.uri} to load balancer"
     #do_client.add_droplet_by_ip_address(dn.node.uri)
@@ -255,3 +262,5 @@ puts ""
 duration = (Time.now - start).to_i
 puts "Deploy duration: #{duration} seconds"
 puts ""
+
+FileUtils.rm_f(RUN_SCRIPT)
