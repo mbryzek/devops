@@ -148,6 +148,7 @@ begin
     deployed = true
   end
 ensure
+  puts ""
   puts "Deleteing credentials file"
   Util.run("ssh root@#{node_ip} 'rm -f #{pgpass_remote}'")
 end
