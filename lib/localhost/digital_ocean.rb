@@ -15,13 +15,31 @@ module DigitalOcean
 
     def remove_droplet_by_ip_address(ip)
       droplets_by_ip_address(ip).each do |droplet|
-        @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
+        if @load_balancer.tag_based?
+          # For tag-based LBs, remove the tag from the droplet
+          @client.tags.untag_resources(
+            name: @load_balancer.tag,
+            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+          )
+        else
+          # For droplet-based LBs, remove directly
+          @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
+        end
       end
     end
 
     def add_droplet_by_ip_address(ip)
       droplets_by_ip_address(ip).each do |droplet|
-        @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
+        if @load_balancer.tag_based?
+          # For tag-based LBs, add the tag back to the droplet
+          @client.tags.tag_resources(
+            name: @load_balancer.tag,
+            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+          )
+        else
+          # For droplet-based LBs, add directly
+          @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
+        end
       end
     end
 
@@ -61,10 +79,16 @@ module DigitalOcean
   end
 
   class LoadBalancer
-    attr_reader :id, :name
+    attr_reader :id, :name, :tag
+
     def initialize(lb)
       @id = lb.id
       @name = lb.name
+      @tag = lb.tag
+    end
+
+    def tag_based?
+      !@tag.nil? && !@tag.empty?
     end
   end
 
