@@ -14,7 +14,6 @@ files = all.map do |f|
 end
 
 project_name = `pwd`.strip.split("/").last
-config = CodegenConfig.new(project_name)
 
 def assert_unique_modules(files)
   files.group_by { |f| f.module.name }.select { |m, files| files.length > 1 }.each do |m, files|
