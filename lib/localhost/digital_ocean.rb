@@ -43,6 +43,32 @@ module DigitalOcean
       end
     end
 
+    def droplet_healthy_in_lb?(ip)
+      droplet_ids = droplets_by_ip_address(ip).map(&:id)
+      return false if droplet_ids.empty?
+
+      # Fetch current LB to check droplet membership
+      lb_id = @load_balancer.id
+      response = @client.load_balancers.find(id: lb_id)
+
+      # Check if all droplets for this IP are in the LB
+      droplet_ids.all? do |droplet_id|
+        response.droplet_ids.include?(droplet_id)
+      end
+    end
+
+    def health_check_wait_seconds
+      # Get the LB health check interval to know how long to wait
+      lb = @client.load_balancers.find(id: @load_balancer.id)
+      hc = lb.health_check
+      # DropletKit uses check_interval_seconds and unhealthy_threshold
+      interval = hc&.check_interval_seconds || 10
+      threshold = hc&.unhealthy_threshold || 3
+      wait = interval * threshold
+      puts "   (LB health check: interval=#{interval}s, unhealthy_threshold=#{threshold})"
+      wait
+    end
+
     private
     def droplets_by_ip_address(ip)
       @droplets.filter { |d| d.ip_addresses.include?(ip) }

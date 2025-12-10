@@ -5,7 +5,7 @@ load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb') # on
 
 SKIP_UPLOAD = false
 if SKIP_UPLOAD
-    puts Util.warning("Skipping network operations")
+    puts Util.warning("Skipping network operations / upload")
 end
 
 args = Args.parse(ARGV, ["app", "file"])
@@ -41,11 +41,12 @@ end
 
 class DeploymentNode
     attr_reader :node, :status, :index
-    def initialize(config, node, index)
+    def initialize(config, node, index, devops_token)
         @config = config
         @node = node
         @index = index.to_i
         @status = Healthcheck::UNKNOWN
+        @devops_token = devops_token
     end
 
     def healthy?
@@ -105,6 +106,73 @@ class DeploymentNode
             Util.run("scp -q #{file} root@#{@node.uri}:~/", :quiet => true)
         end
     end
+
+    def start_drain
+        # Use escaped double quotes to avoid issues with SSH single-quote wrapping
+        result = execute("curl -s -w \"\\n%{http_code}\" -X POST -H \"X-Devops-Token: #{@devops_token}\" http://localhost:#{@config.port}/_internal_/drain")
+        lines = result.split("\n")
+        http_code = lines.last.to_i
+        body = lines[0..-2].join("\n")
+
+        case http_code
+        when 200
+            puts " - Drain started successfully"
+        when 401
+            puts Util.warning(" - Drain endpoint returned 401 Unauthorized")
+        when 0
+            puts Util.warning(" - Failed to connect to drain endpoint")
+        else
+            puts Util.warning(" - Drain endpoint returned HTTP #{http_code}: #{body}")
+        end
+        result
+    end
+end
+
+def wait_until_healthy_in_lb(do_client, dn, max_wait=30)
+    max_wait.times do |i|
+        dots = i % 3 + 1
+        dot_display = "." * dots + " " * (3 - dots)
+        print "\r - Waiting for LB to mark node healthy #{dot_display}"
+        $stdout.flush
+        if do_client.droplet_healthy_in_lb?(dn.node.uri)
+            print "\r" + " " * 80 + "\r"
+            $stdout.flush
+            puts " - LB marked node healthy after #{i + 1}s"
+            return true
+        end
+        sleep 1
+    end
+    print "\r" + " " * 80 + "\r"
+    $stdout.flush
+    puts Util.warning(" - LB did not mark node healthy within #{max_wait}s, proceeding anyway")
+    false
+end
+
+def wait_until_unhealthy(dn, max_wait=30)
+    max_wait.times do |i|
+        dots = i % 3 + 1
+        dot_display = "." * dots + " " * (3 - dots)
+        print "\r - Waiting for health check to fail #{dot_display}"
+        $stdout.flush
+        dn.update_status
+        if !dn.healthy?
+            print "\r" + " " * 80 + "\r"
+            $stdout.flush
+            puts " - Health check failed after #{i + 1}s (node is draining)"
+            return true
+        end
+        sleep 1
+    end
+    print "\r" + " " * 80 + "\r"
+    $stdout.flush
+    puts Util.warning(" - Health check did not fail within #{max_wait}s, proceeding anyway")
+    false
+end
+
+def wait_for_lb_propagation(seconds=5)
+    # Wait for LB to propagate the removal and for in-flight requests to complete
+    puts " - Waiting #{seconds}s for LB propagation and in-flight requests..."
+    sleep seconds
 end
 
 def wait_until_up(dn, iteration=0, max=25)
@@ -184,7 +252,11 @@ if nodes.empty?
         Util.exit_with_error("Node URI #{node} not found for #{config.name}")
     end
 end
-deployment_nodes = nodes.each_with_index.map { |n, i| DeploymentNode.new(config, n, i) }
+devops_token = vars["DEVOPS_TOKEN"]
+if devops_token.nil? || devops_token.empty?
+    Util.exit_with_error("DEVOPS_TOKEN environment variable is required")
+end
+deployment_nodes = nodes.each_with_index.map { |n, i| DeploymentNode.new(config, n, i, devops_token) }
 
 deploy_script = create_deploy_script(config, file)
 
@@ -229,16 +301,19 @@ deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.eac
     dn.execute("rm -rf lib deploy bin")
     dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
     if use_load_balancer
+        puts "Starting drain on node #{dn.node.uri}"
+        dn.start_drain
+        wait_until_unhealthy(dn)
         puts "Removing node #{dn.node.uri} from load balancer"
         do_client.remove_droplet_by_ip_address(dn.node.uri)
-        puts "Waiting 10 seconds for connections to drain..."
-        sleep 10
+        wait_for_lb_propagation()
     end
     dn.execute("./#{File.basename(deploy_script)}")
     wait_until_up(dn)
     if use_load_balancer
         puts "Adding node #{dn.node.uri} to load balancer"
         do_client.add_droplet_by_ip_address(dn.node.uri)
+        wait_until_healthy_in_lb(do_client, dn)
     end
     puts "Done. Node status is #{dn.status.status}"
     if !dn.healthy?
