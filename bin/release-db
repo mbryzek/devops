@@ -1,0 +1,99 @@
+#!/usr/bin/env ruby
+
+# Unified database migration deployment tool
+# Usage: sem-deploy --app platform-postgresql [--env production]
+#
+# This script automates the full deployment:
+#   1. Prompts to create a new tag if needed
+#   2. Looks up node IP from config
+#   3. Copies tarball to node via scp
+#   4. SSHs to node, extracts, and runs sem-apply
+#
+# Replaces manual: sem-dist && scp && ssh && tar && sem-apply
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+
+# Determine the postgresql repo directory
+# Supports: --app platform-postgresql OR --app platform (infers -postgresql)
+db_name = args.app
+if !db_name.end_with?("-postgresql")
+    db_name = "#{db_name}-postgresql"
+end
+
+repo_dir = File.expand_path("~/code/#{db_name}")
+if !File.directory?(repo_dir)
+    Util.exit_with_error("Repository directory not found: #{repo_dir}")
+end
+
+app_name = db_name.sub(/-postgresql$/, '')
+env = Config.load(app_name)
+scala_config = env.scala
+if scala_config.nil?
+    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find deployment node")
+end
+
+scala_env = scala_config.send(args.env)
+db = scala_env.database
+node = scala_env.nodes.first
+if node.nil?
+    Util.exit_with_error("No nodes configured for #{app_name} #{args.env}")
+end
+node_ip = node.uri
+
+puts ""
+puts Util.underline("Database Migration Deployment")
+puts "  App:      #{db_name}"
+puts "  Env:      #{args.env}"
+puts "  Node:     #{node_ip}"
+puts "  Database: #{db.name}@#{db.host}:#{db.port}"
+
+tarball = nil
+
+raise "TODO"
+Dir.chdir(repo_dir) do
+    # Step 1: Ask user about creating a new tag
+    current_tag = Tag.ask
+
+    if current_tag.empty?
+        Util.exit_with_error("No tag found. Please create a tag first.")
+    end
+
+    tarball = File.join(repo_dir, "dist", "#{db_name}-#{current_tag}.tar.gz")
+
+    # Create distribution if tarball doesn't exist
+    if !File.exist?(tarball)
+        puts ""
+        puts "Creating distribution for #{current_tag}..."
+        Util.run("sem-dist")
+    end
+
+    if !File.exist?(tarball)
+        Util.exit_with_error("Tarball not found: #{tarball}")
+    end
+end
+
+# Step 2: Copy to node
+puts ""
+puts "Copying to #{node_ip}..."
+Util.run("scp #{tarball} root@#{node_ip}:~/")
+
+# Step 3: Extract and apply on node
+tarball_name = File.basename(tarball)
+dir_name = tarball_name.sub('.tar.gz', '')
+
+puts ""
+puts "Applying migrations on #{node_ip}..."
+
+remote_cmd = [
+    "cd ~",
+    "tar xfz #{tarball_name}",
+    "cd #{dir_name}",
+    "sem-apply --set sslmode=require --host #{db.host} --port #{db.port} --user #{db.user} --name #{db.name} --password"
+].join(" && ")
+
+Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+
+puts ""
+puts "Migration deployment complete!"
