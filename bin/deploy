@@ -108,8 +108,13 @@ def wait_until_up(dn, iteration=0, max=25)
     dn.update_status
 
     if !dn.healthy? && iteration < max
-        puts " - Waiting for node #{dn.node.uri} to become healthy. Current status: #{dn.status.status}"
+        print "\r - Waiting for node #{dn.node.uri} to become healthy. Current status: #{dn.status.status}   "
+        $stdout.flush
         wait_until_up(dn, iteration + 1, max)
+    elsif iteration > 0
+        # Clear the waiting line when done
+        print "\r" + " " * 80 + "\r"
+        $stdout.flush
     end
 end
 
