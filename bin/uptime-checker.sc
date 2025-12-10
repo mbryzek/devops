@@ -21,6 +21,7 @@ case class Stats(
 
 val url = args.headOption.getOrElse("https://idempotent.io/_internal_/healthcheck")
 val intervalMs = args.drop(1).headOption.flatMap(s => Try(s.toInt).toOption).getOrElse(250)
+val maxDuration = Duration.ofMinutes(15)
 
 val stats = Stats()
 var inDowntime = false
@@ -78,10 +79,11 @@ println("Uptime Checker")
 println("==============")
 println(s"URL: $url")
 println(s"Interval: ${intervalMs}ms")
-println("Press Ctrl+C to stop and see statistics")
+println(s"Max duration: ${formatDuration(maxDuration)}")
+println("Press Ctrl+C to stop early and see statistics")
 println()
 
-while true do
+while Duration.between(stats.startTime, Instant.now()).compareTo(maxDuration) < 0 do
   stats.total += 1
 
   val result = Try {
@@ -130,3 +132,6 @@ while true do
 
   System.out.flush()
   Thread.sleep(intervalMs)
+
+println()
+println(s"Auto-stopped after ${formatDuration(maxDuration)}")
