@@ -62,10 +62,6 @@ class ElmDeclaration
     @global_state = parse_global_state(args)
   end
 
-  def has_args?
-    !@args.empty?
-  end
-
   def ElmDeclaration.parse(file, lines, keyword)
     if line = lines.find { |l| l.strip.match(/^#{keyword}\s*\:/) }
       ElmDeclaration.parse_line(file, line)
@@ -90,10 +86,6 @@ class ElmDeclaration
     else
       s
     end
-  end
-
-  def arg_matches?(pattern)
-    @args.any? { |m| m.include?(pattern) }
   end
 
   private
@@ -263,10 +255,6 @@ class ElmFile
         else
             nil
         end
-    end
-
-    def ElmFile.initLowerCase(v)
-        v.sub(/^./) { |first| first.downcase }
     end
 
     def ElmFile.is_comment(line)

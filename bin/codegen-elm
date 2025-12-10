@@ -13,8 +13,6 @@ files = all.map do |f|
     ElmFile.parse(f)
 end
 
-project_name = `pwd`.strip.split("/").last
-
 def assert_unique_modules(files)
   files.group_by { |f| f.module.name }.select { |m, files| files.length > 1 }.each do |m, files|
     Util.exit_with_error("Multiple files define the same module #{m}:\n" + (
