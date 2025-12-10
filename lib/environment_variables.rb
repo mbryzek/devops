@@ -54,19 +54,21 @@ class EnvironmentVariables
     end
 
     def EnvironmentVariables.from_file(app_name, filename)
-        tpl_path = File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env.tpl")
-        if !File.exist?(tpl_path)
-            Util.exit_with_error("Environment template file '#{tpl_path}' not found")
+        env_path = File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env")
+        if !File.exist?(env_path)
+            Util.exit_with_error("Environment file '#{env_path}' not found.")
         end
 
-        # Use 1Password CLI to inject secrets from the template
-        output = `op inject -i "#{tpl_path}" 2>&1`
-        if !$?.success?
-            Util.exit_with_error("Failed to inject secrets from '#{tpl_path}': #{output}")
+        # Check if file is encrypted (git-crypt locked files start with GITCRYPT header)
+        header = File.binread(env_path, 10)
+        if header&.start_with?("\x00GITCRYPT")
+            env_dir = File.join(DIR, "../../env")
+            STDERR.puts "Environment file is encrypted. Running git-crypt unlock..."
+            Util.run("cd #{env_dir} && git-crypt unlock", :quiet => true)
         end
 
         data = {}
-        output.each_line do |l|
+        File.readlines(env_path).each do |l|
             key, value = l.strip.split("=", 2)
             next if key.to_s.strip.empty?
             data[key] = value
