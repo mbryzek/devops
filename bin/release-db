@@ -1,0 +1,159 @@
+#!/usr/bin/env ruby
+
+# Unified database migration deployment tool
+# Usage: release-db --app platform-postgresql [--env production]
+#
+# This script automates the full deployment:
+#   1. Prompts to create a new tag if needed
+#   2. Looks up node IP from config
+#   3. Copies tarball to node via scp
+#   4. SSHs to node, extracts, and runs sem-apply
+#
+# Replaces manual: sem-dist && scp && ssh && tar && sem-apply
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+require 'securerandom'
+
+args = Args.parse(ARGV, ["app"])
+
+# Determine the postgresql repo directory
+# Supports: --app platform-postgresql OR --app platform (infers -postgresql)
+db_name = args.app
+if !db_name.end_with?("-postgresql")
+    db_name = "#{db_name}-postgresql"
+end
+
+repo_dir = File.expand_path("~/code/#{db_name}")
+if !File.directory?(repo_dir)
+    Util.exit_with_error("Repository directory not found: #{repo_dir}")
+end
+
+app_name = db_name.sub(/-postgresql$/, '')
+env = Config.load(app_name)
+scala_config = env.scala
+if scala_config.nil?
+    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find deployment node")
+end
+
+scala_env = scala_config.send(args.env)
+db = scala_env.database
+node = scala_env.nodes.first
+if node.nil?
+    Util.exit_with_error("No nodes configured for #{app_name} #{args.env}")
+end
+node_ip = node.uri
+
+# Get database password from environment variables
+env_vars = EnvironmentVariables.load(app_name, args.env)
+db_url = env_vars['CONF_DB_DEFAULT_URL']
+if db_url.nil?
+    Util.exit_with_error("CONF_DB_DEFAULT_URL not found in environment variables for #{app_name}")
+end
+
+# Extract password from URL (format: ?user=x&password=y&)
+password = nil
+if i = db_url.index("?")
+    params = db_url.slice(i+1, db_url.length)
+    params.split("&").each { |p|
+        k, v = p.split("=", 2)
+        if k == "password"
+            password = v
+            break
+        end
+    }
+end
+
+if password.nil?
+    Util.exit_with_error("Could not extract password from CONF_DB_DEFAULT_URL")
+end
+
+puts ""
+puts Util.underline("Database Migration Deployment")
+puts "  DB:   #{db_name}"
+puts "  Env:  #{args.env}"
+puts "  Node: #{node_ip}"
+puts "  Host: #{db.name}@#{db.host}:#{db.port}"
+puts ""
+
+tarball = nil
+
+Dir.chdir(repo_dir) do
+    # Step 1: Ask user about creating a new tag
+    current_tag = Tag.ask
+
+    if current_tag.empty?
+        Util.exit_with_error("No tag found. Please create a tag first.")
+    end
+
+    tarball = File.join(repo_dir, "dist", "#{db_name}-#{current_tag}.tar.gz")
+
+    if File.exist?(tarball)
+      if Ask.for_boolean("Tarball already exists. Do you want to overwrite it?")
+        File.delete(tarball)
+      end
+    end
+
+    # Create distribution if tarball doesn't exist
+    if !File.exist?(tarball)
+        puts ""
+        puts "Creating distribution for #{current_tag}"
+        Util.run("/Users/mbryzek/code/schema-evolution-manager/bin/sem-dist --tag #{current_tag}")
+        if !File.exist?(tarball)
+            Util.exit_with_error("sem-dist failed to create tarball at expected location: #{tarball}")
+        end
+    end
+end
+
+# Step 2: Copy tarball to node
+puts "Copying #{tarball} to #{node_ip}"
+puts ""
+Util.run("scp #{tarball} root@#{node_ip}:~/")
+
+# Step 3: Create pgpass file locally and copy to node
+# Format: hostname:port:database:username:password
+pgpass_content = "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}"
+pgpass_remote = "/tmp/.pgpass-#{SecureRandom.hex(8)}"
+
+# Write pgpass to temp file and copy
+local_pgpass = "/tmp/.pgpass-local-#{$$}"
+File.write(local_pgpass, pgpass_content)
+File.chmod(0600, local_pgpass)
+
+puts "Copying credentials to #{node_ip}"
+Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
+File.delete(local_pgpass)
+
+# Step 4: Extract and apply on node
+tarball_name = File.basename(tarball)
+dir_name = tarball_name.sub('.tar.gz', '')
+
+deployed = false
+
+begin
+  puts ""
+  puts "Ready to apply migrations on #{node_ip}"
+  if Ask.for_boolean("Continue?")
+    puts ""
+    remote_cmd = [
+        "cd ~",
+        "tar --warning=no-unknown-keyword -xzf #{tarball_name}",
+        "cd #{dir_name}",
+        "chmod 600 #{pgpass_remote}",
+        "PGPASSFILE=#{pgpass_remote} sem-apply --set sslmode=require --host #{db.host} --port #{db.port} --user #{db.user} --name #{db.name}",
+        "rm -f #{pgpass_remote}"
+    ].join(" && ")
+
+    Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+
+    deployed = true
+  end
+ensure
+  puts "Deleteing credentials file"
+  Util.run("ssh root@#{node_ip} 'rm -f #{pgpass_remote}'")
+end
+
+if deployed
+  puts ""
+  puts "Migration deployment complete!"
+  puts ""
+end
