@@ -106,7 +106,7 @@ end
 def wait_until_up(dn, iteration=0, max=25)
     dots = iteration % 3 + 1
     dot_display = "." * dots + " " * (3 - dots)
-    print "\r - Waiting for node #{dn.node.uri} to become healthy#{dot_display}"
+    print "\r - Waiting for node #{dn.node.uri} to become healthy #{dot_display}"
     $stdout.flush
     sleep 1
     dn.update_status
