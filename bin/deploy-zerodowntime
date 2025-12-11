@@ -2,19 +2,19 @@
 
 # Zero-Downtime Cross-Node Deployment
 #
-# Achieves true zero-downtime by deploying to nodes currently serving
-# another app, then shifting traffic via LB droplet membership.
+# Achieves true zero-downtime by deploying to nodes not currently in the LB,
+# then adding them to LB before removing old nodes.
 #
 # Architecture:
 # - 2 job-capable nodes (each runs one scala app's job server)
 # - 1 shared node (runs both apps' API instances on different ports)
 #
 # Flow:
-# 1. Discover current app assignment from DO tags
+# 1. Find which job node is currently in LB for this app
 # 2. Deploy new version to the OTHER job node + shared node
 # 3. Add new nodes to LB (now both old and new serve traffic)
-# 4. Drain and remove old nodes from LB
-# 5. Stop old processes, update DO tags
+# 4. Drain and remove old job node from LB
+# 5. Stop old process
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
@@ -75,50 +75,39 @@ puts ""
 # Initialize DO client
 do_client = DigitalOcean::Client.new(args.app)
 
-# Discover current assignment: which job node has app's tag?
+# Find which job node is currently in the LB for this app
 current_job_node = nil
 target_job_node = nil
-first_deploy = false
 
 job_nodes.each do |uri|
-    if do_client.droplet_has_tag?(uri, "#{args.app}-jobs")
+    if do_client.droplet_in_lb?(uri)
         current_job_node = uri
     else
         target_job_node = uri
     end
 end
 
-if current_job_node.nil?
-    # First deploy - no existing job node to drain
-    first_deploy = true
-    puts "First deployment for #{args.app} - no existing job node"
+# Handle edge cases
+if current_job_node.nil? && target_job_node.nil?
+    # Neither job node in LB - first deploy, pick first one
     target_job_node = job_nodes[0]
+elsif current_job_node && target_job_node.nil?
+    # Both job nodes in LB? Shouldn't happen, but pick the other one
+    target_job_node = job_nodes.find { |n| n != current_job_node }
+elsif current_job_node.nil?
+    # target_job_node already set (not in LB), current is the other one
+    current_job_node = job_nodes.find { |n| n != target_job_node }
 end
+
+first_deploy = !do_client.droplet_in_lb?(job_nodes[0]) && !do_client.droplet_in_lb?(job_nodes[1])
 
 puts Util.underline("Node Assignment")
 puts "First deploy:     #{first_deploy}"
-puts "Current job node: #{current_job_node || 'none'}"
+puts "Current job node: #{current_job_node || 'none (first deploy)'}"
 puts "Target job node:  #{target_job_node}"
 puts ""
 
-# Get displaced app (the app currently using target_job_node)
-displaced_app = nil
-do_client.droplet_tags(target_job_node).each do |tag|
-    if tag.end_with?("-jobs") && !tag.start_with?(args.app)
-        displaced_app = tag.sub("-jobs", "")
-        break
-    end
-end
-
-if displaced_app
-    puts Util.warning("Will displace #{displaced_app} from #{target_job_node}")
-    puts "After this deploy completes, you'll need to deploy #{displaced_app}"
-    puts ""
-end
-
-# Determine port (use blue port - we're not doing port switching anymore)
 port = config.blue_port
-
 puts Util.underline("Deploying to target nodes on port #{port}")
 
 # Target nodes: new job node + shared node
@@ -361,7 +350,7 @@ print "\r" + " " * 60 + "\r"
 $stdout.flush
 
 # Drain and remove old job node (skip for first deploy)
-if !first_deploy
+if !first_deploy && current_job_node
     puts ""
     puts Util.underline("Draining old job node")
 
@@ -390,31 +379,15 @@ if !first_deploy
 
     old_job_deploy_node.kill_process_on_port
     puts "  Stopped process on #{current_job_node}:#{port}"
-
-    # Remove old tag
-    puts ""
-    puts Util.underline("Updating DigitalOcean tags")
-    do_client.remove_tag_from_droplet(current_job_node, "#{args.app}-jobs")
-    puts "  Removed #{args.app}-jobs tag from #{current_job_node}"
 else
     puts ""
     puts Util.underline("First deploy - skipping old node cleanup")
 end
 
-# Add new tag
-do_client.add_tag_to_droplet(target_job_node, "#{args.app}-jobs")
-puts "  Added #{args.app}-jobs tag to #{target_job_node}"
-
 puts ""
 puts Util.underline("Deployment Complete")
 puts "New version running on:"
 deploy_nodes.each { |dn| puts "  - #{dn.uri}:#{port} (#{dn.job_server? ? 'jobs' : 'api'})" }
-
-if displaced_app
-    puts ""
-    puts Util.warning("IMPORTANT: #{displaced_app} was displaced from #{target_job_node}")
-    puts "Run: deploy-zerodowntime --app #{displaced_app} --file <release>"
-end
 
 duration = (Time.now - start).to_i
 puts ""

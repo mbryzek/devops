@@ -62,49 +62,14 @@ module DigitalOcean
       end
     end
 
-    def droplet_has_tag?(ip, tag_name)
-      with_retry("Check droplet tag") do
-        droplets_by_ip_address(ip).any? do |droplet|
-          droplet_obj = @client.droplets.find(id: droplet.id)
-          droplet_obj.tags.include?(tag_name)
-        end
-      end
-    end
+    # Check if a droplet is currently in this app's LB
+    def droplet_in_lb?(ip)
+      with_retry("Check droplet in LB") do
+        droplet_ids = droplets_by_ip_address(ip).map(&:id)
+        return false if droplet_ids.empty?
 
-    def droplet_tags(ip)
-      with_retry("Get droplet tags") do
-        droplets_by_ip_address(ip).flat_map do |droplet|
-          droplet_obj = @client.droplets.find(id: droplet.id)
-          droplet_obj.tags
-        end.uniq
-      end
-    end
-
-    def add_tag_to_droplet(ip, tag_name)
-      with_retry("Add tag to droplet") do
-        begin
-          @client.tags.create(DropletKit::Tag.new(name: tag_name))
-        rescue DropletKit::Error
-          # Tag already exists
-        end
-
-        droplets_by_ip_address(ip).each do |droplet|
-          @client.tags.tag_resources(
-            name: tag_name,
-            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-          )
-        end
-      end
-    end
-
-    def remove_tag_from_droplet(ip, tag_name)
-      with_retry("Remove tag from droplet") do
-        droplets_by_ip_address(ip).each do |droplet|
-          @client.tags.untag_resources(
-            name: tag_name,
-            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-          )
-        end
+        lb = @client.load_balancers.find(id: @load_balancer.id)
+        droplet_ids.any? { |id| lb.droplet_ids.include?(id) }
       end
     end
 
