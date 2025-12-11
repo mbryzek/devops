@@ -13,7 +13,11 @@ load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
 DRAIN_WAIT_SECONDS = 10
 LB_REMOVAL_POLL_TIMEOUT = 30
 
-whisper = ARGV.include?('--whisper')
+$whisper = ARGV.include?('--whisper')
+
+def log(msg = "")
+  puts msg unless $whisper
+end
 
 # Load global nodes
 global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
@@ -25,21 +29,17 @@ global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'
 # Inspect current state
 inspector = NodeInspector.new.discover
 
-if !whisper
-  puts ""
-  puts Util.underline("Inspecting nodes")
-  inspector.print_details
-end
+log
+log Util.underline("Inspecting nodes")
+inspector.print_details unless $whisper
 
 # Find extra instances
 extras = inspector.extra_instances
 
 if extras.empty?
-  if !whisper
-    puts ""
-    puts "No extra instances found. Nothing to clean up."
-    puts ""
-  end
+  log
+  log "No extra instances found. Nothing to clean up."
+  log
   exit 0
 end
 
@@ -58,7 +58,9 @@ extras.each do |app_name, node_uris|
   end
 end
 
-puts ""
-puts "Cleanup complete. Final state:"
-NodeInspector.new.discover.print_details
-puts ""
+if !$whisper
+  puts ""
+  puts "Cleanup complete. Final state:"
+  NodeInspector.new.discover.print_details
+  puts ""
+end
