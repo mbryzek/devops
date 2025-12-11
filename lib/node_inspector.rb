@@ -22,7 +22,7 @@ class NodeInspector
     ensure_discovered
 
     @node_states.each do |ns|
-      puts "Node: #{ns.uri}"
+      puts "Node #{ns.uri}"
       if ns.apps.empty?
         puts "  No applications running"
       else
@@ -36,44 +36,12 @@ class NodeInspector
     end
   end
 
-  # Print summary for all known apps
-  def print_summary
-    ensure_discovered
-
-    puts Util.underline("Summary")
-    NodeDiscovery::KNOWN_APPS.each do |app_name, port|
-      print_app_summary(app_name, port)
-    end
-    puts ""
-  end
-
-  # Print summary for a specific app
-  def print_app_summary(app_name, port = nil)
-    ensure_discovered
-
-    port ||= NodeDiscovery::KNOWN_APPS[app_name]
-    running_nodes = @node_states.select { |ns| ns.running_app?(app_name) }
-    healthy_nodes = @node_states.select { |ns| ns.healthy_app?(app_name) }
-    job_servers = @node_states.select { |ns| ns.job_server_for?(app_name) }
-
-    puts ""
-    puts "#{app_name} (port #{port}):"
-    puts "  Running on: #{running_nodes.length} node(s)"
-    puts "  Healthy: #{healthy_nodes.length} node(s)"
-    puts "  Job servers: #{job_servers.length} (#{job_servers.map(&:uri).join(', ')})"
-
-    if healthy_nodes.length == 0 && running_nodes.length > 0
-      puts Util.warning("  WARNING: All instances are unhealthy!")
-    end
-  end
-
   # Full inspection output (details + summary)
   def print_all
     puts ""
-    puts Util.underline("Discovering current state of all nodes")
+    puts Util.underline("Current state of all nodes")
     puts ""
     print_details
-    print_summary
   end
 
   # Get summary data for a specific app (for programmatic use)
