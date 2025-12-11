@@ -235,11 +235,32 @@ end
 # Identify borrowed node URI (if any) - borrowed nodes are always deployed as non-job-server
 borrowed_node_uri = planner.borrowed_node&.uri
 
+# Determine which node should be the job server for this app.
+# Job server must be a node that will ONLY run this app after deployment.
+# A node is dedicated if it currently runs no other apps (excluding this app).
+def pick_job_server_uri(deploy_uris, node_states, target_app, borrowed_uri)
+    # Find nodes that will be dedicated to this app (no other apps running)
+    dedicated_nodes = deploy_uris.select { |uri|
+        next false if uri == borrowed_uri  # Borrowed nodes can't be job servers
+        ns = node_states.find { |n| n.uri == uri }
+        other_apps = ns.apps.reject { |a| a.name == target_app }
+        other_apps.empty?
+    }
+
+    # Return the first dedicated node, or nil if none found
+    dedicated_nodes.first
+end
+
+job_server_uri = pick_job_server_uri(deploy_node_uris, node_states, args.app, borrowed_node_uri)
+if job_server_uri
+    puts "Selected job server: #{job_server_uri}"
+else
+    puts Util.warning("No dedicated node available for job server")
+end
+
 # Create deployment node objects for each node we'll deploy to
 all_deploy_nodes = deploy_node_uris.map { |uri|
-    ns = node_states.find { |n| n.uri == uri }
-    # Borrowed nodes should never be job servers - they're temporary
-    is_job_server = (uri == borrowed_node_uri) ? false : ns.job_server_for?(args.app)
+    is_job_server = (uri == job_server_uri)
     DiscoveredNode.new(uri, is_job_server)
 }
 
