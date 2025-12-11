@@ -4,13 +4,16 @@
 # Extra = apps running on job server nodes that aren't that node's job server app.
 # Only removes if at least 2 instances of the app would remain.
 #
-# Usage: ./bin/cleanup-extras
+# Usage: ./bin/cleanup-extras [--whisper]
+#   --whisper: Only output when there's work to do
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
 
 DRAIN_WAIT_SECONDS = 10
 LB_REMOVAL_POLL_TIMEOUT = 30
+
+whisper = ARGV.include?('--whisper')
 
 # Load global nodes
 global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
@@ -20,18 +23,23 @@ end
 global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
 
 # Inspect current state
-puts ""
-puts Util.underline("Inspecting nodes")
 inspector = NodeInspector.new.discover
-inspector.print_details
+
+if !whisper
+  puts ""
+  puts Util.underline("Inspecting nodes")
+  inspector.print_details
+end
 
 # Find extra instances
 extras = inspector.extra_instances
 
 if extras.empty?
-  puts ""
-  puts "No extra instances found. Nothing to clean up."
-  puts ""
+  if !whisper
+    puts ""
+    puts "No extra instances found. Nothing to clean up."
+    puts ""
+  end
   exit 0
 end
 

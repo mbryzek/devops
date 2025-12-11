@@ -407,9 +407,7 @@ end
 
 # Phase 7: Cleanup extra instances
 if !DRY_RUN
-    puts ""
-    puts Util.underline("Phase 7: Cleaning up extra instances")
-    cleanup_cmd = File.join(__dir__, 'cleanup-extras')
+    cleanup_cmd = "#{File.join(__dir__, 'cleanup-extras')} --whisper"
     system(cleanup_cmd)
 end
 
