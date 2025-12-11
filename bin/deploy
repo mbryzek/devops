@@ -365,39 +365,7 @@ if DRY_RUN
         puts "  - #{s.node_state.uri}"
     end
 else
-    # Re-check status of all nodes that should have the app running
-    final_nodes = deployment_steps.select { |s| s.action == :deploy && s.reason !~ /borrowed/ }.map { |s| s.node_state.uri }
-    final_deployment_nodes = final_nodes.map { |uri| deployment_node_map[uri] }
-
-    final_deployment_nodes.each { |dn| dn.update_status }
-
-    healthy = final_deployment_nodes.filter { |dn| dn.healthy? }
-    not_healthy = final_deployment_nodes.filter { |dn| !dn.healthy? }
-
-    if not_healthy.empty?
-        job_servers = final_deployment_nodes.filter { |dn| dn.job_server? }
-        if job_servers.length == 0
-            puts Util.underline("No job servers")
-            puts "Deployment is complete. There is no job server."
-        elsif job_servers.length > 1
-            puts Util.underline("Multiple job servers")
-            puts "Deployment is complete. We expected a single job server but found multiple:"
-            job_servers.each do |dn|
-                puts " - #{dn.node.uri}"
-            end
-        else
-            js = job_servers.first
-            puts "Deployment successful. All nodes are healthy and there is exactly 1 job server [#{js.node.uri}]"
-        end
-    elsif healthy.empty?
-        puts Util.underline("SERVICE OUTAGE")
-        puts "No nodes are healthy"
-    else
-        puts Util.underline("The following nodes are not healthy")
-        not_healthy.each do |n|
-            puts " - %s" % n.node.uri
-        end
-    end
+    system("#{File.join(__dir__, 'inspect-nodes')}")
 end
 
 # Phase 7: Cleanup extra instances
