@@ -198,28 +198,6 @@ node_states.each do |ns|
     puts "  #{ns.uri}: #{apps_str}"
 end
 
-# Phase 2: Plan the deployment
-puts ""
-puts Util.underline("Phase 2: Planning deployment")
-planner = DeploymentPlanner.new(args.app, config.port, node_states)
-deployment_steps = planner.plan
-
-if deployment_steps.empty?
-    Util.exit_with_error("No deployment steps generated - cannot proceed")
-end
-
-deployment_steps.each_with_index do |step, i|
-    puts "  #{i + 1}. #{step}"
-end
-
-if planner.requires_borrowing?
-    puts ""
-    puts Util.warning("Borrowing node #{planner.borrowed_node.uri} for zero-downtime deployment")
-end
-
-# Build list of all nodes we'll deploy to (for tarball creation)
-deploy_node_uris = deployment_steps.select { |s| s.action == :deploy }.map { |s| s.node_state.uri }
-
 # Create fake Node objects for nodes from discovery (needed for RunScript compatibility)
 class DiscoveredNode
     attr_reader :uri
@@ -231,9 +209,6 @@ class DiscoveredNode
         @is_job_server
     end
 end
-
-# Identify borrowed node URI (if any) - borrowed nodes are always deployed as non-job-server
-borrowed_node_uri = planner.borrowed_node&.uri
 
 # Determine which node should be the job server for this app.
 # Job server must be a node that will ONLY run this app after deployment.
@@ -251,10 +226,53 @@ def pick_job_server_uri(deploy_uris, node_states, target_app, borrowed_uri)
     dedicated_nodes.first
 end
 
+# Phase 2: Plan the deployment
+puts ""
+puts Util.underline("Phase 2: Planning deployment")
+planner = DeploymentPlanner.new(args.app, config.port, node_states)
+deployment_steps = planner.plan
+
+if deployment_steps.empty?
+    Util.exit_with_error("No deployment steps generated - cannot proceed")
+end
+
+# Identify borrowed node URI (if any)
+borrowed_node_uri = planner.borrowed_node&.uri
+
+# Build list of all nodes we'll deploy to
+deploy_node_uris = deployment_steps.select { |s| s.action == :deploy }.map { |s| s.node_state.uri }
+
+# Determine job server before displaying plan
 job_server_uri = pick_job_server_uri(deploy_node_uris, node_states, args.app, borrowed_node_uri)
+
+# Reorder deployment steps: job server should be deployed last (before any STOP steps)
 if job_server_uri
-    puts "Selected job server: #{job_server_uri}"
+    deploy_steps = deployment_steps.select { |s| s.action == :deploy }
+    stop_steps = deployment_steps.select { |s| s.action == :stop }
+
+    job_server_step = deploy_steps.find { |s| s.node_state.uri == job_server_uri }
+    other_deploy_steps = deploy_steps.reject { |s| s.node_state.uri == job_server_uri }
+
+    # Reorder: other deploys first, then job server, then stops
+    deployment_steps = other_deploy_steps + [job_server_step].compact + stop_steps
+end
+
+# Display deployment plan
+deployment_steps.each_with_index do |step, i|
+    role = (step.node_state.uri == job_server_uri) ? " [JOB SERVER]" : ""
+    puts "  #{i + 1}. #{step}#{role}"
+end
+
+if planner.requires_borrowing?
+    puts ""
+    puts Util.warning("Borrowing node #{planner.borrowed_node.uri} for zero-downtime deployment")
+end
+
+if job_server_uri
+    puts ""
+    puts "Job server: #{job_server_uri}"
 else
+    puts ""
     puts Util.warning("No dedicated node available for job server")
 end
 
