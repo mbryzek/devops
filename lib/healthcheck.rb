@@ -1,14 +1,15 @@
 require 'json'
 
 class Healthcheck
-  attr_reader :status
+  attr_reader :status, :error_message
 
-  def initialize(data)
+  def initialize(data, error_message: nil)
     @status = data['status'].to_s
     if @status.empty?
         raise ArgumentError, "status is required: #{data.inspect}"
     end
     @job_server = data['job_server'].to_s == "true"
+    @error_message = error_message
   end
 
   def healthy?
@@ -17,6 +18,11 @@ class Healthcheck
 
   def job_server?
     @job_server
+  end
+
+  # Fatal errors won't recover - no point waiting
+  def fatal?
+    @status == "fatal"
   end
 
   def Healthcheck.from_json(json)
@@ -32,23 +38,21 @@ class Healthcheck
                 if data['status']
                     Healthcheck.new(data)
                 elsif data['discriminator'] == 'validation'
-                    puts "Healthcheck validation error: #{data['message']}"
-                    DOWN
+                    # Validation errors are fatal - won't recover
+                    FATAL.tap { |h| h.instance_variable_set(:@error_message, data['message']) }
                 else
-                    puts "WARNING: Unknown Healthcheck response: #{data.inspect}"
                     DOWN
                 end
             else
-              puts "WARNING: Unknown Healthcheck response (expected a hash): #{data.inspect}"
               DOWN
             end
         rescue JSON::ParserError => e
-            puts "WARNING: Failed to parse healthcheck response: #{json.inspect}"
             DOWN
         end
     end
   end
 
   DOWN = Healthcheck.new({ "status" => "down"})
+  FATAL = Healthcheck.new({ "status" => "fatal"})
   UNKNOWN = Healthcheck.new({ "status" => "unknown"})
 end
