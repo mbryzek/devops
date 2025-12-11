@@ -41,10 +41,18 @@ module DigitalOcean
     end
 
     # Remove droplet from LB and wait for it to be fully removed
-    # Returns true if successfully removed, false if timeout
+    # Returns true if successfully removed (or wasn't in LB), false if timeout
     def drain_and_wait(ip, drain_wait: 10, max_poll: 30, poll_interval: 2)
+      # Check if already not in LB - nothing to do
+      if !droplet_in_lb?(ip)
+        puts "Node #{ip} is not in load balancer, skipping drain"
+        return true
+      end
+
       puts "Removing node #{ip} from load balancer"
-      remove_droplet_by_ip_address(ip)
+      droplets_by_ip_address(ip).each do |droplet|
+        @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
+      end
 
       # Poll until droplet is confirmed removed from LB
       start = Time.now
