@@ -4,6 +4,7 @@ module DigitalOcean
 
   class Client
     TOKEN_FILE = '~/.digitalocean/token' unless defined?(TOKEN_FILE)
+    MAX_RETRIES = 3
 
     def initialize(app)
       @app = app
@@ -13,76 +14,97 @@ module DigitalOcean
       @all_droplets = load_all_droplets
     end
 
-    def remove_droplet_by_ip_address(ip)
-      droplets_by_ip_address(ip).each do |droplet|
-        if @load_balancer.tag_based?
-          # For tag-based LBs, remove the tag from the droplet
-          @client.tags.untag_resources(
-            name: @load_balancer.tag,
-            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-          )
+    # Retry wrapper for API calls
+    def with_retry(operation_name)
+      retries = 0
+      begin
+        yield
+      rescue DropletKit::Error, Faraday::Error, Net::OpenTimeout => e
+        retries += 1
+        if retries < MAX_RETRIES
+          wait_time = 2 ** retries
+          puts "  #{operation_name} failed, retrying in #{wait_time}s... (#{e.message})"
+          sleep(wait_time)
+          retry
         else
-          # For droplet-based LBs, remove directly
-          @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
+          raise "#{operation_name} failed after #{MAX_RETRIES} retries: #{e.message}"
+        end
+      end
+    end
+
+    def remove_droplet_by_ip_address(ip)
+      with_retry("Remove droplet from LB") do
+        droplets_by_ip_address(ip).each do |droplet|
+          if @load_balancer.tag_based?
+            @client.tags.untag_resources(
+              name: @load_balancer.tag,
+              resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+            )
+          else
+            @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
+          end
         end
       end
     end
 
     def add_droplet_by_ip_address(ip)
-      droplets_by_ip_address(ip).each do |droplet|
-        if @load_balancer.tag_based?
-          # For tag-based LBs, add the tag back to the droplet
-          @client.tags.tag_resources(
-            name: @load_balancer.tag,
-            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-          )
-        else
-          # For droplet-based LBs, add directly
-          @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
+      with_retry("Add droplet to LB") do
+        droplets_by_ip_address(ip).each do |droplet|
+          if @load_balancer.tag_based?
+            @client.tags.tag_resources(
+              name: @load_balancer.tag,
+              resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+            )
+          else
+            @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
+          end
         end
       end
     end
 
-    # Check if a droplet has a specific tag
     def droplet_has_tag?(ip, tag_name)
-      droplets_by_ip_address(ip).any? do |droplet|
-        droplet_obj = @client.droplets.find(id: droplet.id)
-        droplet_obj.tags.include?(tag_name)
+      with_retry("Check droplet tag") do
+        droplets_by_ip_address(ip).any? do |droplet|
+          droplet_obj = @client.droplets.find(id: droplet.id)
+          droplet_obj.tags.include?(tag_name)
+        end
       end
     end
 
-    # Get all tags for a droplet
     def droplet_tags(ip)
-      droplets_by_ip_address(ip).flat_map do |droplet|
-        droplet_obj = @client.droplets.find(id: droplet.id)
-        droplet_obj.tags
-      end.uniq
+      with_retry("Get droplet tags") do
+        droplets_by_ip_address(ip).flat_map do |droplet|
+          droplet_obj = @client.droplets.find(id: droplet.id)
+          droplet_obj.tags
+        end.uniq
+      end
     end
 
-    # Add a tag to a droplet
     def add_tag_to_droplet(ip, tag_name)
-      # Ensure tag exists
-      begin
-        @client.tags.create(DropletKit::Tag.new(name: tag_name))
-      rescue DropletKit::Error
-        # Tag already exists, ignore
-      end
+      with_retry("Add tag to droplet") do
+        begin
+          @client.tags.create(DropletKit::Tag.new(name: tag_name))
+        rescue DropletKit::Error
+          # Tag already exists
+        end
 
-      droplets_by_ip_address(ip).each do |droplet|
-        @client.tags.tag_resources(
-          name: tag_name,
-          resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-        )
+        droplets_by_ip_address(ip).each do |droplet|
+          @client.tags.tag_resources(
+            name: tag_name,
+            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+          )
+        end
       end
     end
 
-    # Remove a tag from a droplet
     def remove_tag_from_droplet(ip, tag_name)
-      droplets_by_ip_address(ip).each do |droplet|
-        @client.tags.untag_resources(
-          name: tag_name,
-          resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-        )
+      with_retry("Remove tag from droplet") do
+        droplets_by_ip_address(ip).each do |droplet|
+          @client.tags.untag_resources(
+            name: tag_name,
+            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+          )
+        end
       end
     end
 

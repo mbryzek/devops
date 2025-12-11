@@ -34,6 +34,14 @@ start = Time.now
 TMP_DIR = "/tmp/devops-zerodowntime"
 FileUtils.mkdir_p(TMP_DIR)
 
+# Acquire deployment lock to prevent concurrent deploys
+LOCK_FILE = "/tmp/devops-deploy.lock"
+lock_fd = File.open(LOCK_FILE, File::CREAT | File::RDWR)
+if !lock_fd.flock(File::LOCK_EX | File::LOCK_NB)
+    Util.exit_with_error("Another deployment is in progress (lock file: #{LOCK_FILE})")
+end
+at_exit { lock_fd.flock(File::LOCK_UN); lock_fd.close }
+
 if !file.match(/\.tar\.gz$/)
     Util.exit_with_error("Release file must end with .tar.gz")
 end
@@ -70,6 +78,7 @@ do_client = DigitalOcean::Client.new(args.app)
 # Discover current assignment: which job node has app's tag?
 current_job_node = nil
 target_job_node = nil
+first_deploy = false
 
 job_nodes.each do |uri|
     if do_client.droplet_has_tag?(uri, "#{args.app}-jobs")
@@ -80,26 +89,24 @@ job_nodes.each do |uri|
 end
 
 if current_job_node.nil?
-    # First deploy or no tag - pick first available
-    puts "No current job node tagged for #{args.app}, using first available"
+    # First deploy - no existing job node to drain
+    first_deploy = true
+    puts "First deployment for #{args.app} - no existing job node"
     target_job_node = job_nodes[0]
-    current_job_node = job_nodes[1]
 end
 
 puts Util.underline("Node Assignment")
-puts "Current job node: #{current_job_node}"
+puts "First deploy:     #{first_deploy}"
+puts "Current job node: #{current_job_node || 'none'}"
 puts "Target job node:  #{target_job_node}"
 puts ""
 
 # Get displaced app (the app currently using target_job_node)
 displaced_app = nil
-job_nodes.each do |uri|
-    next if uri == current_job_node
-    do_client.droplet_tags(uri).each do |tag|
-        if tag.end_with?("-jobs") && !tag.start_with?(args.app)
-            displaced_app = tag.sub("-jobs", "")
-            break
-        end
+do_client.droplet_tags(target_job_node).each do |tag|
+    if tag.end_with?("-jobs") && !tag.start_with?(args.app)
+        displaced_app = tag.sub("-jobs", "")
+        break
     end
 end
 
@@ -353,42 +360,46 @@ end
 print "\r" + " " * 60 + "\r"
 $stdout.flush
 
-# Now drain and remove old nodes
-puts ""
-puts Util.underline("Draining old job node")
+# Drain and remove old job node (skip for first deploy)
+if !first_deploy
+    puts ""
+    puts Util.underline("Draining old job node")
 
-old_job_deploy_node = DeployNode.new(current_job_node, true, port, devops_token)
+    old_job_deploy_node = DeployNode.new(current_job_node, true, port, devops_token)
 
-if old_job_deploy_node.start_drain
-    puts "  Drain started on #{current_job_node}"
+    if old_job_deploy_node.start_drain
+        puts "  Drain started on #{current_job_node}"
+        puts "  Waiting 5s for in-flight requests..."
+        sleep 5
+    else
+        puts "  Could not drain #{current_job_node} (may already be down)"
+        puts "  Waiting 10s as precaution..."
+        sleep 10
+    end
+
+    # Remove old job node from LB
+    puts ""
+    puts Util.underline("Removing old job node from LB")
+
+    do_client.remove_droplet_by_ip_address(current_job_node)
+    puts "  Removed #{current_job_node} from LB"
+
+    # Stop old process
+    puts ""
+    puts Util.underline("Stopping old process")
+
+    old_job_deploy_node.kill_process_on_port
+    puts "  Stopped process on #{current_job_node}:#{port}"
+
+    # Remove old tag
+    puts ""
+    puts Util.underline("Updating DigitalOcean tags")
+    do_client.remove_tag_from_droplet(current_job_node, "#{args.app}-jobs")
+    puts "  Removed #{args.app}-jobs tag from #{current_job_node}"
 else
-    puts "  Could not drain #{current_job_node} (may already be down)"
+    puts ""
+    puts Util.underline("First deploy - skipping old node cleanup")
 end
-
-puts "  Waiting 5s for in-flight requests..."
-sleep 5
-
-# Remove old job node from LB
-puts ""
-puts Util.underline("Removing old job node from LB")
-
-do_client.remove_droplet_by_ip_address(current_job_node)
-puts "  Removed #{current_job_node} from LB"
-
-# Stop old process
-puts ""
-puts Util.underline("Stopping old process")
-
-old_job_deploy_node.kill_process_on_port
-puts "  Stopped process on #{current_job_node}:#{port}"
-
-# Update DO tags
-puts ""
-puts Util.underline("Updating DigitalOcean tags")
-
-# Remove old tag
-do_client.remove_tag_from_droplet(current_job_node, "#{args.app}-jobs")
-puts "  Removed #{args.app}-jobs tag from #{current_job_node}"
 
 # Add new tag
 do_client.add_tag_to_droplet(target_job_node, "#{args.app}-jobs")
