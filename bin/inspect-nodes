@@ -5,4 +5,17 @@
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
-NodeInspector.new.discover.print_all
+inspector = NodeInspector.new.discover
+inspector.print_all
+
+# Run sanity checks
+errors = inspector.sanity_check
+
+puts ""
+if errors.empty?
+  puts "Infra looks good"
+else
+  puts Util.underline("Issues")
+  errors.each { |e| puts Util.warning("  - #{e}") }
+end
+puts ""

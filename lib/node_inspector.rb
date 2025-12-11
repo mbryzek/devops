@@ -92,6 +92,46 @@ class NodeInspector
     extra
   end
 
+  # Run sanity checks on infrastructure state.
+  # Returns array of error messages. Empty array means everything is good.
+  # Checks:
+  #   - Each app has exactly 1 job server
+  #   - Job server runs on a dedicated node (only that app)
+  #   - Each app has at least 2 instances
+  def sanity_check
+    ensure_discovered
+
+    errors = []
+
+    NodeDiscovery::KNOWN_APPS.each do |app_name, port|
+      running_nodes = @node_states.select { |ns| ns.running_app?(app_name) }
+      job_server_nodes = @node_states.select { |ns| ns.job_server_for?(app_name) }
+
+      # Check: at least 2 instances
+      if running_nodes.length < 2
+        errors << "#{app_name}: only #{running_nodes.length} instance(s) running (need at least 2)"
+      end
+
+      # Check: exactly 1 job server
+      if job_server_nodes.length == 0
+        errors << "#{app_name}: no job server"
+      elsif job_server_nodes.length > 1
+        uris = job_server_nodes.map(&:uri).join(', ')
+        errors << "#{app_name}: multiple job servers (#{uris})"
+      else
+        # Check: job server on dedicated node
+        js_node = job_server_nodes.first
+        other_apps = js_node.apps.reject { |a| a.name == app_name }
+        if other_apps.any?
+          other_names = other_apps.map(&:name).join(', ')
+          errors << "#{app_name}: job server on #{js_node.uri} is not dedicated (also running: #{other_names})"
+        end
+      end
+    end
+
+    errors
+  end
+
   private
 
   def ensure_discovered

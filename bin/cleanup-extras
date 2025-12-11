@@ -37,10 +37,6 @@ end
 
 # Clean up extras
 extras.each do |app_name, node_uris|
-  puts ""
-  puts Util.warning("Found #{node_uris.length} extra instance(s) of #{app_name}: #{node_uris.join(', ')}")
-  puts "Cleaning up..."
-
   do_client = DigitalOcean::Client.new(app_name, node_ips: global_nodes)
 
   node_uris.each do |node_uri|
