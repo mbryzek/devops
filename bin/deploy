@@ -37,11 +37,11 @@ FileUtils.mkdir_p(TMP_DIR)
 RUN_SCRIPT_NAME = "#{args.app}-#{config.scala.artifact_name}-run.sh"
 RUN_SCRIPT = File.join(TMP_DIR, RUN_SCRIPT_NAME)
 
-do_client = DigitalOcean::Client.new(args.app)
-
 # Load global nodes for discovery
 global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
 global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
+
+do_client = DigitalOcean::Client.new(args.app, node_ips: global_nodes)
 
 if !file.match (/\.tar\.gz$/)
     Util.exit_with_error("Release file must end with .tar.gz")

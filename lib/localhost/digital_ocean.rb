@@ -5,8 +5,9 @@ module DigitalOcean
   class Client
     TOKEN_FILE = '~/.digitalocean/token' unless defined?(TOKEN_FILE)
 
-    def initialize(app)
+    def initialize(app, node_ips:)
       @app = app
+      @node_ips = node_ips
       token = Util.read_file(TOKEN_FILE)
       @client = DropletKit::Client.new(access_token: token)
       @load_balancer = find_load_balancer
@@ -15,31 +16,13 @@ module DigitalOcean
 
     def remove_droplet_by_ip_address(ip)
       droplets_by_ip_address(ip).each do |droplet|
-        if @load_balancer.tag_based?
-          # For tag-based LBs, remove the tag from the droplet
-          @client.tags.untag_resources(
-            name: @load_balancer.tag,
-            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-          )
-        else
-          # For droplet-based LBs, remove directly
-          @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
-        end
+        @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
       end
     end
 
     def add_droplet_by_ip_address(ip)
       droplets_by_ip_address(ip).each do |droplet|
-        if @load_balancer.tag_based?
-          # For tag-based LBs, add the tag back to the droplet
-          @client.tags.tag_resources(
-            name: @load_balancer.tag,
-            resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
-          )
-        else
-          # For droplet-based LBs, add directly
-          @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
-        end
+        @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
       end
     end
 
@@ -50,15 +33,7 @@ module DigitalOcean
 
       # Refresh load balancer state
       lb = @client.load_balancers.find(id: @load_balancer.id)
-
-      if @load_balancer.tag_based?
-        # For tag-based LBs, check if droplet has the tag
-        droplet_info = @client.droplets.find(id: droplet.id)
-        droplet_info.tags.include?(@load_balancer.tag)
-      else
-        # For droplet-based LBs, check if droplet is in the list
-        lb.droplet_ids.include?(droplet.id)
-      end
+      lb.droplet_ids.include?(droplet.id)
     end
 
     # Remove droplet from LB and wait for it to be fully removed
@@ -89,9 +64,10 @@ module DigitalOcean
     end
 
     def find_droplets
-      @client.droplets.all().select { |droplet|
-        droplet.tags.include?(@app)
-      }.map { |droplet| Droplet.new(droplet) }
+      all_droplets = @client.droplets.all().map { |droplet| Droplet.new(droplet) }
+      all_droplets.select { |droplet|
+        (@node_ips & droplet.ip_addresses).any?
+      }
     end
 
     def find_load_balancer
@@ -119,16 +95,11 @@ module DigitalOcean
   end
 
   class LoadBalancer
-    attr_reader :id, :name, :tag
+    attr_reader :id, :name
 
     def initialize(lb)
       @id = lb.id
       @name = lb.name
-      @tag = lb.tag
-    end
-
-    def tag_based?
-      !@tag.nil? && !@tag.empty?
     end
   end
 
