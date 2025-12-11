@@ -21,6 +21,8 @@ module DigitalOcean
     end
 
     def add_droplet_by_ip_address(ip)
+      return if droplet_in_lb?(ip)
+
       droplets_by_ip_address(ip).each do |droplet|
         @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
       end
