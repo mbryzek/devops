@@ -10,9 +10,9 @@ if scala_config.nil?
   Util.exit_with_error("App #{args.app} does not have a scala config")
 end
 
-env = scala_config.send(args.env)
 file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
 
-all = RunScript.new(config, file, vars, env.nodes, 0).vars
+# For local dev, pass empty nodes array - RunScript defaults to job_server=true
+all = RunScript.new(config, file, vars, [], 0).vars
 puts all.serialize(format)

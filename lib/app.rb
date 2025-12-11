@@ -64,11 +64,10 @@ class MemoryConfig
 end
 
 class ScalaEnvironment
-  attr_accessor :database, :nodes
+  attr_accessor :database
 
   def initialize(json_data)
     @database = Database.new(json_data['database'])
-    @nodes = json_data['nodes'].map { |node_data| Node.new(node_data) }
   end
 end
 
@@ -80,18 +79,5 @@ class Database
     @host = json_data['host']
     @user = json_data['user']
     @port = json_data['port']
-  end
-end
-
-class Node
-  attr_accessor :uri, :is_job_server
-
-  def initialize(json_data)
-    @uri = json_data['uri']
-    @is_job_server = json_data['isJobServer'] == true
-  end
-
-  def job_server?
-    @is_job_server
   end
 end

@@ -29,19 +29,25 @@ if !File.directory?(repo_dir)
 end
 
 app_name = db_name.sub(/-postgresql$/, '')
-env = Config.load(app_name)
-scala_config = env.scala
+config = Config.load(app_name)
+scala_config = config.scala
 if scala_config.nil?
     Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find deployment node")
 end
 
 scala_env = scala_config.send(args.env)
 db = scala_env.database
-node = scala_env.nodes.first
-if node.nil?
-    Util.exit_with_error("No nodes configured for #{app_name} #{args.env}")
+
+# Load global nodes and pick the first one for running migrations
+global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
+if !File.exist?(global_nodes_path)
+    Util.exit_with_error("Nodes config not found at #{global_nodes_path}. Run ./generate-json.rb first.")
 end
-node_ip = node.uri
+global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
+if global_nodes.empty?
+    Util.exit_with_error("No nodes configured in #{global_nodes_path}")
+end
+node_ip = global_nodes.first
 
 # Get database password from environment variables
 env_vars = EnvironmentVariables.load(app_name, args.env)
