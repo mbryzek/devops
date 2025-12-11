@@ -25,6 +25,8 @@ cmd = "pkl eval %s --format json  > dist/%s.%s.json"
     Util.run(cmd % [file, app, name], :quiet => args.quiet)
 end
 
+Util.run("pkl eval ../env/nodes.pkl --format json  > dist/nodes.json")
+
 args.info ""
 args.info "Done"
 args.info ""
