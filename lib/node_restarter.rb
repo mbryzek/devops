@@ -51,13 +51,13 @@ class NodeRestarter
       # Kill existing process
       puts "  Stopping #{@app_name}..."
       unless kill_app
-        return false
+        next false
       end
 
       # Start application
       puts "  Starting #{@app_name}..."
       unless start_app(deploy_dir, run_script, logfile)
-        return false
+        next false
       end
 
       true
@@ -109,9 +109,13 @@ class NodeRestarter
     if lb_available? && should_add_to_lb
       if healthy
         puts "  Adding #{@node_uri} to load balancer..."
-        do_client.add_droplet_by_ip_address(@node_uri)
+        safe_add_to_lb(@node_uri)
+      elsif was_in_lb
+        # Re-add unhealthy nodes that were previously serving traffic to preserve capacity
+        puts "  WARNING: Re-adding unhealthy node to load balancer (was previously serving traffic)"
+        safe_add_to_lb(@node_uri)
       else
-        puts "  WARNING: Not adding unhealthy node to load balancer"
+        puts "  WARNING: Not adding unhealthy borrowed node to load balancer"
       end
     end
 
@@ -198,7 +202,16 @@ class NodeRestarter
   def re_add_to_lb
     return unless lb_available? && do_client
     puts "  Re-adding #{@node_uri} to load balancer (recovery)..."
-    do_client.add_droplet_by_ip_address(@node_uri)
+    safe_add_to_lb(@node_uri)
+  end
+
+  def safe_add_to_lb(node_uri)
+    return unless do_client
+    begin
+      do_client.add_droplet_by_ip_address(node_uri)
+    rescue => e
+      puts Util.warning("Failed to add node to load balancer: #{e.message}")
+    end
   end
 
   def remote_cmd(cmd)
