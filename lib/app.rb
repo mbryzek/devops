@@ -11,7 +11,25 @@ class App
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
     @hugo = json_data['hugo'] ? HugoConfig.new(json_data['hugo']) : nil
-    @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['flutter']) : nil
+    @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['sveltekit']) : nil
+  end
+
+  # Blue-green deploy is always used for scala apps
+  # Ports are derived: port and port+1
+  def blue_port
+    @port
+  end
+
+  def green_port
+    @port + 1
+  end
+
+  def blue_green_ports
+    [blue_port, green_port]
+  end
+
+  def other_port(current_port)
+    current_port == blue_port ? green_port : blue_port
   end
 end
 

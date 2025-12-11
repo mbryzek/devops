@@ -1,0 +1,397 @@
+#!/usr/bin/env ruby
+
+# Blue-Green Deployment Script
+#
+# Deploys to the inactive port on all nodes in parallel, then switches
+# the load balancer to the new port for zero-downtime deployments.
+#
+# Flow:
+# 1. Determine which port is currently active (from LB forwarding rule)
+# 2. Deploy new version to inactive port on ALL nodes in parallel
+# 3. Wait for all nodes to be healthy on new port
+# 4. Switch LB forwarding rule and health check to new port
+# 5. Wait for LB to mark all nodes healthy
+# 6. Drain and stop processes on old port
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
+
+args = Args.parse(ARGV, ["app", "file"])
+config = Config.load(args.app)
+scala_config = config.scala
+
+if scala_config.nil?
+    Util.exit_with_error("App #{args.app} does not have a scala config")
+end
+
+env = scala_config.send(args.env)
+file = args.file
+vars = EnvironmentVariables.load(args.app, args.env)
+start = Time.now
+
+TMP_DIR = "/tmp/devops-bluegreen"
+FileUtils.mkdir_p(TMP_DIR)
+
+do_client = DigitalOcean::Client.new(args.app)
+
+if !file.match(/\.tar\.gz$/)
+    Util.exit_with_error("Release file must end with .tar.gz")
+end
+if !File.exist?(file)
+    Util.exit_with_error("File #{file} does not exist")
+end
+
+devops_token = vars["DEVOPS_TOKEN"]
+if devops_token.nil? || devops_token.empty?
+    Util.exit_with_error("DEVOPS_TOKEN environment variable is required")
+end
+
+# Determine active and inactive ports
+# Blue-green ports are derived: port and port+1
+active_port = do_client.current_target_port
+if active_port.nil?
+    Util.exit_with_error("Could not determine current LB target port")
+end
+
+if !config.blue_green_ports.include?(active_port)
+    Util.exit_with_error("Current LB port #{active_port} is not in expected ports: #{config.blue_green_ports.join(', ')}")
+end
+
+inactive_port = config.other_port(active_port)
+
+puts ""
+puts Util.underline("Blue-Green Deployment")
+puts "Active port:   #{active_port} (currently serving traffic)"
+puts "Inactive port: #{inactive_port} (deployment target)"
+puts ""
+
+nodes = env.nodes
+if nodes.empty?
+    Util.exit_with_error("No nodes configured for #{config.name}")
+end
+
+# Helper class for blue-green deployment nodes
+class BlueGreenNode
+    attr_reader :node, :index
+
+    def initialize(config, node, index, port, devops_token)
+        @config = config
+        @node = node
+        @index = index.to_i
+        @port = port
+        @devops_token = devops_token
+    end
+
+    def localhost?
+        @node.uri == "localhost"
+    end
+
+    def job_server?
+        @node.job_server?
+    end
+
+    def execute(cmd)
+        if localhost?
+            `#{cmd}`.strip
+        else
+            tmp = "/tmp/bgnode.%s.%s.tmp" % [@node.uri, @port]
+            `ssh root@#{@node.uri} 'rm -f #{tmp}; #{cmd} > #{tmp}'`
+            begin
+                file = download_file(tmp)
+                IO.read(file).strip
+            ensure
+                File.delete(tmp) if File.exist?(tmp)
+            end
+        end
+    end
+
+    def download_file(file)
+        if localhost?
+            file
+        else
+            tmp = "/tmp/#{File.basename(file)}"
+            Util.run("scp -q root@#{@node.uri}:#{file} #{tmp}", :quiet => true)
+            tmp
+        end
+    end
+
+    def upload_file(file)
+        if !localhost?
+            puts "  Uploading #{File.basename(file)} to #{node.uri}"
+            Util.run("scp -q #{file} root@#{@node.uri}:~/", :quiet => true)
+        end
+    end
+
+    def check_health
+        output = execute("curl -s http://localhost:#{@port}/_internal_/healthcheck")
+        Healthcheck.from_json(output)
+    end
+
+    def healthy?
+        check_health.healthy?
+    end
+
+    def start_drain
+        result = execute("curl -s -w \"\\n%{http_code}\" -X POST -H \"X-Devops-Token: #{@devops_token}\" http://localhost:#{@port}/_internal_/drain")
+        lines = result.split("\n")
+        http_code = lines.last.to_i
+        http_code == 200
+    end
+
+    def kill_process_on_port
+        # Kill java process listening on this specific port
+        # Use || true for macOS compatibility (no -r flag on xargs)
+        cmd = "lsof -ti :#{@port} | xargs kill -15 2>/dev/null || true; sleep 2; lsof -ti :#{@port} | xargs kill -9 2>/dev/null || true"
+        execute(cmd)
+    end
+end
+
+# Create node objects for the inactive port
+deployment_nodes = nodes.each_with_index.map { |n, i| BlueGreenNode.new(config, n, i, inactive_port, devops_token) }
+
+# Generate run scripts and tarballs for each node type
+def deployment_dir(file)
+    File.basename(file).sub(/\.tar\.gz$/, "")
+end
+
+def create_run_script(config, file, vars, nodes, index, port)
+    node = nodes[index]
+    memory = node.job_server? ? config.scala.memory.job_server : config.scala.memory.default
+    java_opts = "-Xms#{memory} -Xmx#{memory} -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/ -XX:+ExitOnOutOfMemoryError"
+
+    port_string = port == 80 ? '' : ":#{port}"
+    all_nodes = nodes.map { |n| "#{n.uri}#{port_string}" }
+    node_vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", index.to_s).with_variable("DEPLOYMENT_NODES", all_nodes.join(","))
+
+    script = "#!/usr/bin/env sh\n\n"
+    script += "JAVA_OPTS='#{java_opts}' #{node_vars.serialize("sh")} bin/#{config.scala.dist_run_script_name} \"-Dhttp.port=#{port}\"\n"
+    script
+end
+
+def create_deploy_script(config, file, port)
+    dir = deployment_dir(file)
+    logfile = "#{config.name}-#{port}.log"
+    run_script_name = "#{config.name}-#{port}-run.sh"
+
+    script = <<~EOS
+    #!/bin/sh
+    # Kill any existing process on port #{port}
+    lsof -ti :#{port} | xargs kill -15 2>/dev/null || true
+    sleep 2
+    lsof -ti :#{port} | xargs kill -9 2>/dev/null || true
+    # Extract and run
+    rm -rf #{dir}
+    tar --warning=no-unknown-keyword -xzf #{File.basename(file)}
+    cp #{run_script_name} #{dir}/
+    touch #{logfile}
+    mv -f #{logfile} #{logfile}.last 2>/dev/null || true
+    cd #{dir} && nohup ./#{run_script_name} > ../#{logfile} 2>&1 &
+    EOS
+
+    script
+end
+
+puts Util.underline("Creating deployment packages")
+
+# Create per-node packages
+node_packages = {}
+deployment_nodes.each do |dn|
+    suffix = dn.job_server? ? "jobs" : "default"
+    next if node_packages[suffix]
+
+    run_script_content = create_run_script(config, file, vars, nodes, dn.index, inactive_port)
+    run_script_name = "#{config.name}-#{inactive_port}-run.sh"
+    run_script_path = File.join(TMP_DIR, run_script_name)
+    File.write(run_script_path, run_script_content)
+    Util.run("chmod +x #{run_script_path}")
+
+    deploy_script_content = create_deploy_script(config, file, inactive_port)
+    deploy_script_name = "deploy-#{config.name}-#{inactive_port}.sh"
+    deploy_script_path = File.join(TMP_DIR, deploy_script_name)
+    File.write(deploy_script_path, deploy_script_content)
+    Util.run("chmod +x #{deploy_script_path}")
+
+    # Create tarball
+    tarball_name = "deployment.#{config.name}.#{inactive_port}.#{suffix}.tar.gz"
+    tarball_path = File.join(TMP_DIR, tarball_name)
+
+    # Copy release file to TMP_DIR
+    release_basename = File.basename(file)
+    Util.run("cp #{file} #{TMP_DIR}/") if file != File.join(TMP_DIR, release_basename)
+
+    # Build tarball
+    Util.run("cd #{TMP_DIR} && tar -czf #{tarball_name} #{release_basename} #{run_script_name} #{deploy_script_name}")
+
+    node_packages[suffix] = {
+        tarball: tarball_path,
+        deploy_script: deploy_script_name
+    }
+
+    puts "  Created package for #{suffix} nodes"
+end
+
+# Assign packages to nodes
+deployment_nodes.each do |dn|
+    suffix = dn.job_server? ? "jobs" : "default"
+    dn.instance_variable_set(:@package, node_packages[suffix])
+end
+
+puts ""
+puts Util.underline("Uploading to all nodes in parallel")
+
+upload_threads = deployment_nodes.map do |dn|
+    Thread.new do
+        pkg = dn.instance_variable_get(:@package)
+        dn.upload_file(pkg[:tarball])
+    end
+end
+upload_threads.each(&:join)
+puts "  Upload complete"
+
+puts ""
+puts Util.underline("Deploying to inactive port #{inactive_port} on all nodes in parallel")
+
+deploy_threads = deployment_nodes.map do |dn|
+    Thread.new do
+        begin
+            pkg = dn.instance_variable_get(:@package)
+            tarball_name = File.basename(pkg[:tarball])
+            deploy_script = pkg[:deploy_script]
+
+            # Extract tarball
+            dn.execute("tar --warning=no-unknown-keyword -xzf #{tarball_name}")
+            # Run deploy script
+            dn.execute("./#{deploy_script}")
+
+            puts "  Started on #{dn.node.uri}"
+            { success: true, node: dn.node.uri }
+        rescue => e
+            puts Util.warning("  Failed on #{dn.node.uri}: #{e.message}")
+            { success: false, node: dn.node.uri, error: e.message }
+        end
+    end
+end
+
+results = deploy_threads.map(&:value)
+failures = results.select { |r| r && !r[:success] }
+
+if failures.any?
+    puts ""
+    puts Util.warning("Deployment failed on #{failures.length} node(s):")
+    failures.each { |f| puts "  - #{f[:node]}: #{f[:error]}" }
+
+    # Cleanup: kill processes on inactive port
+    puts ""
+    puts "Cleaning up failed deployment..."
+    deployment_nodes.each do |dn|
+        dn.kill_process_on_port
+    end
+
+    Util.exit_with_error("Aborting deployment due to failures")
+end
+
+puts ""
+puts Util.underline("Waiting for all nodes to be healthy on port #{inactive_port}")
+
+max_wait = 120
+healthy_nodes = []
+max_wait.times do |i|
+    healthy_nodes = deployment_nodes.select { |dn| dn.healthy? }
+
+    if healthy_nodes.length == deployment_nodes.length
+        puts "  All #{deployment_nodes.length} nodes healthy after #{i + 1}s"
+        break
+    end
+
+    dots = i % 3 + 1
+    dot_display = "." * dots + " " * (3 - dots)
+    print "\r  Waiting #{dot_display} (#{healthy_nodes.length}/#{deployment_nodes.length} healthy)"
+    $stdout.flush
+    sleep 1
+end
+
+print "\r" + " " * 60 + "\r"
+$stdout.flush
+
+if healthy_nodes.length != deployment_nodes.length
+    unhealthy = deployment_nodes.reject { |dn| dn.healthy? }
+    puts Util.warning("Not all nodes healthy after #{max_wait}s:")
+    unhealthy.each { |dn| puts "  - #{dn.node.uri}" }
+
+    # Cleanup: kill processes on inactive port
+    puts ""
+    puts "Cleaning up failed deployment..."
+    deployment_nodes.each do |dn|
+        dn.kill_process_on_port
+        puts "  Stopped process on #{dn.node.uri}:#{inactive_port}"
+    end
+
+    Util.exit_with_error("Aborting deployment - new version failed health checks")
+end
+
+puts ""
+puts Util.underline("Switching load balancer to port #{inactive_port}")
+
+do_client.switch_to_port(inactive_port)
+puts "  LB forwarding rule and health check updated"
+puts "  Waiting 5s for LB configuration to propagate..."
+sleep 5
+
+# Wait for LB to recognize new healthy nodes
+puts ""
+puts Util.underline("Waiting for LB to mark nodes healthy")
+
+lb_wait = 45
+lb_wait.times do |i|
+    # Check if LB sees nodes as healthy (by checking if they're in the pool)
+    all_in_lb = deployment_nodes.all? { |dn| do_client.droplet_healthy_in_lb?(dn.node.uri) }
+
+    if all_in_lb
+        puts "  LB health checks passed after #{i + 1}s"
+        break
+    end
+
+    dots = i % 3 + 1
+    dot_display = "." * dots + " " * (3 - dots)
+    print "\r  Waiting for LB #{dot_display}"
+    $stdout.flush
+    sleep 1
+end
+
+print "\r" + " " * 60 + "\r"
+$stdout.flush
+
+# Now drain and stop old port processes
+puts ""
+puts Util.underline("Draining and stopping processes on old port #{active_port}")
+
+old_port_nodes = nodes.each_with_index.map { |n, i| BlueGreenNode.new(config, n, i, active_port, devops_token) }
+
+# Drain all old nodes
+old_port_nodes.each do |dn|
+    if dn.start_drain
+        puts "  Drain started on #{dn.node.uri}:#{active_port}"
+    else
+        puts "  Could not drain #{dn.node.uri}:#{active_port} (may already be down)"
+    end
+end
+
+# Wait a bit for in-flight requests
+puts "  Waiting 5s for in-flight requests to complete..."
+sleep 5
+
+# Kill old processes
+old_port_nodes.each do |dn|
+    dn.kill_process_on_port
+    puts "  Stopped process on #{dn.node.uri}:#{active_port}"
+end
+
+puts ""
+puts Util.underline("Deployment Complete")
+puts "New version running on port #{inactive_port}"
+puts "Old version on port #{active_port} has been stopped"
+
+duration = (Time.now - start).to_i
+puts ""
+puts "Deploy duration: #{duration} seconds"
+puts ""

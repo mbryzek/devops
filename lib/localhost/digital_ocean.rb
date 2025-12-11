@@ -69,6 +69,69 @@ module DigitalOcean
       wait
     end
 
+    # Returns the current target port from the LB forwarding rules
+    def current_target_port
+      lb = @client.load_balancers.find(id: @load_balancer.id)
+      # Find the HTTPS rule (entry port 443) - this is the main production rule
+      rule = lb.forwarding_rules.find { |r| r.entry_port == 443 }
+      rule&.target_port
+    end
+
+    # Switches the LB to route traffic to a new target port
+    # Updates both the forwarding rule and health check
+    def switch_to_port(new_port)
+      lb = @client.load_balancers.find(id: @load_balancer.id)
+
+      # Update forwarding rules - change target port for HTTPS rule
+      new_rules = lb.forwarding_rules.map do |rule|
+        if rule.entry_port == 443
+          DropletKit::ForwardingRule.new(
+            entry_protocol: rule.entry_protocol,
+            entry_port: rule.entry_port,
+            target_protocol: rule.target_protocol,
+            target_port: new_port,
+            certificate_id: rule.certificate_id,
+            tls_passthrough: rule.tls_passthrough
+          )
+        else
+          rule
+        end
+      end
+
+      # Update health check to point to new port
+      new_health_check = DropletKit::HealthCheck.new(
+        protocol: lb.health_check.protocol,
+        port: new_port,
+        path: lb.health_check.path,
+        check_interval_seconds: lb.health_check.check_interval_seconds,
+        response_timeout_seconds: lb.health_check.response_timeout_seconds,
+        unhealthy_threshold: lb.health_check.unhealthy_threshold,
+        healthy_threshold: lb.health_check.healthy_threshold
+      )
+
+      # Create updated LB object - only include tag OR droplet_ids, not both
+      tag_based = lb.tag && !lb.tag.empty?
+      updated_lb = DropletKit::LoadBalancer.new(
+        id: lb.id,
+        name: lb.name,
+        region: lb.region.slug,
+        forwarding_rules: new_rules,
+        health_check: new_health_check,
+        algorithm: lb.algorithm,
+        sticky_sessions: lb.sticky_sessions,
+        redirect_http_to_https: lb.redirect_http_to_https
+      )
+
+      # Set only one of tag or droplet_ids
+      if tag_based
+        updated_lb.tag = lb.tag
+      else
+        updated_lb.droplet_ids = lb.droplet_ids
+      end
+
+      @client.load_balancers.update(updated_lb, id: lb.id)
+    end
+
     private
     def droplets_by_ip_address(ip)
       @droplets.filter { |d| d.ip_addresses.include?(ip) }
