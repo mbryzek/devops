@@ -8,13 +8,16 @@
 #   result.message   # status message
 #
 # Usage (deploy script with custom execution):
-#   restarter = NodeRestarter.new(app_name, port, node_uri, global_nodes, do_client: client)
+#   restarter = NodeRestarter.new(app_name, port, node_uri, global_nodes, digital_ocean_client: client)
 #   result = restarter.deploy_with_lb(drain_required: true, add_to_lb: true) do
 #     # Custom deployment logic here
 #     # Return true if successful, false otherwise
 #   end
 
 class NodeRestarter
+  # Width used to clear terminal status lines
+  TERMINAL_CLEAR_WIDTH = 50
+
   Result = Struct.new(:success, :message, keyword_init: true) do
     def success?
       success
@@ -28,14 +31,14 @@ class NodeRestarter
   # @param port [Integer] Application port for healthcheck
   # @param node_uri [String] Node URI (IP address)
   # @param global_nodes [Array<String>] All node URIs for LB client
-  # @param do_client [DigitalOcean::Client, nil] Optional pre-initialized DO client
-  def initialize(app_name, port, node_uri, global_nodes, do_client: nil)
+  # @param digital_ocean_client [DigitalOcean::Client, nil] Optional pre-initialized DO client
+  def initialize(app_name, port, node_uri, global_nodes, digital_ocean_client: nil)
     @app_name = app_name
     @port = port
     @node_uri = node_uri
     @global_nodes = global_nodes
-    @do_client = do_client
-    @do_client_initialized = !do_client.nil?
+    @digital_ocean_client = digital_ocean_client
+    @digital_ocean_client_initialized = !digital_ocean_client.nil?
   end
 
   # Full restart sequence with zero-downtime (if LB available)
@@ -73,20 +76,35 @@ class NodeRestarter
   def deploy_with_lb(drain_required:, add_to_lb:)
     was_in_lb = false
 
+    # Step 0: Signal instance to drain (marks healthcheck unhealthy)
+    # This gives DO time to detect the node is unhealthy while it continues to serve traffic
+    if drain_required
+      puts "  Signaling #{@node_uri} to drain..."
+      if drain_instance
+        puts "  Instance draining, waiting #{DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS}s for DO healthcheck detection..."
+        sleep DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS
+      else
+        # Still wait on failure - instance may be draining despite failed response
+        reduced_wait = DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS / 2
+        puts "  Warning: Instance drain signal failed. Waiting reduced period (#{reduced_wait}s)..."
+        sleep reduced_wait
+      end
+    end
+
     # Step 1: Drain from LB (if required and node is in LB)
     if drain_required && lb_available?
-      was_in_lb = do_client.droplet_in_lb?(@node_uri)
+      was_in_lb = digital_ocean_client.droplet_in_lb?(@node_uri)
       if was_in_lb
         puts "  Draining #{@node_uri} from load balancer..."
-        success = do_client.drain_and_wait(
+        success = digital_ocean_client.drain_and_wait(
           @node_uri,
           drain_wait: DeploymentConfig::DRAIN_WAIT_SECONDS,
           max_poll: DeploymentConfig::LB_REMOVAL_POLL_TIMEOUT
         )
         unless success
           puts "  Re-adding node to load balancer (drain timeout)..."
-          do_client.add_droplet_by_ip_address(@node_uri)
-          return Result.new(success: false, message: "Failed to drain from load balancer")
+          digital_ocean_client.add_droplet_by_ip_address(@node_uri)
+          return Result.new(success: false, message: "Failed to drain from load balancer. Node re-added to LB. Manual investigation required.")
         end
       else
         puts "  Node #{@node_uri} not in load balancer, skipping drain"
@@ -96,7 +114,17 @@ class NodeRestarter
     # Step 2: Execute deployment logic
     deploy_success = yield
     unless deploy_success
-      re_add_to_lb if was_in_lb
+      if was_in_lb
+        # Check health before re-adding failed deployment to LB
+        puts "  Deployment failed, checking node health before re-adding to load balancer..."
+        healthy = wait_for_health
+        if healthy
+          puts "  Node is healthy, re-adding #{@node_uri} to load balancer..."
+          safe_add_to_lb(@node_uri)
+        else
+          puts "  WARNING: Node is unhealthy after failed deployment. Node remains out of load balancer rotation until manually resolved."
+        end
+      end
       return Result.new(success: false, message: "Deployment failed")
     end
 
@@ -112,10 +140,10 @@ class NodeRestarter
         safe_add_to_lb(@node_uri)
       elsif was_in_lb
         # Re-add unhealthy nodes that were previously serving traffic to preserve capacity
-        puts "  WARNING: Re-adding unhealthy node to load balancer (was previously serving traffic)"
+        puts "  WARNING: Re-adding unhealthy node to load balancer (was previously serving traffic). Manual investigation recommended."
         safe_add_to_lb(@node_uri)
       else
-        puts "  WARNING: Not adding unhealthy borrowed node to load balancer"
+        puts "  WARNING: Not adding unhealthy borrowed node to load balancer. Deployment will continue but this node requires manual investigation."
       end
     end
 
@@ -127,36 +155,46 @@ class NodeRestarter
   end
 
   # Kill the application process
+  # @return [Boolean] true if successful, false otherwise
   def kill_app
     cmd = remote_cmd("./deploy/kill.rb --app #{@app_name}")
-    system(cmd)
+    result = system(cmd)
+    if result.nil?
+      puts "  ERROR: Command execution failed: #{cmd}"
+      return false
+    end
+    $?.success?
   end
 
   # Start the application
+  # @return [Boolean] true if successful, false otherwise
   def start_app(deploy_dir, run_script, logfile)
     cmd = remote_cmd("cd #{deploy_dir} && nohup ./#{run_script} > ../#{logfile} 2>&1 &")
-    system(cmd)
+    result = system(cmd)
+    if result.nil?
+      puts "  ERROR: Command execution failed: #{cmd}"
+      return false
+    end
+    $?.success?
   end
 
   # Wait for healthcheck to return healthy
-  # Returns true if healthy, false if timeout
+  # @return [Boolean] true if healthy, false if timeout
   def wait_for_health
-    DeploymentConfig::HEALTHCHECK_MAX_RETRIES.times do |i|
+    DeploymentConfig::HEALTHCHECK_MAX_POLLS.times do |i|
       dots = (i % 3) + 1
       print "\r  Checking health#{('.' * dots).ljust(3)}"
       $stdout.flush
 
       if check_health
-        print "\r" + " " * 40 + "\r"
-        $stdout.flush
+        clear_terminal_line
         return true
       end
 
-      sleep 1 unless i == DeploymentConfig::HEALTHCHECK_MAX_RETRIES - 1
+      sleep 1 unless i == DeploymentConfig::HEALTHCHECK_MAX_POLLS - 1
     end
 
-    print "\r" + " " * 40 + "\r"
-    $stdout.flush
+    clear_terminal_line
     false
   end
 
@@ -174,43 +212,71 @@ class NodeRestarter
     end
   end
 
+  # Signal the instance to start draining (marks healthcheck as unhealthy)
+  # The instance continues to serve traffic but healthcheck returns unhealthy
+  # Uses longer timeout (5s) than healthcheck since drain may be heavier operation
+  # @return [Boolean] true if successful, false otherwise
+  def drain_instance
+    cmd = remote_cmd("curl -s --connect-timeout 5 -X POST http://localhost:#{@port}/_internal_/drain")
+    result = `#{cmd}`.strip
+    exit_success = $?.success?
+    return false unless exit_success
+
+    begin
+      data = JSON.parse(result)
+      data['status'] == 'draining'
+    rescue JSON::ParserError
+      # Fallback: accept HTTP success but log for monitoring
+      puts "  Note: Drain endpoint returned non-JSON response, assuming success"
+      exit_success
+    end
+  end
+
   # Check if load balancer is available
   def lb_available?
-    do_client&.has_load_balancer?
+    digital_ocean_client&.has_load_balancer?
   end
 
   private
 
-  def do_client
-    return @do_client if @do_client_initialized
+  # Clear the current terminal line (for status animations)
+  def clear_terminal_line
+    print "\r" + " " * TERMINAL_CLEAR_WIDTH + "\r"
+    $stdout.flush
+  end
 
-    @do_client_initialized = true
+  # Get the DigitalOcean client, initializing lazily if needed
+  # @return [DigitalOcean::Client, nil] The client, or nil if unavailable
+  def digital_ocean_client
+    return @digital_ocean_client if @digital_ocean_client_initialized
+
+    @digital_ocean_client_initialized = true
     begin
-      @do_client = DigitalOcean::Client.new(@app_name, node_ips: @global_nodes, require_lb: false)
+      @digital_ocean_client = DigitalOcean::Client.new(@app_name, node_ips: @global_nodes, require_lb: false)
     rescue Errno::ENOENT => e
       # Token file doesn't exist - LB features unavailable
-      puts "  Note: DigitalOcean not configured (#{e.message})"
-      @do_client = nil
+      puts "  Note: DigitalOcean not configured (#{e.message}). Load balancer operations will be skipped."
+      @digital_ocean_client = nil
     rescue => e
       # Unexpected error - should be visible
-      puts Util.warning("Failed to initialize DigitalOcean client: #{e.message}")
-      @do_client = nil
+      puts Util.warning("Failed to initialize DigitalOcean client: #{e.message}. Load balancer operations will be skipped.")
+      @digital_ocean_client = nil
     end
-    @do_client
+    @digital_ocean_client
   end
 
   def re_add_to_lb
-    return unless lb_available? && do_client
+    return unless lb_available? && digital_ocean_client
     puts "  Re-adding #{@node_uri} to load balancer (recovery)..."
     safe_add_to_lb(@node_uri)
   end
 
   def safe_add_to_lb(node_uri)
-    return unless do_client
+    return unless digital_ocean_client
     begin
-      do_client.add_droplet_by_ip_address(node_uri)
+      digital_ocean_client.add_droplet_by_ip_address(node_uri)
     rescue => e
-      puts Util.warning("Failed to add node to load balancer: #{e.message}")
+      puts Util.warning("Failed to add node to load balancer: #{e.message}. Manual intervention may be required.")
     end
   end
 

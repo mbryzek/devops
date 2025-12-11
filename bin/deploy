@@ -319,7 +319,7 @@ else
             config.port,
             node_uri,
             global_nodes,
-            do_client: do_client
+            digital_ocean_client: do_client
         )
 
         result = restarter.deploy_with_lb(drain_required: drain_required, add_to_lb: add_to_lb) do

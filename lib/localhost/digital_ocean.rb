@@ -15,10 +15,16 @@ module DigitalOcean
       @droplets = find_droplets
     end
 
+    # Check if a load balancer is configured for this app
+    # @return [Boolean] true if LB is available
     def has_load_balancer?
       !@load_balancer.nil?
     end
 
+    # Remove a droplet from the load balancer by IP address
+    # Note: Silently returns without action if no LB is configured or droplet is not in LB.
+    #       Use has_load_balancer? to check LB availability before calling if explicit handling is needed.
+    # @param ip [String] The IP address of the droplet to remove
     def remove_droplet_by_ip_address(ip)
       return unless has_load_balancer?
       return unless droplet_in_lb?(ip)
@@ -28,6 +34,10 @@ module DigitalOcean
       end
     end
 
+    # Add a droplet to the load balancer by IP address
+    # Note: Silently returns without action if no LB is configured or droplet is already in LB.
+    #       Use has_load_balancer? to check LB availability before calling if explicit handling is needed.
+    # @param ip [String] The IP address of the droplet to add
     def add_droplet_by_ip_address(ip)
       return unless has_load_balancer?
       return if droplet_in_lb?(ip)
@@ -38,6 +48,8 @@ module DigitalOcean
     end
 
     # Check if a droplet is currently in the load balancer
+    # @param ip [String] The IP address to check
+    # @return [Boolean] true if droplet is in LB, false if not in LB or no LB configured
     def droplet_in_lb?(ip)
       return false unless has_load_balancer?
 
