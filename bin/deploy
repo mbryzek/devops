@@ -286,91 +286,38 @@ puts Util.underline("Phase 5: Executing deployment plan")
 if DRY_RUN
     puts Util.warning("Skipping execution in dry-run mode")
 else
-    # Track borrowed node for cleanup
-    borrowed_deploy_step = deployment_steps.find { |s| s.reason.include?("borrowed") && s.action == :deploy }
-    borrowed_stop_step = deployment_steps.find { |s| s.reason.include?("borrowed") && s.action == :stop }
-    borrowed_node_deployed = false
-    borrowed_node_cleaned_up = false
-    deployment_error = nil
+    deployment_steps.each_with_index do |step, i|
+        next if step.action == :stop  # Cleanup handled by release-scala after deployment
 
-    begin
-        deployment_steps.each_with_index do |step, i|
-            puts ""
-            puts Util.underline("Step #{i + 1}: #{step}")
-
-            if step.action == :deploy
-                dn = deployment_node_map[step.node_state.uri]
-                tarball = dn.instance_variable_get(:@tarball)
-
-                # Upload tarball and extract tools
-                dn.execute("rm -rf lib deploy bin")
-                dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
-
-                # Drain if required (not needed for borrowed or down nodes)
-                if step.reason.include?("drain required")
-                    do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
-                end
-
-                # Execute deployment
-                dn.execute("./#{File.basename(deploy_script)}")
-                wait_until_up(dn)
-
-                # Add back to load balancer if we drained
-                if step.reason.include?("drain required")
-                    puts "Adding node #{dn.node.uri} to load balancer"
-                    do_client.add_droplet_by_ip_address(dn.node.uri)
-                elsif step.reason.include?("borrowed")
-                    # For borrowed nodes, add to LB after deployment
-                    puts "Adding borrowed node #{dn.node.uri} to load balancer"
-                    do_client.add_droplet_by_ip_address(dn.node.uri)
-                    borrowed_node_deployed = true
-                end
-
-                puts "Done. Node status is #{dn.status.status}"
-                if !dn.healthy?
-                    raise "Node #{dn.node.uri} failed to become healthy"
-                end
-
-            elsif step.action == :stop
-                # Return borrowed node - drain from LB and stop the app
-                dn = deployment_node_map[step.node_state.uri]
-
-                do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
-
-                # Stop the application on this node
-                puts "Stopping #{args.app} on borrowed node #{dn.node.uri}"
-                dn.execute("./deploy/kill.rb --app #{config.name}")
-                puts "Borrowed node #{dn.node.uri} returned to original state"
-                borrowed_node_cleaned_up = true
-            end
-        end
-    rescue => e
-        deployment_error = e
         puts ""
-        puts Util.warning("Deployment error: #{e.message}")
-    ensure
-        # Clean up borrowed node if it was deployed but not properly cleaned up
-        if borrowed_deploy_step && borrowed_node_deployed && !borrowed_node_cleaned_up
-            puts ""
-            puts Util.warning("Cleaning up borrowed node")
-            begin
-                dn = deployment_node_map[borrowed_deploy_step.node_state.uri]
-                if do_client.droplet_in_lb?(dn.node.uri)
-                    puts "Removing borrowed node #{dn.node.uri} from load balancer"
-                    do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
-                end
-                puts "Stopping #{args.app} on borrowed node #{dn.node.uri}"
-                dn.execute("./deploy/kill.rb --app #{config.name}") rescue nil
-                puts "Borrowed node #{dn.node.uri} cleaned up"
-                borrowed_node_cleaned_up = true
-            rescue => cleanup_error
-                puts Util.warning("Failed to clean up borrowed node: #{cleanup_error.message}")
-            end
-        end
-    end
+        puts Util.underline("Step #{i + 1}: #{step}")
 
-    if deployment_error
-        Util.exit_with_error("Aborting release: #{deployment_error.message}")
+        dn = deployment_node_map[step.node_state.uri]
+        tarball = dn.instance_variable_get(:@tarball)
+
+        # Upload tarball and extract tools
+        dn.execute("rm -rf lib deploy bin")
+        dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
+
+        # Drain if required (not needed for borrowed or down nodes)
+        if step.reason.include?("drain required")
+            do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
+        end
+
+        # Execute deployment
+        dn.execute("./#{File.basename(deploy_script)}")
+        wait_until_up(dn)
+
+        # Add to load balancer
+        if step.reason.include?("drain required") || step.reason.include?("borrowed")
+            puts "Adding node #{dn.node.uri} to load balancer"
+            do_client.add_droplet_by_ip_address(dn.node.uri)
+        end
+
+        puts "Done. Node status is #{dn.status.status}"
+        if !dn.healthy?
+            Util.exit_with_error("Node #{dn.node.uri} failed to become healthy")
+        end
     end
 end
 
@@ -417,6 +364,14 @@ else
             puts " - %s" % n.node.uri
         end
     end
+end
+
+# Phase 7: Cleanup extra instances
+if !DRY_RUN
+    puts ""
+    puts Util.underline("Phase 7: Cleaning up extra instances")
+    cleanup_cmd = "#{File.join(__dir__, 'cleanup-extras')} --app #{args.app}"
+    system(cleanup_cmd)
 end
 
 puts ""
