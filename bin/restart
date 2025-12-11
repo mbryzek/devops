@@ -26,6 +26,9 @@ if !File.exist?(global_nodes_path)
 end
 global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
 
+# Load environment variables for devops token
+vars = EnvironmentVariables.load(args.app, args.env)
+
 start_time = Time.now
 
 # Finds the most recently deployed directory for an app on a node
@@ -50,7 +53,7 @@ puts Util.underline("Phase 1: Discovery")
 puts ""
 
 # Get latest version from local repository
-app_dir = File.expand_path("~/code/#{args.app}")
+app_dir = args.app == "acumen" ? File.expand_path("~/code/acumen/#{args.app}") : File.expand_path("~/code/#{args.app}")
 latest_version = if File.directory?(app_dir)
   result = `cd #{app_dir} && sem-info tag latest 2>/dev/null`.strip
   $?.success? && !result.empty? ? result : nil
@@ -183,7 +186,8 @@ selected_nodes.each do |entry|
     args.app,
     config.port,
     node_uri,
-    global_nodes
+    global_nodes,
+    devops_token: vars["DEVOPS_TOKEN"]
   )
 
   result = restarter.restart(

@@ -319,7 +319,8 @@ else
             config.port,
             node_uri,
             global_nodes,
-            digital_ocean_client: do_client
+            digital_ocean_client: do_client,
+            devops_token: vars["DEVOPS_TOKEN"]
         )
 
         result = restarter.deploy_with_lb(drain_required: drain_required, add_to_lb: add_to_lb) do

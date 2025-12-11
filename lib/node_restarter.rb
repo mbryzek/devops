@@ -32,13 +32,15 @@ class NodeRestarter
   # @param node_uri [String] Node URI (IP address)
   # @param global_nodes [Array<String>] All node URIs for LB client
   # @param digital_ocean_client [DigitalOcean::Client, nil] Optional pre-initialized DO client
-  def initialize(app_name, port, node_uri, global_nodes, digital_ocean_client: nil)
+  # @param devops_token [String, nil] Optional token for /_internal_/ endpoints
+  def initialize(app_name, port, node_uri, global_nodes, digital_ocean_client: nil, devops_token: nil)
     @app_name = app_name
     @port = port
     @node_uri = node_uri
     @global_nodes = global_nodes
     @digital_ocean_client = digital_ocean_client
     @digital_ocean_client_initialized = !digital_ocean_client.nil?
+    @devops_token = devops_token
   end
 
   # Full restart sequence with zero-downtime (if LB available)
@@ -77,17 +79,12 @@ class NodeRestarter
     was_in_lb = false
 
     # Step 0: Signal instance to drain (marks healthcheck unhealthy)
-    # This gives DO time to detect the node is unhealthy while it continues to serve traffic
+    instance_drain_success = false
     if drain_required
       puts "  Signaling #{@node_uri} to drain..."
-      if drain_instance
-        puts "  Instance draining, waiting #{DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS}s for DO healthcheck detection..."
-        sleep DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS
-      else
-        # Still wait on failure - instance may be draining despite failed response
-        reduced_wait = DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS / 2
-        puts "  Warning: Instance drain signal failed. Waiting reduced period (#{reduced_wait}s)..."
-        sleep reduced_wait
+      instance_drain_success = drain_instance
+      if !instance_drain_success
+        puts "  Warning: Instance drain signal failed, continuing..."
       end
     end
 
@@ -98,7 +95,7 @@ class NodeRestarter
         puts "  Draining #{@node_uri} from load balancer..."
         success = digital_ocean_client.drain_and_wait(
           @node_uri,
-          drain_wait: DeploymentConfig::DRAIN_WAIT_SECONDS,
+          drain_wait: 0,  # Skip internal wait - we wait after LB drain for DO detection
           max_poll: DeploymentConfig::LB_REMOVAL_POLL_TIMEOUT
         )
         unless success
@@ -111,7 +108,13 @@ class NodeRestarter
       end
     end
 
-    # Step 2: Execute deployment logic
+    # Step 2: Wait for DO to detect unhealthy state (after LB drain)
+    if drain_required && instance_drain_success
+      puts "  Waiting #{DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS}s for DO healthcheck detection..."
+      sleep DeploymentConfig::INSTANCE_DRAIN_WAIT_SECONDS
+    end
+
+    # Step 3: Execute deployment logic
     deploy_success = yield
     unless deploy_success
       if was_in_lb
@@ -217,16 +220,20 @@ class NodeRestarter
   # Uses longer timeout (5s) than healthcheck since drain may be heavier operation
   # @return [Boolean] true if successful, false otherwise
   def drain_instance
-    cmd = remote_cmd("curl -s -w '\\nHTTP_CODE:%{http_code}' --connect-timeout 5 -X POST http://localhost:#{@port}/_internal_/drain")
+    return false unless @devops_token
+
+    # Use double quotes inside the command since remote_cmd wraps in single quotes
+    header = "-H \"X-Devops-Token: #{@devops_token}\""
+    cmd = remote_cmd("curl -s -w \"HTTP_CODE:%{http_code}\" #{header} --connect-timeout 5 -X POST http://localhost:#{@port}/_internal_/drain")
     output = `#{cmd}`
     exit_success = $?.success?
 
-    # Parse HTTP code from curl output
+    # Parse HTTP code from curl output (appended at end)
     http_code = nil
-    result = output.strip
-    if result =~ /\nHTTP_CODE:(\d+)$/
+    result = output
+    if result =~ /HTTP_CODE:(\d+)$/
       http_code = $1.to_i
-      result = result.sub(/\nHTTP_CODE:\d+$/, '').strip
+      result = result.sub(/HTTP_CODE:\d+$/, '').strip
     end
 
     unless exit_success
