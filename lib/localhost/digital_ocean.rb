@@ -15,6 +15,8 @@ module DigitalOcean
     end
 
     def remove_droplet_by_ip_address(ip)
+      return unless droplet_in_lb?(ip)
+
       droplets_by_ip_address(ip).each do |droplet|
         @client.load_balancers.remove_droplets([droplet.id], id: @load_balancer.id)
       end
