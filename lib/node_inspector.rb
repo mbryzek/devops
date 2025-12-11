@@ -58,7 +58,7 @@ class NodeInspector
   # Find extra instances that should be stopped.
   # Logic: Job server nodes should only run their designated job server app.
   # Any OTHER app running on a job server node is extra and should be removed.
-  # Only mark as extra if removing would leave at least 2 instances of that app.
+  # Only mark as extra if removing would leave at least 2 HEALTHY instances of that app.
   # Returns hash of { app_name => [node_uris] }
   def extra_instances
     ensure_discovered
@@ -76,13 +76,13 @@ class NodeInspector
       other_apps = ns.apps.reject { |app| app.name == job_server_app.name }
 
       other_apps.each do |app|
-        # Count how many other nodes are running this app
-        other_nodes_running_app = @node_states.count { |other|
-          other != ns && other.running_app?(app.name)
+        # Count how many other nodes have this app running AND healthy
+        other_nodes_with_healthy_app = @node_states.count { |other|
+          other != ns && other.healthy_app?(app.name)
         }
 
-        # Only mark as extra if at least 2 instances would remain
-        if other_nodes_running_app >= 2
+        # Only mark as extra if at least 2 healthy instances would remain
+        if other_nodes_with_healthy_app >= 2
           extra[app.name] ||= []
           extra[app.name] << ns.uri
         end
@@ -103,7 +103,7 @@ class NodeInspector
 
     errors = []
 
-    NodeDiscovery::KNOWN_APPS.each do |app_name, port|
+    NodeDiscovery.known_apps.each do |app_name, port|
       running_nodes = @node_states.select { |ns| ns.running_app?(app_name) }
       job_server_nodes = @node_states.select { |ns| ns.job_server_for?(app_name) }
 

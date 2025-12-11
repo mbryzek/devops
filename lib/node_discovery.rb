@@ -1,7 +1,6 @@
 require 'json'
 require 'net/http'
 require 'uri'
-require 'timeout'
 
 class NodeDiscovery
   # Represents the state of a single application on a node
@@ -30,17 +29,28 @@ class NodeDiscovery
     end
   end
 
-  # Known applications and their ports
-  KNOWN_APPS = {
-    'acumen' => 9200,
-    'platform' => 9300
-  }.freeze
+  # Load scala apps from config files
+  # Returns hash of { app_name => port }
+  def self.known_apps
+    @known_apps ||= begin
+      dist_dir = File.join(File.dirname(__FILE__), "../dist")
+      apps = {}
+      Dir.glob(File.join(dist_dir, "*.config.json")).each do |path|
+        json = JSON.parse(IO.read(path))
+        app = json['app']
+        next unless app && app['scala']  # Only scala apps
+        apps[app['name']] = app['port']
+      end
+      apps.freeze
+    end
+  end
 
   # Timeout for healthcheck requests (seconds)
   PROBE_TIMEOUT = 5
 
   def initialize(node_uris)
     @node_uris = node_uris
+    @known_apps = self.class.known_apps
   end
 
   # Discover what's running on all nodes
@@ -55,7 +65,7 @@ class NodeDiscovery
   private
 
   def probe_node(node_uri)
-    apps = KNOWN_APPS.map do |app_name, port|
+    apps = @known_apps.map do |app_name, port|
       probe_app(node_uri, app_name, port)
     end.compact
 
@@ -71,14 +81,12 @@ class NodeDiscovery
     url = "http://#{node_uri}:#{port}/_internal_/healthcheck"
 
     begin
-      response = Timeout.timeout(PROBE_TIMEOUT) do
-        uri = URI.parse(url)
-        http = Net::HTTP.new(uri.host, uri.port)
-        http.open_timeout = PROBE_TIMEOUT
-        http.read_timeout = PROBE_TIMEOUT
-        request = Net::HTTP::Get.new(uri.request_uri)
-        http.request(request)
-      end
+      uri = URI.parse(url)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.open_timeout = PROBE_TIMEOUT
+      http.read_timeout = PROBE_TIMEOUT
+      request = Net::HTTP::Get.new(uri.request_uri)
+      response = http.request(request)
 
       if response.code == '200'
         data = JSON.parse(response.body)
@@ -92,7 +100,7 @@ class NodeDiscovery
         # App responded but not with 200 - treat as running but unhealthy
         make_unhealthy_app(app_name, port)
       end
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Timeout::Error, SocketError
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Net::OpenTimeout, Net::ReadTimeout, SocketError
       # Connection refused or timeout means app is not running on this port
       nil
     rescue JSON::ParserError => e

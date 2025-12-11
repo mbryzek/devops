@@ -53,9 +53,8 @@ class DeploymentPlanner
         action: DEPLOY,
         reason: "borrowed node - no #{@target_app} running"
       )
-    elsif nodes_with_app.length > 2
-      # All nodes running the app, but we have > 2 nodes
-      # Drain one first (2 remain serving), deploy to it, then it becomes the buffer
+    elsif nodes_with_app.length >= 2
+      # All nodes running the app - drain one first, deploy to it, then it becomes the buffer
       job_servers = nodes_with_app.select { |ns| ns.job_server_for?(@target_app) }
       non_job_servers = nodes_with_app.reject { |ns| ns.job_server_for?(@target_app) }
 
@@ -106,6 +105,12 @@ class DeploymentPlanner
         action: STOP,
         reason: "return borrowed node - drain and stop"
       )
+    end
+
+    # Validate we have at least one deploy step
+    deploy_steps = steps.select { |s| s.action == DEPLOY }
+    if deploy_steps.empty?
+      raise ZeroDowntimeNotPossible, "No nodes available for deployment of #{@target_app}"
     end
 
     steps
