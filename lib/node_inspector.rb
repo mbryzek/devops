@@ -87,29 +87,38 @@ class NodeInspector
     }
   end
 
-  # Find extra instances of an app that should be stopped.
-  # With N scala apps and M nodes, we expect:
-  #   - 1 shared node running all apps (not as job server)
-  #   - N dedicated job server nodes (one per app)
-  # Extra = nodes running ONLY this app as non-job-server (borrowed nodes not returned)
-  # Returns array of node URIs
-  def extra_nodes_for_app(app_name)
+  # Find extra instances that should be stopped.
+  # Logic: Job server nodes should only run their designated job server app.
+  # Any OTHER app running on a job server node is extra and should be removed.
+  # Only mark as extra if removing would leave at least 2 instances of that app.
+  # Returns hash of { app_name => [node_uris] }
+  def extra_instances
     ensure_discovered
 
-    running_nodes = @node_states.select { |ns| ns.running_app?(app_name) }
+    extra = {}
 
-    # Safety: never remove instances if we have fewer than 2 running
-    return [] if running_nodes.length < 2
+    # Find all job server nodes
+    job_server_nodes = @node_states.select { |ns| ns.apps.any?(&:job_server) }
 
-    job_server_node = @node_states.find { |ns| ns.job_server_for?(app_name) }
+    job_server_nodes.each do |ns|
+      # Find the job server app for this node
+      job_server_app = ns.apps.find(&:job_server)
 
-    extra = []
-    running_nodes.each do |ns|
-      next if ns == job_server_node  # Keep the job server
-      next if ns.apps.length > 1     # Keep shared nodes (running multiple apps)
+      # Any other app on this node is a candidate for removal
+      other_apps = ns.apps.reject { |app| app.name == job_server_app.name }
 
-      # This node runs ONLY this app and is not a job server - it's extra
-      extra << ns.uri
+      other_apps.each do |app|
+        # Count how many other nodes are running this app
+        other_nodes_running_app = @node_states.count { |other|
+          other != ns && other.running_app?(app.name)
+        }
+
+        # Only mark as extra if at least 2 instances would remain
+        if other_nodes_running_app >= 2
+          extra[app.name] ||= []
+          extra[app.name] << ns.uri
+        end
+      end
     end
 
     extra
