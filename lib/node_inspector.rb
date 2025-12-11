@@ -97,6 +97,10 @@ class NodeInspector
     ensure_discovered
 
     running_nodes = @node_states.select { |ns| ns.running_app?(app_name) }
+
+    # Safety: never remove instances if we have fewer than 2 running
+    return [] if running_nodes.length < 2
+
     job_server_node = @node_states.find { |ns| ns.job_server_for?(app_name) }
 
     extra = []

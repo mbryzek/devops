@@ -1,18 +1,15 @@
 #!/usr/bin/env ruby
 
-# Inspects running nodes and shuts down extra instances of an app.
-# Extra instances are nodes running ONLY this app (not shared) that aren't job servers.
+# Inspects running nodes and shuts down extra instances of all apps.
+# Extra instances are nodes running ONLY one app (not shared) that aren't job servers.
 #
-# Usage: ./bin/cleanup-extras --app <app_name>
+# Usage: ./bin/cleanup-extras
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
 
 DRAIN_WAIT_SECONDS = 10
 LB_REMOVAL_POLL_TIMEOUT = 30
-
-args = Args.parse(ARGV, ["app"])
-app = args.app
 
 # Load global nodes
 global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
@@ -23,38 +20,41 @@ global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'
 
 # Inspect current state
 puts ""
-puts Util.underline("Inspecting nodes for #{app}")
+puts Util.underline("Inspecting nodes")
 inspector = NodeInspector.new.discover
-inspector.print_app_summary(app)
+inspector.print_details
 
-# Find extra nodes
-extra_nodes = inspector.extra_nodes_for_app(app)
+# Check each known app for extras
+total_extras = 0
+NodeDiscovery::KNOWN_APPS.each do |app_name, port|
+  extra_nodes = inspector.extra_nodes_for_app(app_name)
+  next if extra_nodes.empty?
 
-if extra_nodes.empty?
+  total_extras += extra_nodes.length
+  puts ""
+  puts Util.warning("Found #{extra_nodes.length} extra node(s) running #{app_name}: #{extra_nodes.join(', ')}")
+  puts "Cleaning up extra instances..."
+
+  do_client = DigitalOcean::Client.new(app_name, node_ips: global_nodes)
+
+  extra_nodes.each do |node_uri|
+    puts ""
+    puts "  Draining #{node_uri} from load balancer..."
+    do_client.drain_and_wait(node_uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
+
+    puts "  Stopping #{app_name} on #{node_uri}"
+    cmd = "ssh root@#{node_uri} './deploy/kill.rb --app #{app_name}'"
+    system(cmd)
+  end
+end
+
+if total_extras == 0
   puts ""
   puts "No extra instances found. Nothing to clean up."
+else
   puts ""
-  exit 0
+  puts "Cleanup complete. Final state:"
+  NodeInspector.new.discover.print_details
 end
 
-puts ""
-puts Util.warning("Found #{extra_nodes.length} extra node(s) running #{app}: #{extra_nodes.join(', ')}")
-puts "Cleaning up extra instances..."
-
-do_client = DigitalOcean::Client.new(app, node_ips: global_nodes)
-
-extra_nodes.each do |node_uri|
-  puts ""
-  puts "  Draining #{node_uri} from load balancer..."
-  do_client.drain_and_wait(node_uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
-
-  puts "  Stopping #{app} on #{node_uri}"
-  cmd = "ssh root@#{node_uri} './deploy/kill.rb --app #{app}'"
-  system(cmd)
-end
-
-puts ""
-puts "Cleanup complete. Re-inspecting..."
-inspector = NodeInspector.new.discover
-inspector.print_app_summary(app)
 puts ""

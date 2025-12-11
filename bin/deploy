@@ -370,7 +370,7 @@ end
 if !DRY_RUN
     puts ""
     puts Util.underline("Phase 7: Cleaning up extra instances")
-    cleanup_cmd = "#{File.join(__dir__, 'cleanup-extras')} --app #{args.app}"
+    cleanup_cmd = File.join(__dir__, 'cleanup-extras')
     system(cleanup_cmd)
 end
 
