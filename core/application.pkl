@@ -36,7 +36,6 @@ class MemoryConfig {
 
 class ScalaEnvironment {
     database: Database
-    nodes: Listing<Node>
 }
 
 class Database {
@@ -44,9 +43,4 @@ class Database {
     host: String(!isEmpty)
     user: String(!isEmpty)
     port: Int
-}
-
-class Node {
-  uri: String(!isEmpty)
-  isJobServer: Boolean = false
 }

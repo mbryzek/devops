@@ -1,0 +1,411 @@
+#!/usr/bin/env ruby
+
+# Zero-Downtime Cross-Node Deployment
+#
+# Achieves true zero-downtime by deploying to nodes currently serving
+# another app, then shifting traffic via LB droplet membership.
+#
+# Architecture:
+# - 2 job-capable nodes (each runs one scala app's job server)
+# - 1 shared node (runs both apps' API instances on different ports)
+#
+# Flow:
+# 1. Discover current app assignment from DO tags
+# 2. Deploy new version to the OTHER job node + shared node
+# 3. Add new nodes to LB (now both old and new serve traffic)
+# 4. Drain and remove old nodes from LB
+# 5. Stop old processes, update DO tags
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
+
+args = Args.parse(ARGV, ["app", "file"])
+config = Config.load(args.app)
+scala_config = config.scala
+
+if scala_config.nil?
+    Util.exit_with_error("App #{args.app} does not have a scala config")
+end
+
+file = args.file
+vars = EnvironmentVariables.load(args.app, args.env)
+start = Time.now
+
+TMP_DIR = "/tmp/devops-zerodowntime"
+FileUtils.mkdir_p(TMP_DIR)
+
+if !file.match(/\.tar\.gz$/)
+    Util.exit_with_error("Release file must end with .tar.gz")
+end
+if !File.exist?(file)
+    Util.exit_with_error("File #{file} does not exist")
+end
+
+devops_token = vars["DEVOPS_TOKEN"]
+if devops_token.nil? || devops_token.empty?
+    Util.exit_with_error("DEVOPS_TOKEN environment variable is required")
+end
+
+# Load node pool
+node_pool = NodePool.new
+job_nodes = node_pool.job_nodes
+shared_node = node_pool.shared_node
+
+if job_nodes.length != 2
+    Util.exit_with_error("Expected 2 job nodes, found #{job_nodes.length}")
+end
+if shared_node.nil?
+    Util.exit_with_error("No shared node found in pool")
+end
+
+puts ""
+puts Util.underline("Zero-Downtime Deployment: #{args.app}")
+puts "Job nodes:   #{job_nodes.join(', ')}"
+puts "Shared node: #{shared_node}"
+puts ""
+
+# Initialize DO client
+do_client = DigitalOcean::Client.new(args.app)
+
+# Discover current assignment: which job node has app's tag?
+current_job_node = nil
+target_job_node = nil
+
+job_nodes.each do |uri|
+    if do_client.droplet_has_tag?(uri, "#{args.app}-jobs")
+        current_job_node = uri
+    else
+        target_job_node = uri
+    end
+end
+
+if current_job_node.nil?
+    # First deploy or no tag - pick first available
+    puts "No current job node tagged for #{args.app}, using first available"
+    target_job_node = job_nodes[0]
+    current_job_node = job_nodes[1]
+end
+
+puts Util.underline("Node Assignment")
+puts "Current job node: #{current_job_node}"
+puts "Target job node:  #{target_job_node}"
+puts ""
+
+# Get displaced app (the app currently using target_job_node)
+displaced_app = nil
+job_nodes.each do |uri|
+    next if uri == current_job_node
+    do_client.droplet_tags(uri).each do |tag|
+        if tag.end_with?("-jobs") && !tag.start_with?(args.app)
+            displaced_app = tag.sub("-jobs", "")
+            break
+        end
+    end
+end
+
+if displaced_app
+    puts Util.warning("Will displace #{displaced_app} from #{target_job_node}")
+    puts "After this deploy completes, you'll need to deploy #{displaced_app}"
+    puts ""
+end
+
+# Determine port (use blue port - we're not doing port switching anymore)
+port = config.blue_port
+
+puts Util.underline("Deploying to target nodes on port #{port}")
+
+# Target nodes: new job node + shared node
+target_nodes = [
+    { uri: target_job_node, is_job_server: true },
+    { uri: shared_node, is_job_server: false }
+]
+
+# Helper class for deployment
+class DeployNode
+    attr_reader :uri, :is_job_server
+
+    def initialize(uri, is_job_server, port, devops_token)
+        @uri = uri
+        @is_job_server = is_job_server
+        @port = port
+        @devops_token = devops_token
+    end
+
+    def job_server?
+        @is_job_server
+    end
+
+    def execute(cmd)
+        tmp = "/tmp/deploynode.%s.%s.tmp" % [@uri, @port]
+        `ssh root@#{@uri} 'rm -f #{tmp}; #{cmd} > #{tmp} 2>&1'`
+        begin
+            `scp -q root@#{@uri}:#{tmp} #{tmp}`
+            IO.read(tmp).strip
+        ensure
+            File.delete(tmp) if File.exist?(tmp)
+        end
+    end
+
+    def upload_file(file)
+        puts "  Uploading #{File.basename(file)} to #{@uri}"
+        Util.run("scp -q #{file} root@#{@uri}:~/", :quiet => true)
+    end
+
+    def check_health
+        output = execute("curl -s http://localhost:#{@port}/_internal_/healthcheck")
+        Healthcheck.from_json(output)
+    end
+
+    def healthy?
+        check_health.healthy?
+    end
+
+    def start_drain
+        result = execute("curl -s -w \"\\n%{http_code}\" -X POST -H \"X-Devops-Token: #{@devops_token}\" http://localhost:#{@port}/_internal_/drain")
+        lines = result.split("\n")
+        http_code = lines.last.to_i
+        http_code == 200
+    end
+
+    def kill_process_on_port
+        cmd = "lsof -ti :#{@port} | xargs kill -15 2>/dev/null || true; sleep 2; lsof -ti :#{@port} | xargs kill -9 2>/dev/null || true"
+        execute(cmd)
+    end
+end
+
+# Create deployment helpers
+def create_run_script(config, vars, nodes, index, port)
+    node = nodes[index]
+    memory = node[:is_job_server] ? config.scala.memory.job_server : config.scala.memory.default
+    java_opts = "-Xms#{memory} -Xmx#{memory} -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/ -XX:+ExitOnOutOfMemoryError"
+
+    port_string = port == 80 ? '' : ":#{port}"
+    all_nodes = nodes.map { |n| "#{n[:uri]}#{port_string}" }
+    node_vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", index.to_s).with_variable("DEPLOYMENT_NODES", all_nodes.join(","))
+
+    script = "#!/usr/bin/env sh\n\n"
+    script += "JAVA_OPTS='#{java_opts}' #{node_vars.serialize("sh")} bin/#{config.scala.dist_run_script_name} \"-Dhttp.port=#{port}\"\n"
+    script
+end
+
+def create_deploy_script(config, file, port)
+    dir = File.basename(file).sub(/\.tar\.gz$/, "")
+    logfile = "#{config.name}-#{port}.log"
+    run_script_name = "#{config.name}-#{port}-run.sh"
+
+    <<~EOS
+    #!/bin/sh
+    lsof -ti :#{port} | xargs kill -15 2>/dev/null || true
+    sleep 2
+    lsof -ti :#{port} | xargs kill -9 2>/dev/null || true
+    rm -rf #{dir}
+    tar --warning=no-unknown-keyword -xzf #{File.basename(file)}
+    cp #{run_script_name} #{dir}/
+    touch #{logfile}
+    mv -f #{logfile} #{logfile}.last 2>/dev/null || true
+    cd #{dir} && nohup ./#{run_script_name} > ../#{logfile} 2>&1 &
+    EOS
+end
+
+# Create deployment packages
+puts Util.underline("Creating deployment packages")
+
+node_packages = {}
+target_nodes.each_with_index do |node, index|
+    suffix = node[:is_job_server] ? "jobs" : "default"
+    next if node_packages[suffix]
+
+    run_script_content = create_run_script(config, vars, target_nodes, index, port)
+    run_script_name = "#{config.name}-#{port}-run.sh"
+    run_script_path = File.join(TMP_DIR, run_script_name)
+    File.write(run_script_path, run_script_content)
+    Util.run("chmod +x #{run_script_path}")
+
+    deploy_script_content = create_deploy_script(config, file, port)
+    deploy_script_name = "deploy-#{config.name}-#{port}.sh"
+    deploy_script_path = File.join(TMP_DIR, deploy_script_name)
+    File.write(deploy_script_path, deploy_script_content)
+    Util.run("chmod +x #{deploy_script_path}")
+
+    tarball_name = "deployment.#{config.name}.#{port}.#{suffix}.tar.gz"
+    tarball_path = File.join(TMP_DIR, tarball_name)
+
+    release_basename = File.basename(file)
+    Util.run("cp #{file} #{TMP_DIR}/") if file != File.join(TMP_DIR, release_basename)
+    Util.run("cd #{TMP_DIR} && tar -czf #{tarball_name} #{release_basename} #{run_script_name} #{deploy_script_name}")
+
+    node_packages[suffix] = {
+        tarball: tarball_path,
+        deploy_script: deploy_script_name
+    }
+
+    puts "  Created package for #{suffix} nodes"
+end
+
+# Create deploy node objects
+deploy_nodes = target_nodes.map { |n| DeployNode.new(n[:uri], n[:is_job_server], port, devops_token) }
+
+# Upload in parallel
+puts ""
+puts Util.underline("Uploading to target nodes")
+
+upload_threads = deploy_nodes.map do |dn|
+    Thread.new do
+        suffix = dn.job_server? ? "jobs" : "default"
+        pkg = node_packages[suffix]
+        dn.upload_file(pkg[:tarball])
+    end
+end
+upload_threads.each(&:join)
+puts "  Upload complete"
+
+# Deploy in parallel
+puts ""
+puts Util.underline("Starting processes on target nodes")
+
+deploy_threads = deploy_nodes.map do |dn|
+    Thread.new do
+        begin
+            suffix = dn.job_server? ? "jobs" : "default"
+            pkg = node_packages[suffix]
+            tarball_name = File.basename(pkg[:tarball])
+            deploy_script = pkg[:deploy_script]
+
+            dn.execute("tar --warning=no-unknown-keyword -xzf #{tarball_name}")
+            dn.execute("./#{deploy_script}")
+
+            puts "  Started on #{dn.uri} (#{suffix})"
+            { success: true, node: dn.uri }
+        rescue => e
+            puts Util.warning("  Failed on #{dn.uri}: #{e.message}")
+            { success: false, node: dn.uri, error: e.message }
+        end
+    end
+end
+
+results = deploy_threads.map(&:value)
+failures = results.select { |r| r && !r[:success] }
+
+if failures.any?
+    puts ""
+    puts Util.warning("Deployment failed on #{failures.length} node(s)")
+    deploy_nodes.each { |dn| dn.kill_process_on_port }
+    Util.exit_with_error("Aborting deployment")
+end
+
+# Wait for health checks
+puts ""
+puts Util.underline("Waiting for target nodes to be healthy")
+
+max_wait = 120
+max_wait.times do |i|
+    healthy = deploy_nodes.select { |dn| dn.healthy? }
+
+    if healthy.length == deploy_nodes.length
+        puts "  All #{deploy_nodes.length} nodes healthy after #{i + 1}s"
+        break
+    end
+
+    dots = i % 3 + 1
+    print "\r  Waiting #{('.' * dots).ljust(3)} (#{healthy.length}/#{deploy_nodes.length} healthy)"
+    $stdout.flush
+    sleep 1
+end
+
+print "\r" + " " * 60 + "\r"
+$stdout.flush
+
+unhealthy = deploy_nodes.reject { |dn| dn.healthy? }
+if unhealthy.any?
+    puts Util.warning("Nodes not healthy after #{max_wait}s:")
+    unhealthy.each { |dn| puts "  - #{dn.uri}" }
+    deploy_nodes.each { |dn| dn.kill_process_on_port }
+    Util.exit_with_error("Aborting - health checks failed")
+end
+
+# Add target nodes to LB
+puts ""
+puts Util.underline("Adding target nodes to load balancer")
+
+deploy_nodes.each do |dn|
+    do_client.add_droplet_by_ip_address(dn.uri)
+    puts "  Added #{dn.uri} to LB"
+end
+
+# Wait for LB to see new nodes as healthy
+puts ""
+puts Util.underline("Waiting for LB health checks")
+
+lb_wait = 45
+lb_wait.times do |i|
+    all_healthy = deploy_nodes.all? { |dn| do_client.droplet_healthy_in_lb?(dn.uri) }
+
+    if all_healthy
+        puts "  All nodes healthy in LB after #{i + 1}s"
+        break
+    end
+
+    print "\r  Waiting for LB #{('.' * (i % 3 + 1)).ljust(3)}"
+    $stdout.flush
+    sleep 1
+end
+
+print "\r" + " " * 60 + "\r"
+$stdout.flush
+
+# Now drain and remove old nodes
+puts ""
+puts Util.underline("Draining old job node")
+
+old_job_deploy_node = DeployNode.new(current_job_node, true, port, devops_token)
+
+if old_job_deploy_node.start_drain
+    puts "  Drain started on #{current_job_node}"
+else
+    puts "  Could not drain #{current_job_node} (may already be down)"
+end
+
+puts "  Waiting 5s for in-flight requests..."
+sleep 5
+
+# Remove old job node from LB
+puts ""
+puts Util.underline("Removing old job node from LB")
+
+do_client.remove_droplet_by_ip_address(current_job_node)
+puts "  Removed #{current_job_node} from LB"
+
+# Stop old process
+puts ""
+puts Util.underline("Stopping old process")
+
+old_job_deploy_node.kill_process_on_port
+puts "  Stopped process on #{current_job_node}:#{port}"
+
+# Update DO tags
+puts ""
+puts Util.underline("Updating DigitalOcean tags")
+
+# Remove old tag
+do_client.remove_tag_from_droplet(current_job_node, "#{args.app}-jobs")
+puts "  Removed #{args.app}-jobs tag from #{current_job_node}"
+
+# Add new tag
+do_client.add_tag_to_droplet(target_job_node, "#{args.app}-jobs")
+puts "  Added #{args.app}-jobs tag to #{target_job_node}"
+
+puts ""
+puts Util.underline("Deployment Complete")
+puts "New version running on:"
+deploy_nodes.each { |dn| puts "  - #{dn.uri}:#{port} (#{dn.job_server? ? 'jobs' : 'api'})" }
+
+if displaced_app
+    puts ""
+    puts Util.warning("IMPORTANT: #{displaced_app} was displaced from #{target_job_node}")
+    puts "Run: deploy-zerodowntime --app #{displaced_app} --file <release>"
+end
+
+duration = (Time.now - start).to_i
+puts ""
+puts "Deploy duration: #{duration} seconds"
+puts ""

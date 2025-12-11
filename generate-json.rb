@@ -13,8 +13,15 @@ if !File.directory?("dist")
     Util.run("mkdir dist")
 end
 
-cmd = "pkl eval %s --format json  > dist/%s.%s.json"
+cmd = "pkl eval %s --format json > dist/%s.%s.json"
 
+# Generate nodes.pkl (global node pool)
+nodes_pkl = "../env/nodes.pkl"
+if File.exist?(nodes_pkl)
+    Util.run("pkl eval #{nodes_pkl} --format json > dist/nodes.config.json", :quiet => args.quiet)
+end
+
+# Generate app configs
 `find ../env/apps -type f -name "*.pkl"`.strip.split("\n").each do |file|
     parts = file.split("/").drop(3)
     if parts.length > 2

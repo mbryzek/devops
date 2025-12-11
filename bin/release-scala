@@ -51,9 +51,8 @@ class ReleaseManager
   end
 
   def deploy_release
-    # Scala apps always use blue-green deployment
-    deploy_cmd = "cd ~/code/devops && ./bin/deploy-bluegreen --app #{@app} --file #{File.expand_path(@tarfile)}"
-    puts "Starting blue-green deployment"
+    deploy_cmd = "cd ~/code/devops && ./bin/deploy-zerodowntime --app #{@app} --file #{File.expand_path(@tarfile)}"
+    puts "Starting zero-downtime deployment"
     puts deploy_cmd
     Util.run(deploy_cmd)
     puts

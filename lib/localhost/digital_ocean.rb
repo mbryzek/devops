@@ -10,7 +10,7 @@ module DigitalOcean
       token = Util.read_file(TOKEN_FILE)
       @client = DropletKit::Client.new(access_token: token)
       @load_balancer = find_load_balancer
-      @droplets = find_droplets
+      @all_droplets = load_all_droplets
     end
 
     def remove_droplet_by_ip_address(ip)
@@ -40,6 +40,49 @@ module DigitalOcean
           # For droplet-based LBs, add directly
           @client.load_balancers.add_droplets([droplet.id], id: @load_balancer.id)
         end
+      end
+    end
+
+    # Check if a droplet has a specific tag
+    def droplet_has_tag?(ip, tag_name)
+      droplets_by_ip_address(ip).any? do |droplet|
+        droplet_obj = @client.droplets.find(id: droplet.id)
+        droplet_obj.tags.include?(tag_name)
+      end
+    end
+
+    # Get all tags for a droplet
+    def droplet_tags(ip)
+      droplets_by_ip_address(ip).flat_map do |droplet|
+        droplet_obj = @client.droplets.find(id: droplet.id)
+        droplet_obj.tags
+      end.uniq
+    end
+
+    # Add a tag to a droplet
+    def add_tag_to_droplet(ip, tag_name)
+      # Ensure tag exists
+      begin
+        @client.tags.create(DropletKit::Tag.new(name: tag_name))
+      rescue DropletKit::Error
+        # Tag already exists, ignore
+      end
+
+      droplets_by_ip_address(ip).each do |droplet|
+        @client.tags.tag_resources(
+          name: tag_name,
+          resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+        )
+      end
+    end
+
+    # Remove a tag from a droplet
+    def remove_tag_from_droplet(ip, tag_name)
+      droplets_by_ip_address(ip).each do |droplet|
+        @client.tags.untag_resources(
+          name: tag_name,
+          resources: [{ resource_id: droplet.id.to_s, resource_type: 'droplet' }]
+        )
       end
     end
 
@@ -134,13 +177,11 @@ module DigitalOcean
 
     private
     def droplets_by_ip_address(ip)
-      @droplets.filter { |d| d.ip_addresses.include?(ip) }
+      @all_droplets.filter { |d| d.ip_addresses.include?(ip) }
     end
 
-    def find_droplets
-      @client.droplets.all().select { |droplet|
-        droplet.tags.include?(@app)
-      }.map { |droplet| Droplet.new(droplet) }
+    def load_all_droplets
+      @client.droplets.all().map { |droplet| Droplet.new(droplet) }
     end
 
     def find_load_balancer

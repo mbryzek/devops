@@ -1,0 +1,19 @@
+/// Global node pool configuration
+///
+/// Defines all droplets available for Scala application deployment.
+/// App assignments are determined at runtime by DigitalOcean tags.
+///
+/// Deployment strategy:
+/// - 2 job-capable nodes (each runs one app's job server)
+/// - 1 shared node (runs both apps' API instances)
+/// - Zero-downtime deploys swap job assignments between the 2 job nodes
+open module Nodes
+
+/// A droplet in the node pool
+class Node {
+    /// IP address of the droplet
+    uri: String(!isEmpty)
+
+    /// Role: "jobs" (can be job server) or "shared" (runs API instances)
+    role: String(this == "jobs" || this == "shared")
+}
