@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
-load File.join(File.dirname(__FILE__), '../lib/node_restarter.rb')
+# node_restarter.rb is loaded by common.rb
 load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb') # only load here as pulls in droplet_kit
 
 SKIP_UPLOAD = false

@@ -9,7 +9,7 @@
 # - Ensures zero-downtime when load balancer is available
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
-load File.join(File.dirname(__FILE__), '../lib/node_restarter.rb')
+# node_restarter.rb is loaded by common.rb
 load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
 
 args = Args.parse(ARGV, ["app"])

@@ -217,18 +217,38 @@ class NodeRestarter
   # Uses longer timeout (5s) than healthcheck since drain may be heavier operation
   # @return [Boolean] true if successful, false otherwise
   def drain_instance
-    cmd = remote_cmd("curl -s --connect-timeout 5 -X POST http://localhost:#{@port}/_internal_/drain")
-    result = `#{cmd}`.strip
+    cmd = remote_cmd("curl -s -w '\\nHTTP_CODE:%{http_code}' --connect-timeout 5 -X POST http://localhost:#{@port}/_internal_/drain")
+    output = `#{cmd}`
     exit_success = $?.success?
-    return false unless exit_success
+
+    # Parse HTTP code from curl output
+    http_code = nil
+    result = output.strip
+    if result =~ /\nHTTP_CODE:(\d+)$/
+      http_code = $1.to_i
+      result = result.sub(/\nHTTP_CODE:\d+$/, '').strip
+    end
+
+    unless exit_success
+      puts "  Debug: curl failed (exit_success=false, http_code=#{http_code || 'unknown'})"
+      puts "  Debug: response body: #{result.empty? ? '(empty)' : result[0..200]}"
+      return false
+    end
 
     begin
       data = JSON.parse(result)
-      data['status'] == 'draining'
-    rescue JSON::ParserError
-      # Fallback: accept HTTP success but log for monitoring
-      puts "  Note: Drain endpoint returned non-JSON response, assuming success"
-      exit_success
+      status = data['status']
+      if status == 'draining'
+        true
+      else
+        puts "  Debug: unexpected status '#{status}' (expected 'draining'), http_code=#{http_code}"
+        puts "  Debug: full response: #{result[0..200]}"
+        false
+      end
+    rescue JSON::ParserError => e
+      puts "  Debug: non-JSON response (http_code=#{http_code}): #{result.empty? ? '(empty)' : result[0..200]}"
+      # Accept HTTP 2xx as success even without JSON
+      http_code && http_code >= 200 && http_code < 300
     end
   end
 
