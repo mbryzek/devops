@@ -1,18 +1,20 @@
 # Handles application restart on a single node with load balancer management.
 # Provides zero-downtime restarts when load balancer is configured.
 #
-# Usage:
+# Usage (restart script):
 #   restarter = NodeRestarter.new(app_name, port, node_uri, global_nodes)
 #   result = restarter.restart(deploy_dir: dir, run_script: script)
 #   result.success?  # true/false
 #   result.message   # status message
+#
+# Usage (deploy script with custom execution):
+#   restarter = NodeRestarter.new(app_name, port, node_uri, global_nodes, do_client: client)
+#   result = restarter.deploy_with_lb(drain_required: true, add_to_lb: true) do
+#     # Custom deployment logic here
+#     # Return true if successful, false otherwise
+#   end
 
 class NodeRestarter
-  # Configuration constants (match deploy script)
-  DRAIN_WAIT_SECONDS = 10
-  HEALTHCHECK_MAX_RETRIES = 25
-  LB_REMOVAL_POLL_TIMEOUT = 30
-
   Result = Struct.new(:success, :message, keyword_init: true) do
     def success?
       success
@@ -21,32 +23,65 @@ class NodeRestarter
 
   attr_reader :app_name, :port, :node_uri
 
-  def initialize(app_name, port, node_uri, global_nodes)
+  # Initialize a NodeRestarter
+  # @param app_name [String] Application name
+  # @param port [Integer] Application port for healthcheck
+  # @param node_uri [String] Node URI (IP address)
+  # @param global_nodes [Array<String>] All node URIs for LB client
+  # @param do_client [DigitalOcean::Client, nil] Optional pre-initialized DO client
+  def initialize(app_name, port, node_uri, global_nodes, do_client: nil)
     @app_name = app_name
     @port = port
     @node_uri = node_uri
     @global_nodes = global_nodes
-    @do_client = nil  # Lazy-loaded
+    @do_client = do_client
+    @do_client_initialized = !do_client.nil?
   end
 
   # Full restart sequence with zero-downtime (if LB available)
+  # Used by restart script for simple kill/start restarts
   # Options:
   #   deploy_dir: Directory containing the run script
   #   run_script: Name of the run script file
   #   logfile: Log file name (defaults to "#{app_name}.log")
   def restart(deploy_dir:, run_script:, logfile: nil)
     logfile ||= "#{@app_name}.log"
+
+    deploy_with_lb(drain_required: true, add_to_lb: true) do
+      # Kill existing process
+      puts "  Stopping #{@app_name}..."
+      unless kill_app
+        return false
+      end
+
+      # Start application
+      puts "  Starting #{@app_name}..."
+      unless start_app(deploy_dir, run_script, logfile)
+        return false
+      end
+
+      true
+    end
+  end
+
+  # Deploy with load balancer handling
+  # Used by deploy script with custom deployment logic
+  # @param drain_required [Boolean] Whether to drain from LB before deployment
+  # @param add_to_lb [Boolean] Whether to add to LB after deployment (for borrowed nodes)
+  # @yield Block containing deployment logic, should return true on success
+  # @return [Result] Result of the deployment
+  def deploy_with_lb(drain_required:, add_to_lb:)
     was_in_lb = false
 
-    # Step 1: Drain from LB (if available and node is in LB)
-    if lb_available?
+    # Step 1: Drain from LB (if required and node is in LB)
+    if drain_required && lb_available?
       was_in_lb = do_client.droplet_in_lb?(@node_uri)
       if was_in_lb
         puts "  Draining #{@node_uri} from load balancer..."
         success = do_client.drain_and_wait(
           @node_uri,
-          drain_wait: DRAIN_WAIT_SECONDS,
-          max_poll: LB_REMOVAL_POLL_TIMEOUT
+          drain_wait: DeploymentConfig::DRAIN_WAIT_SECONDS,
+          max_poll: DeploymentConfig::LB_REMOVAL_POLL_TIMEOUT
         )
         unless success
           puts "  Re-adding node to load balancer (drain timeout)..."
@@ -58,37 +93,30 @@ class NodeRestarter
       end
     end
 
-    # Step 2: Kill existing process
-    puts "  Stopping #{@app_name}..."
-    unless kill_app
-      # If kill fails but we drained, try to re-add to LB
+    # Step 2: Execute deployment logic
+    deploy_success = yield
+    unless deploy_success
       re_add_to_lb if was_in_lb
-      return Result.new(success: false, message: "Failed to stop application")
+      return Result.new(success: false, message: "Deployment failed")
     end
 
-    # Step 3: Start application
-    puts "  Starting #{@app_name}..."
-    unless start_app(deploy_dir, run_script, logfile)
-      re_add_to_lb if was_in_lb
-      return Result.new(success: false, message: "Failed to start application")
-    end
-
-    # Step 4: Wait for healthcheck
+    # Step 3: Wait for healthcheck
     puts "  Waiting for healthcheck..."
     healthy = wait_for_health
 
-    # Step 5: Re-add to LB (if was in LB)
-    if lb_available? && was_in_lb
+    # Step 4: Add to LB (if was in LB, or if add_to_lb requested for borrowed nodes)
+    should_add_to_lb = was_in_lb || add_to_lb
+    if lb_available? && should_add_to_lb
       if healthy
-        puts "  Adding #{@node_uri} back to load balancer..."
+        puts "  Adding #{@node_uri} to load balancer..."
         do_client.add_droplet_by_ip_address(@node_uri)
       else
-        puts "  WARNING: Not adding unhealthy node back to load balancer"
+        puts "  WARNING: Not adding unhealthy node to load balancer"
       end
     end
 
     if healthy
-      Result.new(success: true, message: "Node #{@node_uri} restarted successfully")
+      Result.new(success: true, message: "Node #{@node_uri} deployed successfully")
     else
       Result.new(success: false, message: "Node #{@node_uri} did not become healthy within timeout")
     end
@@ -109,7 +137,7 @@ class NodeRestarter
   # Wait for healthcheck to return healthy
   # Returns true if healthy, false if timeout
   def wait_for_health
-    HEALTHCHECK_MAX_RETRIES.times do |i|
+    DeploymentConfig::HEALTHCHECK_MAX_RETRIES.times do |i|
       dots = (i % 3) + 1
       print "\r  Checking health#{('.' * dots).ljust(3)}"
       $stdout.flush
@@ -120,7 +148,7 @@ class NodeRestarter
         return true
       end
 
-      sleep 1 unless i == HEALTHCHECK_MAX_RETRIES - 1
+      sleep 1 unless i == DeploymentConfig::HEALTHCHECK_MAX_RETRIES - 1
     end
 
     print "\r" + " " * 40 + "\r"
@@ -142,15 +170,17 @@ class NodeRestarter
     end
   end
 
-  private
-
+  # Check if load balancer is available
   def lb_available?
     do_client&.has_load_balancer?
   end
 
-  def do_client
-    return @do_client if @do_client
+  private
 
+  def do_client
+    return @do_client if @do_client_initialized
+
+    @do_client_initialized = true
     begin
       @do_client = DigitalOcean::Client.new(@app_name, node_ips: @global_nodes, require_lb: false)
     rescue Errno::ENOENT => e
