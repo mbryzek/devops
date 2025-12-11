@@ -40,3 +40,9 @@ Digital ocean token is expected at
 
 Generate a new one at https://cloud.digitalocean.com/account/api/tokens?i=65dbae
   - we gave it read on droplets and read/update on load balancer
+
+Using https://github.com/digitalocean/droplet_kit
+
+```
+  sudo gem install droplet_kit
+```
