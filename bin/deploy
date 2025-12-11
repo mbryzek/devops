@@ -286,9 +286,11 @@ puts Util.underline("Phase 5: Executing deployment plan")
 if DRY_RUN
     puts Util.warning("Skipping execution in dry-run mode")
 else
-    # Track borrowed node for cleanup on error
-    borrowed_step = deployment_steps.find { |s| s.reason.include?("borrowed") && s.action == :deploy }
-    borrowed_node_added_to_lb = false
+    # Track borrowed node for cleanup
+    borrowed_deploy_step = deployment_steps.find { |s| s.reason.include?("borrowed") && s.action == :deploy }
+    borrowed_stop_step = deployment_steps.find { |s| s.reason.include?("borrowed") && s.action == :stop }
+    borrowed_node_deployed = false
+    borrowed_node_cleaned_up = false
     deployment_error = nil
 
     begin
@@ -321,7 +323,7 @@ else
                     # For borrowed nodes, add to LB after deployment
                     puts "Adding borrowed node #{dn.node.uri} to load balancer"
                     do_client.add_droplet_by_ip_address(dn.node.uri)
-                    borrowed_node_added_to_lb = true
+                    borrowed_node_deployed = true
                 end
 
                 puts "Done. Node status is #{dn.status.status}"
@@ -339,7 +341,7 @@ else
                 puts "Stopping #{args.app} on borrowed node #{dn.node.uri}"
                 dn.execute("./deploy/kill.rb --app #{config.name}")
                 puts "Borrowed node #{dn.node.uri} returned to original state"
-                borrowed_node_added_to_lb = false
+                borrowed_node_cleaned_up = true
             end
         end
     rescue => e
@@ -347,12 +349,12 @@ else
         puts ""
         puts Util.warning("Deployment error: #{e.message}")
     ensure
-        # Clean up borrowed node if deployment failed after it was added to LB
-        if deployment_error && borrowed_step && borrowed_node_added_to_lb
+        # Clean up borrowed node if it was deployed but not properly cleaned up
+        if borrowed_deploy_step && borrowed_node_deployed && !borrowed_node_cleaned_up
             puts ""
-            puts Util.warning("Cleaning up borrowed node due to deployment failure")
+            puts Util.warning("Cleaning up borrowed node")
             begin
-                dn = deployment_node_map[borrowed_step.node_state.uri]
+                dn = deployment_node_map[borrowed_deploy_step.node_state.uri]
                 if do_client.droplet_in_lb?(dn.node.uri)
                     puts "Removing borrowed node #{dn.node.uri} from load balancer"
                     do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
@@ -360,6 +362,7 @@ else
                 puts "Stopping #{args.app} on borrowed node #{dn.node.uri}"
                 dn.execute("./deploy/kill.rb --app #{config.name}") rescue nil
                 puts "Borrowed node #{dn.node.uri} cleaned up"
+                borrowed_node_cleaned_up = true
             rescue => cleanup_error
                 puts Util.warning("Failed to clean up borrowed node: #{cleanup_error.message}")
             end
