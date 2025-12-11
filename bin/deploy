@@ -263,11 +263,6 @@ deployment_steps.each_with_index do |step, i|
     puts "  #{i + 1}. #{step}#{role}"
 end
 
-if planner.requires_borrowing?
-    puts ""
-    puts Util.warning("Borrowing node #{planner.borrowed_node.uri} for zero-downtime deployment")
-end
-
 if job_server_uri
     puts ""
     puts "Job server: #{job_server_uri}"
