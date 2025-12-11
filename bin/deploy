@@ -20,6 +20,17 @@ file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
 start = Time.now
 
+# Configuration constants
+DRAIN_WAIT_SECONDS = 10  # Time to wait after removing from LB for connections to close
+HEALTHCHECK_MAX_RETRIES = 25  # Maximum times to poll healthcheck before failing
+LB_REMOVAL_POLL_TIMEOUT = 30  # Max time to wait for LB removal confirmation
+
+# Check for dry-run mode
+DRY_RUN = args.dry_run? rescue false
+if DRY_RUN
+    puts Util.warning("DRY RUN MODE - No changes will be made")
+end
+
 TMP_DIR = "/tmp/devops"
 FileUtils.mkdir_p(TMP_DIR)
 
@@ -27,6 +38,10 @@ RUN_SCRIPT_NAME = "#{args.app}-#{config.scala.artifact_name}-run.sh"
 RUN_SCRIPT = File.join(TMP_DIR, RUN_SCRIPT_NAME)
 
 do_client = DigitalOcean::Client.new(args.app)
+
+# Load global nodes for discovery
+global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
+global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
 
 if !file.match (/\.tar\.gz$/)
     Util.exit_with_error("Release file must end with .tar.gz")
@@ -107,7 +122,7 @@ class DeploymentNode
     end
 end
 
-def wait_until_up(dn, iteration=0, max=25)
+def wait_until_up(dn, iteration=0, max=HEALTHCHECK_MAX_RETRIES)
     dots = iteration % 3 + 1
     dot_display = "." * dots + " " * (3 - dots)
     print "\r - Waiting for node #{dn.node.uri} to become healthy #{dot_display}"
@@ -171,28 +186,80 @@ def create_tarball(config, release_file, deploy_script, run_script, node_suffix)
     tarball
 end
 
-nodes = if args.node
-            env.nodes.filter { |n| args.node == n.uri }
-        else
-            env.nodes
-        end
+# Phase 1: Discover what's running on all nodes
+puts ""
+puts Util.underline("Phase 1: Discovering current state of all nodes")
+discovery = NodeDiscovery.new(global_nodes)
+node_states = discovery.discover
 
-if nodes.empty?
-    if node.to_s.empty?
-        Util.exit_with_error("No nodes configured for #{config.name}")
-    else
-        Util.exit_with_error("Node URI #{node} not found for #{config.name}")
+node_states.each do |ns|
+    apps_str = ns.apps.map { |a| "#{a.name}(#{a.healthy ? 'healthy' : 'down'}#{a.job_server ? ',job' : ''})" }.join(", ")
+    apps_str = "none" if apps_str.empty?
+    puts "  #{ns.uri}: #{apps_str}"
+end
+
+# Phase 2: Plan the deployment
+puts ""
+puts Util.underline("Phase 2: Planning deployment")
+planner = DeploymentPlanner.new(args.app, config.port, node_states)
+deployment_steps = planner.plan
+
+if deployment_steps.empty?
+    Util.exit_with_error("No deployment steps generated - cannot proceed")
+end
+
+deployment_steps.each_with_index do |step, i|
+    puts "  #{i + 1}. #{step}"
+end
+
+if planner.requires_borrowing?
+    puts ""
+    puts Util.warning("Borrowing node #{planner.borrowed_node.uri} for zero-downtime deployment")
+end
+
+# Build list of all nodes we'll deploy to (for tarball creation)
+deploy_node_uris = deployment_steps.select { |s| s.action == :deploy }.map { |s| s.node_state.uri }
+
+# Create fake Node objects for nodes from discovery (needed for RunScript compatibility)
+class DiscoveredNode
+    attr_reader :uri
+    def initialize(uri, is_job_server)
+        @uri = uri
+        @is_job_server = is_job_server
+    end
+    def job_server?
+        @is_job_server
     end
 end
-deployment_nodes = nodes.each_with_index.map { |n, i| DeploymentNode.new(config, n, i) }
+
+# Identify borrowed node URI (if any) - borrowed nodes are always deployed as non-job-server
+borrowed_node_uri = planner.borrowed_node&.uri
+
+# Create deployment node objects for each node we'll deploy to
+all_deploy_nodes = deploy_node_uris.map { |uri|
+    ns = node_states.find { |n| n.uri == uri }
+    # Borrowed nodes should never be job servers - they're temporary
+    is_job_server = (uri == borrowed_node_uri) ? false : ns.job_server_for?(args.app)
+    DiscoveredNode.new(uri, is_job_server)
+}
+
+deployment_nodes = deploy_node_uris.each_with_index.map { |uri, i|
+    node = all_deploy_nodes.find { |n| n.uri == uri }
+    DeploymentNode.new(config, node, i)
+}
+
+# Create map from URI to DeploymentNode for easy lookup
+deployment_node_map = deployment_nodes.each_with_object({}) { |dn, h| h[dn.node.uri] = dn }
 
 deploy_script = create_deploy_script(config, file)
 
 # Create per-node tarballs with node-specific run scripts
+puts ""
+puts Util.underline("Phase 3: Creating deployment tarballs")
 node_tarballs = {}
 deployment_nodes.each do |dn|
     run_script = File.join(TMP_DIR, RUN_SCRIPT_NAME)
-    RunScript.new(config, file, vars, env.nodes, dn.index).to_file(run_script)
+    RunScript.new(config, file, vars, all_deploy_nodes, dn.index).to_file(run_script)
     node_suffix = dn.node.job_server? ? "jobs" : "default"
     # Reuse tarball if same type already created
     if !node_tarballs[node_suffix]
@@ -202,82 +269,151 @@ deployment_nodes.each do |dn|
 end
 
 puts ""
-puts Util.underline("Uploading tarballs to all nodes and checking node status")
+puts Util.underline("Phase 4: Uploading tarballs to deployment nodes")
 threads = deployment_nodes.map do |dn|
-  [
-    Thread.new do
-      if !SKIP_UPLOAD
-        dn.upload_file(dn.instance_variable_get(:@tarball))
-      end
-    end,
-    Thread.new do
-        dn.update_status
+  Thread.new do
+    if !SKIP_UPLOAD
+      dn.upload_file(dn.instance_variable_get(:@tarball))
     end
-  ]
-end.flatten
+  end
+end
 threads.each(&:join)
 
-use_load_balancer = deployment_nodes.length > 1
-if !use_load_balancer
-    puts Util.warning("Single node deployment - skipping load balancer drain (brief downtime expected)")
-end
-
-deployment_nodes.sort_by { |dn| dn.healthy? ? (dn.job_server? ? 2 : 3) : 1 }.each do |dn|
-    puts ""
-    puts Util.underline("Starting deployment to node #{dn.node.uri}")
-    tarball = dn.instance_variable_get(:@tarball)
-    dn.execute("rm -rf lib deploy bin")
-    dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
-    if use_load_balancer
-        puts "Removing node #{dn.node.uri} from load balancer"
-        do_client.remove_droplet_by_ip_address(dn.node.uri)
-        puts "Waiting 10 seconds for connections to drain..."
-        sleep 10
-    end
-    dn.execute("./#{File.basename(deploy_script)}")
-    wait_until_up(dn)
-    if use_load_balancer
-        puts "Adding node #{dn.node.uri} to load balancer"
-        do_client.add_droplet_by_ip_address(dn.node.uri)
-    end
-    puts "Done. Node status is #{dn.status.status}"
-    if !dn.healthy?
-        Util.exit_with_error("Aborting release as node failed to become healthy")
-    end
-end
-
-healthy = deployment_nodes.filter { |dn| dn.healthy? }
-not_healthy = deployment_nodes.filter { |dn| !dn.healthy? }
-
+# Phase 5: Execute deployment steps
 puts ""
-if not_healthy.empty?
-  job_servers = deployment_nodes.filter { |dn| dn.job_server? }
-  if job_servers.length == 0
-    puts Util.underline("No job servers")
-    puts "Deployment is complete. There is no job server."
+puts Util.underline("Phase 5: Executing deployment plan")
 
-  elsif job_servers.length > 1
-    puts Util.underline("Multiple job servers")
-    puts "Deployment is complete. We expected a single job server but found multiple:"
-    job_servers.each do |dn|
-      puts " - #{dn.node.uri}"
-    end
-
-  else
-    js = job_servers.first
-    puts "Deployment successful. All nodes are healthy and there is exactly 1 job server [#{js.node.uri}]"
-  end
-
-elsif healthy.empty?
-    puts Util.underline("SERVICE OUTAGE")
-    puts "No nodes are healthy"
-
+if DRY_RUN
+    puts Util.warning("Skipping execution in dry-run mode")
 else
-    puts Util.underline("The following nodes are not healthy")
-    not_healthy.each do |n|
-        puts " - %s" % n.node.uri
+    # Track borrowed node for cleanup on error
+    borrowed_step = deployment_steps.find { |s| s.reason.include?("borrowed") && s.action == :deploy }
+    borrowed_node_added_to_lb = false
+    deployment_error = nil
+
+    begin
+        deployment_steps.each_with_index do |step, i|
+            puts ""
+            puts Util.underline("Step #{i + 1}: #{step}")
+
+            if step.action == :deploy
+                dn = deployment_node_map[step.node_state.uri]
+                tarball = dn.instance_variable_get(:@tarball)
+
+                # Upload tarball and extract tools
+                dn.execute("rm -rf lib deploy bin")
+                dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
+
+                # Drain if required (not needed for borrowed or down nodes)
+                if step.reason.include?("drain required")
+                    do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
+                end
+
+                # Execute deployment
+                dn.execute("./#{File.basename(deploy_script)}")
+                wait_until_up(dn)
+
+                # Add back to load balancer if we drained
+                if step.reason.include?("drain required")
+                    puts "Adding node #{dn.node.uri} to load balancer"
+                    do_client.add_droplet_by_ip_address(dn.node.uri)
+                elsif step.reason.include?("borrowed")
+                    # For borrowed nodes, add to LB after deployment
+                    puts "Adding borrowed node #{dn.node.uri} to load balancer"
+                    do_client.add_droplet_by_ip_address(dn.node.uri)
+                    borrowed_node_added_to_lb = true
+                end
+
+                puts "Done. Node status is #{dn.status.status}"
+                if !dn.healthy?
+                    raise "Node #{dn.node.uri} failed to become healthy"
+                end
+
+            elsif step.action == :stop
+                # Return borrowed node - drain from LB and stop the app
+                dn = deployment_node_map[step.node_state.uri]
+
+                do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
+
+                # Stop the application on this node
+                puts "Stopping #{args.app} on borrowed node #{dn.node.uri}"
+                dn.execute("./deploy/kill.rb --app #{config.name}")
+                puts "Borrowed node #{dn.node.uri} returned to original state"
+                borrowed_node_added_to_lb = false
+            end
+        end
+    rescue => e
+        deployment_error = e
+        puts ""
+        puts Util.warning("Deployment error: #{e.message}")
+    ensure
+        # Clean up borrowed node if deployment failed after it was added to LB
+        if deployment_error && borrowed_step && borrowed_node_added_to_lb
+            puts ""
+            puts Util.warning("Cleaning up borrowed node due to deployment failure")
+            begin
+                dn = deployment_node_map[borrowed_step.node_state.uri]
+                if do_client.droplet_in_lb?(dn.node.uri)
+                    puts "Removing borrowed node #{dn.node.uri} from load balancer"
+                    do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
+                end
+                puts "Stopping #{args.app} on borrowed node #{dn.node.uri}"
+                dn.execute("./deploy/kill.rb --app #{config.name}") rescue nil
+                puts "Borrowed node #{dn.node.uri} cleaned up"
+            rescue => cleanup_error
+                puts Util.warning("Failed to clean up borrowed node: #{cleanup_error.message}")
+            end
+        end
     end
 
+    if deployment_error
+        Util.exit_with_error("Aborting release: #{deployment_error.message}")
+    end
+end
+
+# Phase 6: Validation
+puts ""
+puts Util.underline("Phase 6: Validating deployment")
+
+if DRY_RUN
+    puts "Dry run complete. The following nodes would be deployed to:"
+    deployment_steps.select { |s| s.action == :deploy && s.reason !~ /borrowed/ }.each do |s|
+        puts "  - #{s.node_state.uri}"
+    end
+else
+    # Re-check status of all nodes that should have the app running
+    final_nodes = deployment_steps.select { |s| s.action == :deploy && s.reason !~ /borrowed/ }.map { |s| s.node_state.uri }
+    final_deployment_nodes = final_nodes.map { |uri| deployment_node_map[uri] }
+
+    final_deployment_nodes.each { |dn| dn.update_status }
+
+    healthy = final_deployment_nodes.filter { |dn| dn.healthy? }
+    not_healthy = final_deployment_nodes.filter { |dn| !dn.healthy? }
+
+    if not_healthy.empty?
+        job_servers = final_deployment_nodes.filter { |dn| dn.job_server? }
+        if job_servers.length == 0
+            puts Util.underline("No job servers")
+            puts "Deployment is complete. There is no job server."
+        elsif job_servers.length > 1
+            puts Util.underline("Multiple job servers")
+            puts "Deployment is complete. We expected a single job server but found multiple:"
+            job_servers.each do |dn|
+                puts " - #{dn.node.uri}"
+            end
+        else
+            js = job_servers.first
+            puts "Deployment successful. All nodes are healthy and there is exactly 1 job server [#{js.node.uri}]"
+        end
+    elsif healthy.empty?
+        puts Util.underline("SERVICE OUTAGE")
+        puts "No nodes are healthy"
+    else
+        puts Util.underline("The following nodes are not healthy")
+        not_healthy.each do |n|
+            puts " - %s" % n.node.uri
+        end
+    end
 end
 
 puts ""
