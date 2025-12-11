@@ -365,13 +365,9 @@ if DRY_RUN
         puts "  - #{s.node_state.uri}"
     end
 else
-    system("#{File.join(__dir__, 'inspect-nodes')}")
-end
-
-# Phase 7: Cleanup extra instances
-if !DRY_RUN
     cleanup_cmd = "#{File.join(__dir__, 'cleanup-extras')} --whisper"
     system(cleanup_cmd)
+    system("#{File.join(__dir__, 'inspect-nodes')}")
 end
 
 puts ""
