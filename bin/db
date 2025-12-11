@@ -12,14 +12,20 @@ end
 env = scala_config.send(args.env)
 db = env.database
 
-node = env.nodes.first
-if node.nil?
-    Util.exit_with_error("No nodes found")
+# Load global nodes
+global_nodes_path = File.join(DIR, "../dist/nodes.json")
+if !File.exist?(global_nodes_path)
+    Util.exit_with_error("Nodes config not found at #{global_nodes_path}. Run ./generate-json.rb first.")
 end
+global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
+if global_nodes.empty?
+    Util.exit_with_error("No nodes configured")
+end
+node_ip = global_nodes.first
 
 puts ""
 puts Util.underline("Login to #{db.name}:")
-puts "ssh root@#{node.uri}"
+puts "ssh root@#{node_ip}"
 puts "psql --set=sslmode=require -h #{db.host} -p #{db.port} --u #{db.user} #{db.name}"
 env_var_script = Util.cleanpath(File.join(DIR, 'db-password'))
 if !File.exist?(env_var_script)
