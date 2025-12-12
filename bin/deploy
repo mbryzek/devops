@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
+# node_restarter.rb is loaded by common.rb
 load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb') # only load here as pulls in droplet_kit
 
 SKIP_UPLOAD = false
@@ -19,11 +20,6 @@ env = scala_config.send(args.env)
 file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
 start = Time.now
-
-# Configuration constants
-DRAIN_WAIT_SECONDS = 10  # Time to wait after removing from LB for connections to close
-HEALTHCHECK_MAX_RETRIES = 25  # Maximum times to poll healthcheck before failing
-LB_REMOVAL_POLL_TIMEOUT = 30  # Max time to wait for LB removal confirmation
 
 # Check for dry-run mode
 DRY_RUN = args.dry_run? rescue false
@@ -119,23 +115,6 @@ class DeploymentNode
             puts "uploading #{file} to #{node.uri}"
             Util.run("scp -q #{file} root@#{@node.uri}:~/", :quiet => true)
         end
-    end
-end
-
-def wait_until_up(dn, iteration=0, max=HEALTHCHECK_MAX_RETRIES)
-    dots = iteration % 3 + 1
-    dot_display = "." * dots + " " * (3 - dots)
-    print "\r - Waiting for node #{dn.node.uri} to become healthy #{dot_display}"
-    $stdout.flush
-    sleep 1
-    dn.update_status
-
-    if !dn.healthy? && iteration < max
-        wait_until_up(dn, iteration + 1, max)
-    elsif iteration > 0
-        # Clear the waiting line when done
-        print "\r" + " " * 80 + "\r"
-        $stdout.flush
     end
 end
 
@@ -328,29 +307,38 @@ else
 
         dn = deployment_node_map[step.node_state.uri]
         tarball = dn.instance_variable_get(:@tarball)
+        node_uri = dn.node.uri
 
-        # Upload tarball and extract tools
-        dn.execute("rm -rf lib deploy bin")
-        dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
+        # Determine LB handling based on step reason
+        drain_required = step.reason.include?("drain required")
+        add_to_lb = step.reason.include?("borrowed") || drain_required
 
-        # Drain if required (not needed for borrowed or down nodes)
-        if step.reason.include?("drain required")
-            do_client.drain_and_wait(dn.node.uri, drain_wait: DRAIN_WAIT_SECONDS, max_poll: LB_REMOVAL_POLL_TIMEOUT)
+        # Use NodeRestarter for LB handling and health checks
+        restarter = NodeRestarter.new(
+            args.app,
+            config.port,
+            node_uri,
+            global_nodes,
+            digital_ocean_client: do_client,
+            devops_token: vars["DEVOPS_TOKEN"]
+        )
+
+        result = restarter.deploy_with_lb(drain_required: drain_required, add_to_lb: add_to_lb) do
+            # Upload tarball and extract tools
+            dn.execute("rm -rf lib deploy bin")
+            dn.execute("tar --warning=no-unknown-keyword -xzf #{File.basename(tarball)}")
+
+            # Execute deployment script (includes kill + start)
+            dn.execute("./#{File.basename(deploy_script)}")
+            true
         end
 
-        # Execute deployment
-        dn.execute("./#{File.basename(deploy_script)}")
-        wait_until_up(dn)
-
-        # Add to load balancer
-        if step.reason.include?("drain required") || step.reason.include?("borrowed")
-            puts "Adding node #{dn.node.uri} to load balancer"
-            do_client.add_droplet_by_ip_address(dn.node.uri)
-        end
+        # Update deployment node status after healthcheck
+        dn.update_status
 
         puts "Done. Node status is #{dn.status.status}"
-        if !dn.healthy?
-            Util.exit_with_error("Node #{dn.node.uri} failed to become healthy")
+        if !result.success?
+            Util.exit_with_error("Node #{node_uri} failed: #{result.message}")
         end
     end
 end

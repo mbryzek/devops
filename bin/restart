@@ -1,0 +1,208 @@
+#!/usr/bin/env ruby
+
+# Restart a deployed application on selected nodes with zero-downtime
+# Usage: ./bin/restart --app platform
+#
+# Features:
+# - Drains node from load balancer before restart (if LB configured)
+# - Re-adds node to load balancer after healthcheck passes
+# - Ensures zero-downtime when load balancer is available
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+# node_restarter.rb is loaded by common.rb
+load File.join(File.dirname(__FILE__), '../lib/localhost/digital_ocean.rb')
+
+args = Args.parse(ARGV, ["app"])
+config = Config.load(args.app)
+
+if config.scala.nil?
+  Util.exit_with_error("App #{args.app} does not have a scala config")
+end
+
+# Load global nodes for LB operations
+global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
+if !File.exist?(global_nodes_path)
+  Util.exit_with_error("Nodes config not found at #{global_nodes_path}. Run ./generate-json.rb first.")
+end
+global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
+
+# Load environment variables for devops token
+vars = EnvironmentVariables.load(args.app, args.env)
+
+start_time = Time.now
+
+# Finds the most recently deployed directory for an app on a node
+# Directory format: <app-name>-<timestamp>-<version>
+def find_deployment_dir(node_uri, app_name)
+  cmd = "ssh -o ConnectTimeout=5 root@#{node_uri} 'ls -dt #{app_name}-* 2>/dev/null | head -1'"
+  result = `#{cmd}`.strip
+  $?.success? ? result : nil
+end
+
+# Extracts version from deployment directory name
+# Directory format: <app-name>-<version> (e.g., platform-0.7.37)
+def extract_version_from_dir(deploy_dir, app_name)
+  return nil if deploy_dir.nil? || deploy_dir.empty?
+  # Match pattern: app_name-version where version starts with a digit
+  match = deploy_dir.match(/^#{Regexp.escape(app_name)}-(\d.+)$/)
+  match ? match[1] : nil
+end
+
+puts ""
+puts Util.underline("Phase 1: Discovery")
+puts ""
+
+# Get latest version from local repository
+app_dir = args.app == "acumen" ? File.expand_path("~/code/acumen/#{args.app}") : File.expand_path("~/code/#{args.app}")
+latest_version = if File.directory?(app_dir)
+  result = `cd #{app_dir} && sem-info tag latest 2>/dev/null`.strip
+  $?.success? && !result.empty? ? result : nil
+else
+  nil
+end
+
+if latest_version
+  puts "Latest version: #{latest_version}"
+  puts ""
+end
+
+puts "Discovering nodes running #{args.app}..."
+puts ""
+
+# Discover what's running on all nodes
+inspector = NodeInspector.new.discover
+node_states = inspector.node_states
+
+# Find nodes that have ever had the app installed (check for deployment directory)
+# or are currently running it
+nodes_with_app = []
+node_states.each do |ns|
+  deploy_dir = find_deployment_dir(ns.uri, args.app)
+  deployed_version = extract_version_from_dir(deploy_dir, args.app)
+
+  app_state = ns.apps.find { |a| a.name == args.app }
+  if app_state
+    status = app_state.healthy ? "healthy" : "DOWN"
+    role = app_state.job_server ? " (job server)" : ""
+    nodes_with_app << { node: ns, status: "#{status}#{role}", running: true, version: deployed_version }
+  elsif deploy_dir && !deploy_dir.empty?
+    nodes_with_app << { node: ns, status: "not running (deployment exists)", running: false, version: deployed_version }
+  end
+end
+
+if nodes_with_app.empty?
+  Util.exit_with_error("No nodes found with #{args.app} installed")
+end
+
+# Display available nodes
+puts "Nodes with #{args.app} installed:"
+puts ""
+nodes_with_app.each_with_index do |entry, i|
+  version_info = entry[:version] ? " [#{entry[:version]}]" : ""
+  puts "  #{i + 1}. #{entry[:node].uri} - #{entry[:status]}#{version_info}"
+end
+puts ""
+
+# Multi-select nodes to restart
+puts "Enter node numbers to restart (comma-separated, e.g., '1,2,3') or 'all':"
+input = STDIN.gets.strip.downcase
+
+selected_indices = if input == 'all'
+  (0...nodes_with_app.length).to_a
+else
+  input.split(',').map { |s| s.strip.to_i - 1 }.select { |i| i >= 0 && i < nodes_with_app.length }
+end
+
+if selected_indices.empty?
+  Util.exit_with_error("No valid nodes selected")
+end
+
+selected_nodes = selected_indices.map { |i| nodes_with_app[i] }
+
+# Check LB availability for the app
+lb_available = false
+begin
+  test_client = DigitalOcean::Client.new(args.app, node_ips: global_nodes, require_lb: false)
+  lb_available = test_client.has_load_balancer?
+rescue => e
+  puts "  Note: Could not check load balancer: #{e.message}"
+end
+
+puts ""
+puts Util.underline("Phase 2: Restart Execution")
+
+failed_nodes = []
+successful_nodes = []
+
+selected_nodes.each do |entry|
+  node_uri = entry[:node].uri
+  puts ""
+  puts Util.underline("Restarting on #{node_uri}")
+
+  # Find the deployment directory
+  deploy_dir = find_deployment_dir(node_uri, args.app)
+
+  if deploy_dir.nil? || deploy_dir.empty?
+    puts "  ERROR: No deployment directory found for #{args.app} on #{node_uri}"
+    failed_nodes << node_uri
+    next
+  end
+
+  puts "  Deployment directory: #{deploy_dir}"
+
+  # Verify run script exists
+  run_script = "#{args.app}-#{config.scala.artifact_name}-run.sh"
+  verify_cmd = "ssh -o ConnectTimeout=5 root@#{node_uri} 'test -f #{deploy_dir}/#{run_script}'"
+  if !system(verify_cmd, out: File::NULL, err: File::NULL)
+    puts "  ERROR: Run script not found: #{run_script}"
+    failed_nodes << node_uri
+    next
+  end
+
+  # Use NodeRestarter for zero-downtime restart with LB handling
+  restarter = NodeRestarter.new(
+    args.app,
+    config.port,
+    node_uri,
+    global_nodes,
+    devops_token: vars["DEVOPS_TOKEN"]
+  )
+
+  result = restarter.restart(
+    deploy_dir: deploy_dir,
+    run_script: run_script
+  )
+
+  if result.success?
+    puts "  #{result.message}"
+    successful_nodes << node_uri
+  else
+    puts "  ERROR: #{result.message}"
+    failed_nodes << node_uri
+  end
+end
+
+# Summary
+puts ""
+puts Util.underline("Phase 3: Summary")
+puts ""
+
+if successful_nodes.any?
+  puts "Successfully restarted: #{successful_nodes.length} node(s)"
+  successful_nodes.each { |uri| puts "  - #{uri}" }
+end
+
+if failed_nodes.any?
+  puts "" if successful_nodes.any?
+  puts Util.warning("Failed restarts: #{failed_nodes.length} node(s)")
+  failed_nodes.each { |uri| puts "  - #{uri}" }
+end
+
+duration = (Time.now - start_time).to_i
+puts ""
+puts "Total duration: #{duration} seconds"
+puts ""
+
+# Exit with error code if any failures
+exit 1 if failed_nodes.any? && successful_nodes.empty?
+exit 0

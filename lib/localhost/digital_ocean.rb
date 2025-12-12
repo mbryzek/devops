@@ -5,16 +5,28 @@ module DigitalOcean
   class Client
     TOKEN_FILE = '~/.digitalocean/token' unless defined?(TOKEN_FILE)
 
-    def initialize(app, node_ips:)
+    def initialize(app, node_ips:, require_lb: true)
       @app = app
       @node_ips = node_ips
+      @require_lb = require_lb
       token = Util.read_file(TOKEN_FILE)
       @client = DropletKit::Client.new(access_token: token)
       @load_balancer = find_load_balancer
       @droplets = find_droplets
     end
 
+    # Check if a load balancer is configured for this app
+    # @return [Boolean] true if LB is available
+    def has_load_balancer?
+      !@load_balancer.nil?
+    end
+
+    # Remove a droplet from the load balancer by IP address
+    # Note: Silently returns without action if no LB is configured or droplet is not in LB.
+    #       Use has_load_balancer? to check LB availability before calling if explicit handling is needed.
+    # @param ip [String] The IP address of the droplet to remove
     def remove_droplet_by_ip_address(ip)
+      return unless has_load_balancer?
       return unless droplet_in_lb?(ip)
 
       droplets_by_ip_address(ip).each do |droplet|
@@ -22,7 +34,12 @@ module DigitalOcean
       end
     end
 
+    # Add a droplet to the load balancer by IP address
+    # Note: Silently returns without action if no LB is configured or droplet is already in LB.
+    #       Use has_load_balancer? to check LB availability before calling if explicit handling is needed.
+    # @param ip [String] The IP address of the droplet to add
     def add_droplet_by_ip_address(ip)
+      return unless has_load_balancer?
       return if droplet_in_lb?(ip)
 
       droplets_by_ip_address(ip).each do |droplet|
@@ -31,7 +48,11 @@ module DigitalOcean
     end
 
     # Check if a droplet is currently in the load balancer
+    # @param ip [String] The IP address to check
+    # @return [Boolean] true if droplet is in LB, false if not in LB or no LB configured
     def droplet_in_lb?(ip)
+      return false unless has_load_balancer?
+
       droplet = droplets_by_ip_address(ip).first
       return false unless droplet
 
@@ -43,6 +64,8 @@ module DigitalOcean
     # Remove droplet from LB and wait for it to be fully removed
     # Returns true if successfully removed (or wasn't in LB), false if timeout
     def drain_and_wait(ip, drain_wait: 10, max_poll: 30, poll_interval: 2)
+      return true unless has_load_balancer?
+
       # Check if already not in LB - nothing to do
       if !droplet_in_lb?(ip)
         puts "Node #{ip} is not in load balancer, skipping drain"
@@ -89,6 +112,8 @@ module DigitalOcean
       }
 
       if load_balancers.empty?
+        return nil unless @require_lb
+
         if all.empty?
           Util.exit_with_error("Could not find any load balancers")
         end
