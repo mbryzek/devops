@@ -128,28 +128,6 @@ rescue => e
   puts "  Note: Could not check load balancer: #{e.message}"
 end
 
-# Confirmation prompt
-puts ""
-puts "You are about to restart #{args.app} on #{selected_nodes.length} node(s):"
-selected_nodes.each do |entry|
-  puts "  - #{entry[:node].uri}"
-end
-puts ""
-
-if lb_available
-  puts "Load balancer detected. Zero-downtime restart will be performed."
-else
-  puts Util.warning("No load balancer found for #{args.app}. This will cause brief service interruption.")
-end
-
-puts ""
-puts "Continue? (yes/no):"
-confirm = STDIN.gets.strip.downcase
-if confirm != 'yes' && confirm != 'y'
-  puts "Restart cancelled"
-  exit 0
-end
-
 puts ""
 puts Util.underline("Phase 2: Restart Execution")
 

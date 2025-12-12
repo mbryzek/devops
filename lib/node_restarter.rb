@@ -172,7 +172,8 @@ class NodeRestarter
   # Start the application
   # @return [Boolean] true if successful, false otherwise
   def start_app(deploy_dir, run_script, logfile)
-    cmd = remote_cmd("cd #{deploy_dir} && nohup ./#{run_script} > ../#{logfile} 2>&1 &")
+    # Use subshell with full I/O redirection and sleep to ensure SSH returns
+    cmd = remote_cmd("cd #{deploy_dir} && (nohup ./#{run_script} > ../#{logfile} 2>&1 < /dev/null &) && sleep 1")
     result = system(cmd)
     if result.nil?
       puts "  ERROR: Command execution failed: #{cmd}"
