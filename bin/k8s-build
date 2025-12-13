@@ -158,7 +158,7 @@ class K8sBuild
   def build_docker_image
     puts ""
     puts Util.underline("Building Docker image")
-    Util.run("docker build -f #{@dockerfile_path} -t #{image_name} .")
+    Util.run("docker build --platform linux/amd64 -f #{@dockerfile_path} -t #{image_name} .")
   end
 
   def push_docker_image

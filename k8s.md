@@ -65,3 +65,6 @@ kubectl describe deployment platform-web -n bryzek-production | tail -30
 
   # Shell into a running pod
   kubectl exec -it -n bryzek-production <pod-name> -- /bin/sh
+
+  # Delete platform deployments and check pods
+  kubectl delete deployment platform-web -n bryzek-production 2>/dev/null; kubectl delete statefulset platform-job -n bryzek-production 2>/dev/null; kubectl get pods -n bryzek-production
