@@ -3,20 +3,20 @@
 # k8s-build: Build and push Docker images to DigitalOcean Container Registry
 #
 # Usage:
-#   k8s-build --app APP [--version VERSION] [--push]
+#   k8s-build [--app APP] [--version VERSION] [--push] [--no-cache]
 #
 # Examples:
-#   k8s-build --app platform
-#   k8s-build --app platform --version v1.2.3 --push
+#   k8s-build                                           # Build current app (inferred from directory)
+#   k8s-build --app platform                            # Build platform
+#   k8s-build --app platform --version v1.2.3 --push    # Build and push specific version
 #
 # Prerequisites:
 #   - Docker installed and running
 #   - doctl authenticated (for pushing to DOCR)
 
-require 'optparse'
-require 'fileutils'
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
-SCRIPT_DIR = File.dirname(__FILE__)
+args = Args.parse(ARGV, ["app"])
 
 # Registry configuration
 REGISTRY = 'registry.digitalocean.com/bryzek'
@@ -25,107 +25,53 @@ REGISTRY = 'registry.digitalocean.com/bryzek'
 APP_CONFIG = {
   'platform' => {
     source_dir: File.expand_path('~/code/platform'),
-    dockerfile: 'Dockerfile',
-    artifact_name: 'api'
+    dockerfile: 'Dockerfile'
   },
   'acumen' => {
     source_dir: File.expand_path('~/code/acumen/acumen'),
-    dockerfile: 'Dockerfile',
-    artifact_name: 'api'
+    dockerfile: 'Dockerfile'
   }
 }
 
-options = {
-  version: nil,
-  push: false,
-  no_cache: false
-}
-
-OptionParser.new do |opts|
-  opts.banner = "Usage: k8s-build [options]"
-
-  opts.on("--app APP", "Application name (#{APP_CONFIG.keys.join(', ')})") do |app|
-    options[:app] = app
-  end
-
-  opts.on("--version VERSION", "Image version tag (default: git sha)") do |v|
-    options[:version] = v
-  end
-
-  opts.on("--push", "Push image to registry after building") do
-    options[:push] = true
-  end
-
-  opts.on("--no-cache", "Build without Docker cache") do
-    options[:no_cache] = true
-  end
-
-  opts.on("-h", "--help", "Show this help") do
-    puts opts
-    exit
-  end
-end.parse!
-
-# Validate app
-unless options[:app]
-  puts "Error: --app is required"
-  puts "Valid apps: #{APP_CONFIG.keys.join(', ')}"
-  exit 1
+unless APP_CONFIG.key?(args.app)
+  Util.exit_with_error("Invalid app '#{args.app}'. Valid apps: #{APP_CONFIG.keys.join(', ')}")
 end
 
-unless APP_CONFIG.key?(options[:app])
-  puts "Error: Invalid app '#{options[:app]}'"
-  puts "Valid apps: #{APP_CONFIG.keys.join(', ')}"
-  exit 1
-end
-
-config = APP_CONFIG[options[:app]]
+config = APP_CONFIG[args.app]
 
 # Get version from git if not specified
-unless options[:version]
+version = args.version
+unless version
   Dir.chdir(config[:source_dir]) do
-    options[:version] = `git rev-parse --short HEAD`.strip
+    version = `git rev-parse --short HEAD`.strip
+    if version.empty? || !$?.success?
+      Util.exit_with_error("Could not determine git SHA. Please specify --version")
+    end
   end
 end
 
-app = options[:app]
-version = options[:version]
 source_dir = config[:source_dir]
 
 # Verify source directory exists
 unless File.directory?(source_dir)
-  puts "Error: Source directory not found: #{source_dir}"
-  exit 1
+  Util.exit_with_error("Source directory not found: #{source_dir}")
 end
 
 # Verify Dockerfile exists
 dockerfile = File.join(source_dir, config[:dockerfile])
 unless File.exist?(dockerfile)
-  puts "Error: Dockerfile not found: #{dockerfile}"
-  puts ""
-  puts "Please create a Dockerfile in #{source_dir}"
-  exit 1
+  Util.exit_with_error("Dockerfile not found: #{dockerfile}\nPlease create a Dockerfile in #{source_dir}")
 end
 
-image_name = "#{REGISTRY}/#{app}"
+image_name = "#{REGISTRY}/#{args.app}"
 image_tag = "#{image_name}:#{version}"
 latest_tag = "#{image_name}:latest"
-
-def run_command(cmd, description)
-  puts "#{description}..."
-  puts "  $ #{cmd}"
-  system(cmd)
-  unless $?.success?
-    puts "Error: Command failed"
-    exit 1
-  end
-end
 
 puts ""
 puts "=" * 60
 puts "Building Docker image"
 puts "=" * 60
-puts "  App:     #{app}"
+puts "  App:     #{args.app}"
 puts "  Version: #{version}"
 puts "  Source:  #{source_dir}"
 puts "  Image:   #{image_tag}"
@@ -134,39 +80,26 @@ puts ""
 
 Dir.chdir(source_dir) do
   # Build image
-  cache_arg = options[:no_cache] ? '--no-cache' : ''
-  run_command(
-    "docker build #{cache_arg} -t #{image_tag} -t #{latest_tag} .",
-    "Building image"
-  )
+  cache_arg = args.no_cache ? '--no-cache' : ''
+  Util.run("docker build #{cache_arg} -t #{image_tag} -t #{latest_tag} .")
 end
 
 puts ""
 puts "Build successful!"
 puts "  Image: #{image_tag}"
 
-if options[:push]
+if args.push
   puts ""
   puts "=" * 60
   puts "Pushing to registry"
   puts "=" * 60
 
   # Login to DOCR
-  run_command(
-    "doctl registry login",
-    "Logging in to DigitalOcean Container Registry"
-  )
+  Util.run("doctl registry login")
 
   # Push both tags
-  run_command(
-    "docker push #{image_tag}",
-    "Pushing #{image_tag}"
-  )
-
-  run_command(
-    "docker push #{latest_tag}",
-    "Pushing #{latest_tag}"
-  )
+  Util.run("docker push #{image_tag}")
+  Util.run("docker push #{latest_tag}")
 
   puts ""
   puts "Push successful!"
@@ -175,7 +108,7 @@ if options[:push]
 else
   puts ""
   puts "To push to registry, run with --push flag:"
-  puts "  k8s-build --app #{app} --version #{version} --push"
+  puts "  k8s-build --app #{args.app} --version #{version} --push"
 end
 
 puts ""

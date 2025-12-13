@@ -1,7 +1,8 @@
 require 'optparse'
 
 class Args
-    attr_reader :env, :app, :file, :node, :format, :quiet, :tag, :dir, :profile, :path, :no_download
+    attr_reader :env, :app, :file, :node, :format, :quiet, :tag, :dir, :profile, :path, :no_download,
+                :version, :push, :wait, :namespace, :timeout, :no_cache, :dry_run, :output, :job_suffix
     def initialize(args)
         @quiet = !args[:quiet].to_s.empty?
         @env = args[:env]
@@ -14,6 +15,16 @@ class Args
         @profile = args[:profile]
         @path = args[:path]
         @no_download = args[:no_download] ? true : false
+        # k8s-specific arguments
+        @version = args[:version]
+        @push = args[:push] ? true : false
+        @wait = args[:wait] ? true : false
+        @namespace = args[:namespace]
+        @timeout = args[:timeout]
+        @no_cache = args[:no_cache] ? true : false
+        @dry_run = args[:dry_run] ? true : false
+        @output = args[:output]
+        @job_suffix = args[:job_suffix]
     end
 
     def info(msg)
@@ -162,6 +173,43 @@ class Args
 
             opts.on("--no-download", "If specified, do not download files") do
                 av.add("no_download", true)
+            end
+
+            # k8s-specific arguments
+            opts.on("--version VERSION", "Specify version/tag for Docker images") do |version|
+                av.add("version", version)
+            end
+
+            opts.on("--push", "Push image to registry after building") do
+                av.add("push", true)
+            end
+
+            opts.on("--wait", "Wait for operation to complete") do
+                av.add("wait", true)
+            end
+
+            opts.on("--namespace NS", "Kubernetes namespace") do |ns|
+                av.add("namespace", ns)
+            end
+
+            opts.on("--timeout SECONDS", "Timeout in seconds") do |timeout|
+                av.add("timeout", timeout.to_i)
+            end
+
+            opts.on("--no-cache", "Build without Docker cache") do
+                av.add("no_cache", true)
+            end
+
+            opts.on("--dry-run", "Preview changes without applying") do
+                av.add("dry_run", true)
+            end
+
+            opts.on("--output DIR", "Output directory") do |output|
+                av.add("output", output)
+            end
+
+            opts.on("--job-suffix SUFFIX", "Suffix for job names") do |suffix|
+                av.add("job_suffix", suffix)
             end
 
             opts.on("-h", "--help", "Prints this help") do

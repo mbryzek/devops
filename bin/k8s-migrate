@@ -3,81 +3,34 @@
 # k8s-migrate: Run database migrations as a Kubernetes Job
 #
 # Usage:
-#   k8s-migrate --app APP [--version VERSION] [--wait]
+#   k8s-migrate [--app APP] [--version VERSION] [--wait]
 #
 # Examples:
-#   k8s-migrate --app platform                    # Run migration job
-#   k8s-migrate --app platform --version v1.2.3  # Specific version
-#   k8s-migrate --app platform --wait            # Wait for completion
+#   k8s-migrate                                    # Run migration for current app (inferred from directory)
+#   k8s-migrate --app platform                     # Run migration job
+#   k8s-migrate --app platform --version v1.2.3   # Specific version
+#   k8s-migrate --app platform --wait             # Wait for completion
 #
 # Prerequisites:
 #   - kubectl configured with cluster access
 #   - Migration Docker image built and pushed
 #   - DB credentials secret created (via k8s-secrets)
 
-require 'optparse'
-require 'fileutils'
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
 
 SCRIPT_DIR = File.dirname(__FILE__)
 K8S_DIR = File.join(SCRIPT_DIR, '../k8s')
 
 # Kubernetes namespace
-K8S_NAMESPACE = 'bryzek-production'
+K8S_NAMESPACE = args.namespace || 'bryzek-production'
 
-# Valid applications
-VALID_APPS = %w[platform acumen]
+# Version defaults to latest
+version = args.version || 'latest'
 
-options = {
-  version: 'latest',
-  wait: false,
-  timeout: 300
-}
-
-OptionParser.new do |opts|
-  opts.banner = "Usage: k8s-migrate --app APP [options]"
-
-  opts.on("--app APP", "Application name (#{VALID_APPS.join(', ')})") do |app|
-    options[:app] = app
-  end
-
-  opts.on("--version VERSION", "Migration image version [default: latest]") do |v|
-    options[:version] = v
-  end
-
-  opts.on("--wait", "Wait for job completion") do
-    options[:wait] = true
-  end
-
-  opts.on("--timeout SECONDS", Integer, "Wait timeout in seconds [default: 300]") do |t|
-    options[:timeout] = t
-  end
-
-  opts.on("--namespace NS", "Kubernetes namespace [default: #{K8S_NAMESPACE}]") do |ns|
-    options[:namespace] = ns
-  end
-
-  opts.on("-h", "--help", "Show this help") do
-    puts opts
-    exit
-  end
-end.parse!
-
-# Validate app
-unless options[:app]
-  puts "Error: --app is required"
-  puts "Valid apps: #{VALID_APPS.join(', ')}"
-  exit 1
-end
-
-unless VALID_APPS.include?(options[:app])
-  puts "Error: Invalid app '#{options[:app]}'"
-  puts "Valid apps: #{VALID_APPS.join(', ')}"
-  exit 1
-end
-
-app = options[:app]
-version = options[:version]
-namespace = options[:namespace] || K8S_NAMESPACE
+# Timeout defaults to 300 seconds
+timeout = args.timeout || 300
 
 # Generate unique job suffix with timestamp
 job_suffix = Time.now.strftime('%Y%m%d-%H%M%S')
@@ -86,26 +39,25 @@ puts ""
 puts "=" * 60
 puts "Running Database Migration"
 puts "=" * 60
-puts "  App:       #{app}"
+puts "  App:       #{args.app}"
 puts "  Version:   #{version}"
-puts "  Job:       #{app}-migration-#{job_suffix}"
-puts "  Namespace: #{namespace}"
+puts "  Job:       #{args.app}-migration-#{job_suffix}"
+puts "  Namespace: #{K8S_NAMESPACE}"
 puts "=" * 60
 puts ""
 
 # Generate migration manifest
 puts "Generating migration manifest..."
-env_vars = "APP=#{app} VERSION=#{version} JOB_SUFFIX=#{job_suffix}"
+env_vars = "APP=#{args.app} VERSION=#{version} JOB_SUFFIX=#{job_suffix}"
+env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE}" if args.namespace
 pkl_file = File.join(K8S_DIR, 'jobs', 'db-migration.pkl')
-manifest_file = "/tmp/#{app}-migration-#{job_suffix}.yaml"
+manifest_file = "/tmp/#{args.app}-migration-#{job_suffix}.yaml"
 
 cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval #{pkl_file}"
 manifest = `#{cmd} 2>&1`
 
 unless $?.success?
-  puts "Error generating manifest:"
-  puts manifest
-  exit 1
+  Util.exit_with_error("Error generating manifest:\n#{manifest}")
 end
 
 File.write(manifest_file, manifest)
@@ -114,31 +66,27 @@ puts ""
 
 # Apply the job
 puts "Applying migration job..."
-system("kubectl apply -f #{manifest_file}")
-unless $?.success?
-  puts "Error: Failed to apply migration job"
-  exit 1
-end
+Util.run("kubectl apply -f #{manifest_file}")
 
-job_name = "#{app}-migration-#{job_suffix}"
+job_name = "#{args.app}-migration-#{job_suffix}"
 
 puts ""
 puts "Migration job created: #{job_name}"
 puts ""
 
-if options[:wait]
-  puts "Waiting for job completion (timeout: #{options[:timeout]}s)..."
+if args.wait
+  puts "Waiting for job completion (timeout: #{timeout}s)..."
   puts ""
 
   # Wait for job completion
-  success = system("kubectl wait --for=condition=complete --timeout=#{options[:timeout]}s job/#{job_name} -n #{namespace}")
+  success = system("kubectl wait --for=condition=complete --timeout=#{timeout}s job/#{job_name} -n #{K8S_NAMESPACE}")
 
   # Get job logs regardless of success/failure
   puts ""
   puts "=" * 60
   puts "Migration Logs"
   puts "=" * 60
-  system("kubectl logs job/#{job_name} -n #{namespace}")
+  system("kubectl logs job/#{job_name} -n #{K8S_NAMESPACE}")
 
   if success
     puts ""
@@ -147,7 +95,7 @@ if options[:wait]
     puts "=" * 60
   else
     # Check if job failed vs timeout
-    job_status = `kubectl get job #{job_name} -n #{namespace} -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}'`.strip
+    job_status = `kubectl get job #{job_name} -n #{K8S_NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}'`.strip
 
     if job_status == "True"
       puts ""
@@ -159,15 +107,15 @@ if options[:wait]
       puts ""
       puts "=" * 60
       puts "WARNING: Timed out waiting for migration"
-      puts "Check status with: kubectl get job #{job_name} -n #{namespace}"
+      puts "Check status with: kubectl get job #{job_name} -n #{K8S_NAMESPACE}"
       puts "=" * 60
       exit 1
     end
   end
 else
   puts "Job started. To monitor:"
-  puts "  kubectl get job #{job_name} -n #{namespace}"
-  puts "  kubectl logs job/#{job_name} -n #{namespace} -f"
+  puts "  kubectl get job #{job_name} -n #{K8S_NAMESPACE}"
+  puts "  kubectl logs job/#{job_name} -n #{K8S_NAMESPACE} -f"
 end
 
 # Clean up manifest file
