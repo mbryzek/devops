@@ -74,6 +74,19 @@ class K8sBuild
   def build_sbt_dist
     puts ""
     puts Util.underline("Building sbt distribution")
+
+    artifact = @config.scala.artifact_name
+    sbt_dist_dir = "#{artifact}/target/universal"
+    existing_zip = Dir.glob("#{sbt_dist_dir}/*.zip").first
+
+    if existing_zip
+      puts "Found existing distribution: #{existing_zip}"
+      if !Ask.for_boolean("Rebuild? (y/n)")
+        puts "Using existing distribution"
+        return
+      end
+    end
+
     Util.run("sbt dist")
   end
 
