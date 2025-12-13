@@ -39,13 +39,13 @@ end
 
 config = APP_CONFIG[args.app]
 
-# Get version from git if not specified
+# Get version - ask for tag if not specified
 version = args.version
 unless version
   Dir.chdir(config[:source_dir]) do
-    version = `git rev-parse --short HEAD`.strip
-    if version.empty? || !$?.success?
-      Util.exit_with_error("Could not determine git SHA. Please specify --version")
+    version = Tag.ask
+    if version.empty?
+      Util.exit_with_error("No tag available. Please specify --version")
     end
   end
 end
@@ -79,14 +79,18 @@ puts "=" * 60
 puts ""
 
 Dir.chdir(source_dir) do
-  # Build image
+  # Build image with version tag only
   cache_arg = args.no_cache ? '--no-cache' : ''
-  Util.run("docker build #{cache_arg} -t #{image_tag} -t #{latest_tag} .")
+  Util.run("docker build #{cache_arg} -t #{image_tag} .")
 end
 
 puts ""
 puts "Build successful!"
 puts "  Image: #{image_tag}"
+
+# Tag as latest after successful build
+Util.run("docker tag #{image_tag} #{latest_tag}")
+puts "  Tagged: #{latest_tag}"
 
 if args.push
   puts ""
