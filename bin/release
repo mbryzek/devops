@@ -5,25 +5,30 @@
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
 
-args = Args.parse(ARGV, ["app"])
+pwd = `pwd`.strip
+if pwd.end_with?("-postgresql")
+  Util.run File.join(dir, "release-db")
+  return
+end
 
+args = Args.parse(ARGV, ["app"])
 config = Config.load(args.app)
 
 files = if config.scala
-  ["release-scala"]
-elsif config.elm
-  if args.app == "acumen-ui"
-    ["release-elm", "record-ui-version"]
+    ["release-scala"]
+  elsif config.elm
+    if args.app == "acumen-ui"
+      ["release-elm", "record-ui-version"]
+    else
+      ["release-elm"]
+    end
+  elsif config.hugo
+    ["release-hugo"]
+  elsif config.sveltekit
+    ["release-sveltekit"]
   else
-    ["release-elm"]
+    Util.exit_with_error("Do not know how to release app that is not scala, elm, or hugo")
   end
-elsif config.hugo
-  ["release-hugo"]
-elsif config.sveltekit
-  ["release-sveltekit"]
-else
-  Util.exit_with_error("Do not know how to release app that is not scala, elm, or hugo")
-end
 
 files.each do |file|
   cmd = File.join(dir, file) + " --app #{args.app}"

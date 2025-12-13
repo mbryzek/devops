@@ -47,7 +47,6 @@ end
 
 image_name = "#{REGISTRY}/#{args.app}"
 image_tag = "#{image_name}:#{version}"
-latest_tag = "#{image_name}:latest"
 
 # Check if image already exists locally
 image_exists = !`docker images -q #{image_tag}`.strip.empty?
@@ -62,7 +61,7 @@ if image_exists
 
   if should_build
     # Delete existing image
-    Util.run("docker rmi #{image_tag} #{latest_tag}", ignore_error: true)
+    Util.run("docker rmi #{image_tag}", ignore_error: true)
   end
 end
 
@@ -125,10 +124,6 @@ if should_build
   puts ""
   puts "Build successful!"
   puts "  Image: #{image_tag}"
-
-  # Tag as latest after successful build
-  Util.run("docker tag #{image_tag} #{latest_tag}")
-  puts "  Tagged: #{latest_tag}"
 end
 
 # Always push to registry
@@ -140,14 +135,12 @@ puts "=" * 60
 # Login to DOCR
 Util.run("doctl registry login")
 
-# Push both tags
+# Push versioned tag
 Util.run("docker push #{image_tag}")
-Util.run("docker push #{latest_tag}")
 
 puts ""
 puts "Push successful!"
 puts "  #{image_tag}"
-puts "  #{latest_tag}"
 
 puts ""
 puts "Version: #{version}"
