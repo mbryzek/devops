@@ -1,0 +1,98 @@
+/// Kubernetes Job for database migrations using schema-evolution-manager
+/// Expects environment variables:
+///   - APP: Application name (platform, acumen)
+///   - VERSION: Docker image version tag
+
+module dbMigration
+
+import "@k8s/K8sResource.pkl"
+import "@k8s/api/batch/v1/Job.pkl"
+
+/// Application name - must be provided via environment
+local appName = read?("env:APP") ?? throw("APP environment variable is required")
+
+/// Version tag for the migration image
+local version = read?("env:VERSION") ?? "latest"
+
+/// Kubernetes namespace
+local k8sNamespace = "bryzek-production"
+
+/// Docker registry
+local registry = "registry.digitalocean.com/bryzek"
+
+/// Unique job name with timestamp to allow reruns
+local jobSuffix = read?("env:JOB_SUFFIX") ?? "manual"
+
+local commonLabels: Mapping<String, String> = new {
+  ["app"] = appName
+  ["app.kubernetes.io/name"] = "\(appName)-migration"
+  ["app.kubernetes.io/version"] = version
+  ["app.kubernetes.io/component"] = "migration"
+}
+
+resources: Listing<K8sResource> = new {
+  new Job {
+    metadata {
+      name = "\(appName)-migration-\(jobSuffix)"
+      namespace = k8sNamespace
+      labels = commonLabels
+    }
+    spec {
+      // Only try once - migrations should not be retried automatically
+      backoffLimit = 0
+
+      // Clean up completed jobs after 1 hour
+      ttlSecondsAfterFinished = 3600
+
+      template {
+        metadata {
+          labels = commonLabels
+        }
+        spec {
+          // Never restart failed migrations - requires human intervention
+          restartPolicy = "Never"
+
+          containers = new {
+            new {
+              name = "migration"
+              image = "\(registry)/\(appName)-migration:\(version)"
+
+              // Migration runs once and exits
+              command = new {
+                "/bin/sh"
+                "-c"
+                "sem-apply --url \"$DATABASE_URL\""
+              }
+
+              // Load database credentials from secret
+              envFrom = new {
+                new {
+                  secretRef {
+                    name = "\(appName)-db-credentials"
+                  }
+                }
+              }
+
+              resources {
+                requests {
+                  ["memory"] = "256Mi"
+                  ["cpu"] = "100m"
+                }
+                limits {
+                  ["memory"] = "512Mi"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+output {
+  renderer = new YamlRenderer {
+    isStream = true
+  }
+  value = resources
+}
