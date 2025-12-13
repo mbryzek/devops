@@ -23,11 +23,15 @@ if !File.directory?(DIST_DIR)
     FileUtils.mkdir_p(DIST_DIR)
 end
 
+# VERSION is required
+if args.version.nil? || args.version.empty?
+    Util.exit_with_error("--version is required")
+end
+
 # Build environment variables for pkl
-env_vars = []
-env_vars << "VERSION=#{args.version}" if args.version
+env_vars = ["VERSION=#{args.version}"]
 env_vars << "K8S_NAMESPACE=#{args.namespace}" if args.namespace
-env_prefix = env_vars.empty? ? "" : env_vars.join(" ") + " "
+env_prefix = env_vars.join(" ") + " "
 
 # Find all app manifests
 app_files = Dir.glob("#{K8S_DIR}/apps/*.pkl")
