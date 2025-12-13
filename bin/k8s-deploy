@@ -26,8 +26,8 @@ K8S_DIR = File.join(SCRIPT_DIR, '../k8s')
 # Kubernetes namespace
 K8S_NAMESPACE = args.namespace || 'bryzek-production'
 
-# Version defaults to latest
-version = args.version || 'latest'
+# Version - fetch latest tag if not specified
+version = args.version || AppConfig.latest_tag(args.app)
 
 # Timeout defaults to 600 seconds
 timeout = args.timeout || 600
