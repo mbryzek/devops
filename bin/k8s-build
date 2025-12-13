@@ -31,8 +31,7 @@ class K8sBuild
     @app = args.app
     @tag = args.tag
     if @tag.nil? || @tag.empty?
-      @tag = AppConfig.latest_tag(@app)
-      puts "Using latest tag: #{@tag}"
+      @tag = Tag.ask
     end
     @config = Config.load(@app)
 
@@ -156,6 +155,12 @@ class K8sBuild
     puts ""
     puts Util.underline("Building Docker image")
     Util.run("docker build -f #{@dockerfile_path} -t #{image_name} .")
+  end
+
+  def push_docker_image
+    puts ""
+    puts Util.underline("Pushing Docker image")
+    Util.run("docker push #{image_name}")
   end
 
   def image_name
