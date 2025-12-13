@@ -42,14 +42,19 @@ class K8sBuild
 
   def run
     validate_environment
-    build_sbt_dist
-    generate_dockerfile
-    extract_distribution
-    build_docker_image
+    check_existing_image
+
+    unless @skip_build
+      build_sbt_dist
+      generate_dockerfile
+      extract_distribution
+      build_docker_image
+    end
+
     push_docker_image
 
     puts ""
-    puts "Docker image built and pushed: #{image_name}"
+    puts "Docker image pushed: #{image_name}"
     puts ""
   end
 
@@ -68,22 +73,21 @@ class K8sBuild
     end
   end
 
+  def check_existing_image
+    existing_image = `docker images -q #{image_name} 2>/dev/null`.strip
+    if !existing_image.empty?
+      puts ""
+      puts "Found existing docker image: #{image_name}"
+      if !Ask.for_boolean("Rebuild? (y/n)")
+        puts "Using existing image"
+        @skip_build = true
+      end
+    end
+  end
+
   def build_sbt_dist
     puts ""
     puts Util.underline("Building sbt distribution")
-
-    artifact = @config.scala.artifact_name
-    sbt_dist_dir = "#{artifact}/target/universal"
-    existing_zip = Dir.glob("#{sbt_dist_dir}/*.zip").first
-
-    if existing_zip
-      puts "Found existing distribution: #{existing_zip}"
-      if !Ask.for_boolean("Rebuild? (y/n)")
-        puts "Using existing distribution"
-        return
-      end
-    end
-
     Util.run("sbt dist")
   end
 

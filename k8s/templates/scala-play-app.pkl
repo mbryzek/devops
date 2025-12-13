@@ -35,6 +35,8 @@ local memoryDefault = "700Mi"
 local memoryJobServer = "1400Mi"
 local memoryLimit = "700Mi"
 local memoryLimitJobServer = "1400Mi"
+local cpuLimit = "1000m"
+local cpuLimitJobServer = "2000m"
 
 // ImagePullPolicy: IfNotPresent since we require explicit versions
 local pullPolicy = "IfNotPresent"
