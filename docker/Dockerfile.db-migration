@@ -1,0 +1,40 @@
+# Dockerfile for database migrations using schema-evolution-manager
+#
+# This image runs database migrations for Scala applications.
+# It expects DATABASE_URL environment variable to be set.
+#
+# Build: docker build -f Dockerfile.db-migration -t myapp-migration .
+# Run:   docker run -e DATABASE_URL=postgresql://user:pass@host:port/db myapp-migration
+#
+# The Dockerfile should be placed in the *-postgresql directory (e.g., platform-postgresql)
+
+FROM ruby:3.2-slim
+
+# Install PostgreSQL client
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        postgresql-client \
+        build-essential \
+        git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install schema-evolution-manager
+RUN gem install schema-evolution-manager --no-document
+
+# Create non-root user
+RUN groupadd -r migrator && useradd -r -g migrator migrator
+
+WORKDIR /migrations
+
+# Copy migration scripts
+COPY scripts/ /migrations/scripts/
+
+# Set ownership
+RUN chown -R migrator:migrator /migrations
+
+# Switch to non-root user
+USER migrator
+
+# Run migrations
+# DATABASE_URL must be provided at runtime
+CMD ["sh", "-c", "sem-apply --url \"$DATABASE_URL\""]
