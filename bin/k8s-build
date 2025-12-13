@@ -47,12 +47,10 @@ class K8sBuild
     generate_dockerfile
     extract_distribution
     build_docker_image
+    push_docker_image
 
     puts ""
-    puts "Docker image built successfully: #{image_name}"
-    puts ""
-    puts "To push to registry:"
-    puts "  docker push #{image_name}"
+    puts "Docker image built and pushed: #{image_name}"
     puts ""
   end
 
