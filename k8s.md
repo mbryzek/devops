@@ -46,3 +46,21 @@ Deployment Workflow (New)
 # Debugging Commands
 kubectl get pods -n bryzek-production -l app=platform
 kubectl describe deployment platform-web -n bryzek-production | tail -30
+
+  # View logs from all web pods
+  kubectl logs -n bryzek-production -l app=platform,tier=web -f
+
+  # View logs from a specific pod
+  kubectl logs -n bryzek-production platform-web-xxx -f
+
+  # View logs from job server
+  kubectl logs -n bryzek-production -l app=platform,tier=job -f
+
+  # Describe pod for events/errors
+  kubectl describe pod -n bryzek-production <pod-name>
+
+  # Get recent events
+  kubectl get events -n bryzek-production --sort-by='.lastTimestamp' | tail -20
+
+  # Shell into a running pod
+  kubectl exec -it -n bryzek-production <pod-name> -- /bin/sh

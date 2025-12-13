@@ -70,9 +70,7 @@ USER appuser
 # Expose the application port (override via docker run -p or K8s)
 EXPOSE 9000
 
-# Health check endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:9000/_internal_/healthcheck || exit 1
+# Note: Health checks handled by Kubernetes liveness/readiness probes
 
 # Start the application
 ARG DIST_SCRIPT_NAME=api
