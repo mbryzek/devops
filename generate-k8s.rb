@@ -4,9 +4,8 @@
 # the result in the dist/k8s directory
 #
 # Usage:
-#   ./generate-k8s.rb                    # Generate all manifests
-#   ./generate-k8s.rb --app platform     # Generate for specific app
-#   ./generate-k8s.rb --version v1.0.0   # Generate with specific version
+#   ./generate-k8s.rb --version v1.0.0                  # Generate all manifests
+#   ./generate-k8s.rb --version v1.0.0 --app platform   # Generate for specific app
 
 load File.join(File.dirname(__FILE__), 'lib/common.rb')
 
