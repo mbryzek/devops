@@ -67,32 +67,51 @@ image_name = "#{REGISTRY}/#{args.app}"
 image_tag = "#{image_name}:#{version}"
 latest_tag = "#{image_name}:latest"
 
-puts ""
-puts "=" * 60
-puts "Building Docker image"
-puts "=" * 60
-puts "  App:     #{args.app}"
-puts "  Version: #{version}"
-puts "  Source:  #{source_dir}"
-puts "  Image:   #{image_tag}"
-puts "=" * 60
-puts ""
+# Check if image already exists locally
+image_exists = !`docker images -q #{image_tag}`.strip.empty?
 
-Dir.chdir(source_dir) do
-  # Build image with version tag only
-  cache_arg = args.no_cache ? '--no-cache' : ''
-  Util.run("docker build #{cache_arg} -t #{image_tag} .")
+should_build = true
+if image_exists
+  puts ""
+  puts "Image already exists: #{image_tag}"
+  puts ""
+  choice = Ask.select_from_list("What would you like to do?", ["Rebuild image", "Push existing image"])
+  should_build = (choice == "Rebuild image")
+
+  if should_build
+    # Delete existing image
+    Util.run("docker rmi #{image_tag} #{latest_tag}", ignore_error: true)
+  end
 end
 
-puts ""
-puts "Build successful!"
-puts "  Image: #{image_tag}"
+if should_build
+  puts ""
+  puts "=" * 60
+  puts "Building Docker image"
+  puts "=" * 60
+  puts "  App:     #{args.app}"
+  puts "  Version: #{version}"
+  puts "  Source:  #{source_dir}"
+  puts "  Image:   #{image_tag}"
+  puts "=" * 60
+  puts ""
 
-# Tag as latest after successful build
-Util.run("docker tag #{image_tag} #{latest_tag}")
-puts "  Tagged: #{latest_tag}"
+  Dir.chdir(source_dir) do
+    # Build image with version tag only
+    cache_arg = args.no_cache ? '--no-cache' : ''
+    Util.run("docker build #{cache_arg} -t #{image_tag} .")
+  end
 
-if args.push
+  puts ""
+  puts "Build successful!"
+  puts "  Image: #{image_tag}"
+
+  # Tag as latest after successful build
+  Util.run("docker tag #{image_tag} #{latest_tag}")
+  puts "  Tagged: #{latest_tag}"
+end
+
+if args.push || (image_exists && !should_build)
   puts ""
   puts "=" * 60
   puts "Pushing to registry"
@@ -111,7 +130,7 @@ if args.push
   puts "  #{latest_tag}"
 else
   puts ""
-  puts "To push to registry, run with --push flag:"
+  puts "To push to registry, run again or use --push flag:"
   puts "  k8s-build --app #{args.app} --version #{version} --push"
 end
 
