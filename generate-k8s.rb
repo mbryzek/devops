@@ -50,19 +50,6 @@ app_files.each do |file|
     Util.run(cmd, :quiet => args.quiet)
 end
 
-# Generate job manifests if app is specified and job-suffix provided
-if args.app && args.job_suffix
-    job_file = File.join(K8S_DIR, "jobs/db-migration.pkl")
-    if File.exist?(job_file)
-        output_file = File.join(DIST_DIR, "#{args.app}-migration.yaml")
-        job_env = env_prefix + "APP=#{args.app} JOB_SUFFIX=#{args.job_suffix} "
-
-        cmd = "cd #{K8S_DIR} && #{job_env}pkl eval jobs/db-migration.pkl > #{output_file}"
-        args.info "Generating #{output_file}"
-        Util.run(cmd, :quiet => args.quiet)
-    end
-end
-
 args.info ""
 args.info "Done - manifests in #{DIST_DIR}"
 args.info ""
