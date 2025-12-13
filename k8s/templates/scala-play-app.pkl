@@ -94,6 +94,16 @@ resources: Listing<K8sResource> = new {
               name = appName
               image = "\(registry)/\(appName):\(version)"
               imagePullPolicy = pullPolicy
+              env = new {
+                new {
+                  name = "DEPLOYMENT_NODE_INDEX"
+                  value = "1"
+                }
+                new {
+                  name = "DEPLOYMENT_NODES"
+                  value = "\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                }
+              }
               ports = new {
                 new {
                   containerPort = appPort
@@ -184,6 +194,14 @@ resources: Listing<K8sResource> = new {
                 new {
                   name = "DEPLOYMENT_JOB_SERVER"
                   value = "true"
+                }
+                new {
+                  name = "DEPLOYMENT_NODE_INDEX"
+                  value = "0"
+                }
+                new {
+                  name = "DEPLOYMENT_NODES"
+                  value = "\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
