@@ -1,14 +1,15 @@
-  Usage Example
+Usage Example
 
-  # 1. Build and push Docker image
-  devops/bin/k8s-build --app platform --version `sem-info tag latest` --push
+# 1. Build and push Docker image
+devops/bin/k8s-build --app platform --version `sem-info tag latest` --push
 
-  # 2. Sync secrets to Kubernetes
-  devops/bin/k8s-secrets --app platform --apply
+# 2. Sync secrets to Kubernetes
+devops/bin/k8s-secrets --app platform 
 
-  # 4. Deploy to Kubernetes
-  devops/bin/k8s-deploy --app platform --version `sem-info tag latest` --wait
+# 4. Deploy to Kubernetes
+devops/bin/k8s-deploy --app platform --version `sem-info tag latest` --wait
 
+ doctl kubernetes cluster list
 
 Deployment Workflow (New)
 
