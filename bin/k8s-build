@@ -21,28 +21,17 @@ args = Args.parse(ARGV, ["app"])
 # Registry configuration
 REGISTRY = 'registry.digitalocean.com/bryzek'
 
-# Valid applications and their source directories
-APP_CONFIG = {
-  'platform' => {
-    source_dir: File.expand_path('~/code/platform'),
-    dockerfile: 'Dockerfile'
-  },
-  'acumen' => {
-    source_dir: File.expand_path('~/code/acumen/acumen'),
-    dockerfile: 'Dockerfile'
-  }
-}
+source_dir = AppConfig.source_dir(args.app)
 
-unless APP_CONFIG.key?(args.app)
-  Util.exit_with_error("Invalid app '#{args.app}'. Valid apps: #{APP_CONFIG.keys.join(', ')}")
+# Validate source directory exists
+unless File.directory?(source_dir)
+  Util.exit_with_error("Source directory not found: #{source_dir}")
 end
-
-config = APP_CONFIG[args.app]
 
 # Get version - ask for tag if not specified
 version = args.version
 unless version
-  Dir.chdir(config[:source_dir]) do
+  Dir.chdir(source_dir) do
     version = Tag.ask
     if version.empty?
       Util.exit_with_error("No tag available. Please specify --version")
@@ -50,15 +39,13 @@ unless version
   end
 end
 
-source_dir = config[:source_dir]
-
 # Verify source directory exists
 unless File.directory?(source_dir)
   Util.exit_with_error("Source directory not found: #{source_dir}")
 end
 
 # Verify Dockerfile exists
-dockerfile = File.join(source_dir, config[:dockerfile])
+dockerfile = File.join(source_dir, 'Dockerfile')
 unless File.exist?(dockerfile)
   Util.exit_with_error("Dockerfile not found: #{dockerfile}\nPlease create a Dockerfile in #{source_dir}")
 end
