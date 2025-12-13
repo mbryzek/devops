@@ -3,12 +3,12 @@
 # k8s-build: Build and push Docker images to DigitalOcean Container Registry
 #
 # Usage:
-#   k8s-build [--app APP] [--version VERSION] [--push] [--no-cache]
+#   k8s-build [--app APP] [--version VERSION] [--no-cache]
 #
 # Examples:
-#   k8s-build                                           # Build current app (inferred from directory)
-#   k8s-build --app platform                            # Build platform
-#   k8s-build --app platform --version v1.2.3 --push    # Build and push specific version
+#   k8s-build                                    # Build current app (inferred from directory)
+#   k8s-build --app platform                     # Build platform
+#   k8s-build --app platform --version v1.2.3   # Build and push specific version
 #
 # Prerequisites:
 #   - Docker installed and running
@@ -67,22 +67,60 @@ if image_exists
 end
 
 if should_build
+  artifact = AppConfig.artifact(args.app)
+  app_port = AppConfig.port(args.app)
+
   puts ""
   puts "=" * 60
-  puts "Building Docker image"
+  puts "Building Application"
   puts "=" * 60
-  puts "  App:     #{args.app}"
-  puts "  Version: #{version}"
-  puts "  Source:  #{source_dir}"
-  puts "  Image:   #{image_tag}"
+  puts "  App:      #{args.app}"
+  puts "  Artifact: #{artifact}"
+  puts "  Version:  #{version}"
+  puts "  Source:   #{source_dir}"
+  puts "  Image:    #{image_tag}"
   puts "=" * 60
   puts ""
 
+  # Step 1: Build locally with sbt
+  puts "Step 1: Building with sbt..."
   Dir.chdir(source_dir) do
-    # Build image with version tag only
-    cache_arg = args.no_cache ? '--no-cache' : ''
-    Util.run("docker build --platform linux/amd64 #{cache_arg} -t #{image_tag} .")
+    Util.run("sbt #{artifact}/dist")
   end
+
+  # Step 2: Extract distribution
+  puts ""
+  puts "Step 2: Extracting distribution..."
+  dist_dir = File.join(source_dir, 'dist')
+  FileUtils.rm_rf(dist_dir)
+  FileUtils.mkdir_p(dist_dir)
+
+  zip_file = Dir.glob("#{source_dir}/#{artifact}/target/universal/*.zip").first
+  unless zip_file
+    Util.exit_with_error("Distribution zip not found in #{artifact}/target/universal/")
+  end
+
+  Dir.chdir(dist_dir) do
+    Util.run("unzip -q #{zip_file}")
+    # Move contents up from nested directory
+    nested_dir = Dir.glob("*").find { |d| File.directory?(d) }
+    if nested_dir
+      Util.run("mv #{nested_dir}/* . && rmdir #{nested_dir}")
+    end
+    # Remove Windows batch files
+    FileUtils.rm_f(Dir.glob("bin/*.bat"))
+  end
+
+  # Step 3: Build Docker image
+  puts ""
+  puts "Step 3: Building Docker image..."
+  Dir.chdir(source_dir) do
+    cache_arg = args.no_cache ? '--no-cache' : ''
+    Util.run("docker build --platform linux/amd64 #{cache_arg} --build-arg APP_PORT=#{app_port} --build-arg ARTIFACT=#{artifact} -t #{image_tag} .")
+  end
+
+  # Cleanup dist directory
+  FileUtils.rm_rf(dist_dir)
 
   puts ""
   puts "Build successful!"
@@ -93,28 +131,23 @@ if should_build
   puts "  Tagged: #{latest_tag}"
 end
 
-if args.push || (image_exists && !should_build)
-  puts ""
-  puts "=" * 60
-  puts "Pushing to registry"
-  puts "=" * 60
+# Always push to registry
+puts ""
+puts "=" * 60
+puts "Pushing to registry"
+puts "=" * 60
 
-  # Login to DOCR
-  Util.run("doctl registry login")
+# Login to DOCR
+Util.run("doctl registry login")
 
-  # Push both tags
-  Util.run("docker push #{image_tag}")
-  Util.run("docker push #{latest_tag}")
+# Push both tags
+Util.run("docker push #{image_tag}")
+Util.run("docker push #{latest_tag}")
 
-  puts ""
-  puts "Push successful!"
-  puts "  #{image_tag}"
-  puts "  #{latest_tag}"
-else
-  puts ""
-  puts "To push to registry, run again or use --push flag:"
-  puts "  k8s-build --app #{args.app} --version #{version} --push"
-end
+puts ""
+puts "Push successful!"
+puts "  #{image_tag}"
+puts "  #{latest_tag}"
 
 puts ""
 puts "Version: #{version}"

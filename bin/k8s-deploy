@@ -45,16 +45,28 @@ puts ""
 
 # Generate manifests
 puts "Generating Kubernetes manifests..."
-env_vars = "VERSION=#{version}"
-env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE}" if args.namespace
-pkl_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
+app_config_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
+template_file = File.join(K8S_DIR, 'templates', 'scala-play-app.pkl')
 manifest_file = "/tmp/#{args.app}-deploy-#{version}.yaml"
 
-unless File.exist?(pkl_file)
-  Util.exit_with_error("Pkl manifest not found: #{pkl_file}")
+unless File.exist?(app_config_file)
+  Util.exit_with_error("App config not found: #{app_config_file}")
 end
 
-cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval #{pkl_file}"
+unless File.exist?(template_file)
+  Util.exit_with_error("Template not found: #{template_file}")
+end
+
+# Read app config to get port
+config_output = `cd #{K8S_DIR} && pkl eval -f json apps/#{args.app}.pkl 2>/dev/null`
+config = JSON.parse(config_output) rescue {}
+app_port = config["appPort"] || 9000
+
+# Build env vars for template
+env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{version}"
+env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE}" if args.namespace
+
+cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval #{template_file}"
 manifest = `#{cmd} 2>&1`
 
 unless $?.success?
