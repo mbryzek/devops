@@ -6,9 +6,6 @@
   # 2. Sync secrets to Kubernetes
   devops/bin/k8s-secrets --app platform --apply
 
-  # 3. Run database migrations
-  devops/bin/k8s-migrate --app platform --version `sem-info tag latest` --wait
-
   # 4. Deploy to Kubernetes
   devops/bin/k8s-deploy --app platform --version `sem-info tag latest` --wait
 
