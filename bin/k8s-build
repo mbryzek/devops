@@ -10,10 +10,11 @@
 #
 # Usage: k8s-build --app <app-name> [--tag <version>]
 #
+# If --tag is not specified, fetches the latest tag from the app's git repo.
+#
 # Examples:
 #   k8s-build --app platform
 #   k8s-build --app platform --tag 0.1.0
-#   k8s-build --app acumen --tag latest
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'fileutils'
@@ -28,7 +29,11 @@ class K8sBuild
 
   def initialize(args)
     @app = args.app
-    @tag = args.tag || 'latest'
+    @tag = args.tag
+    if @tag.nil? || @tag.empty?
+      @tag = AppConfig.latest_tag(@app)
+      puts "Using latest tag: #{@tag}"
+    end
     @config = Config.load(@app)
 
     if @config.scala.nil?

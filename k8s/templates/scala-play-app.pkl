@@ -4,9 +4,9 @@
 /// Required environment variables:
 ///   - APP: Application name (e.g., "platform", "acumen")
 ///   - PORT: Application port (e.g., 9300)
+///   - VERSION: Docker image version (e.g., "0.1.0")
 ///
 /// Optional environment variables:
-///   - VERSION: Docker image version (default: "latest")
 ///   - K8S_NAMESPACE: Kubernetes namespace (default: "bryzek-production")
 ///   - WEB_REPLICAS: Number of web replicas (default: 2)
 ///   - JOB_REPLICAS: Number of job replicas (default: 1)
@@ -26,7 +26,7 @@ local appPort = (read?("env:PORT") ?? throw("PORT environment variable is requir
 // Optional configuration with defaults
 local k8sNamespace = read?("env:K8S_NAMESPACE") ?? "bryzek-production"
 local registry = "registry.digitalocean.com/bryzek"
-local version = read?("env:VERSION") ?? "latest"
+local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "2").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
@@ -38,8 +38,8 @@ local memoryLimitJobServer = "2Gi"
 local cpuLimit = "1000m"
 local cpuLimitJobServer = "2000m"
 
-// ImagePullPolicy: Always for latest, IfNotPresent otherwise
-local pullPolicy = if (version == "latest") "Always" else "IfNotPresent"
+// ImagePullPolicy: IfNotPresent since we require explicit versions
+local pullPolicy = "IfNotPresent"
 
 local commonLabels: Mapping<String, String> = new {
   ["app"] = appName

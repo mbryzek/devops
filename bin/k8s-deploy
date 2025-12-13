@@ -7,7 +7,7 @@
 #
 # Examples:
 #   k8s-deploy                                    # Deploy current app (inferred from directory)
-#   k8s-deploy --app platform                     # Deploy platform latest
+#   k8s-deploy --app platform                     # Deploy latest tag
 #   k8s-deploy --app platform --version v1.2.3   # Deploy specific version
 #   k8s-deploy --app platform --wait             # Wait for rollout
 #
@@ -27,7 +27,11 @@ K8S_DIR = File.join(SCRIPT_DIR, '../k8s')
 K8S_NAMESPACE = args.namespace || 'bryzek-production'
 
 # Version - fetch latest tag if not specified
-version = args.version || AppConfig.latest_tag(args.app)
+version = args.version
+if version.nil? || version.empty?
+  version = AppConfig.latest_tag(args.app)
+  puts "Using latest tag: #{version}"
+end
 
 # Timeout defaults to 600 seconds
 timeout = args.timeout || 600
