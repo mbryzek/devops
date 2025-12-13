@@ -81,7 +81,7 @@ if should_build
   Dir.chdir(source_dir) do
     # Build image with version tag only
     cache_arg = args.no_cache ? '--no-cache' : ''
-    Util.run("docker build #{cache_arg} -t #{image_tag} .")
+    Util.run("docker build --platform linux/amd64 #{cache_arg} -t #{image_tag} .")
   end
 
   puts ""
