@@ -309,7 +309,6 @@ resources: Listing<K8sResource> = new {
         }
       }
       clusterIP = "None"
-      sessionAffinity = "None"
     }
   }
 
