@@ -40,12 +40,19 @@ if args.app
     end
 end
 
-# Generate app manifests
+# Generate app manifests using the scala-play-app template
 app_files.each do |file|
     app_name = File.basename(file, ".pkl")
     output_file = File.join(DIST_DIR, "#{app_name}.yaml")
 
-    cmd = "cd #{K8S_DIR} && #{env_prefix}pkl eval apps/#{app_name}.pkl > #{output_file}"
+    # Read app config to get port
+    config_output = `cd #{K8S_DIR} && pkl eval -f json apps/#{app_name}.pkl 2>/dev/null`
+    config = JSON.parse(config_output) rescue {}
+    app_port = config["appPort"] || 9000
+
+    # Build env vars for template
+    app_env = "APP=#{app_name} PORT=#{app_port} #{env_prefix}"
+    cmd = "cd #{K8S_DIR} && #{app_env}pkl eval templates/scala-play-app.pkl > #{output_file}"
     args.info "Generating #{output_file}"
     Util.run(cmd, :quiet => args.quiet)
 end

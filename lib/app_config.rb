@@ -1,8 +1,24 @@
 # Shared application configuration for K8s scripts
 class AppConfig
+  # App-specific configuration
+  APPS = {
+    'platform' => { artifact: 'api', port: 9300 },
+    'acumen' => { artifact: 'api', port: 9200 }
+  }.freeze
+
   # Source directory by convention: ~/code/<app_name>
   def self.source_dir(app_name)
     File.expand_path("~/code/#{app_name}")
+  end
+
+  # SBT artifact/subproject name
+  def self.artifact(app_name)
+    APPS.dig(app_name, :artifact) || app_name
+  end
+
+  # Application port
+  def self.port(app_name)
+    APPS.dig(app_name, :port) || 9000
   end
 
   # Fetch the latest tag for an app by running sem-info in its source directory
