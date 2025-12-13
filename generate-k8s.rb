@@ -14,11 +14,13 @@ args = Args.parse(ARGV)
 
 args.info ""
 
-K8S_DIR = File.join(File.dirname(__FILE__), "k8s")
-DIST_DIR = File.join(File.dirname(__FILE__), "dist/k8s")
+# Use absolute paths
+SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
+K8S_DIR = File.join(SCRIPT_DIR, "k8s")
+DIST_DIR = File.join(SCRIPT_DIR, "dist/k8s")
 
 if !File.directory?(DIST_DIR)
-    Util.run("mkdir -p #{DIST_DIR}")
+    FileUtils.mkdir_p(DIST_DIR)
 end
 
 # Build environment variables for pkl
@@ -41,7 +43,7 @@ end
 # Generate app manifests
 app_files.each do |file|
     app_name = File.basename(file, ".pkl")
-    output_file = "#{DIST_DIR}/#{app_name}.yaml"
+    output_file = File.join(DIST_DIR, "#{app_name}.yaml")
 
     cmd = "cd #{K8S_DIR} && #{env_prefix}pkl eval apps/#{app_name}.pkl > #{output_file}"
     args.info "Generating #{output_file}"
@@ -50,9 +52,9 @@ end
 
 # Generate job manifests if app is specified and job-suffix provided
 if args.app && args.job_suffix
-    job_file = "#{K8S_DIR}/jobs/db-migration.pkl"
+    job_file = File.join(K8S_DIR, "jobs/db-migration.pkl")
     if File.exist?(job_file)
-        output_file = "#{DIST_DIR}/#{args.app}-migration.yaml"
+        output_file = File.join(DIST_DIR, "#{args.app}-migration.yaml")
         job_env = env_prefix + "APP=#{args.app} JOB_SUFFIX=#{args.job_suffix} "
 
         cmd = "cd #{K8S_DIR} && #{job_env}pkl eval jobs/db-migration.pkl > #{output_file}"
