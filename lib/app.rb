@@ -11,7 +11,7 @@ class App
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
     @hugo = json_data['hugo'] ? HugoConfig.new(json_data['hugo']) : nil
-    @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['flutter']) : nil
+    @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['sveltekit']) : nil
   end
 end
 

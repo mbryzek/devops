@@ -1,6 +1,9 @@
 #!/usr/bin/env ruby
 
 # Run this script from the project root directory
+# Deploys SvelteKit apps to Cloudflare Pages
+# Supports both @sveltejs/adapter-static (outputs to build/)
+# and @sveltejs/adapter-cloudflare (outputs to .svelte-kit/cloudflare)
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
@@ -10,6 +13,7 @@ helper = ReleaseHelper.new("sveltekit")
 # Check if wrangler is installed
 unless system('which wrangler > /dev/null 2>&1')
   puts "Error: wrangler CLI not found"
+  puts "Install with: npm install -g wrangler"
   exit 1
 end
 
@@ -19,8 +23,25 @@ unless system('wrangler whoami > /dev/null 2>&1')
   exit 1
 end
 
-helper.run "rm -rf .svelte-kit/cloudflare"
+# Clean previous builds
+helper.run "rm -rf build .svelte-kit/cloudflare"
+
 tag = Tag.ask
 helper.maybe_tag_and_push(tag)
+
+# Build the project
 helper.run_system("npm run build")
-helper.run_system("wrangler pages deploy .svelte-kit/cloudflare")
+
+# Detect output directory based on adapter
+output_dir = if Dir.exist?("build")
+  "build"
+elsif Dir.exist?(".svelte-kit/cloudflare")
+  ".svelte-kit/cloudflare"
+else
+  puts "Error: No build output found"
+  puts "Expected 'build/' (adapter-static) or '.svelte-kit/cloudflare' (adapter-cloudflare)"
+  exit 1
+end
+
+puts "Deploying from #{output_dir}"
+helper.run_system("wrangler pages deploy #{output_dir}")

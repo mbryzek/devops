@@ -1,0 +1,214 @@
+#!/usr/bin/env ruby
+
+# k8s-deploy: Deploy application to Kubernetes with rolling updates
+#
+# Usage:
+#   k8s-deploy --app APP [--version VERSION] [--wait]
+#
+# Examples:
+#   k8s-deploy --app platform                    # Deploy latest
+#   k8s-deploy --app platform --version v1.2.3  # Deploy specific version
+#   k8s-deploy --app platform --wait            # Wait for rollout
+#
+# Prerequisites:
+#   - kubectl configured with cluster access
+#   - Docker image built and pushed (via k8s-build)
+#   - Secrets configured (via k8s-secrets)
+#
+# This script:
+#   1. Generates Kubernetes manifests from Pkl
+#   2. Applies manifests (Deployment, StatefulSet, Service, PDB)
+#   3. Optionally waits for rollout completion
+
+require 'optparse'
+require 'fileutils'
+
+SCRIPT_DIR = File.dirname(__FILE__)
+K8S_DIR = File.join(SCRIPT_DIR, '../k8s')
+
+# Kubernetes namespace
+K8S_NAMESPACE = 'bryzek-production'
+
+# Valid applications
+VALID_APPS = %w[platform acumen]
+
+options = {
+  version: 'latest',
+  wait: false,
+  timeout: 600
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: k8s-deploy --app APP [options]"
+
+  opts.on("--app APP", "Application name (#{VALID_APPS.join(', ')})") do |app|
+    options[:app] = app
+  end
+
+  opts.on("--version VERSION", "Image version tag [default: latest]") do |v|
+    options[:version] = v
+  end
+
+  opts.on("--wait", "Wait for rollout to complete") do
+    options[:wait] = true
+  end
+
+  opts.on("--timeout SECONDS", Integer, "Rollout timeout in seconds [default: 600]") do |t|
+    options[:timeout] = t
+  end
+
+  opts.on("--namespace NS", "Kubernetes namespace [default: #{K8S_NAMESPACE}]") do |ns|
+    options[:namespace] = ns
+  end
+
+  opts.on("--dry-run", "Generate manifests without applying") do
+    options[:dry_run] = true
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit
+  end
+end.parse!
+
+# Validate app
+unless options[:app]
+  puts "Error: --app is required"
+  puts "Valid apps: #{VALID_APPS.join(', ')}"
+  exit 1
+end
+
+unless VALID_APPS.include?(options[:app])
+  puts "Error: Invalid app '#{options[:app]}'"
+  puts "Valid apps: #{VALID_APPS.join(', ')}"
+  exit 1
+end
+
+app = options[:app]
+version = options[:version]
+namespace = options[:namespace] || K8S_NAMESPACE
+
+puts ""
+puts "=" * 60
+puts "Deploying to Kubernetes"
+puts "=" * 60
+puts "  App:       #{app}"
+puts "  Version:   #{version}"
+puts "  Namespace: #{namespace}"
+puts "  Dry Run:   #{options[:dry_run] ? 'Yes' : 'No'}"
+puts "=" * 60
+puts ""
+
+# Generate manifests
+puts "Generating Kubernetes manifests..."
+env_vars = "VERSION=#{version}"
+pkl_file = File.join(K8S_DIR, 'apps', "#{app}.pkl")
+manifest_file = "/tmp/#{app}-deploy-#{version}.yaml"
+
+unless File.exist?(pkl_file)
+  puts "Error: Pkl manifest not found: #{pkl_file}"
+  exit 1
+end
+
+cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval #{pkl_file}"
+manifest = `#{cmd} 2>&1`
+
+unless $?.success?
+  puts "Error generating manifest:"
+  puts manifest
+  exit 1
+end
+
+File.write(manifest_file, manifest)
+puts "Manifest written to: #{manifest_file}"
+puts ""
+
+if options[:dry_run]
+  puts "DRY RUN - Manifest contents:"
+  puts "-" * 60
+  puts manifest
+  puts "-" * 60
+  FileUtils.rm_f(manifest_file)
+  exit 0
+end
+
+# Check if namespace exists
+namespace_exists = system("kubectl get namespace #{namespace} > /dev/null 2>&1")
+unless namespace_exists
+  puts "Creating namespace: #{namespace}"
+  system("kubectl create namespace #{namespace}")
+  unless $?.success?
+    puts "Error: Failed to create namespace"
+    exit 1
+  end
+end
+
+# Apply manifests
+puts "Applying Kubernetes manifests..."
+system("kubectl apply -f #{manifest_file}")
+unless $?.success?
+  puts "Error: Failed to apply manifests"
+  exit 1
+end
+
+puts ""
+puts "Manifests applied successfully!"
+
+if options[:wait]
+  puts ""
+  puts "Waiting for rollout to complete..."
+
+  # Wait for Deployment rollout
+  deployment_name = "#{app}-web"
+  puts "  Waiting for Deployment #{deployment_name}..."
+  deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{namespace} --timeout=#{options[:timeout]}s")
+
+  # Wait for StatefulSet rollout
+  statefulset_name = "#{app}-job"
+  puts "  Waiting for StatefulSet #{statefulset_name}..."
+  statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{namespace} --timeout=#{options[:timeout]}s")
+
+  if deployment_success && statefulset_success
+    puts ""
+    puts "=" * 60
+    puts "Deployment completed successfully!"
+    puts "=" * 60
+  else
+    puts ""
+    puts "=" * 60
+    puts "WARNING: Rollout did not complete within timeout"
+    puts ""
+    puts "Check status:"
+    puts "  kubectl get pods -n #{namespace} -l app=#{app}"
+    puts "  kubectl describe deployment #{deployment_name} -n #{namespace}"
+    puts "=" * 60
+    exit 1
+  end
+end
+
+# Show deployment status
+puts ""
+puts "Deployment Status:"
+puts "-" * 60
+system("kubectl get deployment #{app}-web -n #{namespace}")
+system("kubectl get statefulset #{app}-job -n #{namespace}")
+puts ""
+puts "Pods:"
+system("kubectl get pods -n #{namespace} -l app=#{app}")
+
+# Clean up manifest file
+FileUtils.rm_f(manifest_file)
+
+puts ""
+puts "=" * 60
+puts "Deployment Summary"
+puts "=" * 60
+puts "  App:     #{app}"
+puts "  Version: #{version}"
+puts "  Status:  Deployed"
+puts ""
+puts "Useful commands:"
+puts "  kubectl logs -n #{namespace} -l app=#{app},tier=web -f"
+puts "  kubectl logs -n #{namespace} -l app=#{app},tier=job -f"
+puts "  kubectl get pods -n #{namespace} -l app=#{app} -w"
+puts "=" * 60
