@@ -48,7 +48,8 @@ kubectl get pods -n bryzek-production -l app=platform
 kubectl describe deployment platform-web -n bryzek-production | tail -30
 
   # View logs from all web pods
-  kubectl logs -n bryzek-production -l app=platform,tier=web -f
+  kubectl logs -n bryzek-production -l app=platform --tail=100
+  kubectl logs -n bryzek-production -l app=platform -f
 
   # View logs from a specific pod
   kubectl logs -n bryzek-production platform-web-xxx -f

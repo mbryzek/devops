@@ -36,6 +36,7 @@ class MemoryConfig {
 
 class ScalaEnvironment {
     database: Database
+    nodes: Listing<Node>
 }
 
 class Database {
