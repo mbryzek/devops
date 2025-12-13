@@ -23,11 +23,6 @@ REGISTRY = 'registry.digitalocean.com/bryzek'
 
 source_dir = AppConfig.source_dir(args.app)
 
-# Validate source directory exists
-unless File.directory?(source_dir)
-  Util.exit_with_error("Source directory not found: #{source_dir}")
-end
-
 # Get version - ask for tag if not specified
 version = args.version
 unless version

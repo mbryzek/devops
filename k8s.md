@@ -42,3 +42,7 @@ Deployment Workflow (New)
 
  # Run app
  cd ~/code/platform && sbt run
+ 
+# Debugging Commands
+kubectl get pods -n bryzek-production -l app=platform
+kubectl describe deployment platform-web -n bryzek-production | tail -30
