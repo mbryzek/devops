@@ -1,0 +1,28 @@
+# Runtime Dockerfile for Scala Play applications
+#
+# This template is processed by k8s-build - do not use directly.
+# k8s-build substitutes {{APP_PORT}} and {{ARTIFACT}} placeholders.
+#
+# Usage: k8s-build --app platform --tag 0.1.0
+
+FROM eclipse-temurin:21-jre
+
+# Create non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+
+# Copy the pre-built distribution
+COPY dist/ /app/
+
+# Set ownership
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose the application port
+EXPOSE {{APP_PORT}}
+
+# Start the application
+CMD ["/app/bin/{{ARTIFACT}}"]
