@@ -3,13 +3,12 @@
 # k8s-deploy: Deploy application to Kubernetes with rolling updates
 #
 # Usage:
-#   k8s-deploy [--app APP] [--version VERSION] [--wait] [--dry-run]
+#   k8s-deploy [--app APP] [--version VERSION] [--dry-run]
 #
 # Examples:
 #   k8s-deploy                                    # Deploy current app (inferred from directory)
 #   k8s-deploy --app platform                     # Deploy latest tag
 #   k8s-deploy --app platform --version v1.2.3   # Deploy specific version
-#   k8s-deploy --app platform --wait             # Wait for rollout
 #
 # Prerequisites:
 #   - kubectl configured with cluster access
@@ -104,36 +103,34 @@ Util.run("kubectl apply -f #{manifest_file}")
 puts ""
 puts "Manifests applied successfully!"
 
-if args.wait
+puts ""
+puts "Waiting for rollout to complete..."
+
+# Wait for Deployment rollout
+deployment_name = "#{args.app}-web"
+puts "  Waiting for Deployment #{deployment_name}..."
+deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+
+# Wait for StatefulSet rollout
+statefulset_name = "#{args.app}-job"
+puts "  Waiting for StatefulSet #{statefulset_name}..."
+statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+
+if deployment_success && statefulset_success
   puts ""
-  puts "Waiting for rollout to complete..."
-
-  # Wait for Deployment rollout
-  deployment_name = "#{args.app}-web"
-  puts "  Waiting for Deployment #{deployment_name}..."
-  deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-
-  # Wait for StatefulSet rollout
-  statefulset_name = "#{args.app}-job"
-  puts "  Waiting for StatefulSet #{statefulset_name}..."
-  statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-
-  if deployment_success && statefulset_success
-    puts ""
-    puts "=" * 60
-    puts "Deployment completed successfully!"
-    puts "=" * 60
-  else
-    puts ""
-    puts "=" * 60
-    puts "WARNING: Rollout did not complete within timeout"
-    puts ""
-    puts "Check status:"
-    puts "  kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app}"
-    puts "  kubectl describe deployment #{deployment_name} -n #{K8S_NAMESPACE}"
-    puts "=" * 60
-    exit 1
-  end
+  puts "=" * 60
+  puts "Deployment completed successfully!"
+  puts "=" * 60
+else
+  puts ""
+  puts "=" * 60
+  puts "WARNING: Rollout did not complete within timeout"
+  puts ""
+  puts "Check status:"
+  puts "  kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app}"
+  puts "  kubectl describe deployment #{deployment_name} -n #{K8S_NAMESPACE}"
+  puts "=" * 60
+  exit 1
 end
 
 # Show deployment status
