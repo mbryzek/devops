@@ -25,4 +25,5 @@ USER appuser
 EXPOSE {{APP_PORT}}
 
 # Start the application
-CMD ["/app/bin/{{ARTIFACT}}"]
+# Disable PID file - not needed in containers and avoids permission issues
+CMD ["/app/bin/{{ARTIFACT}}", "-Dpidfile.path=/dev/null"]

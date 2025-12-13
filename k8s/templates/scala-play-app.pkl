@@ -31,12 +31,10 @@ local webReplicas = (read?("env:WEB_REPLICAS") ?? "2").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
 // Resource configuration
-local memoryDefault = "750Mi"
-local memoryJobServer = "1500Mi"
-local memoryLimit = "1Gi"
-local memoryLimitJobServer = "2Gi"
-local cpuLimit = "1000m"
-local cpuLimitJobServer = "2000m"
+local memoryDefault = "700Mi"
+local memoryJobServer = "1400Mi"
+local memoryLimit = "700Mi"
+local memoryLimitJobServer = "1400Mi"
 
 // ImagePullPolicy: IfNotPresent since we require explicit versions
 local pullPolicy = "IfNotPresent"
