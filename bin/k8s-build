@@ -98,7 +98,7 @@ class K8sBuild
     template = IO.read(TEMPLATE_PATH)
     dockerfile = template
       .gsub('{{APP_PORT}}', @config.port.to_s)
-      .gsub('{{ARTIFACT}}', @config.scala.artifact_name)
+      .gsub('{{ARTIFACT}}', @config.scala.dist_run_script_name)
 
     if dockerfile.include?('{{')
       Util.exit_with_error("Template substitution failed - placeholders remain in Dockerfile")
@@ -107,7 +107,7 @@ class K8sBuild
     FileUtils.mkdir_p(TMP_DIR)
     @dockerfile_path = File.join(TMP_DIR, "Dockerfile.#{@app}")
     File.open(@dockerfile_path, 'w') { |f| f.write(dockerfile) }
-    puts "Generated #{@dockerfile_path} with PORT=#{@config.port}, ARTIFACT=#{@config.scala.artifact_name}"
+    puts "Generated #{@dockerfile_path} with PORT=#{@config.port}, ARTIFACT=#{@config.scala.dist_run_script_name}"
   end
 
   def extract_distribution

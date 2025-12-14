@@ -43,6 +43,8 @@ kubectl get nodes
 kubectl get pods -n bryzek-production -l app=platform
 kubectl describe deployment platform-web -n bryzek-production | tail -30
 
+kubectl get pods -n bryzek-production -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[*].image'
+
   # View logs from all web pods
   kubectl logs -n bryzek-production -l app=platform --tail=100
   kubectl logs -n bryzek-production -l app=platform -f

@@ -32,10 +32,10 @@ local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 local appNodePort = (read?("env:NODE_PORT") ?? throw("NODE_PORT environment variable is required")).toInt()
 
 // Resource configuration
-local memoryDefault = "700Mi"
-local memoryJobServer = "700Mi"
-local memoryLimit = "700Mi"
-local memoryLimitJobServer = "700Mi"
+local memoryDefault = "600Mi"
+local memoryJobServer = "1100Mi"
+local memoryLimit = "600Mi"
+local memoryLimitJobServer = "1100Mi"
 local cpuLimit = "1000m"
 local cpuLimitJobServer = "2000m"
 
