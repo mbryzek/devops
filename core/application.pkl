@@ -5,11 +5,9 @@ class Application {
     port: Int(isBetween(0, 100000))
     scala: ScalaConfig?
     elm: ElmConfig?
-    hugo: HugoConfig?
     sveltekit: SvelteKit?
 }
 
-class HugoConfig {}
 class SvelteKit {}
 
 class ElmConfig {
