@@ -6,8 +6,9 @@ echo "deb http://apt.postgresql.org/pub/repos/apt/ `lsb_release -cs`-pgdg main" 
 sudo apt update
 sudo apt -y install postgresql-18 postgresql-client-18
 
-sudo apt -y upgrade
-sudo apt -y install openjdk-17-jre-headless
-
 apt -y install ruby-rubygems
 gem install schema-evolution-manager
+
+# Only if running play apps:
+# sudo apt -y upgrade
+# sudo apt -y install openjdk-17-jre-headless
