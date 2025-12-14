@@ -108,7 +108,7 @@ module DigitalOcean
     def find_load_balancer
       all = @client.load_balancers.all().map { |lb| LoadBalancer.new(lb) }
       load_balancers = all.select { |lb|
-        lb.name.include?(@app)
+        lb.name.include?(@app) && lb.name.start_with?("nyc")
       }
 
       if load_balancers.empty?
