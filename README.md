@@ -2,10 +2,14 @@
 
 We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configuration files.
 
-## Deploying a release
+## Deploying Scala applications to Kubernetes
 
 ```
-./bin/deploy.rb --app platform --file ~/code/platform/platform-0.1.4.tar.gz --env development
+# Build Docker image and push to registry
+./bin/k8s-build --app platform --version 0.1.4
+
+# Deploy to Kubernetes
+./bin/k8s-deploy --app platform --version 0.1.4
 ```
 
 ## Measure uptime
@@ -14,29 +18,23 @@ We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configura
 uptime-checker.sc https://idempotent.io/_internal_/healthcheck
 ```
 
-## Generate JSON of configuration
+## Generate JSON configuration
 
 ```
-
 ./generate-json.rb
-
 ```
 
 ## Using pkl
 
 ```
-
 brew install pkl
 pkl eval platform/config.pkl --format json
-
 ```
 
-## Notes
+## Kubernetes scripts
 
-Digital ocean token is expected at
-```
-~/.digitalocean/token
-```
-
-Generate a new one at https://cloud.digitalocean.com/account/api/tokens?i=65dbae
-  - we gave it read on droplets and read/update on load balancer
+- `k8s-build` - Build Docker image and push to registry
+- `k8s-deploy` - Deploy application to Kubernetes
+- `k8s-lb-create` - Create DigitalOcean load balancer
+- `k8s-lb-configure` - Configure HTTPS on load balancer
+- `k8s-secrets` - Sync environment secrets to Kubernetes

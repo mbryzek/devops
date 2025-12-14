@@ -14,7 +14,9 @@ end
 args = Args.parse(ARGV, ["app"])
 config = Config.load(args.app)
 
-files = if config.elm
+files = if config.scala
+    ["release-scala"]
+  elsif config.elm
     if args.app == "acumen-ui"
       ["release-elm", "record-ui-version"]
     else
@@ -25,7 +27,7 @@ files = if config.elm
   elsif config.sveltekit
     ["release-sveltekit"]
   else
-    Util.exit_with_error("Do not know how to release app that is not elm, hugo, or sveltekit")
+    Util.exit_with_error("Do not know how to release app that is not scala, elm, hugo, or sveltekit")
   end
 
 files.each do |file|

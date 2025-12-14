@@ -15,5 +15,17 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 args = Args.parse(ARGV, ["app"])
 format = args.format || 'sh'
 
+# Load environment variables from files
 vars = EnvironmentVariables.load(args.app, args.env)
+
+# Load config to get port for deployment nodes
+config = Config.load(args.app)
+if config.scala
+  port = config.port
+  # For local development, single node on localhost (as job server, index 0)
+  vars = vars.with_variable("DEPLOYMENT_NODES", "localhost:#{port}")
+  vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", "0")
+  vars = vars.with_variable("DEPLOYMENT_JOB_SERVER", "true")
+end
+
 puts vars.serialize(format)
