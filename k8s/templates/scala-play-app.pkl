@@ -35,9 +35,9 @@ local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
 // Resource configuration
 local memoryDefault = "400Mi"
-local memoryJobServer = "700Mi"
+local memoryJobServer = "1Gi"
 local memoryLimit = "400Mi"
-local memoryLimitJobServer = "700Mi"
+local memoryLimitJobServer = "1Gi"
 local cpuLimit = "1000m"
 local cpuLimitJobServer = "2000m"
 
@@ -92,6 +92,25 @@ resources: Listing<K8sResource> = new {
           labels = webLabels
         }
         spec {
+          affinity {
+            podAntiAffinity {
+              // Web pods should avoid nodes with same-app job pods
+              preferredDuringSchedulingIgnoredDuringExecution = new {
+                new {
+                  weight = 100
+                  podAffinityTerm {
+                    labelSelector {
+                      matchLabels = new {
+                        ["app"] = appName
+                        ["tier"] = "job"
+                      }
+                    }
+                    topologyKey = "kubernetes.io/hostname"
+                  }
+                }
+              }
+            }
+          }
           containers = new {
             new {
               name = appName
@@ -100,7 +119,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "-Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -192,6 +211,21 @@ resources: Listing<K8sResource> = new {
           labels = jobLabels
         }
         spec {
+          affinity {
+            podAntiAffinity {
+              // Job pods must not share a node with other job pods
+              requiredDuringSchedulingIgnoredDuringExecution = new {
+                new {
+                  labelSelector {
+                    matchLabels = new {
+                      ["tier"] = "job"
+                    }
+                  }
+                  topologyKey = "kubernetes.io/hostname"
+                }
+              }
+            }
+          }
           containers = new {
             new {
               name = "\(appName)-job"
@@ -200,7 +234,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "-Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
