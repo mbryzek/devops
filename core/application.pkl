@@ -5,11 +5,9 @@ class Application {
     port: Int(isBetween(0, 100000))
     scala: ScalaConfig?
     elm: ElmConfig?
-    hugo: HugoConfig?
     sveltekit: SvelteKit?
 }
 
-class HugoConfig {}
 class SvelteKit {}
 
 class ElmConfig {
@@ -22,21 +20,12 @@ class ElmRewrite {
 }
 
 class ScalaConfig {
-    artifactName: String(!isEmpty)
-    distRunScriptName: String(!isEmpty)
-    memory: MemoryConfig
     production : ScalaEnvironment
     development : ScalaEnvironment
 }
 
-class MemoryConfig {
-    default: String(!isEmpty)
-    jobServer: String(!isEmpty)
-}
-
 class ScalaEnvironment {
     database: Database
-    nodes: Listing<Node>
 }
 
 class Database {
@@ -44,9 +33,4 @@ class Database {
     host: String(!isEmpty)
     user: String(!isEmpty)
     port: Int
-}
-
-class Node {
-  uri: String(!isEmpty)
-  isJobServer: Boolean = false
 }

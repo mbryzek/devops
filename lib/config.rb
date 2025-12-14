@@ -26,12 +26,12 @@ module Config
         App.new(json['app'])
     end
 
-    def Config.load_scala_env(app, env)
+    def Config.load_database(app, env)
         config = Config.load(app)
-        scala_config = config.scala    
+        scala_config = config.scala
         if scala_config.nil?
-            Util.exit_with_error("App #{app} does not have a scala config")
+            Util.exit_with_error("App #{app} does not have a scala config with database info")
         end
-        scala_config.send(env)
+        scala_config.send(env).database
     end
 end

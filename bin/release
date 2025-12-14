@@ -22,12 +22,10 @@ files = if config.scala
     else
       ["release-elm"]
     end
-  elsif config.hugo
-    ["release-hugo"]
   elsif config.sveltekit
     ["release-sveltekit"]
   else
-    Util.exit_with_error("Do not know how to release app that is not scala, elm, or hugo")
+    Util.exit_with_error("Do not know how to release app that is not scala, elm, or sveltekit")
   end
 
 files.each do |file|

@@ -4,8 +4,8 @@
 # the result in the dist/k8s directory
 #
 # Usage:
-#   ./generate-k8s.rb --version v1.0.0                  # Generate all manifests
-#   ./generate-k8s.rb --version v1.0.0 --app platform   # Generate for specific app
+#   ./generate-k8s.rb --tag 1.0.0                  # Generate all manifests
+#   ./generate-k8s.rb --tag 1.0.0 --app platform   # Generate for specific app
 
 load File.join(File.dirname(__FILE__), 'lib/common.rb')
 
@@ -22,13 +22,13 @@ if !File.directory?(DIST_DIR)
     FileUtils.mkdir_p(DIST_DIR)
 end
 
-# VERSION is required
-if args.version.nil? || args.version.empty?
-    Util.exit_with_error("--version is required")
+# Tag is required
+if args.tag.nil? || args.tag.empty?
+    Util.exit_with_error("--tag is required")
 end
 
 # Build environment variables for pkl
-env_vars = ["VERSION=#{args.version}"]
+env_vars = ["VERSION=#{args.tag}"]
 env_vars << "K8S_NAMESPACE=#{args.namespace}" if args.namespace
 env_prefix = env_vars.join(" ") + " "
 

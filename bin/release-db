@@ -32,22 +32,21 @@ app_name = db_name.sub(/-postgresql$/, '')
 config = Config.load(app_name)
 scala_config = config.scala
 if scala_config.nil?
-    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find deployment node")
+    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find database configuration")
 end
 
 scala_env = scala_config.send(args.env)
 db = scala_env.database
 
 # Load global nodes and pick the first one for running migrations
-global_nodes_path = File.join(File.dirname(__FILE__), "../dist/nodes.json")
-if !File.exist?(global_nodes_path)
-    Util.exit_with_error("Nodes config not found at #{global_nodes_path}. Run ./generate-json.rb first.")
+bastion_path = File.join(File.dirname(__FILE__), "../../env/bastion.txt")
+if !File.exist?(bastion_path)
+    Util.exit_with_error("Bastion config not found at #{bastion_path}")
 end
-global_nodes = JSON.parse(IO.read(global_nodes_path))['nodes'].map { |n| n['uri'] }
-if global_nodes.empty?
-    Util.exit_with_error("No nodes configured in #{global_nodes_path}")
+node_ip = IO.read(bastion_path).strip
+if node_ip.empty?
+    Util.exit_with_error("No bastion node configured in #{bastion_path}")
 end
-node_ip = global_nodes.first
 
 # Get database password from environment variables
 env_vars = EnvironmentVariables.load(app_name, args.env)

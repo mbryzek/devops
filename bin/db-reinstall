@@ -13,7 +13,7 @@ end
 
 args = Args.parse(ARGV, ["app", "env"])
 install_script = find_install_inscript(args.app)
-dbname = Config.load_scala_env(args.app, args.env).database.name
+dbname = Config.load_database(args.app, args.env).name
 path = "#{dbname}*.sql"
 
 if !File.exist?(install_script)

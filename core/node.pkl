@@ -1,5 +1,0 @@
-open module Node
-
-class Node {
-    uri: String(!isEmpty)
-}

@@ -2,8 +2,8 @@
 class AppConfig
   # App-specific configuration
   APPS = {
-    'platform' => { artifact: 'api', port: 9300 },
-    'acumen' => { artifact: 'api', port: 9200 }
+    'platform' => { artifact: 'api', port: 9300, run_script: 'api' },
+    'acumen' => { artifact: 'api', port: 9200, run_script: 'acumen-acumen-api' }
   }.freeze
 
   # Source directory by convention: ~/code/<app_name>
@@ -19,6 +19,11 @@ class AppConfig
   # Application port
   def self.port(app_name)
     APPS.dig(app_name, :port) || 9000
+  end
+
+  # Run script name in sbt dist output
+  def self.run_script(app_name)
+    APPS.dig(app_name, :run_script) || app_name
   end
 
   # Fetch the latest tag for an app by running sem-info in its source directory
