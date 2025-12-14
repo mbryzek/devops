@@ -1,6 +1,9 @@
 /// Generic Kubernetes resources for Scala Play Framework applications
 /// Generates Deployment, StatefulSet, Service, and PodDisruptionBudget manifests
 ///
+/// Load balancer is managed separately via doctl (not K8s) due to DO CCM issues.
+/// See bin/k8s-lb-create for creating load balancers after deployment.
+///
 /// Required environment variables:
 ///   - APP: Application name (e.g., "platform", "acumen")
 ///   - PORT: Application port (e.g., 9300)
@@ -29,12 +32,6 @@ local registry = "registry.digitalocean.com/bryzek"
 local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "1").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
-local appNodePort = (read?("env:NODE_PORT") ?? throw("NODE_PORT environment variable is required")).toInt()
-
-// LoadBalancer configuration (optional - read from environment)
-local lbName = read?("env:LB_NAME")
-local lbCertificateName = read?("env:LB_CERTIFICATE_NAME")
-local lbHostname = read?("env:LB_HOSTNAME")
 
 // Resource configuration
 local memoryDefault = "400Mi"
@@ -258,7 +255,8 @@ resources: Listing<K8sResource> = new {
     }
   }
 
-  // Web Service - internal ClusterIP service for the web tier
+  // Web Service - NodePort service for external load balancer routing
+  // Load balancer is created separately via doctl (see bin/k8s-lb-create)
   new Service {
     metadata {
       name = "\(appName)-web"
@@ -278,59 +276,7 @@ resources: Listing<K8sResource> = new {
           protocol = "TCP"
         }
       }
-      type = "ClusterIP"
-    }
-  }
-
-  // LoadBalancer Service - exposes app via DigitalOcean Load Balancer with HTTPS
-  when (lbName != null) {
-    new Service {
-      metadata {
-        name = "\(appName)-lb"
-        namespace = k8sNamespace
-        labels = commonLabels
-        annotations = new {
-          ["service.beta.kubernetes.io/do-loadbalancer-name"] = lbName
-          ["service.beta.kubernetes.io/do-loadbalancer-protocol"] = "http"
-          ["service.beta.kubernetes.io/do-loadbalancer-tls-ports"] = "443"
-          when (lbCertificateName != null) {
-            ["service.beta.kubernetes.io/do-loadbalancer-certificate-name"] = lbCertificateName
-          }
-          ["service.beta.kubernetes.io/do-loadbalancer-redirect-http-to-https"] = "true"
-          ["service.beta.kubernetes.io/do-loadbalancer-disable-lets-encrypt-dns-records"] = "true"
-          ["service.beta.kubernetes.io/do-loadbalancer-enable-backend-keepalive"] = "true"
-          ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-path"] = "/_internal_/healthcheck"
-          ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol"] = "http"
-          ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds"] = "10"
-          ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds"] = "5"
-          ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold"] = "2"
-          ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold"] = "3"
-          when (lbHostname != null) {
-            ["service.beta.kubernetes.io/do-loadbalancer-hostname"] = lbHostname
-          }
-        }
-      }
-      spec {
-        selector = new {
-          ["app"] = appName
-          ["tier"] = "web"
-        }
-        ports = new {
-          new {
-            name = "http"
-            port = 80
-            targetPort = appPort
-            protocol = "TCP"
-          }
-          new {
-            name = "https"
-            port = 443
-            targetPort = appPort
-            protocol = "TCP"
-          }
-        }
-        type = "LoadBalancer"
-      }
+      type = "NodePort"
     }
   }
 

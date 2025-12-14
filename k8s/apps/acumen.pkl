@@ -1,15 +1,12 @@
 /// Acumen application configuration
 /// Used by generate-k8s.rb to generate manifests from scala-play-app template
+///
+/// Load balancer managed via doctl:
+///   Name: acumen-lb
+///   Certificate: 20210406-2-trueacumen-com-ssl-cert (edfc2ac4-5f15-4d4c-baec-7b4e9516384c)
+///   Hostname: api.trueacumen.com
 
 module acumen
 
 appName = "acumen"
 appPort = 9200
-nodePort = 30200
-
-// LoadBalancer configuration
-loadBalancer {
-  name = "acumen-lb"
-  certificateName = "20210406-2-trueacumen-com-ssl-cert"
-  hostname = "api.trueacumen.com"
-}
