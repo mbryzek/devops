@@ -19,7 +19,7 @@ puts ""
 
 # Build Docker image
 puts "Building Docker image..."
-build_cmd = File.join(__dir__, "k8s-build") + " --app #{app} --version #{version}"
+build_cmd = File.join(__dir__, "k8s-build") + " --app #{app} --tag #{version}"
 Util.run(build_cmd)
 
 puts ""
