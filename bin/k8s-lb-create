@@ -1,0 +1,128 @@
+#!/usr/bin/env ruby
+# Creates a DigitalOcean Load Balancer for a Kubernetes application
+#
+# This script creates LBs via doctl instead of K8s LoadBalancer services
+# to avoid the DO CCM firewall rules issue (allow:[],deny:[] blocks traffic).
+#
+# Prerequisites:
+#   - K8s app must be deployed with NodePort service
+#   - doctl must be authenticated
+#   - SSL certificate must exist in DigitalOcean
+#
+# Usage:
+#   k8s-lb-create --app platform --cert-id <cert-id>
+#   k8s-lb-create --app acumen --cert-id <cert-id> --lb-name custom-lb-name
+
+require 'json'
+require 'optparse'
+
+NAMESPACE = ENV['K8S_NAMESPACE'] || 'bryzek-production'
+REGION = ENV['DO_REGION'] || 'nyc3'
+
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: k8s-lb-create --app APP --cert-id CERT_ID [options]"
+  opts.on("--app APP", "Application name (required)") { |v| options[:app] = v }
+  opts.on("--cert-id ID", "DigitalOcean certificate ID (required)") { |v| options[:cert_id] = v }
+  opts.on("--lb-name NAME", "Load balancer name (default: APP-lb)") { |v| options[:lb_name] = v }
+  opts.on("--region REGION", "DigitalOcean region (default: nyc3)") { |v| options[:region] = v }
+end.parse!
+
+raise "--app is required" unless options[:app]
+raise "--cert-id is required" unless options[:cert_id]
+
+app = options[:app]
+cert_id = options[:cert_id]
+lb_name = options[:lb_name] || "#{app}-lb"
+region = options[:region] || REGION
+svc_name = "#{app}-web"
+
+puts "Creating load balancer '#{lb_name}' for #{app}..."
+
+# Check if LB already exists
+existing = `doctl compute load-balancer list --format Name --no-header`.strip.split("\n")
+if existing.include?(lb_name)
+  puts "Error: Load balancer '#{lb_name}' already exists"
+  puts "To update, use: doctl compute load-balancer update <lb-id> ..."
+  exit 1
+end
+
+# Get NodePort from K8s service
+puts "Getting NodePort from service #{svc_name}..."
+nodeport = `kubectl get svc #{svc_name} -n #{NAMESPACE} -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null`.strip
+
+if nodeport.empty?
+  puts "Error: Could not get NodePort from service #{svc_name}"
+  puts "Make sure the service exists and is type NodePort:"
+  puts "  kubectl get svc #{svc_name} -n #{NAMESPACE}"
+  exit 1
+end
+puts "  NodePort: #{nodeport}"
+
+# Get K8s node droplet IDs
+puts "Getting K8s node droplet IDs..."
+node_names = `kubectl get nodes -o jsonpath='{.items[*].metadata.name}'`.strip.split
+droplet_ids = node_names.map do |name|
+  `doctl compute droplet list --format ID,Name --no-header | grep "#{name}" | awk '{print $1}'`.strip
+end.reject(&:empty?).join(',')
+
+if droplet_ids.empty?
+  puts "Error: Could not find droplet IDs for K8s nodes"
+  exit 1
+end
+puts "  Droplet IDs: #{droplet_ids}"
+
+# Create the load balancer
+puts "Creating load balancer..."
+forwarding_rules = [
+  "entry_protocol:http,entry_port:80,target_protocol:http,target_port:#{nodeport}",
+  "entry_protocol:https,entry_port:443,target_protocol:http,target_port:#{nodeport},certificate_id:#{cert_id}"
+].join(' ')
+
+health_check = "protocol:http,port:#{nodeport},path:/_internal_/healthcheck,check_interval_seconds:10,response_timeout_seconds:5,healthy_threshold:2,unhealthy_threshold:3"
+
+cmd = [
+  "doctl compute load-balancer create",
+  "--name #{lb_name}",
+  "--region #{region}",
+  "--droplet-ids #{droplet_ids}",
+  "--forwarding-rules \"#{forwarding_rules}\"",
+  "--health-check \"#{health_check}\"",
+  "--redirect-http-to-https",
+  "--disable-lets-encrypt-dns-records"
+].join(' ')
+
+puts "Running: #{cmd}"
+result = system(cmd)
+
+unless result
+  puts "\nError: Failed to create load balancer"
+  exit 1
+end
+
+# Wait for LB to become active and get IP
+puts "\nWaiting for load balancer to become active..."
+lb_ip = nil
+30.times do
+  sleep 5
+  output = `doctl compute load-balancer list --format Name,IP,Status --no-header | grep "^#{lb_name}"`.strip
+  if output =~ /#{lb_name}\s+(\d+\.\d+\.\d+\.\d+)\s+active/
+    lb_ip = $1
+    break
+  end
+  print "."
+end
+puts ""
+
+if lb_ip
+  puts "\n✓ Load balancer created successfully!"
+  puts "  Name: #{lb_name}"
+  puts "  IP: #{lb_ip}"
+  puts "  NodePort: #{nodeport}"
+  puts "\nTest with:"
+  puts "  curl -k https://#{lb_ip}/_internal_/healthcheck"
+  puts "\nUpdate DNS to point to #{lb_ip}"
+else
+  puts "\nWarning: Load balancer created but IP not yet available"
+  puts "Check status with: doctl compute load-balancer list"
+end
