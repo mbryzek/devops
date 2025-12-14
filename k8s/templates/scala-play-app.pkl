@@ -297,6 +297,8 @@ resources: Listing<K8sResource> = new {
             ["service.beta.kubernetes.io/do-loadbalancer-certificate-name"] = lbCertificateName
           }
           ["service.beta.kubernetes.io/do-loadbalancer-redirect-http-to-https"] = "true"
+          ["service.beta.kubernetes.io/do-loadbalancer-disable-lets-encrypt-dns-records"] = "true"
+          ["service.beta.kubernetes.io/do-loadbalancer-enable-backend-keepalive"] = "true"
           ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-path"] = "/_internal_/healthcheck"
           ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol"] = "http"
           ["service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds"] = "10"
