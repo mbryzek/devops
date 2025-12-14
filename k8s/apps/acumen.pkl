@@ -6,3 +6,10 @@ module acumen
 appName = "acumen"
 appPort = 9200
 nodePort = 30200
+
+// LoadBalancer configuration
+loadBalancer {
+  name = "acumen-lb"
+  certificateName = "20210406-2-trueacumen-com-ssl-cert"
+  hostname = "api.trueacumen.com"
+}

@@ -6,3 +6,10 @@ module platform
 appName = "platform"
 appPort = 9300
 nodePort = 30100
+
+// LoadBalancer configuration
+loadBalancer {
+  name = "platform-lb"
+  certificateName = "idempotent-io-ssl-certificate"
+  hostname = "idempotent.io"
+}
