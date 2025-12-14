@@ -1,0 +1,210 @@
+#!/usr/bin/env ruby
+
+# k8s-deploy: Deploy application to Kubernetes with rolling updates
+#
+# Usage:
+#   k8s-deploy [--app APP] [--version VERSION] [--dry-run]
+#
+# Examples:
+#   k8s-deploy                                    # Deploy current app (inferred from directory)
+#   k8s-deploy --app platform                     # Deploy latest tag
+#   k8s-deploy --app platform --version v1.2.3   # Deploy specific version
+#
+# Prerequisites:
+#   - kubectl configured with cluster access
+#   - Docker image built and pushed (via k8s-build)
+#   - Secrets configured (via k8s-secrets)
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+
+SCRIPT_DIR = File.dirname(__FILE__)
+K8S_DIR = File.join(SCRIPT_DIR, '../k8s')
+
+# Kubernetes namespace
+K8S_NAMESPACE = args.namespace || 'bryzek-production'
+
+# Version - fetch latest tag if not specified
+version = args.version
+if version.nil? || version.empty?
+  version = AppConfig.latest_tag(args.app)
+  puts "Using latest tag: #{version}"
+end
+
+# Timeout defaults to 180 seconds (3 minutes)
+timeout = args.timeout || 180
+
+puts ""
+puts "=" * 60
+puts "Deploying to Kubernetes"
+puts "=" * 60
+puts "  App:       #{args.app}"
+puts "  Version:   #{version}"
+puts "  Namespace: #{K8S_NAMESPACE}"
+puts "  Dry Run:   #{args.dry_run ? 'Yes' : 'No'}"
+puts "=" * 60
+puts ""
+
+# Generate manifests
+puts "Generating Kubernetes manifests..."
+app_config_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
+template_file = File.join(K8S_DIR, 'templates', 'scala-play-app.pkl')
+manifest_file = "/tmp/#{args.app}-deploy-#{version}.yaml"
+
+unless File.exist?(app_config_file)
+  Util.exit_with_error("App config not found: #{app_config_file}")
+end
+
+unless File.exist?(template_file)
+  Util.exit_with_error("Template not found: #{template_file}")
+end
+
+# Read app config to get port
+config_output = `cd #{K8S_DIR} && pkl eval -f json apps/#{args.app}.pkl 2>/dev/null`
+config = JSON.parse(config_output) rescue {}
+app_port = config["appPort"] || 9000
+
+# Build env vars for template (NodePort is auto-assigned by K8s)
+env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{version}"
+env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE}" if args.namespace
+
+cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval templates/scala-play-app.pkl"
+manifest = `#{cmd} 2>&1`
+
+unless $?.success?
+  Util.exit_with_error("Error generating manifest:\n#{manifest}")
+end
+
+File.write(manifest_file, manifest)
+puts "Manifest written to: #{manifest_file}"
+puts ""
+
+if args.dry_run
+  puts "DRY RUN - Manifest contents:"
+  puts "-" * 60
+  puts manifest
+  puts "-" * 60
+  FileUtils.rm_f(manifest_file)
+  exit 0
+end
+
+# Check if namespace exists
+namespace_exists = system("kubectl get namespace #{K8S_NAMESPACE} > /dev/null 2>&1")
+unless namespace_exists
+  puts "Creating namespace: #{K8S_NAMESPACE}"
+  Util.run("kubectl create namespace #{K8S_NAMESPACE}")
+end
+
+# Apply manifests
+puts "Applying Kubernetes manifests..."
+Util.run("kubectl apply -f #{manifest_file}")
+
+puts ""
+puts "Manifests applied successfully!"
+
+puts ""
+puts "Waiting for rollouts to complete (in parallel)..."
+
+deployment_name = "#{args.app}-web"
+statefulset_name = "#{args.app}-job"
+
+# Run both rollouts in parallel using threads
+deployment_success = nil
+statefulset_success = nil
+
+threads = []
+
+threads << Thread.new do
+  puts "  Waiting for Deployment #{deployment_name}..."
+  deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+  if deployment_success
+    puts "  ✓ Deployment #{deployment_name} ready"
+  else
+    puts "  ✗ Deployment #{deployment_name} failed"
+  end
+end
+
+threads << Thread.new do
+  puts "  Waiting for StatefulSet #{statefulset_name}..."
+  statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+  if statefulset_success
+    puts "  ✓ StatefulSet #{statefulset_name} ready"
+  else
+    puts "  ✗ StatefulSet #{statefulset_name} failed"
+  end
+end
+
+# Wait for both threads to complete
+threads.each(&:join)
+
+if deployment_success && statefulset_success
+  puts ""
+  puts "=" * 60
+  puts "Deployment completed successfully!"
+  puts "=" * 60
+else
+  puts ""
+  puts "=" * 60
+  puts "WARNING: Rollout did not complete within timeout"
+  puts "=" * 60
+  puts ""
+
+  # Show pod status
+  puts "Pod Status:"
+  puts "-" * 60
+  system("kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app} -o wide")
+  puts ""
+
+  # Show recent events
+  puts "Recent Events:"
+  puts "-" * 60
+  system("kubectl get events -n #{K8S_NAMESPACE} --sort-by='.lastTimestamp' --field-selector involvedObject.name=#{deployment_name} 2>/dev/null | tail -10")
+  puts ""
+
+  # Show pod logs for any failing pods
+  puts "Checking for failing pods..."
+  failing_pods = `kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app} -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\\n"}{end}' 2>/dev/null`.strip.split("\n").reject(&:empty?)
+
+  failing_pods.each do |pod|
+    puts ""
+    puts "Logs from #{pod}:"
+    puts "-" * 40
+    system("kubectl logs -n #{K8S_NAMESPACE} #{pod} --tail=20 2>/dev/null || echo '  (no logs available)'")
+  end
+
+  puts ""
+  puts "Debug commands:"
+  puts "  kubectl describe pods -n #{K8S_NAMESPACE} -l app=#{args.app}"
+  puts "  kubectl logs -n #{K8S_NAMESPACE} -l app=#{args.app} --tail=50"
+  puts "  kubectl get events -n #{K8S_NAMESPACE} --sort-by='.lastTimestamp'"
+  puts "=" * 60
+  exit 1
+end
+
+# Show deployment status
+puts ""
+puts "Deployment Status:"
+puts "-" * 60
+system("kubectl get deployment #{args.app}-web -n #{K8S_NAMESPACE}")
+system("kubectl get statefulset #{args.app}-job -n #{K8S_NAMESPACE}")
+puts ""
+puts "Pods:"
+system("kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app}")
+
+# Clean up manifest file
+FileUtils.rm_f(manifest_file)
+
+puts ""
+puts "=" * 60
+puts "Deployment Summary"
+puts "=" * 60
+puts "  App:     #{args.app}"
+puts "  Version: #{version}"
+puts "  Status:  Deployed"
+puts ""
+puts "Useful commands:"
+puts "  kubectl logs -n #{K8S_NAMESPACE} -l app=#{args.app},tier=web -f"
+puts "  kubectl logs -n #{K8S_NAMESPACE} -l app=#{args.app},tier=job -f"
+puts "  kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app} -w"
+puts "=" * 60

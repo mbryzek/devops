@@ -1,0 +1,107 @@
+#!/usr/bin/env ruby
+# Configures HTTPS on Kubernetes LoadBalancer services
+# Works around DigitalOcean CCM race condition bug
+#
+# Usage: k8s-lb-configure --app platform --cert-id <cert-id>
+
+require 'json'
+require 'optparse'
+
+NAMESPACE = ENV['K8S_NAMESPACE'] || 'bryzek-production'
+
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: k8s-lb-configure --app APP --cert-id CERT_ID"
+  opts.on("--app APP", "Application name") { |v| options[:app] = v }
+  opts.on("--cert-id ID", "DigitalOcean certificate ID") { |v| options[:cert_id] = v }
+  opts.on("--wait SECONDS", Integer, "Wait time for LB to stabilize (default: 90)") { |v| options[:wait] = v }
+end.parse!
+
+raise "--app is required" unless options[:app]
+raise "--cert-id is required" unless options[:cert_id]
+
+app = options[:app]
+cert_id = options[:cert_id]
+wait_time = options[:wait] || 90
+lb_name = "#{app}-lb"
+svc_name = "#{app}-lb"
+
+puts "Configuring HTTPS for #{lb_name}..."
+
+# Get LB ID from K8s annotation
+puts "Getting LB ID from Kubernetes..."
+lb_id = nil
+30.times do
+  output = `kubectl get svc #{svc_name} -n #{NAMESPACE} -o jsonpath='{.metadata.annotations.kubernetes\\.digitalocean\\.com/load-balancer-id}' 2>/dev/null`.strip
+  if output && !output.empty?
+    lb_id = output
+    break
+  end
+  puts "  Waiting for LB to be created..."
+  sleep 5
+end
+
+raise "Failed to get LB ID from K8s service" unless lb_id
+puts "  LB ID: #{lb_id}"
+
+# Wait for LB to stabilize (avoid 403 race condition)
+puts "Waiting #{wait_time}s for LB to stabilize..."
+sleep wait_time
+
+# Get NodePorts from K8s service
+puts "Getting NodePorts..."
+http_nodeport = `kubectl get svc #{svc_name} -n #{NAMESPACE} -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}'`.strip
+https_nodeport = `kubectl get svc #{svc_name} -n #{NAMESPACE} -o jsonpath='{.spec.ports[?(@.name=="https")].nodePort}'`.strip
+
+raise "Failed to get NodePorts" if http_nodeport.empty? || https_nodeport.empty?
+puts "  HTTP NodePort: #{http_nodeport}, HTTPS NodePort: #{https_nodeport}"
+
+# Get droplet IDs
+puts "Getting droplet IDs..."
+droplet_ids = `doctl compute load-balancer get #{lb_id} --format DropletIDs --no-header`.strip
+
+if droplet_ids.empty?
+  # Fall back to getting K8s node droplet IDs
+  node_names = `kubectl get nodes -o jsonpath='{.items[*].metadata.name}'`.strip.split
+  droplet_ids = node_names.map do |name|
+    `doctl compute droplet list --format ID,Name --no-header | grep "#{name}" | awk '{print $1}'`.strip
+  end.join(',')
+end
+
+raise "Failed to get droplet IDs" if droplet_ids.empty?
+puts "  Droplet IDs: #{droplet_ids}"
+
+# Apply HTTPS configuration
+puts "Applying HTTPS configuration..."
+forwarding_rules = [
+  "entry_protocol:http,entry_port:80,target_protocol:http,target_port:#{http_nodeport}",
+  "entry_protocol:https,entry_port:443,target_protocol:http,target_port:#{https_nodeport},certificate_id:#{cert_id}"
+].join(' ')
+
+health_check = "protocol:http,port:#{http_nodeport},path:/_internal_/healthcheck,check_interval_seconds:10,response_timeout_seconds:5,healthy_threshold:2,unhealthy_threshold:3"
+
+cmd = [
+  "doctl compute load-balancer update #{lb_id}",
+  "--name #{lb_name}",
+  "--region nyc3",
+  "--droplet-ids #{droplet_ids}",
+  "--forwarding-rules \"#{forwarding_rules}\"",
+  "--health-check \"#{health_check}\"",
+  "--redirect-http-to-https",
+  "--disable-lets-encrypt-dns-records"
+].join(' ')
+
+puts "Running: #{cmd}"
+result = system(cmd)
+
+if result
+  puts "\n✓ HTTPS configured successfully for #{lb_name}"
+
+  # Get the LB IP
+  lb_ip = `doctl compute load-balancer get #{lb_id} --format IP --no-header`.strip
+  puts "  LB IP: #{lb_ip}"
+  puts "\nTest with: curl -k https://#{lb_ip}/_internal_/healthcheck"
+else
+  puts "\n✗ Failed to configure HTTPS"
+  exit 1
+end

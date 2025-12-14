@@ -1,0 +1,12 @@
+/// Platform application configuration
+/// Used by generate-k8s.rb to generate manifests from scala-play-app template
+///
+/// Load balancer managed via doctl:
+///   Name: platform-lb
+///   Certificate: idempotent-io-ssl-certificate (a8487391-c0d5-4a33-9ded-408fea25b075)
+///   Hostname: idempotent.io
+
+module platform
+
+appName = "platform"
+appPort = 9300

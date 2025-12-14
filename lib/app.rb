@@ -11,7 +11,7 @@ class App
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
     @hugo = json_data['hugo'] ? HugoConfig.new(json_data['hugo']) : nil
-    @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['flutter']) : nil
+    @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['sveltekit']) : nil
   end
 end
 
@@ -64,10 +64,24 @@ class MemoryConfig
 end
 
 class ScalaEnvironment
-  attr_accessor :database
+  attr_accessor :database, :nodes
 
   def initialize(json_data)
     @database = Database.new(json_data['database'])
+    @nodes = (json_data['nodes'] || []).map { |n| ConfigNode.new(n) }
+  end
+end
+
+class ConfigNode
+  attr_accessor :uri
+
+  def initialize(json_data)
+    @uri = json_data['uri']
+    @is_job_server = json_data['isJobServer'] || false
+  end
+
+  def job_server?
+    @is_job_server
   end
 end
 

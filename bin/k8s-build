@@ -1,0 +1,167 @@
+#!/usr/bin/env ruby
+
+# Builds a Docker image for a Scala Play application for k8s deployment.
+#
+# This script:
+#   1. Runs sbt dist to build the application
+#   2. Generates a Dockerfile from the scala-play template
+#   3. Extracts the distribution to dist/
+#   4. Builds the Docker image
+#
+# Usage: k8s-build --app <app-name> [--tag <version>]
+#
+# If --tag is not specified, fetches the latest tag from the app's git repo.
+#
+# Examples:
+#   k8s-build --app platform
+#   k8s-build --app platform --tag 0.1.0
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+require 'fileutils'
+
+DEVOPS_DIR = File.expand_path(File.join(File.dirname(__FILE__), '..'))
+TEMPLATE_PATH = File.join(DEVOPS_DIR, 'templates/Dockerfile.scala-play')
+REGISTRY = "registry.digitalocean.com/bryzek"
+TMP_DIR = "/tmp/k8s-build"
+
+class K8sBuild
+  attr_reader :app, :tag, :config
+
+  def initialize(args)
+    @app = args.app
+    @tag = args.tag
+    if @tag.nil? || @tag.empty?
+      @tag = Tag.ask
+    end
+    @config = Config.load(@app)
+
+    if @config.scala.nil?
+      Util.exit_with_error("App #{@app} does not have a scala config")
+    end
+  end
+
+  def run
+    validate_environment
+    check_existing_image
+
+    unless @skip_build
+      build_sbt_dist
+      generate_dockerfile
+      extract_distribution
+      build_docker_image
+    end
+
+    push_docker_image
+
+    puts ""
+    puts "Docker image pushed: #{image_name}"
+    puts ""
+  end
+
+  private
+
+  def validate_environment
+    Util.assert_installed("docker")
+    Util.assert_installed("sbt")
+
+    if !File.exist?(TEMPLATE_PATH)
+      Util.exit_with_error("Dockerfile template not found: #{TEMPLATE_PATH}")
+    end
+
+    if !File.exist?("build.sbt")
+      Util.exit_with_error("Must run k8s-build from project root (no build.sbt found)")
+    end
+  end
+
+  def check_existing_image
+    existing_image = `docker images -q #{image_name} 2>/dev/null`.strip
+    if !existing_image.empty?
+      puts ""
+      puts "Found existing docker image: #{image_name}"
+      if !Ask.for_boolean("Rebuild? (y/n)")
+        puts "Using existing image"
+        @skip_build = true
+      end
+    end
+  end
+
+  def build_sbt_dist
+    puts ""
+    puts Util.underline("Building sbt distribution")
+    Util.run("sbt dist")
+  end
+
+  def generate_dockerfile
+    puts ""
+    puts Util.underline("Generating Dockerfile")
+
+    template = IO.read(TEMPLATE_PATH)
+    dockerfile = template
+      .gsub('{{APP_PORT}}', @config.port.to_s)
+      .gsub('{{ARTIFACT}}', @config.scala.dist_run_script_name)
+
+    if dockerfile.include?('{{')
+      Util.exit_with_error("Template substitution failed - placeholders remain in Dockerfile")
+    end
+
+    FileUtils.mkdir_p(TMP_DIR)
+    @dockerfile_path = File.join(TMP_DIR, "Dockerfile.#{@app}")
+    File.open(@dockerfile_path, 'w') { |f| f.write(dockerfile) }
+    puts "Generated #{@dockerfile_path} with PORT=#{@config.port}, ARTIFACT=#{@config.scala.dist_run_script_name}"
+  end
+
+  def extract_distribution
+    puts ""
+    puts Util.underline("Extracting distribution")
+
+    artifact = @config.scala.artifact_name
+    sbt_dist_dir = "#{artifact}/target/universal"
+
+    if !File.directory?(sbt_dist_dir)
+      Util.exit_with_error("Cannot find sbt dist output. Expected at: #{sbt_dist_dir}")
+    end
+
+    zip_file = Dir.glob("#{sbt_dist_dir}/*.zip").first
+    if zip_file.nil?
+      Util.exit_with_error("Cannot find zip file in #{sbt_dist_dir}")
+    end
+
+    # Clean up existing dist directory
+    Util.run("rm -rf dist")
+    Util.run("mkdir -p dist")
+
+    # Extract and flatten
+    Util.run("unzip -q #{zip_file} -d dist")
+
+    # Move contents up one level (sbt creates a nested directory)
+    nested_dir = Dir.glob("dist/*/").first
+    if nested_dir
+      Util.run("mv #{nested_dir}* dist/")
+      Util.run("rmdir #{nested_dir}")
+    end
+
+    # Remove Windows batch files
+    Util.run("rm -f dist/bin/*.bat")
+
+    puts "Distribution extracted to dist/"
+  end
+
+  def build_docker_image
+    puts ""
+    puts Util.underline("Building Docker image")
+    Util.run("docker build --platform linux/amd64 -f #{@dockerfile_path} -t #{image_name} .")
+  end
+
+  def push_docker_image
+    puts ""
+    puts Util.underline("Pushing Docker image")
+    Util.run("docker push #{image_name}")
+  end
+
+  def image_name
+    "#{REGISTRY}/#{@app}:#{@tag}"
+  end
+end
+
+args = Args.parse(ARGV, ["app"])
+K8sBuild.new(args).run

@@ -1,0 +1,331 @@
+/// Generic Kubernetes resources for Scala Play Framework applications
+/// Generates Deployment, StatefulSet, Service, and PodDisruptionBudget manifests
+///
+/// Load balancer is managed separately via doctl (not K8s) due to DO CCM issues.
+/// See bin/k8s-lb-create for creating load balancers after deployment.
+///
+/// Required environment variables:
+///   - APP: Application name (e.g., "platform", "acumen")
+///   - PORT: Application port (e.g., 9300)
+///   - VERSION: Docker image version (e.g., "0.1.0")
+///
+/// Optional environment variables:
+///   - K8S_NAMESPACE: Kubernetes namespace (default: "bryzek-production")
+///   - WEB_REPLICAS: Number of web replicas (default: 2)
+///   - JOB_REPLICAS: Number of job replicas (default: 1)
+
+module scalaPlayApp
+
+import "@k8s/K8sResource.pkl"
+import "@k8s/api/apps/v1/Deployment.pkl"
+import "@k8s/api/apps/v1/StatefulSet.pkl"
+import "@k8s/api/core/v1/Service.pkl"
+import "@k8s/api/policy/v1/PodDisruptionBudget.pkl"
+
+// Required configuration
+local appName = read?("env:APP") ?? throw("APP environment variable is required")
+local appPort = (read?("env:PORT") ?? throw("PORT environment variable is required")).toInt()
+
+// Optional configuration with defaults
+local k8sNamespace = read?("env:K8S_NAMESPACE") ?? "bryzek-production"
+local registry = "registry.digitalocean.com/bryzek"
+local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
+local webReplicas = (read?("env:WEB_REPLICAS") ?? "1").toInt()
+local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
+
+// Resource configuration
+local memoryDefault = "400Mi"
+local memoryJobServer = "700Mi"
+local memoryLimit = "400Mi"
+local memoryLimitJobServer = "700Mi"
+local cpuLimit = "1000m"
+local cpuLimitJobServer = "2000m"
+
+// ImagePullPolicy: IfNotPresent since we require explicit versions
+local pullPolicy = "IfNotPresent"
+
+local commonLabels: Mapping<String, String> = new {
+  ["app"] = appName
+  ["app.kubernetes.io/name"] = appName
+  ["app.kubernetes.io/version"] = version
+}
+
+local webLabels: Mapping<String, String> = new {
+  ["app"] = appName
+  ["app.kubernetes.io/name"] = appName
+  ["app.kubernetes.io/version"] = version
+  ["tier"] = "web"
+}
+
+local jobLabels: Mapping<String, String> = new {
+  ["app"] = appName
+  ["app.kubernetes.io/name"] = appName
+  ["app.kubernetes.io/version"] = version
+  ["tier"] = "job"
+}
+
+resources: Listing<K8sResource> = new {
+  // Web Deployment - serves HTTP traffic
+  new Deployment {
+    metadata {
+      name = "\(appName)-web"
+      namespace = k8sNamespace
+      labels = commonLabels
+    }
+    spec {
+      replicas = webReplicas
+      selector {
+        matchLabels = new {
+          ["app"] = appName
+          ["tier"] = "web"
+        }
+      }
+      strategy {
+        type = "RollingUpdate"
+        rollingUpdate {
+          maxUnavailable = 0
+          maxSurge = 1
+        }
+      }
+      template {
+        metadata {
+          labels = webLabels
+        }
+        spec {
+          containers = new {
+            new {
+              name = appName
+              image = "\(registry)/\(appName):\(version)"
+              imagePullPolicy = pullPolicy
+              env = new {
+                new {
+                  name = "JAVA_OPTS"
+                  value = "-Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                }
+              }
+              ports = new {
+                new {
+                  containerPort = appPort
+                  protocol = "TCP"
+                }
+              }
+              readinessProbe {
+                httpGet {
+                  path = "/_internal_/healthcheck"
+                  port = appPort
+                }
+                initialDelaySeconds = 10
+                periodSeconds = 5
+                failureThreshold = 3
+                timeoutSeconds = 5
+              }
+              livenessProbe {
+                httpGet {
+                  path = "/_internal_/healthcheck"
+                  port = appPort
+                }
+                initialDelaySeconds = 30
+                periodSeconds = 10
+                failureThreshold = 5
+                timeoutSeconds = 5
+              }
+              resources {
+                requests {
+                  ["memory"] = memoryDefault
+                  ["cpu"] = "100m"
+                }
+                limits {
+                  ["memory"] = memoryLimit
+                  ["cpu"] = cpuLimit
+                }
+              }
+              envFrom = new {
+                new {
+                  secretRef {
+                    name = "\(appName)-secrets"
+                  }
+                }
+                new {
+                  configMapRef {
+                    name = "\(appName)-config"
+                  }
+                }
+              }
+              securityContext {
+                allowPrivilegeEscalation = false
+                runAsNonRoot = true
+                runAsUser = 1000
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Job Server StatefulSet - handles async job processing
+  new StatefulSet {
+    metadata {
+      name = "\(appName)-job"
+      namespace = k8sNamespace
+      labels = jobLabels
+    }
+    spec {
+      serviceName = "\(appName)-job"
+      replicas = jobReplicas
+      selector {
+        matchLabels = new {
+          ["app"] = appName
+          ["tier"] = "job"
+        }
+      }
+      template {
+        metadata {
+          labels = jobLabels
+        }
+        spec {
+          containers = new {
+            new {
+              name = "\(appName)-job"
+              image = "\(registry)/\(appName):\(version)"
+              imagePullPolicy = pullPolicy
+              env = new {
+                new {
+                  name = "JAVA_OPTS"
+                  value = "-Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                }
+              }
+              ports = new {
+                new {
+                  containerPort = appPort
+                  protocol = "TCP"
+                }
+              }
+              readinessProbe {
+                httpGet {
+                  path = "/_internal_/healthcheck"
+                  port = appPort
+                }
+                initialDelaySeconds = 15
+                periodSeconds = 10
+                failureThreshold = 3
+                timeoutSeconds = 5
+              }
+              livenessProbe {
+                httpGet {
+                  path = "/_internal_/healthcheck"
+                  port = appPort
+                }
+                initialDelaySeconds = 45
+                periodSeconds = 15
+                failureThreshold = 5
+                timeoutSeconds = 5
+              }
+              resources {
+                requests {
+                  ["memory"] = memoryJobServer
+                  ["cpu"] = "100m"
+                }
+                limits {
+                  ["memory"] = memoryLimitJobServer
+                  ["cpu"] = cpuLimitJobServer
+                }
+              }
+              envFrom = new {
+                new {
+                  secretRef {
+                    name = "\(appName)-secrets"
+                  }
+                }
+                new {
+                  configMapRef {
+                    name = "\(appName)-config"
+                  }
+                }
+              }
+              securityContext {
+                allowPrivilegeEscalation = false
+                runAsNonRoot = true
+                runAsUser = 1000
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Web Service - NodePort service for external load balancer routing
+  // Load balancer is created separately via doctl (see bin/k8s-lb-create)
+  new Service {
+    metadata {
+      name = "\(appName)-web"
+      namespace = k8sNamespace
+      labels = commonLabels
+    }
+    spec {
+      selector = new {
+        ["app"] = appName
+        ["tier"] = "web"
+      }
+      ports = new {
+        new {
+          name = "http"
+          port = 80
+          targetPort = appPort
+          protocol = "TCP"
+        }
+      }
+      type = "NodePort"
+    }
+  }
+
+  // Job Service - headless service for StatefulSet
+  new Service {
+    metadata {
+      name = "\(appName)-job"
+      namespace = k8sNamespace
+      labels = jobLabels
+    }
+    spec {
+      selector = new {
+        ["app"] = appName
+        ["tier"] = "job"
+      }
+      ports = new {
+        new {
+          name = "http"
+          port = appPort
+          targetPort = appPort
+          protocol = "TCP"
+        }
+      }
+      clusterIP = "None"
+    }
+  }
+
+  // Pod Disruption Budget - ensures high availability during node maintenance
+  new PodDisruptionBudget {
+    metadata {
+      name = "\(appName)-pdb"
+      namespace = k8sNamespace
+      labels = commonLabels
+    }
+    spec {
+      minAvailable = 1
+      selector {
+        matchLabels = new {
+          ["app"] = appName
+          ["tier"] = "web"
+        }
+      }
+    }
+  }
+}
+
+output {
+  renderer = new YamlRenderer {
+    isStream = true
+  }
+  value = resources
+}
