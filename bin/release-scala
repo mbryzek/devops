@@ -1,0 +1,34 @@
+#!/usr/bin/env ruby
+
+# Releases a Scala application to Kubernetes.
+# Builds Docker image and deploys to K8s cluster.
+#
+# Usage: release-scala --app <app_name>
+
+require_relative '../lib/common'
+
+args = Args.parse(ARGV, ["app"])
+app = args.app
+
+# Get version tag
+version = Tag.ask
+
+puts ""
+puts Util.underline("Releasing #{app} version #{version}")
+puts ""
+
+# Build Docker image
+puts "Building Docker image..."
+build_cmd = File.join(__dir__, "k8s-build") + " --app #{app} --version #{version}"
+Util.run(build_cmd)
+
+puts ""
+
+# Deploy to Kubernetes
+puts "Deploying to Kubernetes..."
+deploy_cmd = File.join(__dir__, "k8s-deploy") + " --app #{app} --version #{version}"
+Util.run(deploy_cmd)
+
+puts ""
+puts "Release complete: #{app} #{version}"
+puts ""
