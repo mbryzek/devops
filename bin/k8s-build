@@ -143,15 +143,6 @@ class K8sBuild
     # Remove Windows batch files
     Util.run("rm -f dist/bin/*.bat")
 
-    # Validate expected structure
-    expected_bin = "dist/bin/#{@config.scala.artifact_name}"
-    if !File.exist?(expected_bin)
-      Util.exit_with_error(
-        "Expected bin script not found: #{expected_bin}. " +
-        "Verify artifactName in config matches sbt project."
-      )
-    end
-
     puts "Distribution extracted to dist/"
   end
 
