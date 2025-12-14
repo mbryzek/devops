@@ -29,6 +29,7 @@ local registry = "registry.digitalocean.com/bryzek"
 local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "2").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
+local appNodePort = (read?("env:NODE_PORT") ?? throw("NODE_PORT environment variable is required")).toInt()
 
 // Resource configuration
 local memoryDefault = "700Mi"
@@ -252,7 +253,7 @@ resources: Listing<K8sResource> = new {
     }
   }
 
-  // Web Service - exposes web deployment to ingress/load balancer
+  // Web Service - exposes web deployment via NodePort for external load balancer
   new Service {
     metadata {
       name = "\(appName)-web"
@@ -269,10 +270,11 @@ resources: Listing<K8sResource> = new {
           name = "http"
           port = 80
           targetPort = appPort
+          nodePort = appNodePort
           protocol = "TCP"
         }
       }
-      type = "ClusterIP"
+      type = "NodePort"
     }
   }
 

@@ -5,3 +5,4 @@ module platform
 
 appName = "platform"
 appPort = 9300
+nodePort = 30100

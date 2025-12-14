@@ -5,3 +5,4 @@ module acumen
 
 appName = "acumen"
 appPort = 9200
+nodePort = 30200
