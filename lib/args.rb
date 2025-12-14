@@ -176,8 +176,8 @@ class Args
             end
 
             # k8s-specific arguments
-            opts.on("--version VERSION", "Specify version/tag for Docker images") do |version|
-                av.add("version", version)
+            opts.on("--tag TAG", "Specify tag for Docker images") do |tag|
+                av.add("tag", tag)
             end
 
             opts.on("--push", "Push image to registry after building") do

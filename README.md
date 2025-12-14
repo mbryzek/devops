@@ -6,10 +6,10 @@ We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configura
 
 ```
 # Build Docker image and push to registry
-./bin/k8s-build --app platform --version 0.1.4
+./bin/k8s-build --app platform --tag 0.1.4
 
 # Deploy to Kubernetes
-./bin/k8s-deploy --app platform --version 0.1.4
+./bin/k8s-deploy --app platform --tag 0.1.4
 ```
 
 ## Measure uptime

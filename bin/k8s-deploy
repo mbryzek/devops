@@ -3,12 +3,12 @@
 # k8s-deploy: Deploy application to Kubernetes with rolling updates
 #
 # Usage:
-#   k8s-deploy [--app APP] [--version VERSION] [--dry-run]
+#   k8s-deploy [--app APP] [--tag TAG] [--dry-run]
 #
 # Examples:
-#   k8s-deploy                                    # Deploy current app (inferred from directory)
-#   k8s-deploy --app platform                     # Deploy latest tag
-#   k8s-deploy --app platform --version v1.2.3   # Deploy specific version
+#   k8s-deploy                                 # Deploy current app (inferred from directory)
+#   k8s-deploy --app platform                  # Deploy latest tag
+#   k8s-deploy --app platform --tag v1.2.3    # Deploy specific tag
 #
 # Prerequisites:
 #   - kubectl configured with cluster access
@@ -25,11 +25,11 @@ K8S_DIR = File.join(SCRIPT_DIR, '../k8s')
 # Kubernetes namespace
 K8S_NAMESPACE = args.namespace || 'bryzek-production'
 
-# Version - fetch latest tag if not specified
-version = args.version
-if version.nil? || version.empty?
-  version = AppConfig.latest_tag(args.app)
-  puts "Using latest tag: #{version}"
+# Tag - fetch latest tag if not specified
+tag = args.tag
+if tag.nil? || tag.empty?
+  tag = AppConfig.latest_tag(args.app)
+  puts "Using latest tag: #{tag}"
 end
 
 # Timeout defaults to 180 seconds (3 minutes)
@@ -40,7 +40,7 @@ puts "=" * 60
 puts "Deploying to Kubernetes"
 puts "=" * 60
 puts "  App:       #{args.app}"
-puts "  Version:   #{version}"
+puts "  Tag:       #{tag}"
 puts "  Namespace: #{K8S_NAMESPACE}"
 puts "  Dry Run:   #{args.dry_run ? 'Yes' : 'No'}"
 puts "=" * 60
@@ -50,7 +50,7 @@ puts ""
 puts "Generating Kubernetes manifests..."
 app_config_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
 template_file = File.join(K8S_DIR, 'templates', 'scala-play-app.pkl')
-manifest_file = "/tmp/#{args.app}-deploy-#{version}.yaml"
+manifest_file = "/tmp/#{args.app}-deploy-#{tag}.yaml"
 
 unless File.exist?(app_config_file)
   Util.exit_with_error("App config not found: #{app_config_file}")
@@ -66,7 +66,7 @@ config = JSON.parse(config_output) rescue {}
 app_port = config["appPort"] || 9000
 
 # Build env vars for template (NodePort is auto-assigned by K8s)
-env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{version}"
+env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{tag}"
 env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE}" if args.namespace
 
 cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval templates/scala-play-app.pkl"
@@ -199,9 +199,9 @@ puts ""
 puts "=" * 60
 puts "Deployment Summary"
 puts "=" * 60
-puts "  App:     #{args.app}"
-puts "  Version: #{version}"
-puts "  Status:  Deployed"
+puts "  App:    #{args.app}"
+puts "  Tag:    #{tag}"
+puts "  Status: Deployed"
 puts ""
 puts "Useful commands:"
 puts "  kubectl logs -n #{K8S_NAMESPACE} -l app=#{args.app},tier=web -f"

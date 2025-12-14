@@ -26,7 +26,7 @@ puts ""
 
 # Deploy to Kubernetes
 puts "Deploying to Kubernetes..."
-deploy_cmd = File.join(__dir__, "k8s-deploy") + " --app #{app} --version #{version}"
+deploy_cmd = File.join(__dir__, "k8s-deploy") + " --app #{app} --tag #{version}"
 Util.run(deploy_cmd)
 
 puts ""
