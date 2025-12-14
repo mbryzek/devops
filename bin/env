@@ -1,21 +1,19 @@
 #!/usr/bin/env ruby
 
+# Generates environment variables for running scala applications locally.
+# Used with eval to set environment variables for sbt.
+#
+# Usage:
+#   eval "$(~/code/devops/bin/env --app platform --env development --format sh)"
+#   sbt run
+#
+# Or combined:
+#   eval "$(~/code/devops/bin/env --app platform --env development --format sh) sbt run"
+
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
 args = Args.parse(ARGV, ["app"])
 format = args.format || 'sh'
-config = Config.load(args.app)
-scala_config = config.scala
-if scala_config.nil?
-  Util.exit_with_error("App #{args.app} does not have a scala config")
-end
 
-file = args.file
 vars = EnvironmentVariables.load(args.app, args.env)
-
-# Get nodes from environment config
-scala_env = scala_config.send(args.env)
-nodes = scala_env.nodes
-
-all = RunScript.new(config, file, vars, nodes, 0).vars
-puts all.serialize(format)
+puts vars.serialize(format)
