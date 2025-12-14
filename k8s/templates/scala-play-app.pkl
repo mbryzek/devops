@@ -156,8 +156,16 @@ resources: Listing<K8sResource> = new {
                 runAsNonRoot = true
                 runAsUser = 1000
               }
+              lifecycle {
+                preStop {
+                  exec {
+                    command = new { "/bin/sh"; "-c"; "sleep 5" }
+                  }
+                }
+              }
             }
           }
+          terminationGracePeriodSeconds = 30
         }
       }
     }
@@ -248,8 +256,16 @@ resources: Listing<K8sResource> = new {
                 runAsNonRoot = true
                 runAsUser = 1000
               }
+              lifecycle {
+                preStop {
+                  exec {
+                    command = new { "/bin/sh"; "-c"; "sleep 5" }
+                  }
+                }
+              }
             }
           }
+          terminationGracePeriodSeconds = 30
         }
       }
     }
