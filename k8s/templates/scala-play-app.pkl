@@ -31,10 +31,10 @@ local webReplicas = (read?("env:WEB_REPLICAS") ?? "2").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
 // Resource configuration
-local memoryDefault = "700Mi"
-local memoryJobServer = "1400Mi"
-local memoryLimit = "700Mi"
-local memoryLimitJobServer = "1400Mi"
+local memoryDefault = "512Mi"
+local memoryJobServer = "1000Mi"
+local memoryLimit = "512Mi"
+local memoryLimitJobServer = "1000Mi"
 local cpuLimit = "1000m"
 local cpuLimitJobServer = "2000m"
 
