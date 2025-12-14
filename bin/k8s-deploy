@@ -32,8 +32,8 @@ if version.nil? || version.empty?
   puts "Using latest tag: #{version}"
 end
 
-# Timeout defaults to 600 seconds
-timeout = args.timeout || 600
+# Timeout defaults to 180 seconds (3 minutes)
+timeout = args.timeout || 180
 
 puts ""
 puts "=" * 60
@@ -104,17 +104,39 @@ puts ""
 puts "Manifests applied successfully!"
 
 puts ""
-puts "Waiting for rollout to complete..."
+puts "Waiting for rollouts to complete (in parallel)..."
 
-# Wait for Deployment rollout
 deployment_name = "#{args.app}-web"
-puts "  Waiting for Deployment #{deployment_name}..."
-deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-
-# Wait for StatefulSet rollout
 statefulset_name = "#{args.app}-job"
-puts "  Waiting for StatefulSet #{statefulset_name}..."
-statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+
+# Run both rollouts in parallel using threads
+deployment_success = nil
+statefulset_success = nil
+
+threads = []
+
+threads << Thread.new do
+  puts "  Waiting for Deployment #{deployment_name}..."
+  deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+  if deployment_success
+    puts "  ✓ Deployment #{deployment_name} ready"
+  else
+    puts "  ✗ Deployment #{deployment_name} failed"
+  end
+end
+
+threads << Thread.new do
+  puts "  Waiting for StatefulSet #{statefulset_name}..."
+  statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+  if statefulset_success
+    puts "  ✓ StatefulSet #{statefulset_name} ready"
+  else
+    puts "  ✗ StatefulSet #{statefulset_name} failed"
+  end
+end
+
+# Wait for both threads to complete
+threads.each(&:join)
 
 if deployment_success && statefulset_success
   puts ""
@@ -125,10 +147,37 @@ else
   puts ""
   puts "=" * 60
   puts "WARNING: Rollout did not complete within timeout"
+  puts "=" * 60
   puts ""
-  puts "Check status:"
-  puts "  kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app}"
-  puts "  kubectl describe deployment #{deployment_name} -n #{K8S_NAMESPACE}"
+
+  # Show pod status
+  puts "Pod Status:"
+  puts "-" * 60
+  system("kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app} -o wide")
+  puts ""
+
+  # Show recent events
+  puts "Recent Events:"
+  puts "-" * 60
+  system("kubectl get events -n #{K8S_NAMESPACE} --sort-by='.lastTimestamp' --field-selector involvedObject.name=#{deployment_name} 2>/dev/null | tail -10")
+  puts ""
+
+  # Show pod logs for any failing pods
+  puts "Checking for failing pods..."
+  failing_pods = `kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app} -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\\n"}{end}' 2>/dev/null`.strip.split("\n").reject(&:empty?)
+
+  failing_pods.each do |pod|
+    puts ""
+    puts "Logs from #{pod}:"
+    puts "-" * 40
+    system("kubectl logs -n #{K8S_NAMESPACE} #{pod} --tail=20 2>/dev/null || echo '  (no logs available)'")
+  end
+
+  puts ""
+  puts "Debug commands:"
+  puts "  kubectl describe pods -n #{K8S_NAMESPACE} -l app=#{args.app}"
+  puts "  kubectl logs -n #{K8S_NAMESPACE} -l app=#{args.app} --tail=50"
+  puts "  kubectl get events -n #{K8S_NAMESPACE} --sort-by='.lastTimestamp'"
   puts "=" * 60
   exit 1
 end

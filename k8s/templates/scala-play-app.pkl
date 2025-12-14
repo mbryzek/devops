@@ -28,7 +28,7 @@ local k8sNamespace = read?("env:K8S_NAMESPACE") ?? "bryzek-production"
 local registry = "registry.digitalocean.com/bryzek"
 local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "2").toInt()
-local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
+local jobReplicas = (read?("env:JOB_REPLICAS") ?? "0").toInt()
 
 // Resource configuration
 local memoryDefault = "512Mi"

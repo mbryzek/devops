@@ -37,12 +37,8 @@ Deployment Workflow (New)
  source apps/platform/env/common.env
  source apps/platform/env/development.env
 
- # Run migrations locally
- cd ~/code/platform-postgresql && ./dev.rb
+kubectl get nodes
 
- # Run app
- cd ~/code/platform && sbt run
- 
 # Debugging Commands
 kubectl get pods -n bryzek-production -l app=platform
 kubectl describe deployment platform-web -n bryzek-production | tail -30
