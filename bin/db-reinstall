@@ -20,6 +20,13 @@ if !File.exist?(install_script)
   Util.exit_with_error("No install script found for #{args.app}. Expected at #{install_script}")
 end
 
+dev_script = File.join(`pwd`.strip, "dev.rb")
+if !File.exist?(dev_script)
+  Util.exit_with_error("No dev script found for #{args.app}. Expected at #{dev_script}")
+end
+
+post_reinstall_script = File.join(`pwd`.strip, "post-reinstall.sql")
+
 puts ""
 puts "Reinstalling #{dbname} database"
 puts ""
@@ -55,6 +62,19 @@ else
   end
 
   Util.run("psql -U api -f #{file} #{dbname}")
+end
+
+puts ""
+if Ask.for_boolean("Run local migrations?")
+  puts ""
+  puts "Running #{dev_script}"
+  Util.run(dev_script)
+end
+
+if File.exist?(post_reinstall_script)
+  puts ""
+  puts "Applying post-reinstall script #{post_reinstall_script}"
+  Util.run("psql -U api -f #{post_reinstall_script} #{dbname}")
 end
 
 puts ""
