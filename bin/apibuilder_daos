@@ -60,6 +60,6 @@ filtered = if args.app
 upload(args, filtered)
 
 if !args.no_download
-  generate_code(organization, "psql_scala", "./generated/app/db", filtered, args.profile)
+  generate_code(organization, "psql_scala", "./generated/app", filtered, args.profile)
   generate_code(organization, "psql_ddl", "./dao/psql", filtered, args.profile)
 end
