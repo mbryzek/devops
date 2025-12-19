@@ -33,13 +33,15 @@ local version = read?("env:VERSION") ?? throw("VERSION environment variable is r
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "1").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
-// Resource configuration
-local memoryDefault = "600Mi"
-local memoryJobServer = "1100Mi"
-local memoryLimit = "600Mi"
-local memoryLimitJobServer = "1100Mi"
-local cpuLimit = "1000m"
-local cpuLimitJobServer = "2000m"
+// Resource configuration - sized for dedicated node pools
+// Web nodes: s-1vcpu-2gb (2GB RAM, ~1464Mi allocatable, ~500Mi for kube-system)
+// Job nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
+local memoryDefault = "900Mi"
+local memoryJobServer = "2400Mi"
+local memoryLimit = "900Mi"
+local memoryLimitJobServer = "2400Mi"
+local cpuLimit = "900m"
+local cpuLimitJobServer = "1800m"
 
 // ImagePullPolicy: IfNotPresent since we require explicit versions
 local pullPolicy = "IfNotPresent"
@@ -92,9 +94,12 @@ resources: Listing<K8sResource> = new {
           labels = webLabels
         }
         spec {
+          nodeSelector = new {
+            ["tier"] = "web"
+          }
           affinity {
             podAntiAffinity {
-              // Web pods should avoid nodes with same-app job pods
+              // Web pods should spread across web nodes
               preferredDuringSchedulingIgnoredDuringExecution = new {
                 new {
                   weight = 100
@@ -102,7 +107,7 @@ resources: Listing<K8sResource> = new {
                     labelSelector {
                       matchLabels = new {
                         ["app"] = appName
-                        ["tier"] = "job"
+                        ["tier"] = "web"
                       }
                     }
                     topologyKey = "kubernetes.io/hostname"
@@ -211,6 +216,9 @@ resources: Listing<K8sResource> = new {
           labels = jobLabels
         }
         spec {
+          nodeSelector = new {
+            ["tier"] = "job"
+          }
           affinity {
             podAntiAffinity {
               // Job pods must not share a node with other job pods
