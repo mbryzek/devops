@@ -82,12 +82,10 @@ resources: Listing<K8sResource> = new {
           ["tier"] = "web"
         }
       }
+      // Use Recreate strategy since job server maintains uptime during deployment.
+      // This avoids scheduling conflicts when web node can only run 1 pod.
       strategy {
-        type = "RollingUpdate"
-        rollingUpdate {
-          maxUnavailable = 0
-          maxSurge = 1
-        }
+        type = "Recreate"
       }
       template {
         metadata {
