@@ -96,47 +96,56 @@ unless namespace_exists
   Util.run("kubectl create namespace #{K8S_NAMESPACE}")
 end
 
-# Apply manifests
-puts "Applying Kubernetes manifests..."
-Util.run("kubectl apply -f #{manifest_file}")
-
-puts ""
-puts "Manifests applied successfully!"
-
-puts ""
-puts "Waiting for rollouts to complete (in parallel)..."
-
 deployment_name = "#{args.app}-web"
 statefulset_name = "#{args.app}-job"
 
-# Run both rollouts in parallel using threads
+# Deploy resources sequentially for zero-downtime:
+# 1. Services and PDBs (non-disruptive)
+# 2. Deployment (web) - old job server handles traffic during Recreate
+# 3. StatefulSet (job) - deployed last after web is ready
+#
+# The service routes to both web and job pods (selector: app=platform),
+# so the OLD job server handles traffic while web is being recreated.
+puts "Deploying resources sequentially for zero-downtime..."
+puts "  Note: Web deploys first (old job handles traffic), then job deploys last"
+puts ""
+
 deployment_success = nil
 statefulset_success = nil
 
-threads = []
+# Step 1: Apply Services and PodDisruptionBudget (non-disruptive)
+puts "  [1/3] Applying Services and PodDisruptionBudget..."
+services_output = `kubectl apply -f #{manifest_file} 2>&1 | grep -E '^(service|poddisruptionbudget)'`
+puts services_output unless services_output.empty?
+puts "  ✓ Services and PDB applied"
 
-threads << Thread.new do
-  puts "  Waiting for Deployment #{deployment_name}..."
-  deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-  if deployment_success
-    puts "  ✓ Deployment #{deployment_name} ready"
-  else
-    puts "  ✗ Deployment #{deployment_name} failed"
-  end
+# Step 2: Apply Deployment and wait for it to be ready (old job handles traffic)
+puts ""
+puts "  [2/3] Applying and waiting for Deployment #{deployment_name}..."
+Util.run("kubectl apply -f #{manifest_file} -l tier=web")
+deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+if deployment_success
+  puts "  ✓ Deployment #{deployment_name} ready"
+else
+  puts "  ✗ Deployment #{deployment_name} failed"
 end
 
-threads << Thread.new do
-  puts "  Waiting for StatefulSet #{statefulset_name}..."
+# Step 3: Apply StatefulSet last, after web is ready
+if deployment_success
+  puts ""
+  puts "  [3/3] Applying and waiting for StatefulSet #{statefulset_name}..."
+  Util.run("kubectl apply -f #{manifest_file} -l tier=job")
   statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
   if statefulset_success
     puts "  ✓ StatefulSet #{statefulset_name} ready"
   else
     puts "  ✗ StatefulSet #{statefulset_name} failed"
   end
+else
+  puts ""
+  puts "  Skipping StatefulSet - Deployment failed"
+  statefulset_success = false
 end
-
-# Wait for both threads to complete
-threads.each(&:join)
 
 if deployment_success && statefulset_success
   puts ""
