@@ -101,27 +101,51 @@ statefulset_name = "#{args.app}-job"
 
 # Deploy resources sequentially for zero-downtime:
 # 1. Services and PDBs (non-disruptive)
-# 2. Deployment (web) - old job server handles traffic during Recreate
-# 3. StatefulSet (job) - deployed last after web is ready
+# 2. Verify job pod is ready and in endpoints (pre-flight check)
+# 3. Deployment (web) - job handles traffic during Recreate
+# 4. StatefulSet (job) - deployed last after web is ready
 #
-# The service routes to both web and job pods (selector: app=platform),
-# so the OLD job server handles traffic while web is being recreated.
+# The service routes to both web and job pods (selector: app=appname),
+# so the EXISTING job server handles traffic while web is being recreated.
 puts "Deploying resources sequentially for zero-downtime..."
-puts "  Note: Web deploys first (old job handles traffic), then job deploys last"
+puts "  Note: Verify job ready, then web deploys (job handles traffic), then job updates"
 puts ""
 
-deployment_success = nil
 statefulset_success = nil
+deployment_success = nil
 
 # Step 1: Apply Services and PodDisruptionBudget (non-disruptive)
-puts "  [1/3] Applying Services and PodDisruptionBudget..."
+puts "  [1/4] Applying Services and PodDisruptionBudget..."
 services_output = `kubectl apply -f #{manifest_file} 2>&1 | grep -E '^(service|poddisruptionbudget)'`
 puts services_output unless services_output.empty?
 puts "  ✓ Services and PDB applied"
 
-# Step 2: Apply Deployment and wait for it to be ready (old job handles traffic)
+# Step 2: Verify job pod is ready and in endpoints
 puts ""
-puts "  [2/3] Applying and waiting for Deployment #{deployment_name}..."
+puts "  [2/4] Verifying job pod is ready..."
+job_ready = false
+5.times do |i|
+  endpoints = `kubectl get endpoints #{args.app}-web -n #{K8S_NAMESPACE} -o jsonpath='{.subsets[*].addresses[*].targetRef.name}' 2>/dev/null`.strip
+  job_in_endpoints = endpoints.include?("#{args.app}-job")
+  job_pod_ready = system("kubectl get pod #{args.app}-job-0 -n #{K8S_NAMESPACE} -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True")
+
+  if job_in_endpoints && job_pod_ready
+    job_ready = true
+    puts "  ✓ Job pod ready and in endpoints"
+    break
+  else
+    puts "    Waiting for job pod... (attempt #{i + 1}/5)"
+    sleep 2
+  end
+end
+
+unless job_ready
+  puts "  ⚠ Warning: Job pod not fully ready, proceeding anyway"
+end
+
+# Step 3: Apply Deployment and wait for it to be ready (job handles traffic)
+puts ""
+puts "  [3/4] Applying and waiting for Deployment #{deployment_name}..."
 Util.run("kubectl apply -f #{manifest_file} -l tier=web")
 deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
 if deployment_success
@@ -130,10 +154,10 @@ else
   puts "  ✗ Deployment #{deployment_name} failed"
 end
 
-# Step 3: Apply StatefulSet last, after web is ready
+# Step 4: Apply StatefulSet last, after web is ready
 if deployment_success
   puts ""
-  puts "  [3/3] Applying and waiting for StatefulSet #{statefulset_name}..."
+  puts "  [4/4] Applying and waiting for StatefulSet #{statefulset_name}..."
   Util.run("kubectl apply -f #{manifest_file} -l tier=job")
   statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
   if statefulset_success

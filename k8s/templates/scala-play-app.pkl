@@ -72,7 +72,7 @@ resources: Listing<K8sResource> = new {
     metadata {
       name = "\(appName)-web"
       namespace = k8sNamespace
-      labels = commonLabels
+      labels = webLabels
     }
     spec {
       replicas = webReplicas
@@ -181,7 +181,9 @@ resources: Listing<K8sResource> = new {
               lifecycle {
                 preStop {
                   exec {
-                    command = new { "/bin/sh"; "-c"; "sleep 5" }
+                    // Wait for LB health checks to fail and drain connections
+                    // LB check_interval=3s, unhealthy_threshold=2 = 6s max detection
+                    command = new { "/bin/sh"; "-c"; "sleep 10" }
                   }
                 }
               }
@@ -299,7 +301,9 @@ resources: Listing<K8sResource> = new {
               lifecycle {
                 preStop {
                   exec {
-                    command = new { "/bin/sh"; "-c"; "sleep 5" }
+                    // Wait for LB health checks to fail and drain connections
+                    // LB check_interval=3s, unhealthy_threshold=2 = 6s max detection
+                    command = new { "/bin/sh"; "-c"; "sleep 10" }
                   }
                 }
               }
