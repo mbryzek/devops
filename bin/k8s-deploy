@@ -99,6 +99,30 @@ end
 deployment_name = "#{args.app}-web"
 statefulset_name = "#{args.app}-job"
 
+# Diagnostic helper to log cluster state
+def log_cluster_state(app, namespace, label = nil)
+  timestamp = Time.now.strftime("%H:%M:%S.%L")
+  puts "    [#{timestamp}] #{label}" if label
+
+  # Get endpoints
+  endpoints = `kubectl get endpoints #{app}-web -n #{namespace} -o jsonpath='{range .subsets[*].addresses[*]}{.targetRef.name}{" "}{end}' 2>/dev/null`.strip
+  puts "    [#{timestamp}] Endpoints: #{endpoints.empty? ? '(none)' : endpoints}"
+
+  # Get pod status
+  pods = `kubectl get pods -n #{namespace} -l app=#{app} -o wide --no-headers 2>/dev/null`.strip
+  pods.each_line { |line| puts "    [#{timestamp}] Pod: #{line.strip}" }
+
+  # Check if healthcheck works via NodePort on each node
+  nodeport = `kubectl get svc #{app}-web -n #{namespace} -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null`.strip
+  nodes = `kubectl get nodes -o wide --no-headers 2>/dev/null | awk '{print $7}'`.strip.split
+
+  nodes.first(2).each do |node_ip|
+    next if node_ip.empty? || node_ip == "<none>"
+    result = `curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 http://#{node_ip}:#{nodeport}/_internal_/healthcheck 2>/dev/null`
+    puts "    [#{timestamp}] NodePort #{node_ip}:#{nodeport} -> #{result}"
+  end
+end
+
 # Deploy resources sequentially for zero-downtime:
 # 1. Services and PDBs (non-disruptive)
 # 2. Verify job pod is ready and in endpoints (pre-flight check)
@@ -114,10 +138,17 @@ puts ""
 statefulset_success = nil
 deployment_success = nil
 
-# Step 1: Apply Services and PodDisruptionBudget (non-disruptive)
+# Step 1: Apply Services and PodDisruptionBudget only (non-disruptive)
 puts "  [1/4] Applying Services and PodDisruptionBudget..."
-services_output = `kubectl apply -f #{manifest_file} 2>&1 | grep -E '^(service|poddisruptionbudget)'`
-puts services_output unless services_output.empty?
+log_cluster_state(args.app, K8S_NAMESPACE, "BEFORE deploy")
+
+# Extract only Service and PodDisruptionBudget resources from manifest
+svc_pdb_file = "/tmp/#{args.app}-svc-pdb.yaml"
+docs = File.read(manifest_file).split(/^---\s*$/)
+svc_pdb_docs = docs.select { |doc| doc =~ /kind:\s*(Service|PodDisruptionBudget)/ }
+File.write(svc_pdb_file, svc_pdb_docs.join("---\n"))
+Util.run("kubectl apply -f #{svc_pdb_file}")
+FileUtils.rm_f(svc_pdb_file)
 puts "  ✓ Services and PDB applied"
 
 # Step 2: Verify job pod is ready and in endpoints
@@ -127,14 +158,17 @@ job_ready = false
 5.times do |i|
   endpoints = `kubectl get endpoints #{args.app}-web -n #{K8S_NAMESPACE} -o jsonpath='{.subsets[*].addresses[*].targetRef.name}' 2>/dev/null`.strip
   job_in_endpoints = endpoints.include?("#{args.app}-job")
-  job_pod_ready = system("kubectl get pod #{args.app}-job-0 -n #{K8S_NAMESPACE} -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True")
+
+  # Check if pod shows 1/1 Ready
+  pod_status = `kubectl get pod #{args.app}-job-0 -n #{K8S_NAMESPACE} --no-headers 2>/dev/null`.strip
+  job_pod_ready = pod_status.include?("1/1") && pod_status.include?("Running")
 
   if job_in_endpoints && job_pod_ready
     job_ready = true
-    puts "  ✓ Job pod ready and in endpoints"
+    puts "  ✓ Job pod ready and in endpoints (#{endpoints})"
     break
   else
-    puts "    Waiting for job pod... (attempt #{i + 1}/5)"
+    puts "    Waiting for job pod... (attempt #{i + 1}/5) endpoints=#{endpoints} pod=#{pod_status}"
     sleep 2
   end
 end
@@ -147,7 +181,19 @@ end
 puts ""
 puts "  [3/4] Applying and waiting for Deployment #{deployment_name}..."
 Util.run("kubectl apply -f #{manifest_file} -l tier=web")
+
+# Monitor state during rollout
+monitor_thread = Thread.new do
+  10.times do
+    sleep 2
+    log_cluster_state(args.app, K8S_NAMESPACE, "DURING web rollout")
+  end
+end
+
 deployment_success = system("kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+monitor_thread.kill rescue nil
+
+log_cluster_state(args.app, K8S_NAMESPACE, "AFTER web rollout")
 if deployment_success
   puts "  ✓ Deployment #{deployment_name} ready"
 else
@@ -159,7 +205,19 @@ if deployment_success
   puts ""
   puts "  [4/4] Applying and waiting for StatefulSet #{statefulset_name}..."
   Util.run("kubectl apply -f #{manifest_file} -l tier=job")
+
+  # Monitor state during rollout
+  monitor_thread = Thread.new do
+    10.times do
+      sleep 2
+      log_cluster_state(args.app, K8S_NAMESPACE, "DURING job rollout")
+    end
+  end
+
   statefulset_success = system("kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+  monitor_thread.kill rescue nil
+
+  log_cluster_state(args.app, K8S_NAMESPACE, "AFTER job rollout")
   if statefulset_success
     puts "  ✓ StatefulSet #{statefulset_name} ready"
   else
