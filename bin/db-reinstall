@@ -13,7 +13,8 @@ end
 
 args = Args.parse(ARGV, ["app", "env"])
 install_script = find_install_inscript(args.app)
-dbname = Config.load_database(args.app, args.env).name
+dbconfig = Config.load_database(args.app, args.env)
+dbname = dbconfig.name
 path = "#{dbname}*.sql"
 
 if !File.exist?(install_script)
@@ -64,11 +65,20 @@ else
   Util.run("psql -U api -f #{file} #{dbname}")
 end
 
+tmpfile = "/tmp/db-reinstall.#{Process.pid}.tmp"
+Util.run("sem-apply --url postgresql://#{dbconfig.user}@localhost/#{dbconfig.name} --dry_run > #{tmpfile}")
+contents = IO.read(tmpfile)
+File.delete(tmpfile)
+
 puts ""
-if Ask.for_boolean("Run local migrations?")
-  puts ""
-  puts "Running #{dev_script}"
-  Util.run(dev_script)
+if contents.downcase.include?("All scripts have been previously applied".downcase)
+  puts "No new migrations"
+else
+  if Ask.for_boolean("Run local migrations?")
+    puts ""
+    puts "Running #{dev_script}"
+    Util.run(dev_script)
+  end
 end
 
 if File.exist?(post_reinstall_script)
