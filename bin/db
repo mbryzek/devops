@@ -1,0 +1,49 @@
+#!/usr/bin/env ruby
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+
+# Determine the postgresql repo directory
+# Supports: --app platform-postgresql OR --app platform (infers -postgresql)
+db_name = args.app
+if !db_name.end_with?("-postgresql")
+    db_name = "#{db_name}-postgresql"
+end
+
+repo_dir = File.expand_path("~/code/#{db_name}")
+if !File.directory?(repo_dir)
+    Util.exit_with_error("Repository directory not found: #{repo_dir}")
+end
+
+app_name = db_name.sub(/-postgresql$/, '')
+config = Config.load(app_name)
+scala_config = config.scala
+if scala_config.nil?
+    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find database configuration")
+end
+
+scala_env = scala_config.send(args.env)
+db = scala_env.database
+
+# Load global nodes and pick the first one for running migrations
+bastion_path = File.join(File.dirname(__FILE__), "../../env/bastion.txt")
+if !File.exist?(bastion_path)
+    Util.exit_with_error("Bastion config not found at #{bastion_path}")
+end
+node_ip = IO.read(bastion_path).strip
+if node_ip.empty?
+    Util.exit_with_error("No bastion node configured in #{bastion_path}")
+end
+
+puts ""
+puts Util.underline("Login to #{db.name}:")
+puts "ssh root@#{node_ip}"
+puts "psql --set=sslmode=require -h #{db.host} -p #{db.port} --u #{db.user} #{db.name}"
+env_var_script = Util.cleanpath(File.join(DIR, 'db-password'))
+if !File.exist?(env_var_script)
+    Util.exit_with_error("Could not find env var script: #{env_var_script}")
+end
+puts "#{env_var_script} --app #{args.app}"
+puts ""
