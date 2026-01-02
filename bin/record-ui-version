@@ -3,6 +3,7 @@
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
+require 'json'
 CREATE_SESSION_SCRIPT = File.join(dir, "create-session")
 if !File.exist?(CREATE_SESSION_SCRIPT)
   Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} does not exist")
@@ -24,13 +25,15 @@ TOKEN_FILE = "~/.devops/#{args.app}"
 candidate = File.expand_path(TOKEN_FILE)
 
 class TokenFile
-  attr_reader :session_id
-  def initialize(session_id)
+  attr_reader :session_id, :email
+  def initialize(session_id, email = nil)
     @session_id = session_id
+    @email = email
   end
 
   def TokenFile.read(path)
     session_id = nil
+    email = nil
     IO.readlines(path).each do |line|
       l = line.strip
       next if l.empty?
@@ -46,6 +49,8 @@ class TokenFile
       end
       if k == "session_id"
         session_id = v
+      elsif k == "email"
+        email = v
       else
         Util.exit_with_error("File #{path}: Unknown key: #{key}")
       end
@@ -54,7 +59,7 @@ class TokenFile
     if session_id.nil?
       Util.exit_with_error("File #{path}: Missing session_id")
     end
-    TokenFile.new(session_id)
+    TokenFile.new(session_id, email)
   end
 
   def write!(path)
@@ -64,24 +69,28 @@ class TokenFile
       Util.run("mkdir -p #{dir}")
     end
     File.open(full_path, "w") do |f|
-      f << "session_id: #{session_id}"
+      f << "session_id: #{session_id}\n"
+      f << "email: #{email}\n" if email
     end
   end
 end
 
-def create_session
+def create_session(default_email = nil)
     tmpfile = "/tmp/record-ui-version.create_session.#{Process.pid}.tmp"
-    session_id = ""
+    result = nil
     begin
-        system("#{CREATE_SESSION_SCRIPT} --output-file #{tmpfile}")
-        session_id = IO.read(tmpfile).strip
+        cmd = "#{CREATE_SESSION_SCRIPT} --output-file #{tmpfile}"
+        cmd += " --default-email '#{default_email}'" if default_email && !default_email.empty?
+        system(cmd)
+        json_data = IO.read(tmpfile).strip
+        result = JSON.parse(json_data)
     ensure
         `rm -f #{tmpfile}`
     end
-    if session_id.empty?
+    if result.nil? || result['session_id'].to_s.empty?
       Util.exit_with_error("File #{CREATE_SESSION_SCRIPT} failed to create session")
     end
-    session_id
+    result
 end
 
 tf = if File.exist?(candidate)
@@ -91,8 +100,8 @@ else
   puts "Expecting Session ID for #{args.app} in #{candidate} which currently does not exists."
   puts "We will help you create this file by creating a session:"
   puts ""
-  session_id = create_session
-  file = TokenFile.new(session_id)
+  result = create_session
+  file = TokenFile.new(result['session_id'], result['email'])
   file.write!(TOKEN_FILE)
   puts ""
   puts "Created File: #{TOKEN_FILE}"
@@ -124,9 +133,9 @@ def parse_http(response)
   HttpResponse.new(status, body)
 end
 
-def put_version(host, session_id, version)
+def put_version(host, token_file, version)
   url = "#{host}/ui/version"
-  cmd = "curl -i -s -X PUT #{host}/ui/version -H 'acumen_session_id: #{session_id}' -H 'content-type: application/json' -d '{\"version\": \"#{version}\"}'"
+  cmd = "curl -i -s -X PUT #{host}/ui/version -H 'acumen_session_id: #{token_file.session_id}' -H 'content-type: application/json' -d '{\"version\": \"#{version}\"}'"
   http = parse_http(`#{cmd}`)
   puts ""
   if http.status == 200
@@ -135,17 +144,18 @@ def put_version(host, session_id, version)
   elsif http.status == 401
     puts "Received Not Authorized."
     puts ""
-    puts "Please create a new session by logging into #{host}:"
-    session_id = create_session
-    file = TokenFile.new(session_id)
+    puts "Please create a new session for #{host}:"
+    puts ""
+    result = create_session(token_file.email)
+    file = TokenFile.new(result['session_id'], result['email'])
     file.write!(TOKEN_FILE)
-    put_version(host, session_id, version)
+    put_version(host, file, version)
 
   else
     Util.exit_with_error("ERROR: Received HTTP Status #{http.status}")
   end
 end
 
-put_version(api_host, tf.session_id, version)
+put_version(api_host, tf, version)
 puts "Version for #{args.app} successfully set to #{version}"
 puts ""
