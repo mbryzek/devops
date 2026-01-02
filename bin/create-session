@@ -4,11 +4,33 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'net/http'
 require 'uri'
 require 'json'
+require 'openssl'
 require 'optparse'
 
 BRYZEK_GROUP_KEY = "bryzek"
+CONFIG_DIR = File.expand_path("~/.config/devops")
+LAST_EMAIL_FILE = File.join(CONFIG_DIR, "last_email")
+
+def get_last_used_email
+  return nil unless File.exist?(LAST_EMAIL_FILE)
+  email = File.read(LAST_EMAIL_FILE).strip
+  email.empty? ? nil : email
+rescue
+  nil
+end
+
+def save_last_used_email(email)
+  FileUtils.mkdir_p(CONFIG_DIR) unless Dir.exist?(CONFIG_DIR)
+  File.write(LAST_EMAIL_FILE, email)
+rescue
+  # Ignore errors when saving email
+end
 
 def get_default_email
+  # Prefer last used email, fall back to git config
+  last_email = get_last_used_email
+  return last_email if last_email
+
   begin
     email = `git config --get user.email`.strip
     return email unless email.empty?
@@ -22,6 +44,12 @@ def create_session(email, password)
   uri = URI('https://api.trueacumen.com/sessions/login')
   http = Net::HTTP.new(uri.host, uri.port)
   http.use_ssl = true
+  http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+
+  # Create a custom cert store without CRL check (fixes OpenSSL 3.x CRL verification issues)
+  store = OpenSSL::X509::Store.new
+  store.set_default_paths
+  http.cert_store = store
 
   request = Net::HTTP::Post.new(uri)
   request['Content-Type'] = 'application/json'
