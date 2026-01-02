@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
-load File.join(File.dirname(__FILE__), '../lib/common.rb')
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
 
 args = Args.parse(ARGV, ["app"])
 
@@ -37,11 +38,12 @@ if node_ip.empty?
 end
 
 puts ""
-puts Util.underline("Database Migration Deployment")
-puts "  DB:   #{db_name}"
-puts "  Env:  #{args.env}"
-puts "  Node: #{node_ip}"
-puts "  Host: #{db.name}@#{db.host}:#{db.port}"
+puts Util.underline("Login to #{db.name}:")
+puts "ssh root@#{node_ip}"
+puts "psql --set=sslmode=require -h #{db.host} -p #{db.port} --u #{db.user} #{db.name}"
+env_var_script = Util.cleanpath(File.join(DIR, 'db-password'))
+if !File.exist?(env_var_script)
+    Util.exit_with_error("Could not find env var script: #{env_var_script}")
+end
+puts "#{env_var_script} --app #{args.app}"
 puts ""
-
-puts "psql --set sslmode=require --host #{db.host} --port #{db.port} --user #{db.user} --name #{db.name}"
