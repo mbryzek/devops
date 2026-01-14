@@ -1,49 +1,254 @@
 #!/usr/bin/env ruby
 
+# Database CLI tool
+# Usage:
+#   db login --app NAME [--env ENV]    Generate and upload login script to bastion
+#   db exec --app NAME --sql FILE [--env ENV]    Execute a SQL script on the database
+
 DIR = File.dirname(__FILE__)
 load File.join(DIR, '../lib/common.rb')
+require 'securerandom'
 
-args = Args.parse(ARGV, ["app"])
+def show_usage
+    puts <<~USAGE
+Usage: db <command> --app NAME [--env ENV]
 
-# Determine the postgresql repo directory
-# Supports: --app platform-postgresql OR --app platform (infers -postgresql)
-db_name = args.app
-if !db_name.end_with?("-postgresql")
-    db_name = "#{db_name}-postgresql"
+Commands:
+  login    Generate and upload login script to bastion
+  exec     Execute a SQL script on the database
+
+Options:
+  --app    Application name (or inferred from directory)
+  --env    Environment (default: production)
+  --sql    Path to SQL file (required for exec)
+
+Examples:
+  db login --app acumen
+  db exec --app acumen --sql ~/queries/report.sql
+  db exec --app platform --env development --sql ./fix.sql
+    USAGE
+    exit 1
 end
 
-repo_dir = File.expand_path("~/code/#{db_name}")
-if !File.directory?(repo_dir)
-    Util.exit_with_error("Repository directory not found: #{repo_dir}")
+def load_db_config(args)
+    # Determine the postgresql repo directory
+    # Supports: --app platform-postgresql OR --app platform (infers -postgresql)
+    db_name = args.app
+    if !db_name.end_with?("-postgresql")
+        db_name = "#{db_name}-postgresql"
+    end
+
+    app_name = db_name.sub(/-postgresql$/, '')
+    config = Config.load(app_name)
+    scala_config = config.scala
+    if scala_config.nil?
+        Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find database configuration")
+    end
+
+    scala_env = scala_config.send(args.env)
+    db = scala_env.database
+
+    # Load bastion node
+    bastion_path = File.join(File.dirname(__FILE__), "../../env/bastion.txt")
+    if !File.exist?(bastion_path)
+        Util.exit_with_error("Bastion config not found at #{bastion_path}")
+    end
+    node_ip = IO.read(bastion_path).strip
+    if node_ip.empty?
+        Util.exit_with_error("No bastion node configured in #{bastion_path}")
+    end
+
+    # Get database password from environment variables
+    env_vars = EnvironmentVariables.load(app_name, args.env)
+    db_url = env_vars['CONF_DB_DEFAULT_URL']
+    if db_url.nil?
+        Util.exit_with_error("CONF_DB_DEFAULT_URL not found in environment variables for #{app_name}")
+    end
+
+    # Extract password from URL (format: ?user=x&password=y&)
+    password = nil
+    if i = db_url.index("?")
+        params = db_url.slice(i+1, db_url.length)
+        params.split("&").each { |p|
+            k, v = p.split("=", 2)
+            if k == "password"
+                password = v
+                break
+            end
+        }
+    end
+
+    if password.nil?
+        Util.exit_with_error("Could not extract password from CONF_DB_DEFAULT_URL")
+    end
+
+    {
+        app_name: app_name,
+        db: db,
+        node_ip: node_ip,
+        password: password
+    }
 end
 
-app_name = db_name.sub(/-postgresql$/, '')
-config = Config.load(app_name)
-scala_config = config.scala
-if scala_config.nil?
-    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find database configuration")
+def do_login(args)
+    cfg = load_db_config(args)
+    db = cfg[:db]
+    node_ip = cfg[:node_ip]
+    password = cfg[:password]
+    app_name = cfg[:app_name]
+
+    puts ""
+    puts Util.underline("Database Login Setup")
+    puts "  App:  #{app_name}"
+    puts "  Env:  #{args.env}"
+    puts "  DB:   #{db.name}@#{db.host}:#{db.port}"
+    puts ""
+
+    # Generate unique identifiers for this session
+    session_id = SecureRandom.hex(8)
+    pgpass_remote = "/tmp/.pgpass-#{session_id}"
+    script_name = "db-login-#{app_name}.sh"
+    script_remote = "~/#{script_name}"
+
+    # Create the login script content
+    script_content = <<~SCRIPT
+#!/bin/bash
+# Auto-generated database login script for #{app_name}
+# Created: #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}
+
+PGPASS_FILE="#{pgpass_remote}"
+
+if [ ! -f "$PGPASS_FILE" ]; then
+    echo "Error: Credentials file not found at $PGPASS_FILE"
+    echo "Please run 'db login --app #{app_name}' again to regenerate."
+    exit 1
+fi
+
+cleanup() {
+    rm -f "$PGPASS_FILE"
+}
+trap cleanup EXIT
+
+chmod 600 "$PGPASS_FILE"
+PGPASSFILE="$PGPASS_FILE" psql --set=sslmode=require -h #{db.host} -p #{db.port} -U #{db.user} #{db.name}
+    SCRIPT
+
+    # Create pgpass content
+    pgpass_content = "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}"
+
+    # Write files locally
+    local_script = "/tmp/db-login-local-#{$$}"
+    local_pgpass = "/tmp/.pgpass-local-#{$$}"
+
+    begin
+        File.write(local_script, script_content)
+        File.chmod(0755, local_script)
+        File.write(local_pgpass, pgpass_content)
+        File.chmod(0600, local_pgpass)
+
+        # Upload both files
+        puts "Uploading login script to #{node_ip}..."
+        Util.run("scp #{local_script} root@#{node_ip}:#{script_remote}", :quiet => true)
+        Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
+        Util.run("ssh root@#{node_ip} 'chmod 600 #{pgpass_remote}'", :quiet => true)
+
+        puts ""
+        puts "To connect:"
+        puts "  ssh root@#{node_ip}"
+        puts "  ./#{script_name}"
+        puts ""
+    ensure
+        File.delete(local_script) if File.exist?(local_script)
+        File.delete(local_pgpass) if File.exist?(local_pgpass)
+    end
 end
 
-scala_env = scala_config.send(args.env)
-db = scala_env.database
+def do_exec(args)
+    if args.path.nil? || args.path.empty?
+        Util.exit_with_error("Missing required argument: --sql PATH")
+    end
 
-# Load global nodes and pick the first one for running migrations
-bastion_path = File.join(File.dirname(__FILE__), "../../env/bastion.txt")
-if !File.exist?(bastion_path)
-    Util.exit_with_error("Bastion config not found at #{bastion_path}")
-end
-node_ip = IO.read(bastion_path).strip
-if node_ip.empty?
-    Util.exit_with_error("No bastion node configured in #{bastion_path}")
+    sql_file = File.expand_path(args.path)
+    if !File.exist?(sql_file)
+        Util.exit_with_error("SQL file not found: #{sql_file}")
+    end
+
+    cfg = load_db_config(args)
+    db = cfg[:db]
+    node_ip = cfg[:node_ip]
+    password = cfg[:password]
+    app_name = cfg[:app_name]
+
+    puts ""
+    puts Util.underline("Executing SQL Script")
+    puts "  App:    #{app_name}"
+    puts "  Env:    #{args.env}"
+    puts "  DB:     #{db.name}@#{db.host}:#{db.port}"
+    puts "  Script: #{sql_file}"
+    puts ""
+
+    # Generate unique identifiers for this session
+    session_id = SecureRandom.hex(8)
+    pgpass_remote = "/tmp/.pgpass-#{session_id}"
+    sql_remote = "/tmp/db-exec-#{session_id}.sql"
+
+    # Create pgpass content
+    pgpass_content = "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}"
+
+    # Write pgpass locally
+    local_pgpass = "/tmp/.pgpass-local-#{$$}"
+
+    begin
+        File.write(local_pgpass, pgpass_content)
+        File.chmod(0600, local_pgpass)
+
+        # Upload files
+        puts "Uploading..."
+        Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
+        Util.run("scp #{sql_file} root@#{node_ip}:#{sql_remote}", :quiet => true)
+
+        # Execute remotely
+        puts "Executing..."
+        puts ""
+
+        remote_cmd = [
+            "chmod 600 #{pgpass_remote}",
+            "PGPASSFILE=#{pgpass_remote} psql --set=sslmode=require -h #{db.host} -p #{db.port} -U #{db.user} #{db.name} -f #{sql_remote}"
+        ].join(" && ")
+
+        Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+
+        puts ""
+        puts "Done."
+        puts ""
+    ensure
+        File.delete(local_pgpass) if File.exist?(local_pgpass)
+        # Clean up remote files
+        Util.run("ssh root@#{node_ip} 'rm -f #{pgpass_remote} #{sql_remote}'", :quiet => true)
+    end
 end
 
-puts ""
-puts Util.underline("Login to #{db.name}:")
-puts "ssh root@#{node_ip}"
-puts "psql --set=sslmode=require -h #{db.host} -p #{db.port} --u #{db.user} #{db.name}"
-env_var_script = Util.cleanpath(File.join(DIR, 'db-password'))
-if !File.exist?(env_var_script)
-    Util.exit_with_error("Could not find env var script: #{env_var_script}")
+# Parse subcommand
+if ARGV.empty?
+    show_usage
 end
-puts "#{env_var_script} --app #{args.app}"
-puts ""
+
+subcommand = ARGV.shift
+
+case subcommand
+when "login"
+    args = Args.parse(ARGV, ["app"])
+    do_login(args)
+when "exec"
+    # For exec, we need --sql which maps to --path in Args
+    # Replace --sql with --path for compatibility
+    modified_argv = ARGV.map { |arg| arg == "--sql" ? "--path" : arg }
+    args = Args.parse(modified_argv, ["app", "path"])
+    do_exec(args)
+when "-h", "--help", "help"
+    show_usage
+else
+    puts "Unknown command: #{subcommand}"
+    puts ""
+    show_usage
+end
