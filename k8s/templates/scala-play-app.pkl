@@ -36,10 +36,13 @@ local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 // Resource configuration - sized for dedicated node pools
 // Web nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
 // Job nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
-local memoryDefault = "2400Mi"
-local memoryJobServer = "2400Mi"
-local memoryLimit = "2400Mi"
-local memoryLimitJobServer = "2400Mi"
+// Web memory must allow rolling updates: during rollout, a new pod may share a web
+// node with another app's pod. Sum of all web app memory on one node must fit within
+// ~2500Mi (3003Mi allocatable minus ~500Mi kube-system overhead).
+local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
+local memoryJobServer = read?("env:JOB_MEMORY") ?? "2400Mi"
+local memoryLimit = memoryDefault
+local memoryLimitJobServer = memoryJobServer
 local cpuLimit = "1800m"
 local cpuLimitJobServer = "1800m"
 
@@ -82,10 +85,14 @@ resources: Listing<K8sResource> = new {
           ["tier"] = "web"
         }
       }
-      // Use Recreate strategy since job server maintains uptime during deployment.
-      // This avoids scheduling conflicts when web node can only run 1 pod.
+      // RollingUpdate: start new pod before killing old to prevent broadcast
+      // failures when job server cannot reach web during replacement.
       strategy {
-        type = "Recreate"
+        type = "RollingUpdate"
+        rollingUpdate {
+          maxSurge = 1
+          maxUnavailable = 0
+        }
       }
       template {
         metadata {

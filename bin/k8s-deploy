@@ -68,6 +68,8 @@ app_port = config["appPort"] || 9000
 # Build env vars for template (NodePort is auto-assigned by K8s)
 env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{tag}"
 env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE}" if args.namespace
+env_vars += " WEB_MEMORY=#{config['webMemory']}" if config['webMemory']
+env_vars += " JOB_MEMORY=#{config['jobMemory']}" if config['jobMemory']
 
 cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval templates/scala-play-app.pkl"
 manifest = `#{cmd} 2>&1`
