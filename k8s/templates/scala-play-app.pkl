@@ -34,13 +34,13 @@ local webReplicas = (read?("env:WEB_REPLICAS") ?? "1").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
 // Resource configuration - sized for dedicated node pools
-// Web nodes: s-1vcpu-2gb (2GB RAM, ~1464Mi allocatable, ~500Mi for kube-system)
+// Web nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
 // Job nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
-local memoryDefault = "900Mi"
+local memoryDefault = "2400Mi"
 local memoryJobServer = "2400Mi"
-local memoryLimit = "900Mi"
+local memoryLimit = "2400Mi"
 local memoryLimitJobServer = "2400Mi"
-local cpuLimit = "900m"
+local cpuLimit = "1800m"
 local cpuLimitJobServer = "1800m"
 
 // ImagePullPolicy: IfNotPresent since we require explicit versions
