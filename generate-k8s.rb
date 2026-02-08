@@ -55,6 +55,8 @@ app_files.each do |file|
 
     # Build env vars for template
     app_env = "APP=#{app_name} PORT=#{app_port} #{env_prefix}"
+    app_env += " WEB_MEMORY=#{config['webMemory']}" if config['webMemory']
+    app_env += " JOB_MEMORY=#{config['jobMemory']}" if config['jobMemory']
 
     cmd = "cd #{K8S_DIR} && #{app_env}pkl eval templates/scala-play-app.pkl > #{output_file}"
     args.info "Generating #{output_file}"
