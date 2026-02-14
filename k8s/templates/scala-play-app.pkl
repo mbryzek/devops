@@ -249,7 +249,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "-XX:+UseContainerSupport -XX:+UseZGC -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -276,7 +276,7 @@ resources: Listing<K8sResource> = new {
                 initialDelaySeconds = 45
                 periodSeconds = 15
                 failureThreshold = 5
-                timeoutSeconds = 5
+                timeoutSeconds = 30
               }
               resources {
                 requests {
