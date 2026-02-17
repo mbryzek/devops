@@ -324,7 +324,6 @@ resources: Listing<K8sResource> = new {
 
   // Web Service - NodePort service for external load balancer routing
   // Load balancer is created separately via doctl (see bin/k8s-lb-create)
-  // Routes to ALL platform pods (both web and job) for high availability
   new Service {
     metadata {
       name = "\(appName)-web"
@@ -334,6 +333,7 @@ resources: Listing<K8sResource> = new {
     spec {
       selector = new {
         ["app"] = appName
+        ["tier"] = "web"
       }
       ports = new {
         new {
