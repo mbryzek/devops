@@ -5,7 +5,19 @@
 #
 # Usage: k8s-build --app platform --tag 0.1.0
 
+# Stage 1: Download New Relic Java agent
+FROM eclipse-temurin:21-jre AS newrelic
+ARG NEWRELIC_AGENT_VERSION=9.1.0
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip && \
+    curl -sL -o /tmp/newrelic.zip https://download.newrelic.com/newrelic/java-agent/newrelic-agent/${NEWRELIC_AGENT_VERSION}/newrelic-java.zip && \
+    unzip -q /tmp/newrelic.zip -d /tmp && \
+    mkdir -p /opt/newrelic && \
+    cp /tmp/newrelic/newrelic.jar /opt/newrelic/
+
+# Stage 2: Runtime
 FROM eclipse-temurin:21-jre
+
+COPY --from=newrelic /opt/newrelic/newrelic.jar /opt/newrelic/newrelic.jar
 
 # Create non-root user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser
@@ -16,7 +28,7 @@ WORKDIR /app
 COPY dist/ /app/
 
 # Set ownership
-RUN chown -R appuser:appuser /app
+RUN chown -R appuser:appuser /app /opt/newrelic
 
 # Switch to non-root user
 USER appuser
