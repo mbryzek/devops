@@ -36,7 +36,7 @@ local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
 // Optional Java agent (e.g., New Relic APM)
 local javaAgent = read?("env:JAVA_AGENT") ?? ""
-local javaAgentFlag = if (javaAgent == "") "" else "-javaagent:\(javaAgent) "
+local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-javaagent:\(javaAgent) -Dnewrelic.config.app_name=\(appName)-\(tier) "
 
 // Resource configuration - sized for dedicated node pools
 // Web nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
@@ -134,7 +134,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "\(javaAgentFlag)-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlags("web"))-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -254,7 +254,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "\(javaAgentFlag)-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlags("job"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
