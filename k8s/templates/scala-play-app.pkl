@@ -13,6 +13,7 @@
 ///   - K8S_NAMESPACE: Kubernetes namespace (default: "bryzek-production")
 ///   - WEB_REPLICAS: Number of web replicas (default: 2)
 ///   - JOB_REPLICAS: Number of job replicas (default: 1)
+///   - JAVA_AGENT: Path to Java agent JAR (e.g., /opt/newrelic/newrelic.jar)
 
 module scalaPlayApp
 
@@ -32,6 +33,10 @@ local registry = "registry.digitalocean.com/bryzek"
 local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "1").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
+
+// Optional Java agent (e.g., New Relic APM)
+local javaAgent = read?("env:JAVA_AGENT") ?? ""
+local javaAgentFlag = if (javaAgent == "") "" else "-javaagent:\(javaAgent) "
 
 // Resource configuration - sized for dedicated node pools
 // Web nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
@@ -129,7 +134,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlag)-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -249,7 +254,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlag)-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {

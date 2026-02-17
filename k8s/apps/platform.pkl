@@ -10,3 +10,4 @@ module platform
 
 appName = "platform"
 appPort = 9300
+javaAgent = "/opt/newrelic/newrelic.jar"
