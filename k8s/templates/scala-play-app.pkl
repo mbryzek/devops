@@ -40,12 +40,12 @@ local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-jav
 
 // Resource configuration - sized for dedicated node pools
 // Web nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
-// Job nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~500Mi for kube-system)
+// Job nodes: s-2vcpu-8gb-amd (8GB RAM, ~6400Mi allocatable, ~800Mi for kube-system)
 // Web memory must allow rolling updates: during rollout, a new pod may share a web
 // node with another app's pod. Sum of all web app memory on one node must fit within
 // ~2500Mi (3003Mi allocatable minus ~500Mi kube-system overhead).
 local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
-local memoryJobServer = read?("env:JOB_MEMORY") ?? "2400Mi"
+local memoryJobServer = read?("env:JOB_MEMORY") ?? "5600Mi"
 local memoryLimit = memoryDefault
 local memoryLimitJobServer = memoryJobServer
 local cpuLimit = "1800m"
