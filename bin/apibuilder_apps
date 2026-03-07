@@ -74,7 +74,10 @@ def resolved?(specs, spec)
   }
 end
 
-tag = args.tag || calculate_next_tag
+tag = args.tag || begin
+  `git fetch --tags origin 2>/dev/null`
+  calculate_next_tag
+end
 spec_dir = args.dir || Pathname.new(File.join(`pwd`.strip, "spec")).cleanpath
 if !File.directory?(spec_dir)
   Util.exit_with_error "Cannot find directory containing specs. Expected at: #{spec_dir}"
@@ -132,15 +135,36 @@ class Spec
     cmds.join(" ")
   end
 
-  def download_command(profile=nil)
+  def download_command(tag, profile=nil)
     cmds = []
     if profile
       cmds << "PROFILE=%s" % profile
     end
-    cmds << "apibuilder update --app %s" % @application
+    cmds << "apibuilder update --app %s --version %s" % [@application, tag]
     cmds.join(" ")
   end
 
+end
+
+def validate_version_not_ahead(org, application, upload_version)
+  result = `apibuilder list versions #{org} #{application} 2>/dev/null`.strip
+  if !$?.success?
+    $stderr.puts "WARNING: Could not fetch versions for #{org}/#{application}; skipping version guard"
+    return
+  end
+  return if result.empty?
+
+  remote_latest = result.split("\n").first.strip
+  if Gem::Version.new(remote_latest) > Gem::Version.new(upload_version)
+    puts "** ERROR: apibuilder.io has version #{remote_latest} for #{org}/#{application}"
+    puts "   but we are trying to upload #{upload_version} (from git tags)."
+    puts "   This means someone uploaded a higher version directly."
+    puts ""
+    puts "   To fix: investigate who uploaded #{remote_latest}, then either"
+    puts "   create a git tag to match, or run 'apibuilder clean #{org} #{application} --silent'"
+    puts "   to remove the stale remote version."
+    exit(1)
+  end
 end
 
 specs = Dir.glob("#{spec_dir}/*.json").map do |path|
@@ -164,12 +188,14 @@ if args.app && filtered.size != args.app.size
   Util.exit_with_error msg
 end
 
+filtered.each { |spec| validate_version_not_ahead(spec.organization, spec.application, tag) }
+
 filtered.each do |spec|
   Util.run(spec.upload_command(spec.organization, tag, args.profile))
 end
 
 if !args.no_download
   filtered.each do |spec|
-    Util.run(spec.download_command(args.profile))
+    Util.run(spec.download_command(tag, args.profile))
   end
 end
