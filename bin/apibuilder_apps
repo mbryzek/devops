@@ -146,24 +146,37 @@ class Spec
 
 end
 
-def validate_version_not_ahead(org, application, upload_version)
-  result = `apibuilder list versions #{org} #{application} 2>/dev/null`.strip
-  if !$?.success?
-    $stderr.puts "WARNING: Could not fetch versions for #{org}/#{application}; skipping version guard"
-    return
-  end
-  return if result.empty?
+def validate_versions_not_ahead(specs, upload_version, profile=nil)
+  return if specs.empty?
 
-  remote_latest = result.split("\n").first.strip
-  if Gem::Version.new(remote_latest) > Gem::Version.new(upload_version)
-    puts "** ERROR: apibuilder.io has version #{remote_latest} for #{org}/#{application}"
-    puts "   but we are trying to upload #{upload_version} (from git tags)."
-    puts "   This means someone uploaded a higher version directly."
-    puts ""
-    puts "   To fix: investigate who uploaded #{remote_latest}, then either"
-    puts "   create a git tag to match, or run 'apibuilder clean #{org} #{application} --silent'"
-    puts "   to remove the stale remote version."
-    exit(1)
+  specs.group_by(&:organization).each do |org, org_specs|
+    app_keys = org_specs.map(&:application)
+
+    cmd = "apibuilder batch latest-versions #{org} #{app_keys.join(' ')}"
+    cmd = "PROFILE=#{profile} #{cmd}" if profile
+
+    result = `#{cmd} 2>/dev/null`.strip
+    if !$?.success?
+      $stderr.puts "WARNING: Could not fetch batch versions for #{org}; skipping version guard"
+      next
+    end
+    next if result.empty?
+
+    result.split("\n").each do |line|
+      app_key, remote_version = line.strip.split(/\s+/, 2)
+      next if remote_version.nil? || remote_version.empty?
+
+      if Gem::Version.new(remote_version) > Gem::Version.new(upload_version)
+        puts "** ERROR: apibuilder.io has version #{remote_version} for #{org}/#{app_key}"
+        puts "   but we are trying to upload #{upload_version} (from git tags)."
+        puts "   This means someone uploaded a higher version directly."
+        puts ""
+        puts "   To fix: investigate who uploaded #{remote_version}, then either"
+        puts "   create a git tag to match, or run 'apibuilder clean #{org} #{app_key} --silent'"
+        puts "   to remove the stale remote version."
+        exit(1)
+      end
+    end
   end
 end
 
@@ -188,7 +201,7 @@ if args.app && filtered.size != args.app.size
   Util.exit_with_error msg
 end
 
-filtered.each { |spec| validate_version_not_ahead(spec.organization, spec.application, tag) }
+validate_versions_not_ahead(filtered, tag, args.profile)
 
 filtered.each do |spec|
   Util.run(spec.upload_command(spec.organization, tag, args.profile))
