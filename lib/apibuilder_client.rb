@@ -17,7 +17,7 @@ class ApibuilderClient
   end
 
   # Upload a spec file as a new version
-  # PUT /apibuilder/{org}/{app}/{version}
+  # PUT /{org}/{app}/{version}
   def upload_version(org, app, version, spec_path)
     data = IO.read(spec_path)
     body = {
@@ -26,15 +26,15 @@ class ApibuilderClient
         "data" => data,
       }
     }
-    path = "/apibuilder/#{org}/#{app}/#{version}"
+    path = "/#{org}/#{app}/#{version}"
     response = request(:put, path, body)
     handle_response(response, "Upload #{org}/#{app} version #{version}")
   end
 
   # Get generated code for a specific generator
-  # GET /apibuilder/{org}/{app}/{version}/{generator_key}
+  # GET /{org}/{app}/{version}/{generator_key}
   def get_code(org, app, version, generator_key, attributes = nil)
-    path = "/apibuilder/#{org}/#{app}/#{version}/#{generator_key}"
+    path = "/#{org}/#{app}/#{version}/#{generator_key}"
     if attributes && !attributes.empty?
       encoded = URI.encode_www_form_component(JSON.generate(attributes))
       path = "#{path}?attributes=#{encoded}"
@@ -44,9 +44,9 @@ class ApibuilderClient
   end
 
   # Get latest version for an app
-  # GET /apibuilder/{org}/{app}?limit=1
+  # GET /{org}/{app}?limit=1
   def get_latest_version(org, app)
-    path = "/apibuilder/#{org}/#{app}?limit=1"
+    path = "/#{org}/#{app}?limit=1"
     response = request(:get, path)
     case response.code.to_i
     when 200
