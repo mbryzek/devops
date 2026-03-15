@@ -53,7 +53,7 @@ module ApibuilderFileWriter
   end
 
   def self.strip_metadata(content)
-    content.each_line.reject { |line| IGNORE_PATTERNS.any? { |p| p.match?(line) } }.join
+    content.each_line.reject { |line| IGNORE_PATTERNS.any? { |p| p.match?(line) } }.join.rstrip
   end
 
 end
