@@ -5,9 +5,9 @@ module ApibuilderFileWriter
 
   # Lines matching these patterns are ignored when comparing files
   IGNORE_PATTERNS = [
-    /^\s*\*\s*Service version:/,
-    /^\s*\*\s*User agent:/,
-    /^\s*\*\s*apibuilder app/,
+    /^\s*[\*#]\s*Service version:/,
+    /^\s*[\*#]\s*User agent:/,
+    /^\s*[\*#]\s*apibuilder app/,
   ]
 
   # Stages code files into a temporary directory.
