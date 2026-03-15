@@ -4,6 +4,7 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
 args = Args.parse(ARGV, [], { "app" => "list" })
 organization = DevopsConfigFile.load.apibuilder_organization
+client = ApibuilderClient.new(args.profile)
 
 def path_from_root(path)
   Pathname.new(File.join(`pwd`.strip, path)).cleanpath.to_s
@@ -13,27 +14,22 @@ UPDATE_SCRIPT = File.join(File.dirname(__FILE__), 'apibuilder_apps')
 DAO_SPEC_DIR = path_from_root("dao/spec")
 
 def upload(args, apps)
-  cmd = "#{UPDATE_SCRIPT} --dir #{DAO_SPEC_DIR} --no_download"
+  cmd = "#{UPDATE_SCRIPT} --dir #{DAO_SPEC_DIR} --no-download"
   if profile = args.profile
     cmd << " --profile #{profile}"
   end
   apps.each do |app|
     cmd << " --app #{app}"
   end
-
   Util.run cmd
 end
 
-def generate_code(org, generator_key, dir, apps, profile=nil)
-  if !File.directory?(dir)
-    system("mkdir #{dir}")
-  end
+def generate_code(client, org, generator_key, dir, apps)
+  FileUtils.mkdir_p(dir)
   apps.each do |app|
-    cmd = "apibuilder code #{org} #{app} latest #{generator_key} #{dir}"
-    if profile
-      cmd = "PROFILE=#{profile} #{cmd}"
-    end
-    Util.run cmd
+    puts "==> Generating #{generator_key} for #{org}/#{app}@latest => #{dir}"
+    code = client.get_code(org, app, "latest", generator_key)
+    ApibuilderFileWriter.write_code_files(code, dir)
   end
 end
 
@@ -60,6 +56,6 @@ filtered = if args.app
 upload(args, filtered)
 
 if !args.no_download
-  generate_code(organization, "psql_scala", "./generated/app", filtered, args.profile)
-  generate_code(organization, "psql_ddl", "./dao/psql", filtered, args.profile)
+  generate_code(client, organization, "psql_scala", "./generated/app", filtered)
+  generate_code(client, organization, "psql_ddl", "./dao/psql", filtered)
 end
