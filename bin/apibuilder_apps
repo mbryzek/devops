@@ -111,18 +111,23 @@ def validate_versions_not_ahead(client, specs, upload_version)
 end
 
 def download_code(client, app_config, specs, tag)
-  specs.each do |spec|
-    entries = app_config.find_by_app(spec.application)
-    next if entries.empty?
+  Dir.mktmpdir("apibuilder") do |tmp_dir|
+    staged = []
+    specs.each do |spec|
+      entries = app_config.find_by_app(spec.application)
+      next if entries.empty?
 
-    entries.each do |entry|
-      entry.generators.each do |gen|
-        puts "==> Downloading #{spec.organization}/#{spec.application}@#{tag} #{gen.key} => #{gen.target}"
-        attrs = gen.attributes.empty? ? nil : gen.attributes
-        code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
-        ApibuilderFileWriter.write_code_files(code, gen.target)
+      entries.each do |entry|
+        entry.generators.each do |gen|
+          puts "==> Downloading #{spec.organization}/#{spec.application}@#{tag} #{gen.key} => #{gen.target}"
+          attrs = gen.attributes.empty? ? nil : gen.attributes
+          code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
+          staged.concat(ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir))
+        end
       end
     end
+    puts "==> Writing #{staged.size} files"
+    ApibuilderFileWriter.flush(staged)
   end
 end
 

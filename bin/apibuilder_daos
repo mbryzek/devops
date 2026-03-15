@@ -24,13 +24,14 @@ def upload(args, apps)
   Util.run cmd
 end
 
-def generate_code(client, org, generator_key, dir, apps)
-  FileUtils.mkdir_p(dir)
+def stage_generated_code(client, org, generator_key, dir, apps, tmp_dir)
+  staged = []
   apps.each do |app|
     puts "==> Generating #{generator_key} for #{org}/#{app}@latest => #{dir}"
     code = client.get_code(org, app, "latest", generator_key)
-    ApibuilderFileWriter.write_code_files(code, dir)
+    staged.concat(ApibuilderFileWriter.stage_code_files(code, dir, tmp_dir))
   end
+  staged
 end
 
 apps = Dir.glob("#{DAO_SPEC_DIR}/*.json").map do |path|
@@ -56,6 +57,11 @@ filtered = if args.app
 upload(args, filtered)
 
 if !args.no_download
-  generate_code(client, organization, "psql_scala", "./generated/app", filtered)
-  generate_code(client, organization, "psql_ddl", "./dao/psql", filtered)
+  Dir.mktmpdir("apibuilder") do |tmp_dir|
+    staged = []
+    staged.concat(stage_generated_code(client, organization, "psql_scala", "./generated/app", filtered, tmp_dir))
+    staged.concat(stage_generated_code(client, organization, "psql_ddl", "./dao/psql", filtered, tmp_dir))
+    puts "==> Writing #{staged.size} files"
+    ApibuilderFileWriter.flush(staged)
+  end
 end
