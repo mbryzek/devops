@@ -112,20 +112,35 @@ end
 
 def download_code(client, app_config, specs, tag)
   Dir.mktmpdir("apibuilder") do |tmp_dir|
-    staged = []
+    # Collect all (spec, generator) work items
+    work_items = []
     specs.each do |spec|
       entries = app_config.find_by_app(spec.application)
-      next if entries.empty?
-
       entries.each do |entry|
         entry.generators.each do |gen|
-          puts "==> Downloading #{spec.organization}/#{spec.application}@#{tag} #{gen.key} => #{gen.target}"
-          attrs = gen.attributes.empty? ? nil : gen.attributes
-          code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
-          staged.concat(ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir))
+          work_items << { spec: spec, gen: gen }
         end
       end
     end
+
+    # Download in parallel batches, stage to temp dir
+    mutex = Mutex.new
+    staged = []
+    work_items.each_slice(client.max_threads) do |batch|
+      threads = batch.map do |item|
+        Thread.new do
+          spec = item[:spec]
+          gen = item[:gen]
+          puts "==> Downloading #{spec.organization}/#{spec.application}@#{tag} #{gen.key} => #{gen.target}"
+          attrs = gen.attributes.empty? ? nil : gen.attributes
+          code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
+          pairs = ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir)
+          mutex.synchronize { staged.concat(pairs) }
+        end
+      end
+      threads.each(&:join)
+    end
+
     puts "==> Writing #{staged.size} files"
     ApibuilderFileWriter.flush(staged)
   end

@@ -6,14 +6,16 @@ require 'base64'
 class ApibuilderClient
 
   DEFAULT_API_URI = "https://api.apibuilder.io"
+  DEFAULT_MAX_THREADS = 10
   CONFIG_PATH = File.join(Dir.home, ".apibuilder", "config")
 
-  attr_reader :base_uri, :token
+  attr_reader :base_uri, :token, :max_threads
 
   def initialize(profile = nil)
     config = load_config(profile)
     @base_uri = config[:api_uri]
     @token = config[:token]
+    @max_threads = config[:max_threads]
   end
 
   # Upload a spec file as a new version
@@ -113,6 +115,7 @@ class ApibuilderClient
 
     api_uri = DEFAULT_API_URI
     token = nil
+    max_threads = DEFAULT_MAX_THREADS
     current_section = nil
     target_section = profile ? "profile #{profile}" : "default"
 
@@ -122,6 +125,11 @@ class ApibuilderClient
 
       if md = line.match(/^\[(.+)\]$/)
         current_section = md[1]
+      elsif current_section == "settings"
+        key, value = line.split("=", 2).map(&:strip)
+        case key
+        when "max_threads" then max_threads = [value.to_i, 1].max
+        end
       elsif current_section == target_section
         key, value = line.split("=", 2).map(&:strip)
         case key
@@ -135,7 +143,7 @@ class ApibuilderClient
       Util.exit_with_error("Profile '#{profile}' not found in #{CONFIG_PATH}")
     end
 
-    { api_uri: api_uri, token: token }
+    { api_uri: api_uri, token: token, max_threads: max_threads }
   end
 
 end

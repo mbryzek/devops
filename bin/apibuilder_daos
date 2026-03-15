@@ -25,11 +25,18 @@ def upload(args, apps)
 end
 
 def stage_generated_code(client, org, generator_key, dir, apps, tmp_dir)
+  mutex = Mutex.new
   staged = []
-  apps.each do |app|
-    puts "==> Generating #{generator_key} for #{org}/#{app}@latest => #{dir}"
-    code = client.get_code(org, app, "latest", generator_key)
-    staged.concat(ApibuilderFileWriter.stage_code_files(code, dir, tmp_dir))
+  apps.each_slice(client.max_threads) do |batch|
+    threads = batch.map do |app|
+      Thread.new do
+        puts "==> Generating #{generator_key} for #{org}/#{app}@latest => #{dir}"
+        code = client.get_code(org, app, "latest", generator_key)
+        pairs = ApibuilderFileWriter.stage_code_files(code, dir, tmp_dir)
+        mutex.synchronize { staged.concat(pairs) }
+      end
+    end
+    threads.each(&:join)
   end
   staged
 end
