@@ -88,6 +88,10 @@ class ApibuilderClient
     req.body = JSON.generate(body) if body
 
     http.request(req)
+  rescue Errno::ECONNREFUSED
+    Util.exit_with_error("Cannot connect to #{@base_uri}. Is the server running?")
+  rescue SocketError => e
+    Util.exit_with_error("Cannot connect to #{@base_uri}: #{e.message}")
   end
 
   def handle_response(response, context)
