@@ -43,7 +43,8 @@ module ApibuilderFileWriter
         written += 1
       end
     end
-    puts "  #{written} written, #{skipped} unchanged" if skipped > 0
+    puts ""
+    puts "  #{written} written, #{skipped} unchanged"
   end
 
   private
