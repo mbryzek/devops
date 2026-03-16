@@ -1,58 +1,30 @@
 #!/usr/bin/env ruby
 
-# Uploads all of the API Json files in this repo to API Builder. By default,
-# we upload the json files in the 'spec' directory
+# Uploads all API JSON files to API Builder and downloads generated code.
 #
 # Usage:
-#
-#  Upload latest development versions based on git tag. This works by
-#  finding the next version (using sem-info tag next),
-#
-#    upload
-#
-#  Upload specific specifications
-#
-#    upload --app organization --app user
-#
-#  Upload a specific tag
-#
-#    upload --tag 0.0.2-dev
-#
-#  Upload using a specific apibuilder profile
-#
-#    upload --profile localhost
-#
-#  Upload using a specific apibuilder profile
-#
-#    upload --profile localhost
-#
-#  Upload json files in 'examples' directory
-#
-#    upload --dir examples
-#
-#  Skip apibuilder update
-#
-#    upload --no_download
-#
+#   apibuilder_apps                              # Upload and download all specs
+#   apibuilder_apps --app platform --app hoa-api # Specific apps only
+#   apibuilder_apps --profile new                # Use specific profile
+#   apibuilder_apps --no_download                # Upload only
+#   apibuilder_apps --dir examples               # Specs from different directory
+#   apibuilder_apps --tag 0.0.2-dev              # Specific version tag
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
 args = Args.parse(ARGV, [], { "app" => "list" })
 
-Util.assert_installed("apibuilder", "https://github.com/apicollective/apibuilder-cli")
 Util.assert_installed("sem-info", "https://github.com/mbryzek/schema-evolution-manager")
 
 organization = DevopsConfigFile.load.apibuilder_organization
+client = ApibuilderClient.new(args.profile)
 
 def calculate_next_tag
-  Util.assert_installed("sem-info", "https://github.com/mbryzek/schema-evolution-manager")
   `sem-info tag next micro`.strip
 end
 
 # Resolves dependencies of the specifications, returning the specs in
 # an order in which their internal dependencies will resolve.
-#
-# @param remaining List of Spec instances
 def resolve_dependencies(remaining, ordered=[])
   if next_spec = remaining.find { |spec| resolved?(ordered, spec) }
     resolve_dependencies(remaining - [next_spec], ordered + [next_spec])
@@ -60,11 +32,6 @@ def resolve_dependencies(remaining, ordered=[])
     ordered + remaining
   end
 end
-
-# @param specs is a list of specifications that have already been fully
-# resolved
-# @param spec is a specification that we want to see if we can now
-# process (e.g. all of its dependencies are in specs)
 
 def resolved?(specs, spec)
   spec.dependencies.all? { |dep|
@@ -84,7 +51,6 @@ if !File.directory?(spec_dir)
 end
 
 class Dependency
-  
   attr_reader :organization, :application
   def initialize(organization, application)
     @organization = organization
@@ -92,20 +58,16 @@ class Dependency
   end
 
   def Dependency.from_uri(uri)
-    if md = uri.match(/^https?:\/\/app.apibuilder.io\/([^\/]+)\/([^\/]+)/)
-      Dependency.new(md[1], md[2])
-    elsif md = uri.match(/^https?:\/\/www.apibuilder.io\/([^\/]+)\/([^\/]+)/)
+    if md = uri.match(/^https?:\/\/(?:app|www)\.apibuilder\.io\/([^\/]+)\/([^\/]+)/)
       Dependency.new(md[1], md[2])
     else
       Util.exit_with_error("Could not parse import uri[%s]" % uri)
     end
   end
-
 end
 
 class Spec
-
-  attr_reader :organization, :application, :dependencies
+  attr_reader :organization, :application, :path, :dependencies
 
   def initialize(organization, application, path)
     @organization = organization
@@ -113,6 +75,8 @@ class Spec
     @path = path
     @dependencies = parse_dependencies
   end
+
+  private
 
   def parse_dependencies
     contents = IO.read(@path)
@@ -122,61 +86,63 @@ class Spec
              puts "** WARNING: File is not valid json: %s" % @path
              {}
            end
-
     (json['imports'] || []).map { |imp| Dependency.from_uri(imp['uri']) }
   end
-  
-  def upload_command(org, tag, profile=nil)
-    cmds = []
-    if profile
-      cmds << "PROFILE=%s" % profile
-    end
-    cmds << "apibuilder upload %s %s %s --version %s" % [org, @application, @path, tag]
-    cmds.join(" ")
-  end
-
-  def download_command(tag, profile=nil)
-    cmds = []
-    if profile
-      cmds << "PROFILE=%s" % profile
-    end
-    cmds << "apibuilder update --app %s --version %s" % [@application, tag]
-    cmds.join(" ")
-  end
-
 end
 
-def validate_versions_not_ahead(specs, upload_version, profile=nil)
-  return if specs.empty?
+def validate_versions_not_ahead(client, specs, upload_version)
+  specs.each do |spec|
+    latest = client.get_latest_version(spec.organization, spec.application)
+    next if latest.nil?
 
-  specs.group_by(&:organization).each do |org, org_specs|
-    app_keys = org_specs.map(&:application)
+    remote_version = latest["version"]
+    next if remote_version.nil? || remote_version.empty?
 
-    cmd = "apibuilder batch latest-versions #{org} #{app_keys.join(' ')}"
-    cmd = "PROFILE=#{profile} #{cmd}" if profile
-
-    result = `#{cmd} 2>/dev/null`.strip
-    if !$?.success?
-      $stderr.puts "WARNING: Could not fetch batch versions for #{org}; skipping version guard"
-      next
+    if Gem::Version.new(remote_version) > Gem::Version.new(upload_version)
+      puts "** ERROR: API has version #{remote_version} for #{spec.organization}/#{spec.application}"
+      puts "   but we are trying to upload #{upload_version} (from git tags)."
+      puts "   This means someone uploaded a higher version directly."
+      puts ""
+      puts "   To fix: investigate who uploaded #{remote_version}, then either"
+      puts "   create a git tag to match, or remove the stale remote version."
+      exit(1)
     end
-    next if result.empty?
+  end
+end
 
-    result.split("\n").each do |line|
-      app_key, remote_version = line.strip.split(/\s+/, 2)
-      next if remote_version.nil? || remote_version.empty?
-
-      if Gem::Version.new(remote_version) > Gem::Version.new(upload_version)
-        puts "** ERROR: apibuilder.io has version #{remote_version} for #{org}/#{app_key}"
-        puts "   but we are trying to upload #{upload_version} (from git tags)."
-        puts "   This means someone uploaded a higher version directly."
-        puts ""
-        puts "   To fix: investigate who uploaded #{remote_version}, then either"
-        puts "   create a git tag to match, or run 'apibuilder clean #{org} #{app_key} --silent'"
-        puts "   to remove the stale remote version."
-        exit(1)
+def download_code(client, app_config, specs, tag)
+  Dir.mktmpdir("apibuilder") do |tmp_dir|
+    # Collect all (spec, generator) work items
+    work_items = []
+    specs.each do |spec|
+      entries = app_config.find_by_app(spec.application)
+      entries.each do |entry|
+        entry.generators.each do |gen|
+          work_items << { spec: spec, gen: gen }
+        end
       end
     end
+
+    # Download in parallel batches, stage to temp dir
+    mutex = Mutex.new
+    staged = []
+    work_items.each_slice(client.max_threads) do |batch|
+      threads = batch.map do |item|
+        Thread.new do
+          spec = item[:spec]
+          gen = item[:gen]
+          puts "==> Downloading #{spec.organization}/#{spec.application}@#{tag} #{gen.key} => #{gen.target}"
+          attrs = gen.attributes.empty? ? nil : gen.attributes
+          code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
+          pairs = ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir)
+          mutex.synchronize { staged.concat(pairs) }
+        end
+      end
+      threads.each(&:join)
+    end
+
+    puts "==> Writing #{staged.size} files"
+    ApibuilderFileWriter.flush(staged)
   end
 end
 
@@ -190,25 +156,28 @@ filtered = args.app.nil? ? ordered : ordered.select { |spec| args.app.include?(s
 
 if args.app && filtered.size != args.app.size
   missing = args.app.select { |n| !filtered.map(&:application).include?(n) }
-
-  if missing.size == 1
-    msg = "** ERROR: Did not find spec: %s\n" % missing.join(", ")
-  else
-    msg = "** ERROR: Did not find specs: %s\n" % missing.join(", ")
-  end
+  msg = missing.size == 1 ? "** ERROR: Did not find spec: %s\n" : "** ERROR: Did not find specs: %s\n"
+  msg = msg % missing.join(", ")
   msg << "  Available specs:\n"
   msg << "    " + specs.map(&:application).join("\n    ")
   Util.exit_with_error msg
 end
 
-validate_versions_not_ahead(filtered, tag, args.profile)
+validate_versions_not_ahead(client, filtered, tag)
 
+# Upload
 filtered.each do |spec|
-  Util.run(spec.upload_command(spec.organization, tag, args.profile))
+  puts "==> Uploading #{spec.organization}/#{spec.application}@#{tag}"
+  client.upload_version(spec.organization, spec.application, tag, spec.path)
 end
 
+# Download
 if !args.no_download
-  filtered.each do |spec|
-    Util.run(spec.download_command(tag, args.profile))
+  app_config_path = File.join(`pwd`.strip, ".apibuilder", "config")
+  if File.exist?(app_config_path)
+    app_config = ApibuilderAppConfig.new(app_config_path)
+    download_code(client, app_config, filtered, tag)
+  else
+    puts "** No .apibuilder/config found, skipping download"
   end
 end
