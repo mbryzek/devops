@@ -1,0 +1,70 @@
+#!/usr/bin/env ruby
+
+# Downloads generated code based on .apibuilder/config in the current directory.
+# Replacement for `apibuilder update` that uses our own API Builder instance.
+#
+# Usage:
+#   apibuilder_update                              # Download all
+#   apibuilder_update --app platform --app hoa-api # Specific apps only
+#   apibuilder_update --profile localhost           # Use specific profile
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, [], { "app" => "list" })
+
+app_config_path = File.join(`pwd`.strip, ".apibuilder", "config")
+if !File.exist?(app_config_path)
+  Util.exit_with_error "No .apibuilder/config found"
+end
+
+client = ApibuilderClient.new(args.profile)
+app_config = ApibuilderAppConfig.new(app_config_path)
+
+entries = app_config.entries
+entries = entries.select { |e| args.app.include?(e.app) } if args.app
+
+errors = []
+
+Dir.mktmpdir("apibuilder") do |tmp_dir|
+  work_items = []
+  entries.each do |entry|
+    entry.generators.each do |gen|
+      work_items << { entry: entry, gen: gen }
+    end
+  end
+
+  mutex = Mutex.new
+  staged = []
+  work_items.each_slice(client.max_threads) do |batch|
+    threads = batch.map do |item|
+      Thread.new do
+        entry = item[:entry]
+        gen = item[:gen]
+        version = entry.version || "latest"
+        puts "==> Downloading #{entry.org}/#{entry.app}@#{version} #{gen.key} => #{gen.target}"
+        attrs = gen.attributes.empty? ? nil : gen.attributes
+        begin
+          code = client.get_code(entry.org, entry.app, version, gen.key, attrs)
+          pairs = ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir)
+          mutex.synchronize { staged.concat(pairs) }
+        rescue ApibuilderClient::Error => e
+          mutex.synchronize { errors << e.message }
+          $stderr.puts "ERROR: #{e.message}"
+        end
+      end
+    end
+    threads.each(&:join)
+  end
+
+  puts "==> Writing #{staged.size} files"
+  ApibuilderFileWriter.flush(staged)
+end
+
+if errors.any?
+  $stderr.puts ""
+  $stderr.puts "=" * 60
+  $stderr.puts "#{errors.size} error(s):"
+  errors.each { |e| $stderr.puts "  - #{e}" }
+  $stderr.puts "=" * 60
+  exit 1
+end

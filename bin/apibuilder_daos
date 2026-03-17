@@ -24,16 +24,21 @@ def upload(args, apps)
   Util.run cmd
 end
 
-def stage_generated_code(client, org, generator_key, dir, apps, tmp_dir)
+def stage_generated_code(client, org, generator_key, dir, apps, tmp_dir, errors)
   mutex = Mutex.new
   staged = []
   apps.each_slice(client.max_threads) do |batch|
     threads = batch.map do |app|
       Thread.new do
         puts "==> Generating #{generator_key} for #{org}/#{app}@latest => #{dir}"
-        code = client.get_code(org, app, "latest", generator_key)
-        pairs = ApibuilderFileWriter.stage_code_files(code, dir, tmp_dir)
-        mutex.synchronize { staged.concat(pairs) }
+        begin
+          code = client.get_code(org, app, "latest", generator_key)
+          pairs = ApibuilderFileWriter.stage_code_files(code, dir, tmp_dir)
+          mutex.synchronize { staged.concat(pairs) }
+        rescue ApibuilderClient::Error => e
+          mutex.synchronize { errors << e.message }
+          $stderr.puts "ERROR: #{e.message}"
+        end
       end
     end
     threads.each(&:join)
@@ -63,12 +68,23 @@ filtered = if args.app
 
 upload(args, filtered)
 
+errors = []
+
 if !args.no_download
   Dir.mktmpdir("apibuilder") do |tmp_dir|
     staged = []
-    staged.concat(stage_generated_code(client, organization, "psql_scala", "./generated/app", filtered, tmp_dir))
-    staged.concat(stage_generated_code(client, organization, "psql_ddl", "./dao/psql", filtered, tmp_dir))
+    staged.concat(stage_generated_code(client, organization, "psql_scala", "./generated/app", filtered, tmp_dir, errors))
+    staged.concat(stage_generated_code(client, organization, "psql_ddl", "./dao/psql", filtered, tmp_dir, errors))
     puts "==> Writing #{staged.size} files"
     ApibuilderFileWriter.flush(staged)
   end
+end
+
+if errors.any?
+  $stderr.puts ""
+  $stderr.puts "=" * 60
+  $stderr.puts "#{errors.size} error(s):"
+  errors.each { |e| $stderr.puts "  - #{e}" }
+  $stderr.puts "=" * 60
+  exit 1
 end

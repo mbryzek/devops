@@ -15,9 +15,9 @@ module Util
     end
 
     def Util.exit_with_error(msg)
-        puts ""
-        puts "ERROR: #{msg}"
-        puts ""
+        $stderr.puts ""
+        $stderr.puts "ERROR: #{msg}"
+        $stderr.puts ""
         exit 1
     end
 
@@ -39,10 +39,10 @@ module Util
     end
 
     def Util.warning(text)
-        puts ""
-        puts ('*') * 100
-        puts Util.indent("WARNING: " + text)
-        puts ('*') * 100
+        $stderr.puts ""
+        $stderr.puts ('*') * 100
+        $stderr.puts Util.indent("WARNING: " + text)
+        $stderr.puts ('*') * 100
     end
 
     def Util.read_file(path)
