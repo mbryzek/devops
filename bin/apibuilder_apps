@@ -110,7 +110,7 @@ def validate_versions_not_ahead(client, specs, upload_version)
   end
 end
 
-def download_code(client, app_config, specs, tag)
+def download_code(client, app_config, specs, tag, errors)
   Dir.mktmpdir("apibuilder") do |tmp_dir|
     # Collect all (spec, generator) work items
     work_items = []
@@ -133,9 +133,14 @@ def download_code(client, app_config, specs, tag)
           gen = item[:gen]
           puts "==> Downloading #{spec.organization}/#{spec.application}@#{tag} #{gen.key} => #{gen.target}"
           attrs = gen.attributes.empty? ? nil : gen.attributes
-          code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
-          pairs = ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir)
-          mutex.synchronize { staged.concat(pairs) }
+          begin
+            code = client.get_code(spec.organization, spec.application, tag, gen.key, attrs)
+            pairs = ApibuilderFileWriter.stage_code_files(code, gen.target, tmp_dir)
+            mutex.synchronize { staged.concat(pairs) }
+          rescue ApibuilderClient::Error => e
+            mutex.synchronize { errors << e.message }
+            $stderr.puts "ERROR: #{e.message}"
+          end
         end
       end
       threads.each(&:join)
@@ -165,19 +170,37 @@ end
 
 validate_versions_not_ahead(client, filtered, tag)
 
+errors = []
+
 # Upload
+uploaded = []
 filtered.each do |spec|
   puts "==> Uploading #{spec.organization}/#{spec.application}@#{tag}"
-  client.upload_version(spec.organization, spec.application, tag, spec.path)
+  begin
+    client.upload_version(spec.organization, spec.application, tag, spec.path)
+    uploaded << spec
+  rescue ApibuilderClient::Error => e
+    errors << e.message
+    $stderr.puts "ERROR: #{e.message}"
+  end
 end
 
-# Download
+# Download (only specs that uploaded successfully)
 if !args.no_download
   app_config_path = File.join(`pwd`.strip, ".apibuilder", "config")
   if File.exist?(app_config_path)
     app_config = ApibuilderAppConfig.new(app_config_path)
-    download_code(client, app_config, filtered, tag)
+    download_code(client, app_config, uploaded, tag, errors)
   else
     puts "** No .apibuilder/config found, skipping download"
   end
+end
+
+if errors.any?
+  $stderr.puts ""
+  $stderr.puts "=" * 60
+  $stderr.puts "#{errors.size} error(s):"
+  errors.each { |e| $stderr.puts "  - #{e}" }
+  $stderr.puts "=" * 60
+  exit 1
 end

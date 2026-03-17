@@ -5,6 +5,8 @@ require 'base64'
 
 class ApibuilderClient
 
+  class Error < StandardError; end
+
   DEFAULT_API_URI = "https://api.apibuilder.io"
   DEFAULT_MAX_THREADS = 10
   CONFIG_PATH = File.join(Dir.home, ".apibuilder", "config")
@@ -57,10 +59,10 @@ class ApibuilderClient
     when 404
       nil
     when 401
-      $stderr.puts "WARNING: Unauthorized fetching #{org}/#{app} versions; skipping version guard"
+      Util.warning("Unauthorized fetching #{org}/#{app} versions; skipping version guard")
       nil
     else
-      $stderr.puts "WARNING: HTTP #{response.code.to_i} fetching #{org}/#{app} versions; skipping version guard"
+      Util.warning("HTTP #{response.code.to_i} fetching #{org}/#{app} versions; skipping version guard")
       nil
     end
   end
@@ -100,15 +102,21 @@ class ApibuilderClient
     when 200, 201, 204
       code == 204 ? nil : JSON.parse(response.body)
     when 404
-      Util.exit_with_error("#{context}: Not found (404)")
+      raise Error, "#{context}: Not found (404)"
     when 401
-      Util.exit_with_error("#{context}: Unauthorized. Check your API token in ~/.apibuilder/config")
+      raise Error, "#{context}: Unauthorized. Check your API token in ~/.apibuilder/config"
     when 422
       errors = JSON.parse(response.body)
       messages = errors.map { |e| e["message"] || e.to_s }.join("\n  ")
-      Util.exit_with_error("#{context}: Validation errors:\n  #{messages}")
+      raise Error, "#{context}: Validation errors:\n  #{messages}"
     else
-      Util.exit_with_error("#{context}: HTTP #{code}\n#{response.body}")
+      message = begin
+                  parsed = JSON.parse(response.body)
+                  parsed["message"] || response.body
+                rescue JSON::ParserError
+                  response.body
+                end
+      raise Error, "#{context}: HTTP #{code}\n#{message}"
     end
   end
 
