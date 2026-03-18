@@ -68,7 +68,7 @@ class ApiConfig
 
   def parse_generators(generators_hash)
     generators_hash.map do |key, target|
-      Generator.new(key: key, target: target, attributes: [])
+      Generator.new(key: key, target: target, attributes: {})
     end
   end
 
