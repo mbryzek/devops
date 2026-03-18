@@ -1,0 +1,220 @@
+#!/usr/bin/env ruby
+
+# Unified CLI for API Builder batch operations.
+#
+# Usage:
+#   api upload              # upload only
+#   api codegen             # codegen only
+#   api upload codegen      # upload then codegen
+#   api --profile localhost upload codegen  # with profile
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+VALID_OPERATIONS = %w[upload codegen].freeze
+
+USAGE = <<~TEXT
+  Usage: api [--profile PROFILE] <operation> [<operation> ...]
+
+  Operations: #{VALID_OPERATIONS.join(', ')}
+
+  Examples:
+    api upload              # upload only
+    api codegen             # codegen only
+    api upload codegen      # upload then codegen
+    api --profile localhost upload codegen
+TEXT
+
+def parse_args(argv)
+  profile = nil
+  operations = []
+  args = argv.dup
+
+  while arg = args.shift
+    case arg
+    when "--profile"
+      profile = args.shift
+      Util.exit_with_error("--profile requires a value") if profile.nil?
+    when "-h", "--help"
+      puts USAGE
+      exit 0
+    else
+      if VALID_OPERATIONS.include?(arg)
+        operations << arg unless operations.include?(arg)
+      else
+        Util.exit_with_error("Unknown argument: #{arg}\n\n#{USAGE}")
+      end
+    end
+  end
+
+  if operations.empty?
+    Util.exit_with_error("At least one operation is required.\n\n#{USAGE}")
+  end
+
+  { profile: profile, operations: operations }
+end
+
+def build_batch_form(config, org, operations)
+  blocks = config.blocks_for_org(org)
+
+  # Collect unique applications across all blocks, merging generators
+  app_data = {}  # application_key => { file_path:, generators: [] }
+
+  blocks.each do |block|
+    block.applications.each do |app|
+      app_data[app.key] ||= { file_path: app.file_path, generators: [] }
+
+      block.generators.each do |gen|
+        batch_gen = { "generator_key" => gen.key }
+        if !block.attributes.empty?
+          batch_gen["attributes"] = block.attributes
+        end
+        app_data[app.key][:generators] << batch_gen
+      end
+    end
+  end
+
+  applications = app_data.map do |app_key, data|
+    entry = { "application_key" => app_key }
+
+    if operations.include?("upload")
+      file_path = data[:file_path]
+      if !File.exist?(file_path)
+        Util.exit_with_error("Application file not found: #{file_path} (for #{app_key})")
+      end
+      entry["original"] = JSON.parse(IO.read(file_path))
+    end
+
+    if operations.include?("codegen")
+      entry["generators"] = data[:generators]
+    end
+
+    entry
+  end
+
+  {
+    "operations" => operations,
+    "applications" => applications,
+  }
+end
+
+def extract_zip(zip_data, config, project_root)
+  require 'tmpdir'
+  require 'zip'  # rubyzip gem
+
+  written = 0
+  unchanged = 0
+
+  Dir.mktmpdir("api-batch") do |tmp_dir|
+    zip_path = File.join(tmp_dir, "batch.zip")
+    IO.binwrite(zip_path, zip_data)
+
+    Zip::File.open(zip_path) do |zip|
+      zip.each do |zip_entry|
+        next if zip_entry.directory?
+
+        parts = zip_entry.name.split("/")
+        # Structure: <org_key>/<application_key>/<generator_key>/<files...>
+        if parts.length < 4
+          Util.warning("Unexpected zip entry: #{zip_entry.name}")
+          next
+        end
+
+        _org_key = parts[0]
+        application_key = parts[1]
+        generator_key = parts[2]
+        relative_file = parts[3..].join("/")
+
+        target = config.find_target(application_key, generator_key)
+        if target.nil?
+          Util.warning("No target found for #{application_key}/#{generator_key}, skipping #{zip_entry.name}")
+          next
+        end
+
+        dest_path = File.join(project_root, target, relative_file)
+
+        # Read new content from zip
+        new_content = zip_entry.get_input_stream.read
+
+        if File.exist?(dest_path) && !meaningful_change?(new_content, IO.read(dest_path))
+          unchanged += 1
+        else
+          FileUtils.mkdir_p(File.dirname(dest_path))
+          IO.binwrite(dest_path, new_content)
+          puts "  wrote #{dest_path}"
+          written += 1
+        end
+      end
+    end
+  end
+
+  puts ""
+  puts "  #{written} written, #{unchanged} unchanged"
+end
+
+IGNORE_PATTERNS = [
+  /^\s*[\*#]\s*Service version:/,
+  /^\s*[\*#]\s*User agent:/,
+  /^\s*[\*#]\s*apibuilder app/,
+].freeze
+
+def meaningful_change?(new_content, existing_content)
+  strip_metadata(new_content) != strip_metadata(existing_content)
+end
+
+def strip_metadata(content)
+  content.each_line.reject { |line| IGNORE_PATTERNS.any? { |p| p.match?(line) } }.join.rstrip
+end
+
+# --- Main ---
+
+parsed = parse_args(ARGV)
+profile = parsed[:profile]
+operations = parsed[:operations]
+
+config_path = File.join(`pwd`.strip, ".api", "config")
+config = ApiConfig.new(config_path)
+
+client = ApibuilderClient.new(profile)
+batch_client = ApiBatchClient.new(client)
+project_root = `pwd`.strip
+
+config.orgs.each do |org|
+  puts "==> Building batch for #{org}"
+  form = build_batch_form(config, org, operations)
+
+  puts "==> Submitting batch to #{org} (#{form["applications"].size} applications, operations: #{operations.join(', ')})"
+  batch = batch_client.create_batch(org, form)
+  batch_id = batch["id"]
+  puts "==> Batch #{batch_id} created, polling for completion..."
+
+  result = batch_client.poll_until_complete(org, batch_id)
+
+  case result["status"]
+  when "error"
+    $stderr.puts ""
+    $stderr.puts "=" * 60
+    errors = result["errors"] || []
+    $stderr.puts "Batch failed with #{errors.size} error(s):"
+    errors.each do |err|
+      parts = [err["application_key"], err["generator_key"]].compact.join("/")
+      $stderr.puts "  - #{parts}: #{err["message"]}"
+    end
+    $stderr.puts "=" * 60
+    exit 1
+  when "done"
+    puts "==> Batch #{batch_id} completed"
+
+    if operations.include?("codegen") && result["zip_file"]
+      zip_url = result["zip_file"]["url"]
+      puts "==> Downloading generated code..."
+      zip_data = batch_client.download_zip(zip_url)
+      if zip_data.nil?
+        Util.exit_with_error("Batch completed but zip has expired. Please re-run.")
+      end
+      puts "==> Extracting files..."
+      extract_zip(zip_data, config, project_root)
+    end
+  end
+end
+
+puts "==> Done"
