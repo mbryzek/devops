@@ -8,26 +8,26 @@ class ApiBatchClient
     @client = client
   end
 
-  # POST /apibuilder/:org/batches
-  def create_batch(org, form)
-    path = "/apibuilder/#{org}/batches"
+  # POST /apibuilder/batches
+  def create_batch(form)
+    path = "/apibuilder/batches"
     response = request(:post, path, form)
-    handle_response(response, "Create batch for #{org}")
+    handle_response(response, "Create batch")
   end
 
-  # GET /apibuilder/:org/batches/:id
-  def get_batch(org, id)
-    path = "/apibuilder/#{org}/batches/#{id}"
+  # GET /apibuilder/batches/:id
+  def get_batch(id)
+    path = "/apibuilder/batches/#{id}"
     response = request(:get, path)
-    handle_response(response, "Get batch #{id} for #{org}")
+    handle_response(response, "Get batch #{id}")
   end
 
   # Polls until batch reaches a terminal status (done or error).
   # Returns the final batch response.
-  def poll_until_complete(org, id)
+  def poll_until_complete(id)
     POLL_INTERVALS.each do |interval|
       sleep(interval)
-      batch = get_batch(org, id)
+      batch = get_batch(id)
       return batch if terminal?(batch)
     end
 
@@ -41,7 +41,7 @@ class ApiBatchClient
       while elapsed < CONTINUE_PROMPT_EVERY
         sleep(CONTINUE_INTERVAL)
         elapsed += CONTINUE_INTERVAL
-        batch = get_batch(org, id)
+        batch = get_batch(id)
         return batch if terminal?(batch)
       end
     end
@@ -69,7 +69,8 @@ class ApiBatchClient
   private
 
   def terminal?(batch)
-    batch["status"] == "done" || batch["status"] == "error"
+    errors = batch["errors"] || []
+    !errors.empty? || !batch["zip_file"].nil?
   end
 
   def prompt_continue
