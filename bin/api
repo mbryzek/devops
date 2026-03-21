@@ -85,7 +85,7 @@ def build_batch_form(config, org, operations, app_filter)
   end
 
   applications = app_data.map do |app_key, data|
-    entry = { "application_key" => app_key }
+    entry = { "organization_key" => org, "application_key" => app_key }
 
     if operations.include?("upload")
       file_path = data[:file_path]
