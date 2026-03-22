@@ -13,18 +13,20 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 VALID_OPERATIONS = %w[upload codegen].freeze
 
 USAGE = <<~TEXT
-  Usage: api [--profile PROFILE] [--app APP ...] <operation> [<operation> ...]
+  Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] <operation> [<operation> ...]
 
   Operations: #{VALID_OPERATIONS.join(', ')}
 
   Options:
-    --app APP    Process only the specified application(s). Can be repeated.
+    --app APP      Process only the specified application(s). Can be repeated.
+    --group GROUP  Process only blocks with the specified group.
 
   Examples:
     api upload              # upload only
     api codegen             # codegen only
     api upload codegen      # upload then codegen
     api --app platform upload codegen
+    api --group dao upload codegen
     api --profile localhost upload codegen
 TEXT
 
@@ -32,6 +34,7 @@ def parse_args(argv)
   profile = nil
   operations = []
   apps = []
+  group = nil
   args = argv.dup
 
   while arg = args.shift
@@ -43,6 +46,9 @@ def parse_args(argv)
       app = args.shift
       Util.exit_with_error("--app requires a value") if app.nil?
       apps << app unless apps.include?(app)
+    when "--group"
+      group = args.shift
+      Util.exit_with_error("--group requires a value") if group.nil?
     when "-h", "--help"
       puts USAGE
       exit 0
@@ -59,11 +65,15 @@ def parse_args(argv)
     Util.exit_with_error("At least one operation is required.\n\n#{USAGE}")
   end
 
-  { profile: profile, operations: operations, apps: apps.empty? ? nil : apps }
+  { profile: profile, operations: operations, apps: apps.empty? ? nil : apps, group: group }
 end
 
-def build_batch_form(config, org, operations, app_filter)
+def build_batch_form(config, org, operations, app_filter, group_filter)
+
   blocks = config.blocks_for_org(org)
+  if group_filter
+    blocks = blocks.select { |b| b.group == group_filter }
+  end
 
   # Collect unique applications across all blocks, merging generators
   app_data = {}  # application_key => { file_path:, generators: [] }
@@ -85,7 +95,7 @@ def build_batch_form(config, org, operations, app_filter)
   end
 
   applications = app_data.map do |app_key, data|
-    entry = { "application_key" => app_key }
+    entry = { "organization_key" => org, "application_key" => app_key }
 
     if operations.include?("upload")
       file_path = data[:file_path]
@@ -110,7 +120,6 @@ end
 
 def extract_zip(zip_data, config, project_root)
   require 'tmpdir'
-  require 'zip'  # rubyzip gem
 
   written = 0
   unchanged = 0
@@ -119,41 +128,41 @@ def extract_zip(zip_data, config, project_root)
     zip_path = File.join(tmp_dir, "batch.zip")
     IO.binwrite(zip_path, zip_data)
 
-    Zip::File.open(zip_path) do |zip|
-      zip.each do |zip_entry|
-        next if zip_entry.directory?
+    extract_dir = File.join(tmp_dir, "extracted")
+    system("unzip", "-q", zip_path, "-d", extract_dir) || Util.exit_with_error("Failed to unzip #{zip_path}")
 
-        parts = zip_entry.name.split("/")
-        # Structure: <org_key>/<application_key>/<generator_key>/<files...>
-        if parts.length < 4
-          Util.warning("Unexpected zip entry: #{zip_entry.name}")
-          next
-        end
+    Dir.glob("#{extract_dir}/**/*").each do |full_path|
+      next if File.directory?(full_path)
 
-        _org_key = parts[0]
-        application_key = parts[1]
-        generator_key = parts[2]
-        relative_file = parts[3..].join("/")
+      relative = full_path.sub("#{extract_dir}/", "")
+      parts = relative.split("/")
+      # Structure: <org_key>/<application_key>/<generator_key>/<files...>
+      if parts.length < 4
+        Util.warning("Unexpected zip entry: #{relative}")
+        next
+      end
 
-        target = config.find_target(application_key, generator_key)
-        if target.nil?
-          Util.warning("No target found for #{application_key}/#{generator_key}, skipping #{zip_entry.name}")
-          next
-        end
+      _org_key = parts[0]
+      application_key = parts[1]
+      generator_key = parts[2]
+      relative_file = parts[3..].join("/")
 
-        dest_path = File.join(project_root, target, relative_file)
+      target = config.find_target(application_key, generator_key)
+      if target.nil?
+        Util.warning("No target found for #{application_key}/#{generator_key}, skipping #{relative}")
+        next
+      end
 
-        # Read new content from zip
-        new_content = zip_entry.get_input_stream.read
+      dest_path = File.join(project_root, target, relative_file)
+      new_content = IO.read(full_path)
 
-        if File.exist?(dest_path) && !meaningful_change?(new_content, IO.read(dest_path))
-          unchanged += 1
-        else
-          FileUtils.mkdir_p(File.dirname(dest_path))
-          IO.binwrite(dest_path, new_content)
-          puts "  wrote #{dest_path}"
-          written += 1
-        end
+      if File.exist?(dest_path) && !meaningful_change?(new_content, IO.read(dest_path))
+        unchanged += 1
+      else
+        FileUtils.mkdir_p(File.dirname(dest_path))
+        IO.binwrite(dest_path, new_content)
+        puts "  wrote #{dest_path}"
+        written += 1
       end
     end
   end
@@ -182,6 +191,7 @@ parsed = parse_args(ARGV)
 profile = parsed[:profile]
 operations = parsed[:operations]
 app_filter = parsed[:apps]
+group_filter = parsed[:group]
 
 config_path = File.join(`pwd`.strip, ".api", "config")
 config = ApiConfig.new(config_path)
@@ -190,8 +200,16 @@ client = ApibuilderClient.new(profile)
 batch_client = ApiBatchClient.new(client)
 project_root = `pwd`.strip
 
+if group_filter
+  all_groups = config.blocks.map(&:group).compact.uniq
+  if !all_groups.include?(group_filter)
+    Util.exit_with_error("Unknown group: #{group_filter}\n  Available: #{all_groups.sort.join(', ')}")
+  end
+end
+
 if app_filter
-  all_app_keys = config.blocks.flat_map { |b| b.applications.map(&:key) }.uniq
+  filtered_blocks = group_filter ? config.blocks.select { |b| b.group == group_filter } : config.blocks
+  all_app_keys = filtered_blocks.flat_map { |b| b.applications.map(&:key) }.uniq
   missing = app_filter.select { |a| !all_app_keys.include?(a) }
   if missing.any?
     msg = "Unknown app(s): #{missing.join(', ')}\n  Available: #{all_app_keys.sort.join(', ')}"
@@ -201,12 +219,12 @@ end
 
 config.orgs.each do |org|
   puts "==> Building batch for #{org}"
-  form = build_batch_form(config, org, operations, app_filter)
+  form = build_batch_form(config, org, operations, app_filter, group_filter)
 
   if form["applications"].empty?
     next
   end
-
+  
   puts "==> Submitting batch to #{org} (#{form["applications"].size} applications, operations: #{operations.join(', ')})"
   batch = batch_client.create_batch(org, form)
   batch_id = batch["id"]
@@ -228,6 +246,12 @@ config.orgs.each do |org|
     exit 1
   when "done"
     puts "==> Batch #{batch_id} completed"
+
+    if operations.include?("codegen")
+      if result["zip_file"].nil?
+        $stderr.puts "WARNING: Batch completed but no zip_file in response. Full result: #{JSON.generate(result.reject { |k,_| k == "applications" })}"
+      end
+    end
 
     if operations.include?("codegen") && result["zip_file"]
       zip_url = result["zip_file"]["url"]

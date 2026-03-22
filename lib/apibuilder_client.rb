@@ -21,8 +21,8 @@ class ApibuilderClient
   end
 
   # Upload a spec file as a new version
-  # PUT /apibuilder/{org}/{app}/{version}
-  def upload_version(org, app, version, spec_path)
+  # POST /apibuilder/{org}/{app}
+  def upload_version(org, app, spec_path)
     data = IO.read(spec_path)
     body = {
       "original_form" => {
@@ -30,9 +30,9 @@ class ApibuilderClient
         "data" => data,
       }
     }
-    path = "/apibuilder/#{org}/#{app}/#{version}"
-    response = request(:put, path, body)
-    handle_response(response, "Upload #{org}/#{app} version #{version}")
+    path = "/apibuilder/#{org}/#{app}"
+    response = request(:post, path, body)
+    handle_response(response, "Upload #{org}/#{app}")
   end
 
   # Get generated code for a specific generator

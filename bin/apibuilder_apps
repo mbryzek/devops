@@ -175,9 +175,9 @@ errors = []
 # Upload
 uploaded = []
 filtered.each do |spec|
-  puts "==> Uploading #{spec.organization}/#{spec.application}@#{tag}"
+  puts "==> Uploading #{spec.organization}/#{spec.application}"
   begin
-    client.upload_version(spec.organization, spec.application, tag, spec.path)
+    client.upload_version(spec.organization, spec.application, spec.path)
     uploaded << spec
   rescue ApibuilderClient::Error => e
     errors << e.message

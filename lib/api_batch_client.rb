@@ -8,16 +8,16 @@ class ApiBatchClient
     @client = client
   end
 
-  # POST /apibuilder/:org/batches
+  # POST /apibuilder/batches
   def create_batch(org, form)
-    path = "/apibuilder/#{org}/batches"
+    path = "/apibuilder/batches"
     response = request(:post, path, form)
     handle_response(response, "Create batch for #{org}")
   end
 
-  # GET /apibuilder/:org/batches/:id
+  # GET /apibuilder/batches/:id
   def get_batch(org, id)
-    path = "/apibuilder/#{org}/batches/#{id}"
+    path = "/apibuilder/batches/#{id}"
     response = request(:get, path)
     handle_response(response, "Get batch #{id} for #{org}")
   end
