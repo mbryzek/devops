@@ -4,7 +4,7 @@ class ApiConfig
 
   Generator = Struct.new(:key, :target, :attributes, keyword_init: true)
   Application = Struct.new(:key, :file_path, keyword_init: true)
-  Block = Struct.new(:org, :generators, :attributes, :applications, keyword_init: true)
+  Block = Struct.new(:org, :group, :generators, :attributes, :applications, keyword_init: true)
 
   attr_reader :blocks
 
@@ -53,9 +53,15 @@ class ApiConfig
       (block_list || []).each do |block_data|
         generators = parse_generators(block_data["generators"] || {})
         attributes = block_data["attributes"] || {}
-        applications = parse_applications(block_data["applications"] || {})
+        group = block_data["group"]
+        applications = if glob = block_data["spec_glob"]
+                         parse_spec_glob(glob)
+                       else
+                         parse_applications(block_data["applications"] || {})
+                       end
         blocks << Block.new(
           org: org,
+          group: group,
           generators: generators,
           attributes: attributes,
           applications: applications,
@@ -69,6 +75,17 @@ class ApiConfig
   def parse_generators(generators_hash)
     generators_hash.map do |key, target|
       Generator.new(key: key, target: target, attributes: {})
+    end
+  end
+
+  def parse_spec_glob(glob)
+    files = Dir.glob(glob).sort
+    if files.empty?
+      Util.exit_with_error("spec_glob '#{glob}' matched no files")
+    end
+    files.map do |path|
+      key = File.basename(path, ".json")
+      Application.new(key: key, file_path: path)
     end
   end
 
