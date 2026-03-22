@@ -217,6 +217,9 @@ if app_filter
   end
 end
 
+num_orgs = config.orgs.size
+puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
+
 config.orgs.each do |org|
   puts "==> Building batch for #{org}"
   form = build_batch_form(config, org, operations, app_filter, group_filter)
@@ -224,8 +227,9 @@ config.orgs.each do |org|
   if form["applications"].empty?
     next
   end
-  
-  puts "==> Submitting batch to #{org} (#{form["applications"].size} applications, operations: #{operations.join(', ')})"
+
+  num_apps = form["applications"].size
+  puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
   batch = batch_client.create_batch(org, form)
   batch_id = batch["id"]
   puts "==> Batch #{batch_id} created, polling for completion..."
