@@ -23,6 +23,13 @@ unless system('wrangler whoami > /dev/null 2>&1')
   exit 1
 end
 
+# Verify .env.production exists (required for Vite build-time env vars)
+unless File.exist?(".env.production")
+  puts "Error: .env.production not found"
+  puts "This file is required for production builds (VITE_API_BASE_URL, etc.)"
+  exit 1
+end
+
 # Clean previous builds
 helper.run "rm -rf build .svelte-kit/cloudflare"
 
