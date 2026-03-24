@@ -187,6 +187,8 @@ end
 
 # --- Main ---
 
+start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
 parsed = parse_args(ARGV)
 profile = parsed[:profile]
 operations = parsed[:operations]
@@ -270,4 +272,5 @@ config.orgs.each do |org|
   end
 end
 
-puts "==> Done"
+elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+puts "==> Done (#{format('%.1f', elapsed)} seconds)"
