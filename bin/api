@@ -3,9 +3,11 @@
 # Unified CLI for API Builder batch operations.
 #
 # Usage:
-#   api upload              # upload only
-#   api codegen             # codegen only
-#   api upload codegen      # upload then codegen
+#   api                             # auto-detect: upload (if specs found) + codegen
+#   api --profile localhost         # same, with profile
+#   api upload                      # upload only
+#   api codegen                     # codegen only
+#   api upload codegen              # upload then codegen
 #   api --profile localhost upload codegen  # with profile
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
@@ -13,21 +15,25 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 VALID_OPERATIONS = %w[upload codegen].freeze
 
 USAGE = <<~TEXT
-  Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] <operation> [<operation> ...]
+  Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] [<operation> ...]
 
   Operations: #{VALID_OPERATIONS.join(', ')}
+
+  When no operations are specified, codegen is always included and upload is
+  included automatically if any spec files referenced in .api/config exist locally.
 
   Options:
     --app APP      Process only the specified application(s). Can be repeated.
     --group GROUP  Process only blocks with the specified group.
 
   Examples:
-    api upload              # upload only
-    api codegen             # codegen only
-    api upload codegen      # upload then codegen
+    api                             # auto-detect operations
+    api --profile localhost         # auto-detect with profile
+    api upload                      # upload only
+    api codegen                     # codegen only
+    api upload codegen              # upload then codegen
     api --app platform upload codegen
     api --group dao upload codegen
-    api --profile localhost upload codegen
 TEXT
 
 def parse_args(argv)
@@ -59,10 +65,6 @@ def parse_args(argv)
         Util.exit_with_error("Unknown argument: #{arg}\n\n#{USAGE}")
       end
     end
-  end
-
-  if operations.empty?
-    Util.exit_with_error("At least one operation is required.\n\n#{USAGE}")
   end
 
   { profile: profile, operations: operations, apps: apps.empty? ? nil : apps, group: group }
@@ -197,6 +199,15 @@ group_filter = parsed[:group]
 
 config_path = File.join(`pwd`.strip, ".api", "config")
 config = ApiConfig.new(config_path)
+
+if operations.empty?
+  operations = ["codegen"]
+  has_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(a.file_path) } }
+  if has_specs
+    operations.unshift("upload")
+  end
+  puts "==> Auto-detected operations: #{operations.join(', ')}"
+end
 
 client = ApibuilderClient.new(profile)
 batch_client = ApiBatchClient.new(client)

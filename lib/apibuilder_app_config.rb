@@ -50,17 +50,14 @@ class ApibuilderAppConfig
     when Hash
       # Simple format: { "generator_key" => "target_dir" }
       generators.map do |key, target|
-        Generator.new(key: key, target: target, attributes: [])
+        Generator.new(key: key, target: target, attributes: {})
       end
     when Array
       # List format with optional attributes
       generators.map do |entry|
         key = entry["generator"] or Util.exit_with_error("Generator entry missing 'generator' key: #{entry.inspect}")
         target = entry["target"] or Util.exit_with_error("Generator entry missing 'target' key: #{entry.inspect}")
-        attrs = (entry["attributes"] || []).map do |attr|
-          value = attr["value"]
-          { "name" => attr["name"], "value" => value.is_a?(String) ? value : JSON.generate(value) }
-        end
+        attrs = (entry["attributes"] || {}).transform_values { |v| v.is_a?(String) ? v : JSON.generate(v) }
         Generator.new(
           key: key,
           target: target,
