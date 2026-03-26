@@ -46,23 +46,23 @@ puts ""
 puts Util.underline("Checking Invariants")
 puts ""
 
+print "Fetching #{ENDPOINTS.map { |e| e[:name] }.join(', ')}..."
+$stdout.flush
+
 results = ENDPOINTS.map do |endpoint|
   Thread.new do
-    print "Fetching #{endpoint[:name]}..."
-    $stdout.flush
     vars = EnvironmentVariables.load(endpoint[:app], "production")
     devops_token = vars["DEVOPS_TOKEN"]
     if devops_token.nil? || devops_token.empty?
-      puts " ERROR: DEVOPS_TOKEN not configured for #{endpoint[:app]}"
-      { endpoint: endpoint, data: nil }
+      { endpoint: endpoint, data: nil, error: "DEVOPS_TOKEN not configured for #{endpoint[:app]}" }
     else
       data = fetch_invariants(endpoint, devops_token)
-      puts " done"
       { endpoint: endpoint, data: data }
     end
   end
 end.map(&:value)
 
+puts " done"
 puts ""
 
 all_passed = true
@@ -70,7 +70,10 @@ results.sort_by { |r| r[:endpoint][:name] }.each do |r|
   endpoint = r[:endpoint]
   data = r[:data]
 
-  if data.nil?
+  if r[:error]
+    puts Util.underline("#{endpoint[:name]}: ERROR - #{r[:error]}")
+    all_passed = false
+  elsif data.nil?
     puts Util.underline("#{endpoint[:name]}: UNREACHABLE")
     all_passed = false
   else
