@@ -201,14 +201,20 @@ start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
 # Handle special subcommands before parse_args (which rejects unknown args)
 if ARGV.first == "init"
+  Util.exit_with_error("Usage: api init (takes no arguments)") if ARGV.length > 1
   client = ApibuilderClient.new(nil, allow_no_token: true)
   result = client.anonymous_init
-  org_key = result["organization_key"]
-  token = result["token"]
+  org_key = result["organization_key"] or Util.exit_with_error("Server response missing organization_key")
+  token = result["token"] or Util.exit_with_error("Server response missing token")
   config_dir = File.join(Dir.home, ".apibuilder")
   config_path = File.join(config_dir, "config")
+  if File.exist?(config_path)
+    Util.exit_with_error("Config already exists at #{config_path}. Delete it first to reinitialize.")
+  end
   FileUtils.mkdir_p(config_dir)
-  IO.write(config_path, "[default]\ntoken = #{token}\n")
+  tmp_path = "#{config_path}.tmp"
+  IO.write(tmp_path, "[default]\ntoken = #{token}\n")
+  File.rename(tmp_path, config_path)
   puts "==> Anonymous org created: #{org_key}"
   puts "==> Token written to #{config_path}"
   exit 0
@@ -256,6 +262,8 @@ if ARGV.first == "validate"
       $stderr.puts "==> #{file_path}: validation failed"
       errors.each { |e| $stderr.puts "  - #{e["message"]}" }
       exit 1
+    else
+      Util.exit_with_error("Unexpected batch status '#{result["status"]}' for #{file_path}")
     end
   rescue ApibuilderClient::Error => e
     $stderr.puts "==> #{file_path}: validation failed"
