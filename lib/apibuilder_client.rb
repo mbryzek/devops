@@ -13,11 +13,18 @@ class ApibuilderClient
 
   attr_reader :base_uri, :token, :max_threads
 
-  def initialize(profile = nil)
-    config = load_config(profile)
+  def initialize(profile = nil, allow_no_token: false)
+    config = load_config(profile, allow_no_token: allow_no_token)
     @base_uri = config[:api_uri]
     @token = config[:token]
     @max_threads = config[:max_threads]
+  end
+
+  # Create an anonymous org and token for zero-friction onboarding
+  # POST /apibuilder/anonymous
+  def anonymous_init
+    response = request(:post, "/apibuilder/anonymous")
+    handle_response(response, "Anonymous init")
   end
 
   # Upload a spec file as a new version
@@ -120,8 +127,11 @@ class ApibuilderClient
     end
   end
 
-  def load_config(profile)
+  def load_config(profile, allow_no_token: false)
     if !File.exist?(CONFIG_PATH)
+      if allow_no_token
+        return { api_uri: DEFAULT_API_URI, token: nil, max_threads: DEFAULT_MAX_THREADS }
+      end
       Util.exit_with_error("API Builder config not found at #{CONFIG_PATH}")
     end
 
