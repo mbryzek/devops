@@ -8,7 +8,8 @@ class ApibuilderClient
   class Error < StandardError; end
 
   DEFAULT_API_URI = "https://api.apibuilder.io"
-  CONFIG_PATH = File.join(Dir.home, ".apibuilder", "config")
+  GLOBAL_CONFIG_DIR = File.join(Dir.home, ".apibuilder")
+  CONFIG_PATH = File.join(GLOBAL_CONFIG_DIR, "config")
 
   attr_reader :base_uri, :token
 
@@ -18,14 +19,57 @@ class ApibuilderClient
     @token = config[:token]
   end
 
-  # Create an anonymous org and token for zero-friction onboarding
-  # POST /apibuilder/anonymous
-  def anonymous_init
-    response = request(:post, "/apibuilder/anonymous")
-    handle_response(response, "Anonymous init")
+  # Performs an authenticated HTTP request and returns the parsed response body.
+  # Raises ApibuilderClient::Error on non-success responses.
+  def request(method, path, body = nil)
+    response = raw_request(method, path, body)
+    handle_response(response, "#{method.upcase} #{path}")
   end
 
-  # Upload a spec file as a new version
+  # Performs an authenticated HTTP request and returns the raw Net::HTTP response.
+  def raw_request(method, path, body = nil)
+    uri = URI.parse("#{@base_uri}#{path}")
+    http = build_http(uri)
+
+    req = build_request(method, uri)
+    req.body = JSON.generate(body) if body
+
+    http.request(req)
+  rescue Errno::ECONNREFUSED
+    Util.exit_with_error("Cannot connect to #{@base_uri}. Is the server running?")
+  rescue SocketError => e
+    Util.exit_with_error("Cannot connect to #{@base_uri}: #{e.message}")
+  end
+
+  # Downloads a file from an absolute URL (no auth) and returns the raw body.
+  # Returns nil for 404/410 (expired).
+  def download(url)
+    uri = URI.parse(url)
+    http = build_http(uri)
+    response = http.request(Net::HTTP::Get.new(uri.request_uri))
+
+    code = response.code.to_i
+    if code == 200
+      response.body
+    elsif code == 404 || code == 410
+      nil
+    else
+      Util.exit_with_error("Failed to download #{url}: HTTP #{code}")
+    end
+  end
+
+  # Create an anonymous org and token (no auth sent).
+  # POST /apibuilder/anonymous
+  def anonymous_init
+    uri = URI.parse("#{@base_uri}/apibuilder/anonymous")
+    http = build_http(uri)
+    req = Net::HTTP::Post.new(uri.request_uri)
+    req["Content-Type"] = "application/json"
+    response = http.request(req)
+    handle_response(response, "POST /apibuilder/anonymous")
+  end
+
+  # Upload a spec file as a new version.
   # POST /apibuilder/{org}/{app}
   def upload_version(org, app, spec_path)
     data = IO.read(spec_path)
@@ -35,12 +79,10 @@ class ApibuilderClient
         "data" => data,
       }
     }
-    path = "/apibuilder/#{org}/#{app}"
-    response = request(:post, path, body)
-    handle_response(response, "Upload #{org}/#{app}")
+    request(:post, "/apibuilder/#{org}/#{app}", body)
   end
 
-  # Get generated code for a specific generator
+  # Get generated code for a specific generator.
   # GET /apibuilder/{org}/{app}/{version}/{generator_key}
   def get_code(org, app, version, generator_key, attributes = nil)
     path = "/apibuilder/#{org}/#{app}/#{version}/#{generator_key}"
@@ -48,19 +90,17 @@ class ApibuilderClient
       encoded = URI.encode_www_form_component(JSON.generate(attributes))
       path = "#{path}?attributes=#{encoded}"
     end
-    response = request(:get, path)
-    handle_response(response, "Generate #{generator_key} for #{org}/#{app}@#{version}")
+    request(:get, path)
   end
 
-  # Get latest version for an app
+  # Get latest version for an app.
   # GET /apibuilder/{org}/{app}?limit=1
   def get_latest_version(org, app)
     path = "/apibuilder/#{org}/#{app}?limit=1"
-    response = request(:get, path)
+    response = raw_request(:get, path)
     case response.code.to_i
     when 200
-      versions = JSON.parse(response.body)
-      versions.first
+      JSON.parse(response.body).first
     when 404
       nil
     when 401
@@ -72,33 +112,108 @@ class ApibuilderClient
     end
   end
 
+  # Reads a value from the global config for a given profile and key.
+  # Returns nil if the config file, profile, or key is not found.
+  def self.read_config_value(profile, key)
+    return nil unless File.exist?(CONFIG_PATH)
+
+    target_section = profile ? "profile #{profile}" : "default"
+    current_section = nil
+
+    IO.readlines(CONFIG_PATH).each do |line|
+      line = line.strip
+      next if line.empty? || line.start_with?("#")
+
+      if md = line.match(/^\[(.+)\]$/)
+        current_section = md[1]
+      elsif current_section == target_section
+        k, v = line.split("=", 2).map(&:strip)
+        return v if k == key
+      end
+    end
+
+    nil
+  end
+
+  # Writes or updates a profile section in the global config file.
+  # Returns true if written, false if the user declined to replace an existing section.
+  def self.write_config_section(profile, entries)
+    section_header = profile ? "[profile #{profile}]" : "[default]"
+    section_content = entries.map { |k, v| "#{k} = #{v}" }.join("\n")
+    full_section = "#{section_header}\n#{section_content}\n"
+
+    FileUtils.mkdir_p(GLOBAL_CONFIG_DIR)
+
+    if File.exist?(CONFIG_PATH)
+      existing = IO.read(CONFIG_PATH)
+      if existing.include?(section_header)
+        profile_name = profile || "default"
+        $stderr.print "Profile '#{profile_name}' already exists in #{CONFIG_PATH}. Replace it? [y/N] "
+        answer = $stdin.gets&.strip&.downcase
+        if answer != "y"
+          puts "==> Aborted"
+          return false
+        end
+        updated = remove_config_section(existing, section_header)
+        write_config_file(updated.rstrip + "\n\n" + full_section)
+      else
+        write_config_file(existing.rstrip + "\n\n" + full_section)
+      end
+    else
+      write_config_file(full_section)
+    end
+
+    true
+  end
+
   private
 
-  def request(method, path, body = nil)
-    uri = URI.parse("#{@base_uri}#{path}")
+  def self.remove_config_section(content, section_header)
+    in_section = false
+    content.lines.reject do |line|
+      if line.strip == section_header
+        in_section = true
+        true
+      elsif in_section && line.match?(/^\[/)
+        in_section = false
+        false
+      else
+        in_section
+      end
+    end.join
+  end
+  private_class_method :remove_config_section
+
+  def self.write_config_file(content)
+    tmp_path = "#{CONFIG_PATH}.tmp"
+    IO.write(tmp_path, content)
+    File.rename(tmp_path, CONFIG_PATH)
+  end
+  private_class_method :write_config_file
+
+  HTTP_METHODS = {
+    get: Net::HTTP::Get,
+    post: Net::HTTP::Post,
+    put: Net::HTTP::Put,
+    delete: Net::HTTP::Delete,
+  }.freeze
+
+  def build_http(uri)
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = uri.scheme == "https"
     http.open_timeout = 30
     http.read_timeout = 300
+    http
+  end
 
-    req = case method
-          when :get then Net::HTTP::Get.new(uri.request_uri)
-          when :put then Net::HTTP::Put.new(uri.request_uri)
-          when :post then Net::HTTP::Post.new(uri.request_uri)
-          when :delete then Net::HTTP::Delete.new(uri.request_uri)
-          end
-
+  def build_request(method, uri)
+    klass = HTTP_METHODS.fetch(method) { Util.exit_with_error("Unsupported HTTP method: #{method}") }
+    req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
     if @token && !@token.empty?
       req["Authorization"] = "Basic " + Base64.strict_encode64("#{@token}:")
     end
-    req.body = JSON.generate(body) if body
-
-    http.request(req)
-  rescue Errno::ECONNREFUSED
-    Util.exit_with_error("Cannot connect to #{@base_uri}. Is the server running?")
-  rescue SocketError => e
-    Util.exit_with_error("Cannot connect to #{@base_uri}: #{e.message}")
+    req
   end
 
   def handle_response(response, context)
@@ -133,28 +248,14 @@ class ApibuilderClient
       Util.exit_with_error("API Builder config not found at #{CONFIG_PATH}")
     end
 
-    api_uri = DEFAULT_API_URI
-    token = nil
-    current_section = nil
-    target_section = profile ? "profile #{profile}" : "default"
+    api_uri = self.class.read_config_value(profile, "api_uri") || DEFAULT_API_URI
+    token = self.class.read_config_value(profile, "token")
 
-    IO.readlines(CONFIG_PATH).each do |line|
-      line = line.strip
-      next if line.empty? || line.start_with?("#")
-
-      if md = line.match(/^\[(.+)\]$/)
-        current_section = md[1]
-      elsif current_section == target_section
-        key, value = line.split("=", 2).map(&:strip)
-        case key
-        when "api_uri" then api_uri = value
-        when "token" then token = value
-        end
+    if token.nil? && !allow_no_token
+      target = profile ? "profile #{profile}" : "default"
+      if profile
+        Util.exit_with_error("Profile '#{profile}' not found in #{CONFIG_PATH}")
       end
-    end
-
-    if token.nil? && !allow_no_token && target_section != "default"
-      Util.exit_with_error("Profile '#{profile}' not found in #{CONFIG_PATH}")
     end
 
     { api_uri: api_uri, token: token }
