@@ -16,8 +16,8 @@ VALID_OPERATIONS = %w[upload codegen].freeze
 
 USAGE = <<~TEXT
   Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] [<operation> ...]
-         api init
-         api validate <file>
+         api [--profile PROFILE] init [--language typescript] [--language scala]
+         api [--profile PROFILE] validate <file>
 
   Commands:
     init [options]    Create an anonymous org and token, write to ~/.apibuilder/config.
@@ -205,10 +205,19 @@ end
 start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
 # Handle special subcommands before parse_args (which rejects unknown args)
-if ARGV.first == "init"
+# Extract --profile early so it works with init/validate too
+init_profile = nil
+remaining_argv = ARGV.dup
+if idx = remaining_argv.index("--profile")
+  remaining_argv.delete_at(idx)
+  init_profile = remaining_argv.delete_at(idx)
+  Util.exit_with_error("--profile requires a value") if init_profile.nil?
+end
+
+if remaining_argv.first == "init"
   VALID_LANGUAGES = %w[typescript scala].freeze
   languages = []
-  args = ARGV[1..].dup
+  args = remaining_argv[1..].dup
   while arg = args.shift
     case arg
     when "--language"
@@ -224,7 +233,7 @@ if ARGV.first == "init"
     end
   end
 
-  client = ApibuilderClient.new(nil, allow_no_token: true)
+  client = ApibuilderClient.new(init_profile, allow_no_token: true)
   result = client.anonymous_init
   org_key = result["organization_key"] or Util.exit_with_error("Server response missing organization_key")
   token = result["token"] or Util.exit_with_error("Server response missing token")
@@ -286,8 +295,8 @@ if ARGV.first == "init"
   exit 0
 end
 
-if ARGV.first == "validate"
-  file_path = ARGV[1]
+if remaining_argv.first == "validate"
+  file_path = remaining_argv[1]
   Util.exit_with_error("Usage: api validate <file>") if file_path.nil?
   Util.exit_with_error("File not found: #{file_path}") unless File.exist?(file_path)
 
@@ -297,7 +306,7 @@ if ARGV.first == "validate"
            Util.exit_with_error("Invalid JSON in #{file_path}: #{e.message}")
          end
 
-  client = ApibuilderClient.new
+  client = ApibuilderClient.new(init_profile)
   batch_client = ApiBatchClient.new(client)
 
   org = spec["organization"]&.[]("key") || "tmp"
