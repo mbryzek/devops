@@ -1,0 +1,57 @@
+#!/usr/bin/env ruby
+
+require 'json'
+require 'net/http'
+require 'uri'
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+ENDPOINTS = [
+  { name: "Acumen", url: "https://api.trueacumen.com", app: "acumen" },
+  { name: "Platform", url: "https://idempotent.io", app: "platform" }
+]
+
+def requeue(endpoint, devops_token)
+  uri = URI.parse("#{endpoint[:url]}/_internal_/requeue")
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = (uri.scheme == "https")
+  http.open_timeout = 10
+  http.read_timeout = 30
+
+  request = Net::HTTP::Post.new(uri.request_uri)
+  request["X-Devops-Token"] = devops_token
+  request["Content-Type"] = "application/json"
+
+  response = http.request(request)
+  case response.code.to_i
+  when 200
+    data = JSON.parse(response.body)
+    data["requeued"]
+  else
+    raise "HTTP #{response.code}: #{response.body}"
+  end
+rescue => e
+  raise "#{e.message}"
+end
+
+puts ""
+puts Util.underline("Requeuing Failed Tasks")
+puts ""
+
+ENDPOINTS.each do |endpoint|
+  vars = EnvironmentVariables.load(endpoint[:app], "production")
+  devops_token = vars["DEVOPS_TOKEN"]
+  if devops_token.nil? || devops_token.empty?
+    puts "  #{endpoint[:name]}: ERROR - DEVOPS_TOKEN not configured"
+    next
+  end
+
+  begin
+    count = requeue(endpoint, devops_token)
+    puts "  #{endpoint[:name]}: #{count} tasks requeued"
+  rescue => e
+    puts "  #{endpoint[:name]}: ERROR - #{e.message}"
+  end
+end
+
+puts ""
