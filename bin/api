@@ -13,6 +13,7 @@
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
 VALID_OPERATIONS = %w[upload codegen].freeze
+VALID_LANGUAGES = %w[typescript scala].freeze
 
 USAGE = <<~TEXT
   Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] [<operation> ...]
@@ -31,46 +32,66 @@ USAGE = <<~TEXT
   included automatically if any spec files referenced in .api/config exist locally.
 
   Options:
-    --app APP      Process only the specified application(s). Can be repeated.
-    --group GROUP  Process only blocks with the specified group.
+    --profile PROFILE  Use a named profile from ~/.apibuilder/config
+    --app APP          Process only the specified application(s). Can be repeated.
+    --group GROUP      Process only blocks with the specified group.
 
   Examples:
-    api init                                    # create anonymous org + token
-    api init --language typescript              # + create .api/config for TypeScript
-    api init --language scala                   # + create .api/config for Scala
-    api init --language typescript --language scala  # + create .api/config for both
-    api validate spec/myapp.json    # validate a spec file
-    api                             # auto-detect operations
-    api --profile localhost         # auto-detect with profile
-    api upload                      # upload only
-    api codegen                     # codegen only
-    api upload codegen              # upload then codegen
+    api init                                        # create anonymous org + token
+    api init --language typescript                   # + create .api/config for TypeScript
+    api init --language scala                        # + create .api/config for Scala
+    api init --language typescript --language scala   # + create .api/config for both
+    api validate spec/myapp.json                     # validate a spec file
+    api                                              # auto-detect operations
+    api --profile localhost                           # auto-detect with profile
+    api upload                                       # upload only
+    api codegen                                      # codegen only
+    api upload codegen                               # upload then codegen
     api --app platform upload codegen
     api --group dao upload codegen
 TEXT
 
-def parse_args(argv)
+# --- Argument Parsing ---
+
+def parse_option_value(args, flag)
+  value = args.shift
+  Util.exit_with_error("#{flag} requires a value") if value.nil?
+  value
+end
+
+def parse_global_args(argv)
   profile = nil
-  operations = []
-  apps = []
-  group = nil
+  remaining = []
   args = argv.dup
 
   while arg = args.shift
     case arg
     when "--profile"
-      profile = args.shift
-      Util.exit_with_error("--profile requires a value") if profile.nil?
-    when "--app"
-      app = args.shift
-      Util.exit_with_error("--app requires a value") if app.nil?
-      apps << app unless apps.include?(app)
-    when "--group"
-      group = args.shift
-      Util.exit_with_error("--group requires a value") if group.nil?
+      profile = parse_option_value(args, "--profile")
     when "-h", "--help"
       puts USAGE
       exit 0
+    else
+      remaining << arg
+    end
+  end
+
+  { profile: profile, remaining: remaining }
+end
+
+def parse_batch_args(remaining)
+  operations = []
+  apps = []
+  group = nil
+
+  args = remaining.dup
+  while arg = args.shift
+    case arg
+    when "--app"
+      app = parse_option_value(args, "--app")
+      apps << app unless apps.include?(app)
+    when "--group"
+      group = parse_option_value(args, "--group")
     else
       if VALID_OPERATIONS.include?(arg)
         operations << arg unless operations.include?(arg)
@@ -80,17 +101,146 @@ def parse_args(argv)
     end
   end
 
-  { profile: profile, operations: operations, apps: apps.empty? ? nil : apps, group: group }
+  { operations: operations, apps: apps.empty? ? nil : apps, group: group }
 end
 
-def build_batch_form(config, org, operations, app_filter, group_filter)
+def parse_init_args(remaining)
+  languages = []
+  args = remaining.dup
 
-  blocks = config.blocks_for_org(org)
-  if group_filter
-    blocks = blocks.select { |b| b.group == group_filter }
+  while arg = args.shift
+    case arg
+    when "--language"
+      lang = parse_option_value(args, "--language").downcase
+      if !VALID_LANGUAGES.include?(lang)
+        Util.exit_with_error("Unknown language: #{lang}\nValid languages: #{VALID_LANGUAGES.join(', ')}")
+      end
+      languages << lang unless languages.include?(lang)
+    else
+      Util.exit_with_error("Unknown argument: #{arg}\nUsage: api init [--profile PROFILE] [--language typescript] [--language scala]")
+    end
   end
 
-  # Collect unique applications across all blocks, merging generators
+  languages
+end
+
+# --- Init Command ---
+
+LANGUAGE_GENERATORS = {
+  "typescript" => {
+    "typescript" => "./src/generated",
+  },
+  "scala" => {
+    "bryzek_play_model"       => "generated/app/apibuilder",
+    "bryzek_play_mock_model"  => "generated/test/apibuilder",
+    "bryzek_play_client"      => "generated/app/apibuilder",
+    "bryzek_play_mock_client" => "generated/test/apibuilder",
+    "bryzek_play_controller"  => "generated/app/apibuilder",
+    "bryzek_play_routes"      => "conf",
+  },
+}.freeze
+
+def run_init(profile, languages)
+  api_uri = ApibuilderClient.read_config_value(profile, "api_uri") || ApibuilderClient::DEFAULT_API_URI
+
+  client = ApibuilderClient.new(profile, allow_no_token: true)
+  result = client.anonymous_init
+  org_key = result["organization_key"] or Util.exit_with_error("Server response missing organization_key")
+  token = result["token"] or Util.exit_with_error("Server response missing token")
+
+  entries = profile ? { "api_uri" => api_uri, "token" => token } : { "token" => token }
+  if !ApibuilderClient.write_config_section(profile, entries)
+    exit 0
+  end
+
+  profile_name = profile || "default"
+  puts "==> Anonymous org created: #{org_key}"
+  puts "==> Token written to #{ApibuilderClient::CONFIG_PATH} [#{profile_name}]"
+
+  write_local_config(org_key, languages) if languages.any?
+end
+
+def write_local_config(org_key, languages)
+  local_config_dir = File.join(Dir.pwd, ".api")
+  local_config_path = File.join(local_config_dir, "config")
+
+  if File.exist?(local_config_path)
+    Util.exit_with_error(".api/config already exists. Delete it first to reinitialize.")
+  end
+
+  blocks = languages.map do |lang|
+    generators = LANGUAGE_GENERATORS.fetch(lang)
+    gen_lines = generators.map { |key, target| "      #{key}: #{target}" }.join("\n")
+    "  - generators:\n#{gen_lines}\n    applications:\n      my-api:"
+  end
+
+  content = "#{org_key}:\n#{blocks.join("\n\n")}\n"
+
+  FileUtils.mkdir_p(local_config_dir)
+  tmp_path = "#{local_config_path}.tmp"
+  IO.write(tmp_path, content)
+  File.rename(tmp_path, local_config_path)
+  puts "==> .api/config created with #{languages.join(' + ')} generators"
+end
+
+# --- Validate Command ---
+
+def run_validate(profile, file_path)
+  Util.exit_with_error("Usage: api validate <file>") if file_path.nil?
+  Util.exit_with_error("File not found: #{file_path}") unless File.exist?(file_path)
+
+  spec = begin
+           JSON.parse(IO.read(file_path))
+         rescue JSON::ParserError => e
+           Util.exit_with_error("Invalid JSON in #{file_path}: #{e.message}")
+         end
+
+  client = ApibuilderClient.new(profile)
+  batch_client = ApiBatchClient.new(client)
+
+  org = spec["organization"]&.[]("key") || "tmp"
+  app = spec["application"]&.[]("key") || File.basename(file_path, ".json")
+
+  form = {
+    "operations" => ["upload"],
+    "applications" => [
+      {
+        "organization_key" => org,
+        "application_key"  => app,
+        "original"         => spec,
+      }
+    ],
+  }
+
+  begin
+    batch = batch_client.create_batch(org, form)
+    result = batch_client.poll_until_complete(org, batch["id"])
+
+    case result["status"]
+    when "done"
+      puts "==> #{file_path}: valid"
+      exit 0
+    when "error"
+      errors = result["errors"] || []
+      $stderr.puts "==> #{file_path}: validation failed"
+      errors.each { |e| $stderr.puts "  - #{e["message"]}" }
+      exit 1
+    else
+      Util.exit_with_error("Unexpected batch status '#{result["status"]}' for #{file_path}")
+    end
+  rescue ApibuilderClient::Error => e
+    $stderr.puts "==> #{file_path}: validation failed"
+    $stderr.puts "  #{e.message}"
+    exit 1
+  end
+end
+
+# --- Batch Operations ---
+
+def build_batch_form(config, org, operations, app_filter, group_filter)
+  blocks = config.blocks_for_org(org)
+  blocks = blocks.select { |b| b.group == group_filter } if group_filter
+
   app_data = {}  # application_key => { file_path:, generators: [] }
 
   blocks.each do |block|
@@ -101,9 +251,7 @@ def build_batch_form(config, org, operations, app_filter, group_filter)
 
       block.generators.each do |gen|
         batch_gen = { "generator_key" => gen.key }
-        if !block.attributes.empty?
-          batch_gen["attributes"] = block.attributes
-        end
+        batch_gen["attributes"] = block.attributes if !block.attributes.empty?
         app_data[app.key][:generators] << batch_gen
       end
     end
@@ -200,243 +348,107 @@ def strip_metadata(content)
   content.each_line.reject { |line| IGNORE_PATTERNS.any? { |p| p.match?(line) } }.join.rstrip
 end
 
+def validate_filters(config, app_filter, group_filter)
+  if group_filter
+    all_groups = config.blocks.map(&:group).compact.uniq
+    if !all_groups.include?(group_filter)
+      Util.exit_with_error("Unknown group: #{group_filter}\n  Available: #{all_groups.sort.join(', ')}")
+    end
+  end
+
+  if app_filter
+    filtered_blocks = group_filter ? config.blocks.select { |b| b.group == group_filter } : config.blocks
+    all_app_keys = filtered_blocks.flat_map { |b| b.applications.map(&:key) }.uniq
+    missing = app_filter.select { |a| !all_app_keys.include?(a) }
+    if missing.any?
+      Util.exit_with_error("Unknown app(s): #{missing.join(', ')}\n  Available: #{all_app_keys.sort.join(', ')}")
+    end
+  end
+end
+
+def run_batch(profile, operations, app_filter, group_filter)
+  config_path = File.join(Dir.pwd, ".api", "config")
+  config = ApiConfig.new(config_path)
+
+  if operations.empty?
+    operations = ["codegen"]
+    has_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(a.file_path) } }
+    operations.unshift("upload") if has_specs
+    puts "==> Auto-detected operations: #{operations.join(', ')}"
+  end
+
+  validate_filters(config, app_filter, group_filter)
+
+  client = ApibuilderClient.new(profile)
+  batch_client = ApiBatchClient.new(client)
+  project_root = Dir.pwd
+
+  num_orgs = config.orgs.size
+  puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
+
+  config.orgs.each do |org|
+    puts "==> Building batch for #{org}"
+    form = build_batch_form(config, org, operations, app_filter, group_filter)
+    next if form["applications"].empty?
+
+    num_apps = form["applications"].size
+    puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
+    batch = batch_client.create_batch(org, form)
+    batch_id = batch["id"]
+    puts "==> Batch #{batch_id} created, polling for completion..."
+
+    result = batch_client.poll_until_complete(org, batch_id)
+
+    case result["status"]
+    when "error"
+      $stderr.puts ""
+      $stderr.puts "=" * 60
+      errors = result["errors"] || []
+      $stderr.puts "Batch failed with #{errors.size} error(s):"
+      errors.each do |err|
+        parts = [err["application_key"], err["generator_key"]].compact.join("/")
+        $stderr.puts "  - #{parts}: #{err["message"]}"
+      end
+      $stderr.puts "=" * 60
+      exit 1
+    when "done"
+      puts "==> Batch #{batch_id} completed"
+
+      if operations.include?("codegen") && result["zip_file"].nil?
+        $stderr.puts "WARNING: Batch completed but no zip_file in response. Full result: #{JSON.generate(result.reject { |k,_| k == "applications" })}"
+      end
+
+      if operations.include?("codegen") && result["zip_file"]
+        zip_url = result["zip_file"]["url"]
+        puts "==> Downloading generated code..."
+        zip_data = batch_client.download_zip(zip_url)
+        if zip_data.nil?
+          Util.exit_with_error("Batch completed but zip has expired. Please re-run.")
+        end
+        puts "==> Extracting files..."
+        extract_zip(zip_data, config, project_root)
+      end
+    end
+  end
+end
+
 # --- Main ---
 
 start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-# Handle special subcommands before parse_args (which rejects unknown args)
-# Extract --profile early so it works with init/validate too
-init_profile = nil
-remaining_argv = ARGV.dup
-if idx = remaining_argv.index("--profile")
-  remaining_argv.delete_at(idx)
-  init_profile = remaining_argv.delete_at(idx)
-  Util.exit_with_error("--profile requires a value") if init_profile.nil?
-end
+global = parse_global_args(ARGV)
+profile = global[:profile]
+remaining = global[:remaining]
 
-if remaining_argv.first == "init"
-  VALID_LANGUAGES = %w[typescript scala].freeze
-  languages = []
-  args = remaining_argv[1..].dup
-  while arg = args.shift
-    case arg
-    when "--language"
-      lang = args.shift
-      Util.exit_with_error("--language requires a value") if lang.nil?
-      lang = lang.downcase
-      if !VALID_LANGUAGES.include?(lang)
-        Util.exit_with_error("Unknown language: #{lang}\nValid languages: #{VALID_LANGUAGES.join(', ')}")
-      end
-      languages << lang unless languages.include?(lang)
-    else
-      Util.exit_with_error("Unknown argument: #{arg}\nUsage: api init [--language typescript] [--language scala]")
-    end
-  end
-
-  client = ApibuilderClient.new(init_profile, allow_no_token: true)
-  result = client.anonymous_init
-  org_key = result["organization_key"] or Util.exit_with_error("Server response missing organization_key")
-  token = result["token"] or Util.exit_with_error("Server response missing token")
-
-  # Write ~/.apibuilder/config
-  global_config_dir = File.join(Dir.home, ".apibuilder")
-  global_config_path = File.join(global_config_dir, "config")
-  if File.exist?(global_config_path)
-    Util.exit_with_error("Config already exists at #{global_config_path}. Delete it first to reinitialize.")
-  end
-  FileUtils.mkdir_p(global_config_dir)
-  tmp_path = "#{global_config_path}.tmp"
-  IO.write(tmp_path, "[default]\ntoken = #{token}\n")
-  File.rename(tmp_path, global_config_path)
-  puts "==> Anonymous org created: #{org_key}"
-  puts "==> Token written to #{global_config_path}"
-
-  # Write local .api/config with default generators
-  if languages.any?
-    local_config_dir = File.join(Dir.pwd, ".api")
-    local_config_path = File.join(local_config_dir, "config")
-    if File.exist?(local_config_path)
-      Util.exit_with_error(".api/config already exists. Delete it first to reinitialize.")
-    end
-
-    blocks = []
-    if languages.include?("typescript")
-      blocks << <<~BLOCK
-        - generators:
-            typescript: ./src/generated
-          applications:
-            my-api:
-      BLOCK
-    end
-    if languages.include?("scala")
-      blocks << <<~BLOCK
-        - generators:
-            bryzek_play_model: generated/app/apibuilder
-            bryzek_play_mock_model: generated/test/apibuilder
-            bryzek_play_client: generated/app/apibuilder
-            bryzek_play_mock_client: generated/test/apibuilder
-            bryzek_play_controller: generated/app/apibuilder
-            bryzek_play_routes: conf
-          applications:
-            my-api:
-      BLOCK
-    end
-
-    indented = blocks.map { |b| b.gsub(/^/, "  ") }.join("\n")
-    config_content = "#{org_key}:\n#{indented}"
-
-    FileUtils.mkdir_p(local_config_dir)
-    tmp_path = "#{local_config_path}.tmp"
-    IO.write(tmp_path, config_content)
-    File.rename(tmp_path, local_config_path)
-    puts "==> .api/config created with #{languages.join(' + ')} generators"
-  end
-
-  exit 0
-end
-
-if remaining_argv.first == "validate"
-  file_path = remaining_argv[1]
-  Util.exit_with_error("Usage: api validate <file>") if file_path.nil?
-  Util.exit_with_error("File not found: #{file_path}") unless File.exist?(file_path)
-
-  spec = begin
-           JSON.parse(IO.read(file_path))
-         rescue JSON::ParserError => e
-           Util.exit_with_error("Invalid JSON in #{file_path}: #{e.message}")
-         end
-
-  client = ApibuilderClient.new(init_profile)
-  batch_client = ApiBatchClient.new(client)
-
-  org = spec["organization"]&.[]("key") || "tmp"
-  app = spec["application"]&.[]("key") || File.basename(file_path, ".json")
-
-  form = {
-    "operations" => ["upload"],
-    "applications" => [
-      {
-        "organization_key" => org,
-        "application_key"  => app,
-        "original"         => spec,
-      }
-    ],
-  }
-
-  begin
-    batch = batch_client.create_batch(org, form)
-    batch_id = batch["id"]
-    result = batch_client.poll_until_complete(org, batch_id)
-
-    case result["status"]
-    when "done"
-      puts "==> #{file_path}: valid"
-      exit 0
-    when "error"
-      errors = result["errors"] || []
-      $stderr.puts "==> #{file_path}: validation failed"
-      errors.each { |e| $stderr.puts "  - #{e["message"]}" }
-      exit 1
-    else
-      Util.exit_with_error("Unexpected batch status '#{result["status"]}' for #{file_path}")
-    end
-  rescue ApibuilderClient::Error => e
-    $stderr.puts "==> #{file_path}: validation failed"
-    $stderr.puts "  #{e.message}"
-    exit 1
-  end
-end
-
-parsed = parse_args(ARGV)
-profile = parsed[:profile]
-operations = parsed[:operations]
-app_filter = parsed[:apps]
-group_filter = parsed[:group]
-
-config_path = File.join(`pwd`.strip, ".api", "config")
-config = ApiConfig.new(config_path)
-
-if operations.empty?
-  operations = ["codegen"]
-  has_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(a.file_path) } }
-  if has_specs
-    operations.unshift("upload")
-  end
-  puts "==> Auto-detected operations: #{operations.join(', ')}"
-end
-
-client = ApibuilderClient.new(profile)
-batch_client = ApiBatchClient.new(client)
-project_root = `pwd`.strip
-
-if group_filter
-  all_groups = config.blocks.map(&:group).compact.uniq
-  if !all_groups.include?(group_filter)
-    Util.exit_with_error("Unknown group: #{group_filter}\n  Available: #{all_groups.sort.join(', ')}")
-  end
-end
-
-if app_filter
-  filtered_blocks = group_filter ? config.blocks.select { |b| b.group == group_filter } : config.blocks
-  all_app_keys = filtered_blocks.flat_map { |b| b.applications.map(&:key) }.uniq
-  missing = app_filter.select { |a| !all_app_keys.include?(a) }
-  if missing.any?
-    msg = "Unknown app(s): #{missing.join(', ')}\n  Available: #{all_app_keys.sort.join(', ')}"
-    Util.exit_with_error(msg)
-  end
-end
-
-num_orgs = config.orgs.size
-puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
-
-config.orgs.each do |org|
-  puts "==> Building batch for #{org}"
-  form = build_batch_form(config, org, operations, app_filter, group_filter)
-
-  if form["applications"].empty?
-    next
-  end
-
-  num_apps = form["applications"].size
-  puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
-  batch = batch_client.create_batch(org, form)
-  batch_id = batch["id"]
-  puts "==> Batch #{batch_id} created, polling for completion..."
-
-  result = batch_client.poll_until_complete(org, batch_id)
-
-  case result["status"]
-  when "error"
-    $stderr.puts ""
-    $stderr.puts "=" * 60
-    errors = result["errors"] || []
-    $stderr.puts "Batch failed with #{errors.size} error(s):"
-    errors.each do |err|
-      parts = [err["application_key"], err["generator_key"]].compact.join("/")
-      $stderr.puts "  - #{parts}: #{err["message"]}"
-    end
-    $stderr.puts "=" * 60
-    exit 1
-  when "done"
-    puts "==> Batch #{batch_id} completed"
-
-    if operations.include?("codegen")
-      if result["zip_file"].nil?
-        $stderr.puts "WARNING: Batch completed but no zip_file in response. Full result: #{JSON.generate(result.reject { |k,_| k == "applications" })}"
-      end
-    end
-
-    if operations.include?("codegen") && result["zip_file"]
-      zip_url = result["zip_file"]["url"]
-      puts "==> Downloading generated code..."
-      zip_data = batch_client.download_zip(zip_url)
-      if zip_data.nil?
-        Util.exit_with_error("Batch completed but zip has expired. Please re-run.")
-      end
-      puts "==> Extracting files..."
-      extract_zip(zip_data, config, project_root)
-    end
-  end
+case remaining.first
+when "init"
+  languages = parse_init_args(remaining[1..])
+  run_init(profile, languages)
+when "validate"
+  run_validate(profile, remaining[1])
+else
+  parsed = parse_batch_args(remaining)
+  run_batch(profile, parsed[:operations], parsed[:apps], parsed[:group])
 end
 
 elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time

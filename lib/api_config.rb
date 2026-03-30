@@ -9,7 +9,7 @@ class ApiConfig
   attr_reader :blocks
 
   def initialize(path = nil)
-    path ||= File.join(`pwd`.strip, ".api", "config")
+    path ||= File.join(Dir.pwd, ".api", "config")
     if !File.exist?(path)
       Util.exit_with_error("No .api/config found at #{path}")
     end
