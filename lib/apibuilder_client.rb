@@ -8,16 +8,14 @@ class ApibuilderClient
   class Error < StandardError; end
 
   DEFAULT_API_URI = "https://api.apibuilder.io"
-  DEFAULT_MAX_THREADS = 10
   CONFIG_PATH = File.join(Dir.home, ".apibuilder", "config")
 
-  attr_reader :base_uri, :token, :max_threads
+  attr_reader :base_uri, :token
 
   def initialize(profile = nil, allow_no_token: false)
     config = load_config(profile, allow_no_token: allow_no_token)
     @base_uri = config[:api_uri]
     @token = config[:token]
-    @max_threads = config[:max_threads]
   end
 
   # Create an anonymous org and token for zero-friction onboarding
@@ -91,7 +89,7 @@ class ApibuilderClient
           end
 
     req["Content-Type"] = "application/json"
-    if @token
+    if @token && !@token.empty?
       req["Authorization"] = "Basic " + Base64.strict_encode64("#{@token}:")
     end
     req.body = JSON.generate(body) if body
@@ -130,14 +128,13 @@ class ApibuilderClient
   def load_config(profile, allow_no_token: false)
     if !File.exist?(CONFIG_PATH)
       if allow_no_token
-        return { api_uri: DEFAULT_API_URI, token: nil, max_threads: DEFAULT_MAX_THREADS }
+        return { api_uri: DEFAULT_API_URI, token: nil }
       end
       Util.exit_with_error("API Builder config not found at #{CONFIG_PATH}")
     end
 
     api_uri = DEFAULT_API_URI
     token = nil
-    max_threads = DEFAULT_MAX_THREADS
     current_section = nil
     target_section = profile ? "profile #{profile}" : "default"
 
@@ -147,11 +144,6 @@ class ApibuilderClient
 
       if md = line.match(/^\[(.+)\]$/)
         current_section = md[1]
-      elsif current_section == "settings"
-        key, value = line.split("=", 2).map(&:strip)
-        case key
-        when "max_threads" then max_threads = [value.to_i, 1].max
-        end
       elsif current_section == target_section
         key, value = line.split("=", 2).map(&:strip)
         case key
@@ -161,11 +153,11 @@ class ApibuilderClient
       end
     end
 
-    if token.nil? && target_section != "default"
+    if token.nil? && !allow_no_token && target_section != "default"
       Util.exit_with_error("Profile '#{profile}' not found in #{CONFIG_PATH}")
     end
 
-    { api_uri: api_uri, token: token, max_threads: max_threads }
+    { api_uri: api_uri, token: token }
   end
 
 end

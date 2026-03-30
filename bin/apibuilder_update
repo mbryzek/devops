@@ -35,7 +35,7 @@ Dir.mktmpdir("apibuilder") do |tmp_dir|
 
   mutex = Mutex.new
   staged = []
-  work_items.each_slice(client.max_threads) do |batch|
+  work_items.each_slice(10) do |batch|
     threads = batch.map do |item|
       Thread.new do
         entry = item[:entry]

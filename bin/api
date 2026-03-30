@@ -229,27 +229,97 @@ if remaining_argv.first == "init"
       end
       languages << lang unless languages.include?(lang)
     else
-      Util.exit_with_error("Unknown argument: #{arg}\nUsage: api init [--language typescript] [--language scala]")
+      Util.exit_with_error("Unknown argument: #{arg}\nUsage: api init [--profile PROFILE] [--language typescript] [--language scala]")
     end
   end
 
-  client = ApibuilderClient.new(init_profile, allow_no_token: true)
-  result = client.anonymous_init
+  # Resolve api_uri from profile (if config exists), but don't send a token for anonymous init
+  api_uri = ApibuilderClient::DEFAULT_API_URI
+  global_config_dir = File.join(Dir.home, ".apibuilder")
+  global_config_path = File.join(global_config_dir, "config")
+
+  if File.exist?(global_config_path)
+    target_section = init_profile ? "profile #{init_profile}" : "default"
+    current_section = nil
+    IO.readlines(global_config_path).each do |line|
+      line = line.strip
+      next if line.empty? || line.start_with?("#")
+      if md = line.match(/^\[(.+)\]$/)
+        current_section = md[1]
+      elsif current_section == target_section
+        key, value = line.split("=", 2).map(&:strip)
+        api_uri = value if key == "api_uri"
+      end
+    end
+  end
+
+  # Create anonymous org without sending auth
+  uri = URI.parse("#{api_uri}/apibuilder/anonymous")
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = uri.scheme == "https"
+  http.open_timeout = 30
+  http.read_timeout = 60
+  req = Net::HTTP::Post.new(uri.request_uri)
+  req["Content-Type"] = "application/json"
+  response = http.request(req)
+
+  if response.code.to_i != 200 && response.code.to_i != 201
+    Util.exit_with_error("Anonymous init failed: HTTP #{response.code}\n#{response.body}")
+  end
+
+  result = JSON.parse(response.body)
   org_key = result["organization_key"] or Util.exit_with_error("Server response missing organization_key")
   token = result["token"] or Util.exit_with_error("Server response missing token")
 
-  # Write ~/.apibuilder/config
-  global_config_dir = File.join(Dir.home, ".apibuilder")
-  global_config_path = File.join(global_config_dir, "config")
-  if File.exist?(global_config_path)
-    Util.exit_with_error("Config already exists at #{global_config_path}. Delete it first to reinitialize.")
-  end
+  # Write or update ~/.apibuilder/config
+  profile_name = init_profile || "default"
+  section_header = init_profile ? "[profile #{init_profile}]" : "[default]"
+  section_content = init_profile \
+    ? "#{section_header}\napi_uri = #{api_uri}\ntoken = #{token}\n" \
+    : "#{section_header}\ntoken = #{token}\n"
+
   FileUtils.mkdir_p(global_config_dir)
-  tmp_path = "#{global_config_path}.tmp"
-  IO.write(tmp_path, "[default]\ntoken = #{token}\n")
-  File.rename(tmp_path, global_config_path)
+
+  if File.exist?(global_config_path)
+    # Check if this profile section already exists
+    existing = IO.read(global_config_path)
+    if existing.include?(section_header)
+      $stderr.print "Profile '#{profile_name}' already exists in #{global_config_path}. Replace it? [y/N] "
+      answer = $stdin.gets&.strip&.downcase
+      if answer != "y"
+        puts "==> Aborted"
+        exit 0
+      end
+      # Remove existing section (everything from header to next header or EOF)
+      lines = existing.lines
+      in_section = false
+      filtered = lines.reject do |line|
+        if line.strip == section_header
+          in_section = true
+          true
+        elsif in_section && line.match?(/^\[/)
+          in_section = false
+          false
+        else
+          in_section
+        end
+      end
+      updated = filtered.join.rstrip + "\n\n" + section_content
+      tmp_path = "#{global_config_path}.tmp"
+      IO.write(tmp_path, updated)
+      File.rename(tmp_path, global_config_path)
+    else
+      # Append new profile section
+      IO.write(global_config_path, IO.read(global_config_path).rstrip + "\n\n" + section_content)
+    end
+  else
+    tmp_path = "#{global_config_path}.tmp"
+    IO.write(tmp_path, section_content)
+    File.rename(tmp_path, global_config_path)
+  end
+
   puts "==> Anonymous org created: #{org_key}"
-  puts "==> Token written to #{global_config_path}"
+  puts "==> Token written to #{global_config_path} [#{profile_name}]"
 
   # Write local .api/config with default generators
   if languages.any?
