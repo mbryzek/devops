@@ -20,7 +20,9 @@ USAGE = <<~TEXT
          api validate <file>
 
   Commands:
-    init              Create an anonymous org and token, write to ~/.apibuilder/config
+    init [options]    Create an anonymous org and token, write to ~/.apibuilder/config.
+                      Use --language to also create a local .api/config with default
+                      code generators. Can be repeated for multiple languages.
     validate <file>   Validate an api.json spec file via server-side validation
 
   Operations: #{VALID_OPERATIONS.join(', ')}
@@ -33,7 +35,10 @@ USAGE = <<~TEXT
     --group GROUP  Process only blocks with the specified group.
 
   Examples:
-    api init                        # create anonymous org + token
+    api init                                    # create anonymous org + token
+    api init --language typescript              # + create .api/config for TypeScript
+    api init --language scala                   # + create .api/config for Scala
+    api init --language typescript --language scala  # + create .api/config for both
     api validate spec/myapp.json    # validate a spec file
     api                             # auto-detect operations
     api --profile localhost         # auto-detect with profile
@@ -201,22 +206,83 @@ start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
 # Handle special subcommands before parse_args (which rejects unknown args)
 if ARGV.first == "init"
-  Util.exit_with_error("Usage: api init (takes no arguments)") if ARGV.length > 1
+  VALID_LANGUAGES = %w[typescript scala].freeze
+  languages = []
+  args = ARGV[1..].dup
+  while arg = args.shift
+    case arg
+    when "--language"
+      lang = args.shift
+      Util.exit_with_error("--language requires a value") if lang.nil?
+      lang = lang.downcase
+      if !VALID_LANGUAGES.include?(lang)
+        Util.exit_with_error("Unknown language: #{lang}\nValid languages: #{VALID_LANGUAGES.join(', ')}")
+      end
+      languages << lang unless languages.include?(lang)
+    else
+      Util.exit_with_error("Unknown argument: #{arg}\nUsage: api init [--language typescript] [--language scala]")
+    end
+  end
+
   client = ApibuilderClient.new(nil, allow_no_token: true)
   result = client.anonymous_init
   org_key = result["organization_key"] or Util.exit_with_error("Server response missing organization_key")
   token = result["token"] or Util.exit_with_error("Server response missing token")
-  config_dir = File.join(Dir.home, ".apibuilder")
-  config_path = File.join(config_dir, "config")
-  if File.exist?(config_path)
-    Util.exit_with_error("Config already exists at #{config_path}. Delete it first to reinitialize.")
+
+  # Write ~/.apibuilder/config
+  global_config_dir = File.join(Dir.home, ".apibuilder")
+  global_config_path = File.join(global_config_dir, "config")
+  if File.exist?(global_config_path)
+    Util.exit_with_error("Config already exists at #{global_config_path}. Delete it first to reinitialize.")
   end
-  FileUtils.mkdir_p(config_dir)
-  tmp_path = "#{config_path}.tmp"
+  FileUtils.mkdir_p(global_config_dir)
+  tmp_path = "#{global_config_path}.tmp"
   IO.write(tmp_path, "[default]\ntoken = #{token}\n")
-  File.rename(tmp_path, config_path)
+  File.rename(tmp_path, global_config_path)
   puts "==> Anonymous org created: #{org_key}"
-  puts "==> Token written to #{config_path}"
+  puts "==> Token written to #{global_config_path}"
+
+  # Write local .api/config with default generators
+  if languages.any?
+    local_config_dir = File.join(Dir.pwd, ".api")
+    local_config_path = File.join(local_config_dir, "config")
+    if File.exist?(local_config_path)
+      Util.exit_with_error(".api/config already exists. Delete it first to reinitialize.")
+    end
+
+    blocks = []
+    if languages.include?("typescript")
+      blocks << <<~BLOCK
+        - generators:
+            typescript: ./src/generated
+          applications:
+            my-api:
+      BLOCK
+    end
+    if languages.include?("scala")
+      blocks << <<~BLOCK
+        - generators:
+            bryzek_play_model: generated/app/apibuilder
+            bryzek_play_mock_model: generated/test/apibuilder
+            bryzek_play_client: generated/app/apibuilder
+            bryzek_play_mock_client: generated/test/apibuilder
+            bryzek_play_controller: generated/app/apibuilder
+            bryzek_play_routes: conf
+          applications:
+            my-api:
+      BLOCK
+    end
+
+    indented = blocks.map { |b| b.gsub(/^/, "  ") }.join("\n")
+    config_content = "#{org_key}:\n#{indented}"
+
+    FileUtils.mkdir_p(local_config_dir)
+    tmp_path = "#{local_config_path}.tmp"
+    IO.write(tmp_path, config_content)
+    File.rename(tmp_path, local_config_path)
+    puts "==> .api/config created with #{languages.join(' + ')} generators"
+  end
+
   exit 0
 end
 
