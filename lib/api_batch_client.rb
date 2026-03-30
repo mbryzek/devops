@@ -25,9 +25,12 @@ class ApiBatchClient
   # Polls until batch reaches a terminal status (done or error).
   # Returns the final batch response.
   def poll_until_complete(org, id)
+    reported = Set.new
+
     POLL_INTERVALS.each do |interval|
       sleep(interval)
       batch = get_batch(org, id)
+      report_progress(batch, reported)
       return batch if terminal?(batch)
     end
 
@@ -42,6 +45,7 @@ class ApiBatchClient
         sleep(CONTINUE_INTERVAL)
         elapsed += CONTINUE_INTERVAL
         batch = get_batch(org, id)
+        report_progress(batch, reported)
         return batch if terminal?(batch)
       end
     end
@@ -70,6 +74,16 @@ class ApiBatchClient
 
   def terminal?(batch)
     batch["status"] == "done" || batch["status"] == "error"
+  end
+
+  def report_progress(batch, reported)
+    completed = batch["completed_operations"] || []
+    completed.each do |op|
+      if !reported.include?(op)
+        reported.add(op)
+        puts "==> #{op.capitalize} complete"
+      end
+    end
   end
 
   def prompt_continue
