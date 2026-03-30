@@ -42,14 +42,26 @@ def print_failures(result)
   end
 end
 
+app_filter = nil
+ARGV.each_with_index do |arg, i|
+  if arg == "--app" && ARGV[i + 1]
+    app_filter = ARGV[i + 1].downcase
+  end
+end
+
+endpoints = app_filter ? ENDPOINTS.select { |e| e[:app] == app_filter } : ENDPOINTS
+if endpoints.empty?
+  Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{ENDPOINTS.map { |e| e[:app] }.join(', ')}")
+end
+
 puts ""
 puts Util.underline("Checking Invariants")
 puts ""
 
-print "Fetching #{ENDPOINTS.map { |e| e[:name] }.join(', ')}..."
+print "Fetching #{endpoints.map { |e| e[:name] }.join(', ')}..."
 $stdout.flush
 
-results = ENDPOINTS.map do |endpoint|
+results = endpoints.map do |endpoint|
   Thread.new do
     vars = EnvironmentVariables.load(endpoint[:app], "production")
     devops_token = vars["DEVOPS_TOKEN"]
