@@ -34,11 +34,23 @@ rescue => e
   raise "#{e.message}"
 end
 
+app_filter = nil
+ARGV.each_with_index do |arg, i|
+  if arg == "--app" && ARGV[i + 1]
+    app_filter = ARGV[i + 1].downcase
+  end
+end
+
+endpoints = app_filter ? ENDPOINTS.select { |e| e[:app] == app_filter } : ENDPOINTS
+if endpoints.empty?
+  Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{ENDPOINTS.map { |e| e[:app] }.join(', ')}")
+end
+
 puts ""
 puts Util.underline("Requeuing Failed Tasks")
 puts ""
 
-ENDPOINTS.each do |endpoint|
+endpoints.each do |endpoint|
   vars = EnvironmentVariables.load(endpoint[:app], "production")
   devops_token = vars["DEVOPS_TOKEN"]
   if devops_token.nil? || devops_token.empty?
