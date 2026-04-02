@@ -1,7 +1,7 @@
 class ApiBatchClient
 
-  POLL_INTERVALS = [0.25, 0.5] + [1.0] * 28  # ~30s total before first prompt
-  CONTINUE_INTERVAL = 1.0
+  POLL_INTERVALS = [0.25] + [0.35] * 85  # ~30s total before first prompt
+  CONTINUE_INTERVAL = 0.35
   CONTINUE_PROMPT_EVERY = 30  # seconds between re-prompts
 
   def initialize(client)
