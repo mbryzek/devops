@@ -1,3 +1,5 @@
+require 'set'
+
 class ApiBatchClient
 
   POLL_INTERVALS = [0.25] + [0.35] * 85  # ~30s total before first prompt
@@ -27,7 +29,10 @@ class ApiBatchClient
       sleep(interval)
       batch = get_batch(org, id)
       report_progress(batch, reported)
-      return batch if terminal?(batch)
+      if terminal?(batch)
+        clear_progress_line(reported)
+        return batch
+      end
     end
 
     loop do
@@ -42,7 +47,10 @@ class ApiBatchClient
         elapsed += CONTINUE_INTERVAL
         batch = get_batch(org, id)
         report_progress(batch, reported)
-        return batch if terminal?(batch)
+        if terminal?(batch)
+          clear_progress_line(reported)
+          return batch
+        end
       end
     end
   end
