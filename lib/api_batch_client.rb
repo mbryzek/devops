@@ -21,7 +21,7 @@ class ApiBatchClient
   # Polls until batch reaches a terminal status (done or error).
   # Returns the final batch response.
   def poll_until_complete(org, id)
-    reported = Set.new
+    reported = { done: Set.new, last_completed: {}, last_len: 0 }
 
     POLL_INTERVALS.each do |interval|
       sleep(interval)
@@ -59,12 +59,32 @@ class ApiBatchClient
   end
 
   def report_progress(batch, reported)
-    completed = batch["completed_operations"] || []
-    completed.each do |op|
-      if !reported.include?(op)
-        reported.add(op)
+    operations = batch["operations"] || []
+    operations.each do |op_status|
+      op = op_status["operation"]
+      completed = op_status["completed"]
+      total = op_status["total"]
+
+      next if reported[:done].include?(op)
+
+      if completed >= total
+        clear_progress_line(reported)
+        reported[:done].add(op)
         puts "==> #{op.capitalize} complete"
+      elsif completed != reported[:last_completed][op]
+        reported[:last_completed][op] = completed
+        msg = "==> #{op.capitalize} (#{completed}/#{total})"
+        print "\r#{msg}#{' ' * [0, (reported[:last_len] || 0) - msg.length].max}"
+        reported[:last_len] = msg.length
+        $stdout.flush
       end
+    end
+  end
+
+  def clear_progress_line(reported)
+    if reported[:last_len] && reported[:last_len] > 0
+      print "\r#{' ' * reported[:last_len]}\r"
+      reported[:last_len] = 0
     end
   end
 
