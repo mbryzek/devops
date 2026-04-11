@@ -395,7 +395,7 @@ def run_batch(profile, operations, app_filter, group_filter)
     puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
     batch = batch_client.create_batch(org, form)
     batch_id = batch["id"]
-    puts "==> Batch #{batch_id} created, polling for completion..."
+    puts "==> Batch #{batch_id} created, polling for processing to begin..."
 
     result = batch_client.poll_until_complete(org, batch_id)
 
