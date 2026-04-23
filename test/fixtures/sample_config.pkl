@@ -1,0 +1,31 @@
+amends "../../api/ApiConfig.pkl"
+
+org = "bryzek"
+
+applications = new Listing<AppGroup> {
+  // Model-only bundle
+  new {
+    names { "apibuilder-spec"; "platform-error" }
+    generators = module.modelOnly()
+  }
+  // Full bundle with per-caller routes dir
+  new {
+    names { "rallyd-api"; "rallyd-club"; "rallyd-admin" }
+    generators = module.full("rallyd/conf")
+  }
+  // Inline single generator with filter
+  new {
+    names { "platform" }
+    generators = module.singleGenerator("typescript", "./src/generated")
+    filter = new { types { "user_reference"; "person" }; resources { "person"; "user" } }
+  }
+  // Spec glob (dao-style)
+  new {
+    specGlob = "dao/spec/*.json"
+    group = "dao"
+    generators = new Listing<Generator> {
+      new { key = "psql_scala"; target = "generated/app" }
+      new { key = "psql_ddl";   target = "dao/psql" }
+    }
+  }
+}
