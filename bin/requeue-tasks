@@ -7,12 +7,12 @@ require 'uri'
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
 ENDPOINTS = [
-  { name: "Acumen", url: "https://api.trueacumen.com", app: "acumen" },
-  { name: "Platform", url: "https://idempotent.io", app: "platform" }
+  { name: "Acumen", url: "https://api.trueacumen.com", localhost: "http://localhost:9200", app: "acumen" },
+  { name: "Platform", url: "https://idempotent.io", localhost: "http://localhost:9300", app: "platform" }
 ]
 
 def requeue(endpoint, devops_token)
-  uri = URI.parse("#{endpoint[:url]}/_internal_/requeue")
+  uri = URI.parse("#{endpoint[:active_url]}/_internal_/requeue")
   http = Net::HTTP.new(uri.host, uri.port)
   http.use_ssl = (uri.scheme == "https")
   http.open_timeout = 10
@@ -35,9 +35,12 @@ rescue => e
 end
 
 app_filter = nil
+use_localhost = false
 ARGV.each_with_index do |arg, i|
   if arg == "--app" && ARGV[i + 1]
     app_filter = ARGV[i + 1].downcase
+  elsif arg == "--localhost"
+    use_localhost = true
   end
 end
 
@@ -46,12 +49,17 @@ if endpoints.empty?
   Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{ENDPOINTS.map { |e| e[:app] }.join(', ')}")
 end
 
+env_name = use_localhost ? "development" : "production"
+endpoints = endpoints.map do |e|
+  e.merge(active_url: use_localhost ? e[:localhost] : e[:url])
+end
+
 puts ""
-puts Util.underline("Requeuing Failed Tasks")
+puts Util.underline("Requeuing Failed Tasks#{use_localhost ? ' (localhost)' : ''}")
 puts ""
 
 endpoints.each do |endpoint|
-  vars = EnvironmentVariables.load(endpoint[:app], "production")
+  vars = EnvironmentVariables.load(endpoint[:app], env_name)
   devops_token = vars["DEVOPS_TOKEN"]
   if devops_token.nil? || devops_token.empty?
     puts "  #{endpoint[:name]}: ERROR - DEVOPS_TOKEN not configured"
