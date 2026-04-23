@@ -1,0 +1,152 @@
+/// Shared API Builder config DSL.
+/// Consumers amend this module from `<repo>/.api/config.pkl`.
+/// The evaluated output matches the flat block structure the Ruby `api` CLI
+/// reads from the legacy YAML format.
+///
+/// Bundle factories (`modelOnly`, `clientOnly`, `controllerClientMock`, `full`,
+/// `singleGenerator`) are defined at module scope. Inside the `new Listing<AppGroup>`
+/// literal, Pkl's lexical scoping doesn't expose module-level functions directly,
+/// so call them via `module.modelOnly()` (or import this module explicitly and
+/// call `cfg.modelOnly()`). See `.api/config.pkl` in each consuming repo for examples.
+open module ApiConfig
+
+/// API Builder org key (e.g. "bryzek").
+org: String
+
+/// Default target directories used by the bundle factories below.
+class Targets {
+  sourceCode: String
+  testCode: String
+}
+
+/// Repos can override to match their own directory layout.
+/// lib-ai, for example, uses `app/scala/com/bryzek/ai/generated`.
+defaultTargets: Targets = new {
+  sourceCode = "generated/app/apibuilder"
+  testCode = "generated/test/apibuilder"
+}
+
+/// One generator entry — `key` is the API Builder generator key,
+/// `target` is the output directory, `attributes` is optional extra config.
+class Generator {
+  key: String
+  target: String
+  attributes: Mapping<String, Any>?
+}
+
+/// Optional block-level filter (API Builder `attributes.filter`).
+class Filter {
+  types: Listing<String>?
+  resources: Listing<String>?
+}
+
+/// One application group in a config file. Maps to one block in the flat output.
+/// Use either `names` (+ `generators` + optional `filter`) OR `specGlob` (+ `group` + `generators`).
+class AppGroup {
+  /// Application keys (e.g. "rallyd-api"). Required unless `specGlob` is set.
+  names: Listing<String>?
+  /// Generators for this group. Use a bundle factory (modelOnly(), full(...)) or build inline.
+  generators: Listing<Generator>
+  /// Filter attributes for the whole block.
+  filter: Filter?
+  /// Group tag — exposed as `group` in the output (used by `--group` CLI flag).
+  group: String?
+  /// Spec glob — populates `applications` by globbing the filesystem.
+  specGlob: String?
+  /// Per-app spec file path overrides (key = app name, value = relative path).
+  specPaths: Mapping<String, String>?
+}
+
+applications: Listing<AppGroup>
+
+// --- Bundle factory functions ---
+// Each returns a concrete `Listing<Generator>` the caller assigns to `AppGroup.generators`.
+// Factories read `defaultTargets` from the enclosing module, so repo-level
+// overrides of `defaultTargets` propagate automatically.
+
+function modelOnly(): Listing<Generator> = new Listing<Generator> {
+  new { key = "bryzek_play_model";      target = defaultTargets.sourceCode }
+  new { key = "bryzek_play_mock_model"; target = defaultTargets.testCode }
+}
+
+function clientOnly(): Listing<Generator> = new Listing<Generator> {
+  new { key = "bryzek_play_client";      target = defaultTargets.sourceCode }
+  new { key = "bryzek_play_mock_client"; target = defaultTargets.testCode }
+}
+
+function controllerClientMock(): Listing<Generator> = new Listing<Generator> {
+  new { key = "bryzek_play_controller";  target = defaultTargets.sourceCode }
+  new { key = "bryzek_play_client";      target = defaultTargets.sourceCode }
+  new { key = "bryzek_play_mock_client"; target = defaultTargets.testCode }
+}
+
+/// Full bundle with a per-caller routes conf dir.
+function full(routesConf: String): Listing<Generator> = new Listing<Generator> {
+  new { key = "bryzek_play_controller";  target = defaultTargets.sourceCode }
+  new { key = "bryzek_play_client";      target = defaultTargets.sourceCode }
+  new { key = "bryzek_play_mock_client"; target = defaultTargets.testCode }
+  new { key = "bryzek_play_routes";      target = routesConf }
+}
+
+/// Inline single-generator helper for one-off cases (typescript, elm_v2, etc.).
+function singleGenerator(genKey: String, genTarget: String): Listing<Generator> = new Listing<Generator> {
+  new { key = genKey; target = genTarget }
+}
+
+// --- Render output (flat block structure matching the legacy YAML shape) ---
+
+local function renderGeneratorValue(g: Generator) =
+  if (g.attributes != null)
+    new Dynamic { target = g.target; attributes = g.attributes }
+  else
+    g.target
+
+local function renderGenerators(ag: AppGroup): Mapping<String, Any> =
+  new Mapping<String, Any> {
+    for (g in ag.generators) {
+      [g.key] = renderGeneratorValue(g)
+    }
+  }
+
+local function renderApps(ag: AppGroup): Mapping<String, String?> =
+  new Mapping<String, String?> {
+    for (name in ag.names!!) {
+      [name] = if (ag.specPaths != null) ag.specPaths.getOrNull(name) else null
+    }
+  }
+
+local function renderFilter(f: Filter): Dynamic = new Dynamic {
+  when (f.types != null) { types = f.types }
+  when (f.resources != null) { resources = f.resources }
+}
+
+local function renderBlock(ag: AppGroup) =
+  if (ag.names != null && ag.specGlob != null)
+    throw("Invalid AppGroup: `names` and `specGlob` are mutually exclusive, but both are set.")
+  else if (ag.names == null && ag.specGlob == null)
+    throw("Invalid AppGroup: exactly one of `names` or `specGlob` must be set.")
+  else
+    new Dynamic {
+      generators = renderGenerators(ag)
+      when (ag.specGlob == null) { applications = renderApps(ag) }
+      when (ag.filter != null) { attributes = new Dynamic { filter = renderFilter(ag.filter!!) } }
+      when (ag.group != null) { group = ag.group }
+      when (ag.specGlob != null) { spec_glob = ag.specGlob }
+    }
+
+output {
+  value = new Dynamic {
+    [org] = new Listing {
+      for (ag in applications) {
+        renderBlock(ag)
+      }
+    }
+  }
+  // omitNullProperties = false is required: application entries with null spec paths
+  // (meaning "use the default spec/<key>.json") must appear as `"key": null` in the
+  // JSON output so the Ruby loader can enumerate the application keys. With the
+  // default (omitNullProperties = true), those null entries would be silently dropped.
+  renderer = new JsonRenderer {
+    omitNullProperties = false
+  }
+}

@@ -1,0 +1,55 @@
+#!/usr/bin/env ruby
+require 'minitest/autorun'
+require_relative '../lib/common'
+require_relative '../lib/api_config'
+
+class TestApiConfig < Minitest::Test
+  FIXTURE = File.expand_path('fixtures/sample_config.pkl', __dir__)
+
+  def setup
+    # The fixture uses `spec_glob = "dao/spec/*.json"`, which is resolved
+    # relative to Dir.pwd. Use the block form so cwd is restored afterwards
+    # and doesn't leak into other tests.
+    Dir.chdir(File.dirname(FIXTURE)) do
+      @config = ApiConfig.new(FIXTURE)
+    end
+  end
+
+  def test_orgs
+    assert_equal ["bryzek"], @config.orgs
+  end
+
+  def test_block_count
+    assert_equal 4, @config.blocks.size
+  end
+
+  def test_model_only_block
+    block = @config.blocks.find { |b| b.applications.map(&:key).include?("apibuilder-spec") }
+    gen_keys = block.generators.map(&:key).sort
+    assert_equal ["bryzek_play_mock_model", "bryzek_play_model"], gen_keys
+  end
+
+  def test_routes_override_applied
+    block = @config.blocks.find { |b| b.applications.map(&:key).include?("rallyd-api") }
+    routes = block.generators.find { |g| g.key == "bryzek_play_routes" }
+    assert_equal "rallyd/conf", routes.target
+  end
+
+  def test_filter_attributes_preserved
+    block = @config.blocks.find { |b| b.applications.map(&:key) == ["platform"] }
+    assert_equal ["user_reference", "person"], block.attributes.dig("filter", "types")
+  end
+
+  def test_spec_glob_block
+    block = @config.blocks.find { |b| b.group == "dao" }
+    refute_nil block
+    assert_equal ["psql_scala", "psql_ddl"].sort, block.generators.map(&:key).sort
+    # Verifies glob expansion: test/fixtures/dao/spec/dummy.json → Application(key="dummy").
+    assert_equal ["dummy"], block.applications.map(&:key)
+  end
+
+  def test_find_target
+    assert_equal "generated/app/apibuilder", @config.find_target("apibuilder-spec", "bryzek_play_model")
+    assert_equal "rallyd/conf", @config.find_target("rallyd-api", "bryzek_play_routes")
+  end
+end
