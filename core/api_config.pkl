@@ -11,7 +11,7 @@
 ///     }
 ///
 /// The `api` CLI invokes `pkl eval` with `--module-path <devops>/core` so that
-/// `modulepath:api_config.pkl` resolves to this file.
+/// `modulepath:/api_config.pkl` resolves to this file.
 
 @ModuleInfo { minPklVersion = "0.27.0" }
 open module ApiConfig

@@ -1,5 +1,5 @@
 require 'yaml'
-require 'shellwords'
+require 'open3'
 
 class ApiConfig
 
@@ -7,10 +7,8 @@ class ApiConfig
   Application = Struct.new(:key, :file_path, keyword_init: true)
   Block = Struct.new(:org, :group, :generators, :attributes, :applications, keyword_init: true)
 
-  SCHEMA_MODULE_PATH = File.expand_path("../core", __dir__).tap do |p|
-    schema = File.join(p, "api_config.pkl")
-    raise "PKL schema not found at #{schema}" unless File.exist?(schema)
-  end
+  SCHEMA_MODULE_PATH = File.expand_path("../core", __dir__)
+  SCHEMA_FILE = File.join(SCHEMA_MODULE_PATH, "api_config.pkl")
 
   attr_reader :blocks
 
@@ -59,12 +57,18 @@ class ApiConfig
 
   def evaluate_pkl(pkl_path)
     Util.assert_installed("pkl", "https://github.com/apple/pkl")
-    cmd = "pkl eval -f yaml --module-path #{Shellwords.escape(SCHEMA_MODULE_PATH)} #{Shellwords.escape(pkl_path)}"
-    out = `#{cmd} 2>&1`
-    if !$?.success?
-      Util.exit_with_error("pkl eval failed for #{pkl_path}:\n#{out}")
+    if !File.exist?(SCHEMA_FILE)
+      Util.exit_with_error("PKL schema not found at #{SCHEMA_FILE}")
     end
-    out
+    stdout, stderr, status = Open3.capture3(
+      "pkl", "eval", "-f", "yaml",
+      "--module-path", SCHEMA_MODULE_PATH,
+      pkl_path
+    )
+    if !status.success?
+      Util.exit_with_error("pkl eval failed for #{pkl_path}:\n#{stderr}")
+    end
+    stdout
   end
 
   def parse(source, source_label)
