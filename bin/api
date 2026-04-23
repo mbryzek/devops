@@ -22,14 +22,14 @@ USAGE = <<~TEXT
 
   Commands:
     init [options]    Create an anonymous org and token, write to ~/.apibuilder/config.
-                      Use --language to also create a local .api/config with default
+                      Use --language to also create a local .api/config.pkl with default
                       code generators. Can be repeated for multiple languages.
     validate <file>   Validate an api.json spec file via server-side validation
 
   Operations: #{VALID_OPERATIONS.join(', ')}
 
   When no operations are specified, codegen is always included and upload is
-  included automatically if any spec files referenced in .api/config exist locally.
+  included automatically if any spec files referenced in .api/config.pkl exist locally.
 
   Options:
     --profile PROFILE  Use a named profile from ~/.apibuilder/config
@@ -38,9 +38,9 @@ USAGE = <<~TEXT
 
   Examples:
     api init                                        # create anonymous org + token
-    api init --language typescript                   # + create .api/config for TypeScript
-    api init --language scala                        # + create .api/config for Scala
-    api init --language typescript --language scala   # + create .api/config for both
+    api init --language typescript                   # + create .api/config.pkl for TypeScript
+    api init --language scala                        # + create .api/config.pkl for Scala
+    api init --language typescript --language scala   # + create .api/config.pkl for both
     api validate spec/myapp.json                     # validate a spec file
     api                                              # auto-detect operations
     api --profile localhost                           # auto-detect with profile

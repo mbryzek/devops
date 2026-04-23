@@ -136,6 +136,10 @@ output {
       }
     }
   }
+  // omitNullProperties = false is required: application entries with null spec paths
+  // (meaning "use the default spec/<key>.json") must appear as `"key": null` in the
+  // JSON output so the Ruby loader can enumerate the application keys. With the
+  // default (omitNullProperties = true), those null entries would be silently dropped.
   renderer = new JsonRenderer {
     omitNullProperties = false
   }

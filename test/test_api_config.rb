@@ -43,10 +43,8 @@ class TestApiConfig < Minitest::Test
     block = @config.blocks.find { |b| b.group == "dao" }
     refute_nil block
     assert_equal ["psql_scala", "psql_ddl"].sort, block.generators.map(&:key).sort
-    # Note: applications is populated by globbing the fixture's spec_glob pattern,
-    # but this fixture has no real dao/spec/*.json files. Expect the loader to
-    # exit with an error on blocks with empty glob results — so this test won't
-    # exercise application parsing. Verify generator shape only.
+    # Verifies glob expansion: test/fixtures/dao/spec/dummy.json → Application(key="dummy").
+    assert_equal ["dummy"], block.applications.map(&:key)
   end
 
   def test_find_target
