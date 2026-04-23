@@ -7,6 +7,9 @@
 ///     org = "bryzek"
 ///     blocks {
 ///       new PlayFullStack { subproject = "api"; applications { "platform" } }
+///       new TypeScript { applications { "platform-error" } }
+///       new TypeScriptFiles {}       // platform-storage with filter.types=[file]
+///       new Elm { applications { "acumen-api" } }
 ///       new Dao {}
 ///     }
 ///
@@ -16,14 +19,18 @@
 @ModuleInfo { minPklVersion = "0.27.0" }
 open module ApiConfig
 
-/// Base class for an apibuilder config block: a set of generators applied to
-/// a list of applications. Subclasses below cover every convention we use.
-abstract class Block {
+/// Base class for an apibuilder config block: one set of generators applied
+/// to a list of applications. Use a subclass when one matches; otherwise
+/// instantiate `Block` directly with an explicit generators map.
+open class Block {
   generators: Mapping<String, String>
   applications: Listing<String> = new Listing {}
+  attributes: Mapping<String, Any>? = null
   group: String? = null
   spec_glob: String? = null
 }
+
+// === Scala Play generators ===
 
 /// Play subproject codegen: controller + client + mock client + routes.
 /// `bryzek_play_routes` targets `<subproject>/conf` in the project root.
@@ -46,11 +53,15 @@ class PlayModel extends Block {
   }
 }
 
-/// Client + mock client only. No controller or routes.
+/// Client + mock client only. Defaults match standard Play layout; override
+/// `client_target` / `mock_target` for libraries with custom paths.
 class PlayClient extends Block {
+  hidden client_target: String = "generated/app/apibuilder"
+  hidden mock_target: String = "generated/test/apibuilder"
+
   generators = new Mapping {
-    ["bryzek_play_client"] = "generated/app/apibuilder"
-    ["bryzek_play_mock_client"] = "generated/test/apibuilder"
+    ["bryzek_play_client"] = client_target
+    ["bryzek_play_mock_client"] = mock_target
   }
 }
 
@@ -63,6 +74,41 @@ class Dao extends Block {
     ["psql_ddl"] = "dao/psql"
   }
 }
+
+// === Frontend generators ===
+
+/// TypeScript client codegen. Default target is `./src/generated`; override
+/// `target` for projects that place generated code elsewhere (e.g. playwright
+/// subprojects often use `./generated`).
+open class TypeScript extends Block {
+  hidden target: String = "./src/generated"
+
+  generators = new Mapping {
+    ["typescript"] = target
+  }
+}
+
+/// TypeScript codegen for `platform-storage` with `filter.types=[file]`.
+/// This exact pattern appears in every frontend project that uploads files.
+class TypeScriptFiles extends TypeScript {
+  attributes = new Mapping {
+    ["filter"] = new Mapping {
+      ["types"] = new Listing { "file" }
+    }
+  }
+  applications = new Listing { "platform-storage" }
+}
+
+/// Elm v2 client codegen. Default target is `./src`.
+class Elm extends Block {
+  hidden target: String = "./src"
+
+  generators = new Mapping {
+    ["elm_v2"] = target
+  }
+}
+
+// === Output ===
 
 /// The apibuilder organization key (e.g. "bryzek").
 org: String
