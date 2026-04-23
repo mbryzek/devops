@@ -8,10 +8,11 @@ class TestApiConfig < Minitest::Test
 
   def setup
     # The fixture uses `spec_glob = "dao/spec/*.json"`, which is resolved
-    # relative to Dir.pwd. Chdir to the fixture directory so the glob matches
-    # the test's dummy spec file.
-    Dir.chdir(File.dirname(FIXTURE))
-    @config = ApiConfig.new(FIXTURE)
+    # relative to Dir.pwd. Use the block form so cwd is restored afterwards
+    # and doesn't leak into other tests.
+    Dir.chdir(File.dirname(FIXTURE)) do
+      @config = ApiConfig.new(FIXTURE)
+    end
   end
 
   def test_orgs

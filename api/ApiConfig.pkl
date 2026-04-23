@@ -120,13 +120,19 @@ local function renderFilter(f: Filter): Dynamic = new Dynamic {
   when (f.resources != null) { resources = f.resources }
 }
 
-local function renderBlock(ag: AppGroup) = new Dynamic {
-  generators = renderGenerators(ag)
-  when (ag.specGlob == null) { applications = renderApps(ag) }
-  when (ag.filter != null) { attributes = new Dynamic { filter = renderFilter(ag.filter!!) } }
-  when (ag.group != null) { group = ag.group }
-  when (ag.specGlob != null) { spec_glob = ag.specGlob }
-}
+local function renderBlock(ag: AppGroup) =
+  if (ag.names != null && ag.specGlob != null)
+    throw("Invalid AppGroup: `names` and `specGlob` are mutually exclusive, but both are set.")
+  else if (ag.names == null && ag.specGlob == null)
+    throw("Invalid AppGroup: exactly one of `names` or `specGlob` must be set.")
+  else
+    new Dynamic {
+      generators = renderGenerators(ag)
+      when (ag.specGlob == null) { applications = renderApps(ag) }
+      when (ag.filter != null) { attributes = new Dynamic { filter = renderFilter(ag.filter!!) } }
+      when (ag.group != null) { group = ag.group }
+      when (ag.specGlob != null) { spec_glob = ag.specGlob }
+    }
 
 output {
   value = new Dynamic {
