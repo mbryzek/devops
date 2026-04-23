@@ -1,4 +1,5 @@
-require 'yaml'
+require 'json'
+require 'open3'
 
 class ApiConfig
 
@@ -9,9 +10,9 @@ class ApiConfig
   attr_reader :blocks
 
   def initialize(path = nil)
-    path ||= File.join(Dir.pwd, ".api", "config")
+    path ||= File.join(Dir.pwd, ".api", "config.pkl")
     if !File.exist?(path)
-      Util.exit_with_error("No .api/config found at #{path}")
+      Util.exit_with_error("No .api/config.pkl found at #{path}")
     end
     @blocks = parse(path)
   end
@@ -41,15 +42,16 @@ class ApiConfig
   private
 
   def parse(path)
-    yaml = begin
-             YAML.safe_load(IO.read(path), permitted_classes: [Symbol])
-           rescue Psych::SyntaxError => e
-             Util.exit_with_error("Invalid YAML in #{path}: #{e.message}")
+    json = evaluate_pkl(path)
+    data = begin
+             JSON.parse(json)
+           rescue JSON::ParserError => e
+             Util.exit_with_error("pkl produced non-JSON output for #{path}: #{e.message}")
            end
 
     blocks = []
 
-    (yaml || {}).each do |org, block_list|
+    (data || {}).each do |org, block_list|
       (block_list || []).each do |block_data|
         generators = parse_generators(block_data["generators"] || {})
         attributes = block_data["attributes"] || {}
@@ -72,9 +74,25 @@ class ApiConfig
     blocks
   end
 
+  def evaluate_pkl(path)
+    stdout, stderr, status = begin
+                               Open3.capture3("pkl", "eval", "-f", "json", path)
+                             rescue Errno::ENOENT
+                               Util.exit_with_error("pkl executable not found on PATH. Install pkl (https://pkl-lang.org) to evaluate #{path}.")
+                             end
+    if !status.success?
+      Util.exit_with_error("pkl eval failed for #{path}:\n#{stderr}")
+    end
+    stdout
+  end
+
   def parse_generators(generators_hash)
-    generators_hash.map do |key, target|
-      Generator.new(key: key, target: target, attributes: {})
+    generators_hash.map do |key, value|
+      if value.is_a?(Hash)
+        Generator.new(key: key, target: value["target"], attributes: value["attributes"] || {})
+      else
+        Generator.new(key: key, target: value, attributes: {})
+      end
     end
   end
 

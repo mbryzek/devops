@@ -7,6 +7,10 @@ class TestApiConfig < Minitest::Test
   FIXTURE = File.expand_path('fixtures/sample_config.pkl', __dir__)
 
   def setup
+    # The fixture uses `spec_glob = "dao/spec/*.json"`, which is resolved
+    # relative to Dir.pwd. Chdir to the fixture directory so the glob matches
+    # the test's dummy spec file.
+    Dir.chdir(File.dirname(FIXTURE))
     @config = ApiConfig.new(FIXTURE)
   end
 
