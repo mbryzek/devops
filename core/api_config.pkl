@@ -113,10 +113,31 @@ class Elm extends Block {
 /// The apibuilder organization key (e.g. "bryzek").
 org: String
 
-/// All blocks for this org.
-blocks: Listing<Block>
+/// Explicit blocks. Use for anything that doesn't fit the `subprojects`
+/// shortcut below (PlayModel, PlayClient, Dao, TypeScript, Elm, etc.).
+blocks: Listing<Block> = new Listing {}
+
+/// Shortcut for PlayFullStack blocks: one entry per Play subproject ->
+/// list of applications. Each entry expands to a PlayFullStack block
+/// with routes -> `<subproject>/conf`. Usage:
+///
+///     subprojects {
+///       api { "platform"; "platform-cluster" }
+///       hoa { "hoa-api"; "hoa-admin" }
+///     }
+subprojects: Dynamic = new Dynamic {}
+
+local allBlocks: Listing<Block> = new Listing {
+  for (b in blocks) { b }
+  for (sp, apps in subprojects.toMap()) {
+    new PlayFullStack {
+      subproject = sp as String
+      applications = new Listing<String> { for (a in apps as Dynamic) { a as String } }
+    }
+  }
+}
 
 output {
-  value = new Mapping { [org] = blocks }
+  value = new Mapping { [org] = allBlocks }
   renderer = new YamlRenderer {}
 }
