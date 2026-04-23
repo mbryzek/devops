@@ -1,0 +1,76 @@
+/// Shared schema for `.api/config.pkl` files consumed by the `api` CLI.
+///
+/// Usage in a project's `.api/config.pkl`:
+///
+///     amends "modulepath:/api_config.pkl"
+///
+///     org = "bryzek"
+///     blocks {
+///       new PlayFullStack { subproject = "api"; applications { "platform" } }
+///       new Dao {}
+///     }
+///
+/// The `api` CLI invokes `pkl eval` with `--module-path <devops>/core` so that
+/// `modulepath:api_config.pkl` resolves to this file.
+
+@ModuleInfo { minPklVersion = "0.27.0" }
+open module ApiConfig
+
+/// Base class for an apibuilder config block: a set of generators applied to
+/// a list of applications. Subclasses below cover every convention we use.
+abstract class Block {
+  generators: Mapping<String, String>
+  applications: Listing<String> = new Listing {}
+  group: String? = null
+  spec_glob: String? = null
+}
+
+/// Play subproject codegen: controller + client + mock client + routes.
+/// `bryzek_play_routes` targets `<subproject>/conf` in the project root.
+class PlayFullStack extends Block {
+  hidden subproject: String
+
+  generators = new Mapping {
+    ["bryzek_play_controller"] = "generated/app/apibuilder"
+    ["bryzek_play_client"] = "generated/app/apibuilder"
+    ["bryzek_play_mock_client"] = "generated/test/apibuilder"
+    ["bryzek_play_routes"] = "\(subproject)/conf"
+  }
+}
+
+/// Model + mock model only. No client, controller, or routes.
+class PlayModel extends Block {
+  generators = new Mapping {
+    ["bryzek_play_model"] = "generated/app/apibuilder"
+    ["bryzek_play_mock_model"] = "generated/test/apibuilder"
+  }
+}
+
+/// Client + mock client only. No controller or routes.
+class PlayClient extends Block {
+  generators = new Mapping {
+    ["bryzek_play_client"] = "generated/app/apibuilder"
+    ["bryzek_play_mock_client"] = "generated/test/apibuilder"
+  }
+}
+
+/// DAO code generation driven by `dao/spec/*.json`.
+class Dao extends Block {
+  group = "dao"
+  spec_glob = "dao/spec/*.json"
+  generators = new Mapping {
+    ["psql_scala"] = "generated/app"
+    ["psql_ddl"] = "dao/psql"
+  }
+}
+
+/// The apibuilder organization key (e.g. "bryzek").
+org: String
+
+/// All blocks for this org.
+blocks: Listing<Block>
+
+output {
+  value = new Mapping { [org] = blocks }
+  renderer = new YamlRenderer {}
+}

@@ -367,8 +367,7 @@ def validate_filters(config, app_filter, group_filter)
 end
 
 def run_batch(profile, operations, app_filter, group_filter)
-  config_path = File.join(Dir.pwd, ".api", "config")
-  config = ApiConfig.new(config_path)
+  config = ApiConfig.new(File.join(Dir.pwd, ".api"))
 
   if operations.empty?
     operations = ["codegen"]

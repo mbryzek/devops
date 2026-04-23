@@ -1,4 +1,5 @@
 require 'yaml'
+require 'shellwords'
 
 class ApiConfig
 
@@ -6,14 +7,30 @@ class ApiConfig
   Application = Struct.new(:key, :file_path, keyword_init: true)
   Block = Struct.new(:org, :group, :generators, :attributes, :applications, keyword_init: true)
 
+  SCHEMA_MODULE_PATH = File.expand_path("../core", __dir__).tap do |p|
+    schema = File.join(p, "api_config.pkl")
+    raise "PKL schema not found at #{schema}" unless File.exist?(schema)
+  end
+
   attr_reader :blocks
 
-  def initialize(path = nil)
-    path ||= File.join(Dir.pwd, ".api", "config")
-    if !File.exist?(path)
-      Util.exit_with_error("No .api/config found at #{path}")
-    end
-    @blocks = parse(path)
+  # api_dir: path to the `.api` directory (defaults to `<cwd>/.api`).
+  # If `<api_dir>/config.pkl` exists, it is used (evaluated via `pkl eval`).
+  # Otherwise `<api_dir>/config` (legacy YAML) is used.
+  def initialize(api_dir = nil)
+    api_dir ||= File.join(Dir.pwd, ".api")
+    pkl_path = File.join(api_dir, "config.pkl")
+    yaml_path = File.join(api_dir, "config")
+
+    source, source_label = if File.exist?(pkl_path)
+                             [evaluate_pkl(pkl_path), pkl_path]
+                           elsif File.exist?(yaml_path)
+                             [IO.read(yaml_path), yaml_path]
+                           else
+                             Util.exit_with_error("No config.pkl or config found in #{api_dir}")
+                           end
+
+    @blocks = parse(source, source_label)
   end
 
   # Returns all unique org names
@@ -40,11 +57,21 @@ class ApiConfig
 
   private
 
-  def parse(path)
+  def evaluate_pkl(pkl_path)
+    Util.assert_installed("pkl", "https://github.com/apple/pkl")
+    cmd = "pkl eval -f yaml --module-path #{Shellwords.escape(SCHEMA_MODULE_PATH)} #{Shellwords.escape(pkl_path)}"
+    out = `#{cmd} 2>&1`
+    if !$?.success?
+      Util.exit_with_error("pkl eval failed for #{pkl_path}:\n#{out}")
+    end
+    out
+  end
+
+  def parse(source, source_label)
     yaml = begin
-             YAML.safe_load(IO.read(path), permitted_classes: [Symbol])
+             YAML.safe_load(source, permitted_classes: [Symbol])
            rescue Psych::SyntaxError => e
-             Util.exit_with_error("Invalid YAML in #{path}: #{e.message}")
+             Util.exit_with_error("Invalid YAML in #{source_label}: #{e.message}")
            end
 
     blocks = []
@@ -57,7 +84,7 @@ class ApiConfig
         applications = if glob = block_data["spec_glob"]
                          parse_spec_glob(glob)
                        else
-                         parse_applications(block_data["applications"] || {})
+                         parse_applications(block_data["applications"] || [])
                        end
         blocks << Block.new(
           org: org,
@@ -89,8 +116,17 @@ class ApiConfig
     end
   end
 
-  def parse_applications(applications_hash)
-    applications_hash.map do |key, file_path|
+  # Accepts either:
+  #   - Array of app keys: ["platform", "platform-cluster"]  (from PKL config)
+  #   - Hash of {key => file_path_or_nil}:                   (from YAML config)
+  def parse_applications(applications)
+    entries = case applications
+              when Array then applications.map { |k| [k, nil] }
+              when Hash  then applications.to_a
+              else
+                Util.exit_with_error("Invalid 'applications' value: expected list or map, got #{applications.class}")
+              end
+    entries.map do |key, file_path|
       file_path = file_path || "spec/#{key}.json"
       Application.new(key: key, file_path: file_path)
     end
