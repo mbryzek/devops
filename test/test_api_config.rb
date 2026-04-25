@@ -20,7 +20,7 @@ class TestApiConfig < Minitest::Test
   end
 
   def test_block_count
-    assert_equal 4, @config.blocks.size
+    assert_equal 5, @config.blocks.size
   end
 
   def test_model_only_block
@@ -38,6 +38,11 @@ class TestApiConfig < Minitest::Test
   def test_filter_attributes_preserved
     block = @config.blocks.find { |b| b.applications.map(&:key) == ["platform"] }
     assert_equal ["user_reference", "person"], block.attributes.dig("filter", "types")
+  end
+
+  def test_block_level_attributes_preserved
+    block = @config.blocks.find { |b| b.applications.map(&:key) == ["hoa-api"] }
+    assert_equal "community_id", block.attributes["http_request_params_global_variable"]
   end
 
   def test_spec_glob_block

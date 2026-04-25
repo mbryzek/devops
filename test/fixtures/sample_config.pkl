@@ -19,6 +19,14 @@ applications = new Listing<AppGroup> {
     generators = module.singleGenerator("typescript", "./src/generated")
     filter = new { types { "user_reference"; "person" }; resources { "person"; "user" } }
   }
+  // Block-level attributes (e.g. http_request_params_global_variable)
+  new {
+    names { "hoa-api" }
+    generators = module.singleGenerator("elm_v2", "./src")
+    attributes = new Mapping<String, Any> {
+      ["http_request_params_global_variable"] = "community_id"
+    }
+  }
   // Spec glob (dao-style)
   new {
     specGlob = "dao/spec/*.json"
