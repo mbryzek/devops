@@ -49,6 +49,10 @@ class AppGroup {
   generators: Listing<Generator>
   /// Filter attributes for the whole block.
   filter: Filter?
+  /// Additional block-level attributes (e.g. `http_request_params_global_variable`).
+  /// Rendered alongside `filter` inside the output `attributes` block.
+  /// `"filter"` is reserved — set the `filter` field instead of putting it here.
+  attributes: Mapping<String, Any>?(this == null || !this.containsKey("filter"))
   /// Group tag — exposed as `group` in the output (used by `--group` CLI flag).
   group: String?
   /// Spec glob — populates `applications` by globbing the filesystem.
@@ -120,6 +124,15 @@ local function renderFilter(f: Filter): Dynamic = new Dynamic {
   when (f.resources != null) { resources = f.resources }
 }
 
+local function renderAttributes(ag: AppGroup): Dynamic = new Dynamic {
+  when (ag.filter != null) { filter = renderFilter(ag.filter!!) }
+  when (ag.attributes != null) {
+    for (k, v in ag.attributes!!) {
+      [k] = v
+    }
+  }
+}
+
 local function renderBlock(ag: AppGroup) =
   if (ag.names != null && ag.specGlob != null)
     throw("Invalid AppGroup: `names` and `specGlob` are mutually exclusive, but both are set.")
@@ -129,7 +142,7 @@ local function renderBlock(ag: AppGroup) =
     new Dynamic {
       generators = renderGenerators(ag)
       when (ag.specGlob == null) { applications = renderApps(ag) }
-      when (ag.filter != null) { attributes = new Dynamic { filter = renderFilter(ag.filter!!) } }
+      when (ag.filter != null || ag.attributes != null) { attributes = renderAttributes(ag) }
       when (ag.group != null) { group = ag.group }
       when (ag.specGlob != null) { spec_glob = ag.specGlob }
     }
