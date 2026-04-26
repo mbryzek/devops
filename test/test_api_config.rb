@@ -57,4 +57,22 @@ class TestApiConfig < Minitest::Test
     assert_equal "generated/app/apibuilder", @config.find_target("apibuilder-spec", "bryzek_play_model")
     assert_equal "rallyd/conf", @config.find_target("rallyd-api", "bryzek_play_routes")
   end
+
+  # Auto-imported transitive deps: app not listed in any block, but the
+  # generator key is. Fall back to the first block's target for that generator.
+  def test_find_target_falls_back_for_unlisted_app
+    assert_equal "./src/generated", @config.find_target("platform-storage", "typescript")
+    assert_equal "generated/app/apibuilder", @config.find_target("some-unlisted-app", "bryzek_play_model")
+  end
+
+  def test_find_target_returns_nil_when_generator_unknown
+    assert_nil @config.find_target("anything", "no_such_generator")
+  end
+
+  # Listed apps don't fall back: if the user listed an app under a specific
+  # generator set, asking for a different generator should return nil rather
+  # than picking up an unrelated block's target — that would mask config errors.
+  def test_find_target_does_not_fall_back_for_listed_app_missing_generator
+    assert_nil @config.find_target("apibuilder-spec", "typescript")
+  end
 end
