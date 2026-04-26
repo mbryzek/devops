@@ -68,4 +68,11 @@ class TestApiConfig < Minitest::Test
   def test_find_target_returns_nil_when_generator_unknown
     assert_nil @config.find_target("anything", "no_such_generator")
   end
+
+  # Listed apps don't fall back: if the user listed an app under a specific
+  # generator set, asking for a different generator should return nil rather
+  # than picking up an unrelated block's target — that would mask config errors.
+  def test_find_target_does_not_fall_back_for_listed_app_missing_generator
+    assert_nil @config.find_target("apibuilder-spec", "typescript")
+  end
 end

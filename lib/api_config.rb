@@ -29,19 +29,26 @@ class ApiConfig
 
   # Finds the target directory for a given application_key and generator_key.
   #
-  # Falls back to any block that uses the same generator when the application
-  # isn't explicitly listed: the server now auto-includes transitively-imported
-  # specs in the codegen response, and those files need a target dir even though
-  # the user didn't list them in config.pkl. Picking the first matching block's
-  # target is fine because configs almost always use one target per generator.
+  # If the app is explicitly listed in any block, only that block's generators
+  # are considered — returning nil if the requested generator isn't configured
+  # there avoids masking misconfiguration.
+  #
+  # If the app isn't listed in any block, falls back to the first block that
+  # uses the matching generator key. This handles transitively-imported specs
+  # the server auto-includes in codegen responses (the user didn't list them
+  # but their files still need a target dir). Picking the first matching block
+  # is fine because configs almost always use one target per generator.
   def find_target(application_key, generator_key)
+    app_listed = false
     @blocks.each do |block|
       if block.applications.any? { |a| a.key == application_key }
+        app_listed = true
         if gen = block.generators.find { |g| g.key == generator_key }
           return gen.target
         end
       end
     end
+    return nil if app_listed
     @blocks.each do |block|
       if gen = block.generators.find { |g| g.key == generator_key }
         return gen.target
