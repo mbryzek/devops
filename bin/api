@@ -35,6 +35,10 @@ USAGE = <<~TEXT
     --profile PROFILE  Use a named profile from ~/.apibuilder/config
     --app APP          Process only the specified application(s). Can be repeated.
     --group GROUP      Process only blocks with the specified group.
+    --expand-imports   Force the server to walk transitive imports and auto-include
+                       them with type-scoped filters. On by default when no --app
+                       filter is used; otherwise off (subset uploads should not
+                       wipe types from imported apps' generated files).
 
   Examples:
     api init                                        # create anonymous org + token
@@ -83,6 +87,7 @@ def parse_batch_args(remaining)
   operations = []
   apps = []
   group = nil
+  expand_imports_flag = false
 
   args = remaining.dup
   while arg = args.shift
@@ -92,6 +97,8 @@ def parse_batch_args(remaining)
       apps << app unless apps.include?(app)
     when "--group"
       group = parse_option_value(args, "--group")
+    when "--expand-imports"
+      expand_imports_flag = true
     else
       if VALID_OPERATIONS.include?(arg)
         operations << arg unless operations.include?(arg)
@@ -101,7 +108,17 @@ def parse_batch_args(remaining)
     end
   end
 
-  { operations: operations, apps: apps.empty? ? nil : apps, group: group }
+  { operations: operations, apps: apps.empty? ? nil : apps, group: group, expand_imports_flag: expand_imports_flag }
+end
+
+# Resolve the effective import_expansion mode for a batch.
+# Auto-enable on full uploads (no --app filter) so transitive third-party imports
+# like apibuilder-spec / platform-error still get codegen'd. Stay disabled on
+# subset uploads to avoid the server wiping types from sibling apps' files.
+def resolve_import_expansion(app_filter, expand_imports_flag)
+  return "enabled" if expand_imports_flag
+  return "enabled" if app_filter.nil?
+  "disabled"
 end
 
 def parse_init_args(remaining)
@@ -258,7 +275,7 @@ end
 
 # --- Batch Operations ---
 
-def build_batch_form(config, org, operations, app_filter, group_filter)
+def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
   blocks = config.blocks_for_org(org)
   blocks = blocks.select { |b| b.group == group_filter } if group_filter
 
@@ -299,6 +316,7 @@ def build_batch_form(config, org, operations, app_filter, group_filter)
   {
     "operations" => operations,
     "applications" => applications,
+    "import_expansion" => import_expansion,
   }
 end
 
@@ -387,7 +405,7 @@ def validate_filters(config, app_filter, group_filter)
   end
 end
 
-def run_batch(profile, operations, app_filter, group_filter)
+def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag)
   config_path = File.join(Dir.pwd, ".api", "config.pkl")
   config = ApiConfig.new(config_path)
 
@@ -407,13 +425,15 @@ def run_batch(profile, operations, app_filter, group_filter)
   num_orgs = config.orgs.size
   puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
 
+  import_expansion = resolve_import_expansion(app_filter, expand_imports_flag)
+
   config.orgs.each do |org|
     puts "==> Building batch for #{org}"
-    form = build_batch_form(config, org, operations, app_filter, group_filter)
+    form = build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
     next if form["applications"].empty?
 
     num_apps = form["applications"].size
-    puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
+    puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')}, import_expansion: #{import_expansion})"
     batch = batch_client.create_batch(org, form)
     batch_id = batch["id"]
     puts "==> Batch #{batch_id} created, polling for processing to begin..."
@@ -455,22 +475,24 @@ end
 
 # --- Main ---
 
-start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+if __FILE__ == $PROGRAM_NAME
+  start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-global = parse_global_args(ARGV)
-profile = global[:profile]
-remaining = global[:remaining]
+  global = parse_global_args(ARGV)
+  profile = global[:profile]
+  remaining = global[:remaining]
 
-case remaining.first
-when "init"
-  languages = parse_init_args(remaining[1..])
-  run_init(profile, languages)
-when "validate"
-  run_validate(profile, remaining[1])
-else
-  parsed = parse_batch_args(remaining)
-  run_batch(profile, parsed[:operations], parsed[:apps], parsed[:group])
+  case remaining.first
+  when "init"
+    languages = parse_init_args(remaining[1..])
+    run_init(profile, languages)
+  when "validate"
+    run_validate(profile, remaining[1])
+  else
+    parsed = parse_batch_args(remaining)
+    run_batch(profile, parsed[:operations], parsed[:apps], parsed[:group], parsed[:expand_imports_flag])
+  end
+
+  elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+  puts "==> Done (#{format('%.1f', elapsed)} seconds)"
 end
-
-elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
-puts "==> Done (#{format('%.1f', elapsed)} seconds)"
