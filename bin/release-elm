@@ -46,11 +46,15 @@ def rewrite_version(file, version)
   tmp = []
   version_found = false
   IO.readlines(file).each do |l|
-    if !version_found && md = l.strip.match(/^version\s*:\s*"([^"]+)"/)
-      tmp << l.sub(md[1], version)
+    # Substitute the {{VERSION}} placeholder anywhere in the line — used to
+    # cache-bust references like `<script src="/elm.js?v={{VERSION}}">` so a
+    # new release immediately invalidates CDN-cached static assets.
+    line = l.gsub("{{VERSION}}", version)
+    if !version_found && md = line.strip.match(/^version\s*:\s*"([^"]+)"/)
+      tmp << line.sub(md[1], version)
       version_found = true
     else
-      tmp << l
+      tmp << line
     end
   end
   if !version_found
@@ -73,7 +77,9 @@ def extract_file(l, tag)
   if md = l.match(/#{tag}\s*=\s*\"([^\"]+)/)
     url = md[1]
     if url.match(/^\//)
-      f = url[1..-1]
+      # Strip any query string (e.g. `?v={{VERSION}}` cache-bust suffix) — the
+      # underlying file on disk is the bare path.
+      f = url[1..-1].sub(/\?.*\z/, "")
       if !File.exist?(f)
         raise "Failed to find file '#{f} from the following line in index.html:\n#{l}"
       end
