@@ -45,11 +45,12 @@ def rewrite_version(file, version)
   puts "rewrite_version #{file} #{version}"
   tmp = []
   version_found = false
+  # Append `?v=<version>` to /elm.js and /style.css refs at release time.
+  # Source stays clean so elm-live serves them correctly in dev — a `?v=...`
+  # query string trips elm-live's pushstate fallback in v4.x.
+  cache_bust_re = %r{(<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*["'])(/(?:elm\.js|style\.css))(?:\?[^"']*)?(["'])}
   IO.readlines(file).each do |l|
-    # Substitute the {{VERSION}} placeholder anywhere in the line — used to
-    # cache-bust references like `<script src="/elm.js?v={{VERSION}}">` so a
-    # new release immediately invalidates CDN-cached static assets.
-    line = l.gsub("{{VERSION}}", version)
+    line = l.gsub(cache_bust_re) { "#{$1}#{$2}?v=#{version}#{$3}" }
     if !version_found && md = line.strip.match(/^version\s*:\s*"([^"]+)"/)
       tmp << line.sub(md[1], version)
       version_found = true
