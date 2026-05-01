@@ -64,9 +64,18 @@ def runScript(extraArgs: Seq[String], extraEnv: Map[String, String] = Map.empty)
 
   // Start from the current system env, clear PLATFORM vars, then apply overrides.
   // This preserves PATH, HOME, JAVA_HOME etc. that scala-cli needs.
+  //
+  // PLATFORM_CONFIG_FILE is pinned to a path that does not exist so the script
+  // cannot accidentally pick up the developer's real ~/.platform/config and have
+  // a token leak in from there. Tests that exercise the config file flow opt in
+  // via `withTempConfig`, which overrides PLATFORM_CONFIG_FILE.
   import scala.jdk.CollectionConverters.*
   val sysEnv: Map[String, String] = System.getenv().asScala.toMap
-  val cleared = sysEnv ++ Map("PLATFORM_TOKEN" -> "", "PLATFORM_API_URL" -> "")
+  val cleared = sysEnv ++ Map(
+    "PLATFORM_TOKEN" -> "",
+    "PLATFORM_API_URL" -> "",
+    "PLATFORM_CONFIG_FILE" -> "/nonexistent/platform-metrics-spec/config",
+  )
   val mergedEnv = (cleared ++ extraEnv).toSeq
 
   val cmd = Seq("scala-cli", "run", platformMetricsScript, "--") ++ extraArgs
