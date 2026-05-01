@@ -3,21 +3,28 @@
 //> using scala 3.8
 //> using dep com.softwaremill.sttp.client3::core:3.11.0
 //> using dep com.typesafe:config:1.4.7
-//> using dep org.json4s::json4s-native:4.0.7
+//> using dep org.playframework::play-json:3.0.5
+//> using dep org.playframework::play:3.0.7
+//> using dep org.typelevel::cats-core:2.13.0
+//> using dep joda-time:joda-time:2.13.1
+//> using file ../generated/app/apibuilder/BryzekPlayModelComBryzekPlatformError.scala
+//> using file ../generated/app/apibuilder/BryzekPlayModelComBryzekPlatformMetrics.scala
+//> using file ../generated/app/apibuilder/GeneratedBinders.scala
 
+import com.bryzek.platform.error.models.ValidationError
+import com.bryzek.platform.error.models.json.*
+import com.bryzek.platform.metrics.models.{Aggregation, MetricUnit, MetricUpsertForm, PointForm}
+import com.bryzek.platform.metrics.models.json.*
 import com.typesafe.config.{Config, ConfigFactory, ConfigException}
-import org.json4s.*
-import org.json4s.native.JsonMethods.*
-import org.json4s.native.Serialization
-import org.json4s.native.Serialization.write
+import org.joda.time.LocalDate
+import play.api.libs.json.{JsError, JsPath, JsResult, JsSuccess, JsValue, Json, JsonValidationError, Reads}
 import sttp.client3.*
+
 import java.io.File
 import java.nio.file.{Files, Paths}
 import java.nio.file.attribute.PosixFilePermission
 import java.util.Base64
 import scala.util.{Try, Success, Failure}
-
-implicit val formats: Formats = DefaultFormats
 
 // ── Exit codes ────────────────────────────────────────────────────────────────
 val ExitOk           = 0
@@ -302,19 +309,7 @@ def executeRequest(spec: RequestSpec, verbose: Boolean): (Int, String) =
     backend.close()
 
 def parseValidationErrors(body: String): List[String] =
-  Try {
-    val json = parse(body)
-    json match
-      case JArray(items) =>
-        items.flatMap {
-          case JObject(fields) =>
-            fields.collectFirst { case ("message", JString(msg)) => msg }
-          case JString(_) | JNull | JNothing | JBool(_) | JInt(_) | JLong(_)
-              | JDouble(_) | JDecimal(_) | JArray(_) | JSet(_) => None
-        }
-      case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
-          | JDecimal(_) | JString(_) | JObject(_) | JSet(_) => Nil
-  }.getOrElse(Nil)
+  Try(Json.parse(body).as[Seq[ValidationError]].map(_.message).toList).getOrElse(Nil)
 
 def handleResponse(statusCode: Int, body: String, successMsg: String): Unit =
   val category = statusCode / 100
@@ -387,13 +382,13 @@ def runRecordPoint(parsed: ParsedArgs, config: ResolvedConfig): Unit =
 
   val url = s"${config.apiUrl}/${flags.tenantId}/metrics/points"
 
-  val bodyMap: Map[String, JValue] = Map(
-    "series_key" -> JString(flags.seriesKey),
-    "metric_key" -> JString(flags.metricKey),
-    "date"       -> JString(flags.dateStr),
-    "value"      -> JDecimal(flags.value)
+  val form = PointForm(
+    seriesKey = flags.seriesKey,
+    metricKey = flags.metricKey,
+    date = LocalDate.parse(flags.dateStr),
+    value = flags.value,
   )
-  val body = compact(render(JObject(bodyMap.toList.map { case (k, v) => JField(k, v) })))
+  val body = Json.stringify(Json.toJson(form))
 
   val spec = RequestSpec(
     method     = "POST",
@@ -410,8 +405,7 @@ def runRecordPoint(parsed: ParsedArgs, config: ResolvedConfig): Unit =
 
   val successMsg = if statusCode / 100 == 2 then
     Try {
-      val json = parse(responseBody)
-      val id = (json \ "id").extractOpt[String].getOrElse("?")
+      val id = (Json.parse(responseBody) \ "id").asOpt[String].getOrElse("?")
       s"OK metric_point=$id"
     }.getOrElse("OK")
   else ""
@@ -425,18 +419,21 @@ def runSetMetric(parsed: ParsedArgs, config: ResolvedConfig): Unit =
     case Left(err) => failValidation(err)
     case Right(v)  => v
 
-  // The body is a metric_upsert_form: series_key + metric_key + optional metadata.
-  // Optional metadata fields absent = leave unchanged on update; null on create.
-  val fields: List[JField] = List(
-    JField("series_key", JString(flags.seriesKey)),
-    JField("metric_key", JString(flags.metricKey)),
-  ) ++ List.concat(
-    parsed.name.map(v => JField("name", JString(v))),
-    parsed.unit.map(v => JField("unit", JString(v))),
-    flags.aggregation.map(v => JField("aggregation", JString(v))),
-    parsed.description.map(v => JField("description", JString(v)))
+  val unit = parsed.unit match
+    case None    => None
+    case Some(u) => MetricUnit.fromString(u) match
+      case Some(known) => Some(known)
+      case None        => failValidation(s"Invalid unit '$u'. Valid: ${MetricUnit.all.map(_.toString).mkString(", ")}.")
+
+  val form = MetricUpsertForm(
+    seriesKey = flags.seriesKey,
+    metricKey = flags.metricKey,
+    name = parsed.name,
+    unit = unit,
+    aggregation = flags.aggregation.map(Aggregation.apply),
+    description = parsed.description,
   )
-  val body = compact(render(JObject(fields)))
+  val body = Json.stringify(Json.toJson(form))
 
   val url = s"${config.apiUrl}/${flags.tenantId}/metrics/metrics"
   val spec = RequestSpec(
@@ -454,8 +451,7 @@ def runSetMetric(parsed: ParsedArgs, config: ResolvedConfig): Unit =
 
   val successMsg = if statusCode / 100 == 2 then
     Try {
-      val json = parse(responseBody)
-      val id = (json \ "id").extractOpt[String].getOrElse("?")
+      val id = (Json.parse(responseBody) \ "id").asOpt[String].getOrElse("?")
       s"OK metric=$id"
     }.getOrElse("OK")
   else ""
@@ -464,11 +460,7 @@ def runSetMetric(parsed: ParsedArgs, config: ResolvedConfig): Unit =
 
 // ── record-points (bulk) ──────────────────────────────────────────────────────
 
-case class ValidatedRecordPointsFlags(
-  tenantId: String,
-  body:     String,   // already-validated JSON array of point_form
-  count:    Int
-)
+case class ValidatedRecordPointsFlags(tenantId: String, forms: Seq[PointForm])
 
 def readFileOrStdin(path: String): Either[String, String] =
   if path == "-" then
@@ -482,70 +474,67 @@ def readFileOrStdin(path: String): Either[String, String] =
         s"Error reading $path: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
       )
 
-/** Validate that the parsed JSON is an array of well-formed point_form objects.
-  * Returns the canonical body string (re-serialized) and the count. */
-def validatePointFormsJson(raw: String): Either[String, (String, Int)] =
-  Try(parse(raw)).toEither.left.map(e =>
+/** Parse and validate the JSON body as a [point_form] array using the apibuilder-
+  * generated Reads. Lets play-json handle field presence, type coercion, and
+  * date parsing — no hand-rolled JSON traversal here.
+  *
+  * Note: the generated joda LocalDate Reads parses via `parseLocalDate`, which
+  * throws `IllegalArgumentException` on a malformed date instead of yielding
+  * `JsError`. We catch that here and surface it as an "invalid date" error so the
+  * caller sees a clear message instead of a stack trace.
+  */
+def parsePointFormsJson(raw: String): Either[String, Seq[PointForm]] =
+  Try(Json.parse(raw)).toEither.left.map(e =>
     s"Invalid JSON: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
-  ).flatMap {
-    case JArray(items) =>
-      val errors = items.zipWithIndex.flatMap { case (item, idx) => validatePointForm(item, idx) }
-      if errors.nonEmpty then
-        Left(errors.mkString("\n"))
-      else
-        Right((compact(render(JArray(items))), items.size))
-    case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
-        | JDecimal(_) | JString(_) | JObject(_) | JSet(_) =>
+  ).flatMap { json =>
+    if !json.isInstanceOf[play.api.libs.json.JsArray] then
       Left("Body must be a JSON array of point_form objects")
+    else
+      Try(json.validate[Seq[PointForm]]).toEither.left.map { e =>
+        s"invalid date or field value: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
+      }.flatMap {
+        case JsSuccess(forms, _) => Right(forms)
+        case JsError(errors)     => Left(formatJsErrors(errors))
+      }
   }
 
-def validatePointForm(item: JValue, idx: Int): Option[String] =
-  item match
-    case obj: JObject =>
-      val seriesKey = (obj \ "series_key").extractOpt[String]
-      val metricKey = (obj \ "metric_key").extractOpt[String]
-      val date      = (obj \ "date").extractOpt[String]
-      val value     = (obj \ "value")
-      val missing = List(
-        seriesKey.fold(Some("series_key"): Option[String])(_ => None),
-        metricKey.fold(Some("metric_key"): Option[String])(_ => None),
-        date.fold(Some("date"): Option[String])(_ => None),
-      ).flatten
-      val numericProblem = value match
-        case JInt(_) | JLong(_) | JDouble(_) | JDecimal(_) => None
-        case JNothing | JNull => Some("value")
-        case JArray(_) | JObject(_) | JBool(_) | JString(_) | JSet(_) => Some("value")
-      val allMissing = missing ++ numericProblem.toList
-      if allMissing.isEmpty then
-        date.flatMap(d => Try(java.time.LocalDate.parse(d)).toEither.left.toOption.map(_ =>
-          s"Item $idx: invalid date '${d}' (expected YYYY-MM-DD)"
-        ))
-      else
-        Some(s"Item $idx: missing or invalid field(s): ${allMissing.mkString(", ")}")
-    case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
-        | JDecimal(_) | JString(_) | JArray(_) | JSet(_) =>
-      Some(s"Item $idx: must be a JSON object")
+/** Render JsError into a readable multi-line string. Each entry mentions the
+  * offending JSON path (e.g. `(0)/date`) and the reason (e.g. `error.path.missing`).
+  */
+def formatJsErrors(errors: collection.Seq[(JsPath, collection.Seq[JsonValidationError])]): String =
+  errors.map { case (path, errs) =>
+    val pathStr = path.toString
+    val msgs = errs.map { e =>
+      // Translate play-json's stock keys into something a human-friendly. We special-case
+      // `error.path.missing` so the test (and the user) sees the field name plainly.
+      e.message match
+        case "error.path.missing" =>
+          val field = path.path.lastOption.fold(pathStr)(_.toJsonString.stripPrefix("."))
+          s"missing required field: $field"
+        case other => other
+    }.mkString(", ")
+    s"$pathStr: $msgs"
+  }.mkString("\n")
 
 def validateRecordPointsFlags(parsed: ParsedArgs): Either[String, ValidatedRecordPointsFlags] =
   for
     tenantId <- parsed.tenant.toRight("--tenant is required")
     path     <- parsed.file.toRight("--file is required (use '-' for stdin)")
     raw      <- readFileOrStdin(path)
-    valid    <- validatePointFormsJson(raw)
-  yield
-    val (body, count) = valid
-    ValidatedRecordPointsFlags(tenantId = tenantId, body = body, count = count)
+    forms    <- parsePointFormsJson(raw)
+  yield ValidatedRecordPointsFlags(tenantId = tenantId, forms = forms)
 
 def runRecordPoints(parsed: ParsedArgs, config: ResolvedConfig): Unit =
   val flags = validateRecordPointsFlags(parsed) match
     case Left(err) => failValidation(err)
     case Right(v)  => v
 
-  val url = s"${config.apiUrl}/${flags.tenantId}/metrics/points/bulk"
+  val url  = s"${config.apiUrl}/${flags.tenantId}/metrics/points/bulk"
+  val body = Json.stringify(Json.toJson(flags.forms))
   val spec = RequestSpec(
     method     = "POST",
     url        = url,
-    body       = flags.body,
+    body       = body,
     authHeader = buildAuthHeader(config.token)
   )
 
@@ -555,7 +544,7 @@ def runRecordPoints(parsed: ParsedArgs, config: ResolvedConfig): Unit =
 
   val (statusCode, responseBody) = executeRequest(spec, parsed.verbose)
 
-  val successMsg = if statusCode / 100 == 2 then s"OK n_points=${flags.count}" else ""
+  val successMsg = if statusCode / 100 == 2 then s"OK n_points=${flags.forms.size}" else ""
 
   handleResponse(statusCode, responseBody, successMsg)
 

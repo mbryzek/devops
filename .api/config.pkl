@@ -1,0 +1,13 @@
+amends "../api/ApiConfig.pkl"
+
+org = "bryzek"
+
+// `bin/platform-metrics.sc` (and any future scala-cli scripts under bin/) consume the
+// platform-metrics models for typed JSON parsing/serialization. We pull only the
+// models (no Play WS client, no controller, no routes) so the CLI stays light.
+applications = new Listing<AppGroup> {
+  new {
+    names { "platform-error"; "platform-metrics" }
+    generators = module.modelOnly()
+  }
+}
