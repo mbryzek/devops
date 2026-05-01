@@ -434,7 +434,7 @@ test("config file is used when no CLI flag and no env var") {
   withTempConfig("""
     |default {
     |  api_url = "https://config.example.com"
-    |  platform_token = "tok_from_config"
+    |  token = "tok_from_config"
     |}
     """.stripMargin) { (_, configEnv) =>
     val result = runScript(
@@ -492,11 +492,11 @@ test("missing token exits with non-zero code and clear message") {
 
 println("\nConfig file")
 
-test("platform_token and api_url loaded from temp config file") {
+test("token and api_url loaded from temp config file") {
   withTempConfig("""
     |default {
     |  api_url = "https://from-file.example.com"
-    |  platform_token = "tok_from_file"
+    |  token = "tok_from_file"
     |}
     """.stripMargin) { (_, configEnv) =>
     val result = runScript(
@@ -520,11 +520,11 @@ test("--profile foo reads the foo block from config file") {
   withTempConfig("""
     |default {
     |  api_url = "https://default.example.com"
-    |  platform_token = "tok_default"
+    |  token = "tok_default"
     |}
     |staging {
     |  api_url = "https://staging.example.com"
-    |  platform_token = "tok_staging"
+    |  token = "tok_staging"
     |}
     """.stripMargin) { (_, configEnv) =>
     val result = runScript(
@@ -564,7 +564,7 @@ test("old hoa_token key in config file is NOT recognized") {
       ),
       Map("PLATFORM_TOKEN" -> "", "PLATFORM_API_URL" -> "") ++ configEnv
     )
-    // Should fail because hoa_token is not recognized, only platform_token is
+    // Should fail because hoa_token is not recognized, only token is
     assert(result.exitCode != 0)
     assertContains(result.stderr, "token")
   }

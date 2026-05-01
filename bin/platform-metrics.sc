@@ -138,7 +138,7 @@ def usageMessage: String =
     |Config file: ~/.platform/config
     |  default {
     |    api_url = "https://api.platform.com"
-    |    platform_token = "tok_xxxxxxxxxxxx"
+    |    token = "tok_xxxxxxxxxxxx"
     |  }
     |
     |Environment variables: PLATFORM_TOKEN, PLATFORM_API_URL""".stripMargin
@@ -175,7 +175,7 @@ def loadConfig(parsed: ParsedArgs): Either[String, ResolvedConfig] =
 
   // Parse config file once and read both keys from the single parsed Config
   val fileConfig: Option[Config] = loadConfigFile()
-  val tokenFromFile: Option[String] = fileConfig.flatMap(c => readConfigKey(c, parsed.profile, "platform_token"))
+  val tokenFromFile: Option[String] = fileConfig.flatMap(c => readConfigKey(c, parsed.profile, "token"))
   val apiUrlFromFile: Option[String] = fileConfig.flatMap(c => readConfigKey(c, parsed.profile, "api_url"))
 
   val token = parsed.token
@@ -188,7 +188,7 @@ def loadConfig(parsed: ParsedArgs): Either[String, ResolvedConfig] =
 
   (token, apiUrl) match
     case (None, _) =>
-      Left(s"Missing platform token. Provide via --token, PLATFORM_TOKEN env var, or $configFilePath (profile '${parsed.profile}', key 'platform_token')")
+      Left(s"Missing platform token. Provide via --token, PLATFORM_TOKEN env var, or $configFilePath (profile '${parsed.profile}', key 'token')")
     case (_, None) =>
       Left(s"Missing API URL. Provide via --api-url, PLATFORM_API_URL env var, or $configFilePath (profile '${parsed.profile}', key 'api_url')")
     case (Some(tok), Some(url)) =>

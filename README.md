@@ -79,7 +79,7 @@ Output: `OK metric=m_abc123`
 ```hocon
 default {
   api_url = "https://api.platform.com"
-  platform_token = "tok_xxxxxxxxxxxx"
+  token = "tok_xxxxxxxxxxxx"
 }
 ```
 
