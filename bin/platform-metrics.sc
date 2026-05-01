@@ -39,6 +39,7 @@ case class ParsedArgs(
   unit: Option[String]        = None,
   aggregation: Option[String] = None,
   description: Option[String] = None,
+  file: Option[String]        = None,
   token: Option[String]       = None,
   apiUrl: Option[String]      = None,
   profile: String             = "default",
@@ -52,7 +53,7 @@ def parseArgs(rawArgs: Array[String]): Either[String, ParsedArgs] =
   else
     val subcommand = rawArgs(0)
     subcommand match
-      case "record-point" | "set-metric" =>
+      case "record-point" | "record-points" | "set-metric" =>
         parseSubcommandArgs(subcommand, rawArgs.drop(1))
       case "help" | "--help" | "-h" =>
         Left(usageMessage)
@@ -84,6 +85,8 @@ def parseSubcommandArgs(subcommand: String, rawArgs: Array[String]): Either[Stri
         parsed = parsed.copy(aggregation = Some(rawArgs(i + 1))); i += 2
       case "--description" if i + 1 < rawArgs.length =>
         parsed = parsed.copy(description = Some(rawArgs(i + 1))); i += 2
+      case "--file" if i + 1 < rawArgs.length =>
+        parsed = parsed.copy(file = Some(rawArgs(i + 1))); i += 2
       case "--token" if i + 1 < rawArgs.length =>
         parsed = parsed.copy(token = Some(rawArgs(i + 1))); i += 2
       case "--api-url" if i + 1 < rawArgs.length =>
@@ -96,7 +99,7 @@ def parseSubcommandArgs(subcommand: String, rawArgs: Array[String]): Either[Stri
         parsed = parsed.copy(dryRun = true); i += 1
       case knownFlagMissingValue
           if Seq("--tenant", "--series-key", "--metric-key", "--date", "--value",
-                 "--name", "--unit", "--aggregation", "--description",
+                 "--name", "--unit", "--aggregation", "--description", "--file",
                  "--token", "--api-url", "--profile")
                .contains(knownFlagMissingValue) =>
         error = Some(s"Flag $knownFlagMissingValue requires a value"); i += 1
@@ -112,14 +115,20 @@ def usageMessage: String =
     |
     |Subcommands:
     |
-    |  record-point  Record a metric data point
+    |  record-point   Record a single metric data point
     |    --tenant <id>          Tenant id (required)
     |    --series-key <key>     Series key (required)
     |    --metric-key <key>     Metric key (required)
     |    --date <YYYY-MM-DD>    Date of the data point (required)
     |    --value <number>       Numeric value (required)
     |
-    |  set-metric    Update metric metadata (looks up metric by series-key + metric-key, then PUTs)
+    |  record-points  Record many metric data points in one bulk request
+    |    --tenant <id>          Tenant id (required)
+    |    --file <path|->        JSON array of {series_key, metric_key, date, value} (required;
+    |                           use '-' to read from stdin)
+    |
+    |  set-metric     Upsert metric metadata by (series_key, metric_key). Auto-creates the
+    |                 metric if it does not exist; otherwise updates the metadata.
     |    --tenant <id>          Tenant id (required)
     |    --series-key <key>     Series key (required)
     |    --metric-key <key>     Metric key (required)
@@ -409,61 +418,19 @@ def runRecordPoint(parsed: ParsedArgs, config: ResolvedConfig): Unit =
 
   handleResponse(statusCode, responseBody, successMsg)
 
-// ── set-metric ────────────────────────────────────────────────────────────────
-
-/** Resolve series key → series id via GET /:tenant_id/metrics/series?key=<k> */
-def resolveSeriesId(tenantId: String, seriesKey: String, config: ResolvedConfig, verbose: Boolean): String =
-  val url = s"${config.apiUrl}/$tenantId/metrics/series?key=${java.net.URLEncoder.encode(seriesKey, "UTF-8")}"
-  val spec = RequestSpec(method = "GET", url = url, body = "", authHeader = buildAuthHeader(config.token))
-  val (statusCode, body) = executeRequest(spec, verbose)
-  if statusCode != 200 then
-    System.err.println(s"Error looking up series '$seriesKey': HTTP $statusCode: $body")
-    sys.exit(ExitValidation)
-  val json = Try(parse(body)).getOrElse(JArray(Nil))
-  json match
-    case JArray(items) if items.nonEmpty =>
-      (items.head \ "id").extractOpt[String].getOrElse {
-        System.err.println(s"Series '$seriesKey' response missing 'id' field")
-        sys.exit(ExitValidation)
-      }
-    case JArray(_) =>
-      System.err.println(s"Series '$seriesKey' not found for tenant '$tenantId'")
-      sys.exit(ExitValidation)
-    case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
-        | JDecimal(_) | JString(_) | JObject(_) | JSet(_) =>
-      System.err.println(s"Unexpected response format when looking up series '$seriesKey'")
-      sys.exit(ExitValidation)
-
-/** Resolve (series_id, metric_key) → metric id via GET /:tenant_id/metrics/metrics?series_id=<id>&key=<k> */
-def resolveMetricId(tenantId: String, seriesId: String, metricKey: String, config: ResolvedConfig, verbose: Boolean): String =
-  val url = s"${config.apiUrl}/$tenantId/metrics/metrics?series_id=${java.net.URLEncoder.encode(seriesId, "UTF-8")}&key=${java.net.URLEncoder.encode(metricKey, "UTF-8")}"
-  val spec = RequestSpec(method = "GET", url = url, body = "", authHeader = buildAuthHeader(config.token))
-  val (statusCode, body) = executeRequest(spec, verbose)
-  if statusCode != 200 then
-    System.err.println(s"Error looking up metric '$metricKey': HTTP $statusCode: $body")
-    sys.exit(ExitValidation)
-  val json = Try(parse(body)).getOrElse(JArray(Nil))
-  json match
-    case JArray(items) if items.nonEmpty =>
-      (items.head \ "id").extractOpt[String].getOrElse {
-        System.err.println(s"Metric '$metricKey' response missing 'id' field")
-        sys.exit(ExitValidation)
-      }
-    case JArray(_) =>
-      System.err.println(s"Metric '$metricKey' not found in series '$seriesId' for tenant '$tenantId'")
-      sys.exit(ExitValidation)
-    case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
-        | JDecimal(_) | JString(_) | JObject(_) | JSet(_) =>
-      System.err.println(s"Unexpected response format when looking up metric '$metricKey'")
-      sys.exit(ExitValidation)
+// ── set-metric (server-side upsert by keys) ───────────────────────────────────
 
 def runSetMetric(parsed: ParsedArgs, config: ResolvedConfig): Unit =
   val flags = validateSetMetricFlags(parsed) match
     case Left(err) => failValidation(err)
     case Right(v)  => v
 
-  // Only include keys that were explicitly provided — absent = no change
-  val fields: List[JField] = List.concat(
+  // The body is a metric_upsert_form: series_key + metric_key + optional metadata.
+  // Optional metadata fields absent = leave unchanged on update; null on create.
+  val fields: List[JField] = List(
+    JField("series_key", JString(flags.seriesKey)),
+    JField("metric_key", JString(flags.metricKey)),
+  ) ++ List.concat(
     parsed.name.map(v => JField("name", JString(v))),
     parsed.unit.map(v => JField("unit", JString(v))),
     flags.aggregation.map(v => JField("aggregation", JString(v))),
@@ -471,30 +438,17 @@ def runSetMetric(parsed: ParsedArgs, config: ResolvedConfig): Unit =
   )
   val body = compact(render(JObject(fields)))
 
-  if parsed.dryRun then
-    val seriesUrl  = s"${config.apiUrl}/${flags.tenantId}/metrics/series?key=${java.net.URLEncoder.encode(flags.seriesKey, "UTF-8")}"
-    val metricsUrl = s"${config.apiUrl}/${flags.tenantId}/metrics/metrics?series_id=<series_id>&key=${java.net.URLEncoder.encode(flags.metricKey, "UTF-8")}"
-    val putUrl     = s"${config.apiUrl}/${flags.tenantId}/metrics/metrics/<metric_id>"
-    println(s"[dry-run] GET $seriesUrl")
-    println(s"[dry-run] GET $metricsUrl")
-    println(s"[dry-run] PUT $putUrl")
-    println(s"[dry-run] Body: $body")
-    sys.exit(ExitOk)
-
-  // Step 1: resolve series key → series id
-  val seriesId = resolveSeriesId(flags.tenantId, flags.seriesKey, config, parsed.verbose)
-
-  // Step 2: resolve (series_id, metric_key) → metric id
-  val metricId = resolveMetricId(flags.tenantId, seriesId, flags.metricKey, config, parsed.verbose)
-
-  // Step 3: PUT the update
-  val putUrl = s"${config.apiUrl}/${flags.tenantId}/metrics/metrics/$metricId"
+  val url = s"${config.apiUrl}/${flags.tenantId}/metrics/metrics"
   val spec = RequestSpec(
-    method     = "PUT",
-    url        = putUrl,
+    method     = "POST",
+    url        = url,
     body       = body,
     authHeader = buildAuthHeader(config.token)
   )
+
+  if parsed.dryRun then
+    printRequest(spec, parsed.verbose)
+    sys.exit(ExitOk)
 
   val (statusCode, responseBody) = executeRequest(spec, parsed.verbose)
 
@@ -505,6 +459,103 @@ def runSetMetric(parsed: ParsedArgs, config: ResolvedConfig): Unit =
       s"OK metric=$id"
     }.getOrElse("OK")
   else ""
+
+  handleResponse(statusCode, responseBody, successMsg)
+
+// ── record-points (bulk) ──────────────────────────────────────────────────────
+
+case class ValidatedRecordPointsFlags(
+  tenantId: String,
+  body:     String,   // already-validated JSON array of point_form
+  count:    Int
+)
+
+def readFileOrStdin(path: String): Either[String, String] =
+  if path == "-" then
+    Right(scala.io.Source.stdin.mkString)
+  else
+    val f = new File(path)
+    if !f.exists() then
+      Left(s"File not found: $path")
+    else
+      Try(scala.io.Source.fromFile(f).mkString).toEither.left.map(e =>
+        s"Error reading $path: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
+      )
+
+/** Validate that the parsed JSON is an array of well-formed point_form objects.
+  * Returns the canonical body string (re-serialized) and the count. */
+def validatePointFormsJson(raw: String): Either[String, (String, Int)] =
+  Try(parse(raw)).toEither.left.map(e =>
+    s"Invalid JSON: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"
+  ).flatMap {
+    case JArray(items) =>
+      val errors = items.zipWithIndex.flatMap { case (item, idx) => validatePointForm(item, idx) }
+      if errors.nonEmpty then
+        Left(errors.mkString("\n"))
+      else
+        Right((compact(render(JArray(items))), items.size))
+    case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
+        | JDecimal(_) | JString(_) | JObject(_) | JSet(_) =>
+      Left("Body must be a JSON array of point_form objects")
+  }
+
+def validatePointForm(item: JValue, idx: Int): Option[String] =
+  item match
+    case obj: JObject =>
+      val seriesKey = (obj \ "series_key").extractOpt[String]
+      val metricKey = (obj \ "metric_key").extractOpt[String]
+      val date      = (obj \ "date").extractOpt[String]
+      val value     = (obj \ "value")
+      val missing = List(
+        seriesKey.fold(Some("series_key"): Option[String])(_ => None),
+        metricKey.fold(Some("metric_key"): Option[String])(_ => None),
+        date.fold(Some("date"): Option[String])(_ => None),
+      ).flatten
+      val numericProblem = value match
+        case JInt(_) | JLong(_) | JDouble(_) | JDecimal(_) => None
+        case JNothing | JNull => Some("value")
+        case JArray(_) | JObject(_) | JBool(_) | JString(_) | JSet(_) => Some("value")
+      val allMissing = missing ++ numericProblem.toList
+      if allMissing.isEmpty then
+        date.flatMap(d => Try(java.time.LocalDate.parse(d)).toEither.left.toOption.map(_ =>
+          s"Item $idx: invalid date '${d}' (expected YYYY-MM-DD)"
+        ))
+      else
+        Some(s"Item $idx: missing or invalid field(s): ${allMissing.mkString(", ")}")
+    case JNull | JNothing | JBool(_) | JInt(_) | JLong(_) | JDouble(_)
+        | JDecimal(_) | JString(_) | JArray(_) | JSet(_) =>
+      Some(s"Item $idx: must be a JSON object")
+
+def validateRecordPointsFlags(parsed: ParsedArgs): Either[String, ValidatedRecordPointsFlags] =
+  for
+    tenantId <- parsed.tenant.toRight("--tenant is required")
+    path     <- parsed.file.toRight("--file is required (use '-' for stdin)")
+    raw      <- readFileOrStdin(path)
+    valid    <- validatePointFormsJson(raw)
+  yield
+    val (body, count) = valid
+    ValidatedRecordPointsFlags(tenantId = tenantId, body = body, count = count)
+
+def runRecordPoints(parsed: ParsedArgs, config: ResolvedConfig): Unit =
+  val flags = validateRecordPointsFlags(parsed) match
+    case Left(err) => failValidation(err)
+    case Right(v)  => v
+
+  val url = s"${config.apiUrl}/${flags.tenantId}/metrics/points/bulk"
+  val spec = RequestSpec(
+    method     = "POST",
+    url        = url,
+    body       = flags.body,
+    authHeader = buildAuthHeader(config.token)
+  )
+
+  if parsed.dryRun then
+    printRequest(spec, parsed.verbose)
+    sys.exit(ExitOk)
+
+  val (statusCode, responseBody) = executeRequest(spec, parsed.verbose)
+
+  val successMsg = if statusCode / 100 == 2 then s"OK n_points=${flags.count}" else ""
 
   handleResponse(statusCode, responseBody, successMsg)
 
@@ -525,8 +576,9 @@ val config: ResolvedConfig = loadConfig(parsedArgs) match
   case Right(c) => c
 
 parsedArgs.subcommand match
-  case "record-point" => runRecordPoint(parsedArgs, config)
-  case "set-metric"   => runSetMetric(parsedArgs, config)
+  case "record-point"  => runRecordPoint(parsedArgs, config)
+  case "record-points" => runRecordPoints(parsedArgs, config)
+  case "set-metric"    => runSetMetric(parsedArgs, config)
   case unhandledSubcommand =>
     System.err.println(s"Internal error: unhandled subcommand '$unhandledSubcommand'")
     sys.exit(ExitValidation)
