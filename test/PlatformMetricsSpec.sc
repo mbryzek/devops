@@ -249,7 +249,7 @@ test("requires --value flag") {
 
 println("\nset-metric")
 
-test("dry-run prints two GET lookups then PUT with body") {
+test("dry-run prints single POST to /metrics with full upsert body") {
   val result = runScript(
     Seq(
       "set-metric",
@@ -265,21 +265,20 @@ test("dry-run prints two GET lookups then PUT with body") {
     Map("PLATFORM_TOKEN" -> "tok_test123", "PLATFORM_API_URL" -> "https://api.example.com")
   )
   assertEqual(result.exitCode, 0)
-  // Verify the series lookup GET
-  assertContains(result.stdout, "GET")
-  assertContains(result.stdout, "/hpca/metrics/series")
-  assertContains(result.stdout, "key=water")
-  // Verify the metrics lookup GET
+  // Single POST to /metrics — no GET lookups, no PUT
+  assertContains(result.stdout, "POST")
   assertContains(result.stdout, "/hpca/metrics/metrics")
-  assertContains(result.stdout, "well_pump_total_gpd")
-  // Verify the PUT
-  assertContains(result.stdout, "PUT")
-  assertContains(result.stdout, "/hpca/metrics/metrics")
-  // Verify body fields
-  assertContains(result.stdout, "Well Pump Total GPD")
-  assertContains(result.stdout, "gpd")
-  assertContains(result.stdout, "avg")
-  assertContains(result.stdout, "Water pumped from well")
+  assertNotContains(result.stdout, "GET")
+  assertNotContains(result.stdout, "PUT")
+  // Body carries series_key + metric_key + metadata
+  val bodyLine = result.stdout.linesIterator.find(_.contains("Body:")).getOrElse("")
+  assertContains(bodyLine, "\"series_key\"")
+  assertContains(bodyLine, "\"metric_key\"")
+  assertContains(bodyLine, "well_pump_total_gpd")
+  assertContains(bodyLine, "Well Pump Total GPD")
+  assertContains(bodyLine, "gpd")
+  assertContains(bodyLine, "avg")
+  assertContains(bodyLine, "Water pumped from well")
 }
 
 test("absent optional flags produce body without those keys") {
@@ -296,13 +295,17 @@ test("absent optional flags produce body without those keys") {
   )
   assertEqual(result.exitCode, 0)
   val bodyLine = result.stdout.linesIterator.find(_.contains("Body:")).getOrElse("")
+  // Required upsert fields are always present
+  assertContains(bodyLine, "\"series_key\"")
+  assertContains(bodyLine, "\"metric_key\"")
   assertContains(bodyLine, "\"name\"")
+  // Optional metadata fields stay absent
   assertNotContains(bodyLine, "\"unit\"")
   assertNotContains(bodyLine, "\"aggregation\"")
   assertNotContains(bodyLine, "\"description\"")
 }
 
-test("empty set-metric body is valid (no optional keys)") {
+test("set-metric body without optional metadata still includes keys") {
   val result = runScript(
     Seq(
       "set-metric",
@@ -314,7 +317,10 @@ test("empty set-metric body is valid (no optional keys)") {
     Map("PLATFORM_TOKEN" -> "tok_test", "PLATFORM_API_URL" -> "https://api.example.com")
   )
   assertEqual(result.exitCode, 0)
-  assertContains(result.stdout, "PUT")
+  assertContains(result.stdout, "POST")
+  val bodyLine = result.stdout.linesIterator.find(_.contains("Body:")).getOrElse("")
+  assertContains(bodyLine, "\"series_key\"")
+  assertContains(bodyLine, "\"metric_key\"")
 }
 
 test("set-metric requires --tenant flag") {
@@ -633,6 +639,126 @@ test("known flag with no value gives clear error") {
   )
   assert(result.exitCode != 0)
   assertContains(result.stderr, "--value requires a value")
+}
+
+// ── record-points (bulk) tests ────────────────────────────────────────────────
+
+println("\nrecord-points")
+
+def withTempPointsFile(content: String)(body: String => Unit): Unit =
+  val tmp = File.createTempFile("bulk-points-", ".json")
+  try
+    Using(new PrintWriter(tmp)) { pw => pw.write(content) }
+    body(tmp.getAbsolutePath)
+  finally
+    tmp.delete()
+
+test("dry-run posts to /points/bulk with array body") {
+  withTempPointsFile(
+    """[
+      |  {"series_key": "water", "metric_key": "well_pump_total_gpd", "date": "2026-04-26", "value": 1905},
+      |  {"series_key": "water", "metric_key": "distribution_gpd", "date": "2026-04-26", "value": 1746}
+      |]""".stripMargin
+  ) { path =>
+    val result = runScript(
+      Seq("record-points", "--tenant", "hemlockpoint", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok_test", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assertEqual(result.exitCode, 0)
+    assertContains(result.stdout, "POST")
+    assertContains(result.stdout, "/hemlockpoint/metrics/points/bulk")
+    val bodyLine = result.stdout.linesIterator.find(_.contains("Body:")).getOrElse("")
+    // Body is a JSON array containing both entries
+    assertContains(bodyLine, "[")
+    assertContains(bodyLine, "well_pump_total_gpd")
+    assertContains(bodyLine, "distribution_gpd")
+    assertContains(bodyLine, "1905")
+    assertContains(bodyLine, "1746")
+  }
+}
+
+test("requires --file flag") {
+  val result = runScript(
+    Seq("record-points", "--tenant", "hemlockpoint", "--dry-run"),
+    Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+  )
+  assert(result.exitCode != 0)
+  assertContains(result.stderr, "--file")
+}
+
+test("requires --tenant flag") {
+  withTempPointsFile("[]") { path =>
+    val result = runScript(
+      Seq("record-points", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assert(result.exitCode != 0)
+    assertContains(result.stderr, "--tenant")
+  }
+}
+
+test("missing file produces clear error") {
+  val result = runScript(
+    Seq("record-points", "--tenant", "hemlockpoint", "--file", "/nonexistent/path.json", "--dry-run"),
+    Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+  )
+  assert(result.exitCode != 0)
+  assertContains(result.stderr, "File not found")
+}
+
+test("invalid JSON produces clear error") {
+  withTempPointsFile("this is not json") { path =>
+    val result = runScript(
+      Seq("record-points", "--tenant", "hemlockpoint", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assert(result.exitCode != 0)
+    assertContains(result.stderr, "Invalid JSON")
+  }
+}
+
+test("non-array body rejected") {
+  withTempPointsFile("""{"series_key": "water"}""") { path =>
+    val result = runScript(
+      Seq("record-points", "--tenant", "hemlockpoint", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assert(result.exitCode != 0)
+    assertContains(result.stderr, "must be a JSON array")
+  }
+}
+
+test("missing required field in array element rejected") {
+  withTempPointsFile("""[{"series_key": "water", "metric_key": "k", "value": 1}]""") { path =>
+    val result = runScript(
+      Seq("record-points", "--tenant", "hemlockpoint", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assert(result.exitCode != 0)
+    assertContains(result.stderr, "date")
+  }
+}
+
+test("invalid date format in array element rejected") {
+  withTempPointsFile("""[{"series_key": "water", "metric_key": "k", "date": "27-04-2026", "value": 1}]""") { path =>
+    val result = runScript(
+      Seq("record-points", "--tenant", "hemlockpoint", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assert(result.exitCode != 0)
+    assertContains(result.stderr, "invalid date")
+  }
+}
+
+test("empty array is valid") {
+  withTempPointsFile("[]") { path =>
+    val result = runScript(
+      Seq("record-points", "--tenant", "hemlockpoint", "--file", path, "--dry-run"),
+      Map("PLATFORM_TOKEN" -> "tok", "PLATFORM_API_URL" -> "https://api.example.com")
+    )
+    assertEqual(result.exitCode, 0)
+    assertContains(result.stdout, "/hemlockpoint/metrics/points/bulk")
+  }
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────

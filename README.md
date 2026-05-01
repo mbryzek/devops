@@ -41,11 +41,11 @@ bin/platform-metrics.sc <subcommand> [options]
 
 #### record-point
 
-Record a data point for a metric. Idempotent — re-posting the same `(metric, date)` updates the value. Auto-creates the metric row if it does not exist yet.
+Record a single data point for a metric. Idempotent — re-posting the same `(metric, date)` updates the value. Auto-creates the metric row if it does not exist yet.
 
 ```
 bin/platform-metrics.sc record-point \
-  --tenant hpca \
+  --tenant hemlockpoint \
   --series-key water \
   --metric-key well_pump_total_gpd \
   --date 2026-04-27 \
@@ -54,15 +54,26 @@ bin/platform-metrics.sc record-point \
 
 Output: `OK metric_point=mp_abc123`
 
+#### record-points (bulk)
+
+Record many data points in **one** request. Body is a JSON array of `{series_key, metric_key, date, value}` objects, read from a file (use `-` for stdin). All-or-nothing: if any entry is invalid, no writes occur and 422 is returned with all errors. Idempotent like single-point — safe to retry the whole payload.
+
+```
+bin/platform-metrics.sc record-points --tenant hemlockpoint --file /tmp/points.json
+echo '[...]' | bin/platform-metrics.sc record-points --tenant hemlockpoint --file -
+```
+
+Output: `OK n_points=35`
+
 #### set-metric
 
-Update metric metadata (name, unit, aggregation, description). All fields are optional — only provided fields are changed.
+Upsert a metric by `(series_key, metric_key)`. Auto-creates the metric if it does not exist; otherwise updates only the metadata fields you pass (absent fields are preserved). Idempotent.
 
-Internally, `set-metric` performs two GET lookups to resolve the series key and metric key to their IDs, then issues a PUT by ID.
+Implementation: a single `POST /:tenant_id/metrics/metrics` to the server-side upsert endpoint — no client-side GET-lookup-then-PUT.
 
 ```
 bin/platform-metrics.sc set-metric \
-  --tenant hpca \
+  --tenant hemlockpoint \
   --series-key water \
   --metric-key well_pump_total_gpd \
   --name "Well Pump Total GPD" \
