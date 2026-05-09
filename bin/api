@@ -19,12 +19,17 @@ USAGE = <<~TEXT
   Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] [<operation> ...]
          api [--profile PROFILE] init [--language typescript] [--language scala]
          api [--profile PROFILE] validate <file>
+         api [--profile PROFILE] result [--dry-run]
 
   Commands:
     init [options]    Create an anonymous org and token, write to ~/.apibuilder/config.
                       Use --language to also create a local .api/config.pkl with default
                       code generators. Can be repeated for multiple languages.
     validate <file>   Validate an api.json spec file via server-side validation
+    result            Generate a repo-wide ApiResult.scala from the union of all
+                      specs whose blocks bind the play_controller generator in
+                      .api/config.pkl. Use --dry-run to print the request body
+                      and exit before HTTP.
 
   Operations: #{VALID_OPERATIONS.join(', ')}
 
@@ -53,6 +58,8 @@ USAGE = <<~TEXT
     api upload codegen                               # upload then codegen
     api --app platform upload codegen
     api --group dao upload codegen
+    api result                                       # generate ApiResult.scala
+    api result --dry-run                             # print request body, skip HTTP
 TEXT
 
 # --- Argument Parsing ---
@@ -219,6 +226,119 @@ def write_local_config(org_key, languages)
   if languages.size > 1
     puts "NOTE: Only the #{language} starter was written. Edit the file to add additional generators."
   end
+end
+
+# --- Result Command ---
+
+RESULT_GENERATOR_KEY = "play_api_result"
+
+def parse_result_args(remaining)
+  dry_run = false
+  args = remaining.dup
+  while arg = args.shift
+    case arg
+    when "--dry-run"
+      dry_run = true
+    else
+      Util.exit_with_error("Unknown argument: #{arg}\nUsage: api [--profile PROFILE] result [--dry-run]")
+    end
+  end
+  { dry_run: dry_run }
+end
+
+# Collects every (org, app_key) pair from blocks that bind `play_controller`.
+# Only those specs participate in ApiResult derivation — third-party clients
+# (clientOnly), model-only specs, and DAO spec_glob blocks are excluded.
+def collect_result_applications(config)
+  apps = []
+  seen = {}
+  config.blocks.each do |block|
+    next unless block.generators.any? { |g| g.key == "play_controller" }
+    block.applications.each do |app|
+      key = [block.org, app.key]
+      next if seen[key]
+      seen[key] = true
+      apps << { "organization_key" => block.org, "application_key" => app.key }
+    end
+  end
+  apps
+end
+
+# Stub-friendly wrapper: posts to the multi-spec invocation endpoint.
+# Returns the parsed JSON body on success. On 422 prints validation errors and
+# exits non-zero. On other errors prints the response body and exits non-zero.
+def post_multi_spec_invocation(client, generator_key, applications)
+  path = "/apibuilder/generators/#{generator_key}/multi-spec-invocations"
+  response = client.raw_request(:post, path, { "applications" => applications })
+  code = response.code.to_i
+  case code
+  when 200, 201
+    JSON.parse(response.body)
+  when 422
+    errors = begin
+               JSON.parse(response.body)
+             rescue JSON::ParserError
+               [{ "message" => response.body }]
+             end
+    $stderr.puts "==> Validation errors:"
+    errors.each do |e|
+      code = e["code"]
+      msg = e["message"] || e.to_s
+      $stderr.puts(code ? "  - [#{code}] #{msg}" : "  - #{msg}")
+    end
+    exit 1
+  else
+    $stderr.puts "==> POST #{path} failed with HTTP #{code}"
+    $stderr.puts response.body
+    exit 1
+  end
+end
+
+def write_result_files(files, project_root)
+  written = 0
+  (files || []).each do |file|
+    dir = file["dir"] || ""
+    name = file["name"] or Util.exit_with_error("Server response file missing 'name'")
+    contents = file["contents"] || ""
+    dest_dir = File.join(project_root, dir)
+    FileUtils.mkdir_p(dest_dir)
+    dest_path = File.join(dest_dir, name)
+    canonical_root = File.realpath(project_root)
+    canonical_dest = File.expand_path(dest_path)
+    unless canonical_dest.start_with?(canonical_root + File::SEPARATOR) || canonical_dest == canonical_root
+      Util.exit_with_error("Refusing to write outside project root: #{dest_path}")
+    end
+    IO.write(dest_path, contents)
+    puts "  wrote #{dest_path}"
+    written += 1
+  end
+  puts ""
+  puts "  #{written} file(s) written"
+end
+
+def run_result(profile, dry_run)
+  config_path = File.join(Dir.pwd, ".api", "config.pkl")
+  Util.exit_with_error("Config file not found: #{config_path}") unless File.exist?(config_path)
+  config = ApiConfig.new(config_path)
+
+  applications = collect_result_applications(config)
+  if applications.empty?
+    Util.exit_with_error("No applications in #{config_path} bind the play_controller generator")
+  end
+
+  body = { "applications" => applications }
+
+  if dry_run
+    puts "==> DRY RUN — POST /apibuilder/generators/#{RESULT_GENERATOR_KEY}/multi-spec-invocations"
+    puts JSON.pretty_generate(body)
+    puts "==> #{applications.size} application(s)"
+    return
+  end
+
+  client = ApibuilderClient.new(profile)
+  puts "==> Submitting #{applications.size} application(s) to #{RESULT_GENERATOR_KEY}"
+  result = post_multi_spec_invocation(client, RESULT_GENERATOR_KEY, applications)
+  write_result_files(result["files"], Dir.pwd)
 end
 
 # --- Validate Command ---
@@ -488,6 +608,9 @@ if __FILE__ == $PROGRAM_NAME
     run_init(profile, languages)
   when "validate"
     run_validate(profile, remaining[1])
+  when "result"
+    parsed = parse_result_args(remaining[1..])
+    run_result(profile, parsed[:dry_run])
   else
     parsed = parse_batch_args(remaining)
     run_batch(profile, parsed[:operations], parsed[:apps], parsed[:group], parsed[:expand_imports_flag])
