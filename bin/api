@@ -294,12 +294,14 @@ def post_multi_spec_invocation(client, generator_key, applications)
   end
 end
 
-def write_result_files(files, project_root)
+def write_result_files(files, project_root, default_target)
   written = 0
   (files || []).each do |file|
-    dir = file["dir"] || ""
     name = file["name"] or Util.exit_with_error("Server response file missing 'name'")
     contents = file["contents"] || ""
+    dir = file["dir"]
+    dir = default_target if dir.nil? || dir.empty?
+    dir ||= ""
     dest_dir = File.join(project_root, dir)
     FileUtils.mkdir_p(dest_dir)
     dest_path = File.join(dest_dir, name)
@@ -316,6 +318,31 @@ def write_result_files(files, project_root)
   puts "  #{written} file(s) written"
 end
 
+# Picks the canonical "generated Scala source" target for this repo by inspecting
+# the targets bound to bryzek_play_model / bryzek_play_client / their mocks across
+# every block in .api/config.pkl. Returns the most common target, or nil if no
+# such generators are bound. ApiResult.scala lands in the same place as the rest
+# of the generated apibuilder Scala output.
+SCALA_SOURCE_GENERATORS = %w[
+  bryzek_play_model
+  bryzek_play_client
+  bryzek_play_mock_model
+  bryzek_play_mock_client
+].freeze
+
+def default_scala_source_target(config)
+  counts = Hash.new(0)
+  config.blocks.each do |block|
+    block.generators.each do |g|
+      next unless SCALA_SOURCE_GENERATORS.include?(g.key)
+      next if g.target.nil? || g.target.empty?
+      counts[g.target] += 1
+    end
+  end
+  return nil if counts.empty?
+  counts.max_by { |_target, n| n }.first
+end
+
 def run_result(profile, dry_run)
   config_path = File.join(Dir.pwd, ".api", "config.pkl")
   Util.exit_with_error("Config file not found: #{config_path}") unless File.exist?(config_path)
@@ -326,19 +353,22 @@ def run_result(profile, dry_run)
     Util.exit_with_error("No applications in #{config_path} bind the play_controller generator")
   end
 
+  default_target = default_scala_source_target(config)
+
   body = { "applications" => applications }
 
   if dry_run
     puts "==> DRY RUN — POST /apibuilder/generators/#{RESULT_GENERATOR_KEY}/multi-spec-invocations"
     puts JSON.pretty_generate(body)
     puts "==> #{applications.size} application(s)"
+    puts "==> default target: #{default_target || '(none — file will land at server-specified dir or repo root)'}"
     return
   end
 
   client = ApibuilderClient.new(profile)
   puts "==> Submitting #{applications.size} application(s) to #{RESULT_GENERATOR_KEY}"
   result = post_multi_spec_invocation(client, RESULT_GENERATOR_KEY, applications)
-  write_result_files(result["files"], Dir.pwd)
+  write_result_files(result["files"], Dir.pwd, default_target)
 end
 
 # --- Validate Command ---
