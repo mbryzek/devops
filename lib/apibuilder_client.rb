@@ -230,14 +230,39 @@ class ApibuilderClient
       messages = errors.map { |e| e["message"] || e.to_s }.join("\n  ")
       raise Error, "#{context}: Validation errors:\n  #{messages}"
     else
-      message = begin
-                  parsed = JSON.parse(response.body)
-                  parsed["message"] || response.body
-                rescue JSON::ParserError
-                  response.body
-                end
+      message = extract_error_message(response.body)
       raise Error, "#{context}: HTTP #{code}\n#{message}"
     end
+  end
+
+  # Best-effort extraction of a human-readable error message from a server
+  # response body. Handles JSON, Play's HTML error page (whose useful payload
+  # lives inside <p id="detail" class="pre">...</p>), and falls back to raw text.
+  def extract_error_message(body)
+    return "(empty response)" if body.nil? || body.strip.empty?
+
+    begin
+      parsed = JSON.parse(body)
+      msg = parsed.is_a?(Hash) ? (parsed["message"] || parsed["error"]) : nil
+      return msg if msg
+    rescue JSON::ParserError
+      # fall through to HTML / text handling
+    end
+
+    if body =~ /<html/i
+      detail = body[/<p[^>]*id=["']detail["'][^>]*>(.*?)<\/p>/im, 1]
+      text = detail || body
+      text = text.gsub(/<[^>]+>/, "")
+      text = text.gsub("&quot;", '"').gsub("&lt;", "<").gsub("&gt;", ">").gsub("&amp;", "&").gsub("&nbsp;", " ")
+      text = text.strip
+      # Trim verbose Guice/Java stack-trace-ish noise but keep first ~40 lines
+      lines = text.lines.map(&:rstrip).reject(&:empty?)
+      summary = lines.first(40).join("\n")
+      summary << "\n... (truncated; #{lines.size - 40} more lines)" if lines.size > 40
+      return summary.empty? ? "(unparseable HTML error page)" : summary
+    end
+
+    body.strip
   end
 
   def load_config(profile, allow_no_token: false)
