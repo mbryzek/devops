@@ -21,13 +21,19 @@ spec:
         app: court-reserve-workers
         app.kubernetes.io/name: court-reserve-workers
     spec:
+      # Pin to the `job` node pool so a Chromium scrape can't compete with
+      # web-serving traffic on `tier: web` nodes.
+      nodeSelector:
+        tier: job
       # 90s gives an in-flight Chromium scrape time to finish + closeSession()
       # to flush profile state before SIGKILL. Tune up if scrapes get longer.
       terminationGracePeriodSeconds: 90
       containers:
         - name: court-reserve-workers
           image: registry.digitalocean.com/bryzek/court-reserve-workers:__IMAGE_TAG__
-          imagePullPolicy: Always
+          # Image tags from `sem-info tag latest` are immutable semver, so
+          # IfNotPresent is safe and avoids redundant registry pulls on restart.
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8787
               protocol: TCP
