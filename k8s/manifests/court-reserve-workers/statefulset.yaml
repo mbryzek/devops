@@ -21,10 +21,12 @@ spec:
         app: court-reserve-workers
         app.kubernetes.io/name: court-reserve-workers
     spec:
-      # Pin to the `job` node pool so a Chromium scrape can't compete with
-      # web-serving traffic on `tier: web` nodes.
+      # Dedicated `tier: crawler` node pool so a Chromium scrape doesn't
+      # compete with web traffic (tier: web) or backend jobs (tier: job).
+      # Currently a single s-1vcpu-2gb node — bump pool size or size class
+      # if the crawler queue grows.
       nodeSelector:
-        tier: job
+        tier: crawler
       # 90s gives an in-flight Chromium scrape time to finish + closeSession()
       # to flush profile state before SIGKILL. Tune up if scrapes get longer.
       terminationGracePeriodSeconds: 90
@@ -49,13 +51,22 @@ spec:
           volumeMounts:
             - name: browser-profile
               mountPath: /app/browser-profile
+          # Sized for actual Chromium-headless usage: ~250Mi idle, ~500-900Mi
+          # during a scrape, ~1.5Gi peak on heavy admin grids. The original
+          # 2Gi/4Gi was inherited from Fly's performance-2x and never measured.
+          # Request fits in the existing job node pool without scale-out;
+          # bursts borrow from acumen-job's unused headroom. Under contention
+          # CRW (Burstable) is OOM-killed first — acceptable for a retryable
+          # background scraper.
           resources:
             requests:
-              cpu: 500m
-              memory: 2Gi
+              cpu: 200m
+              memory: 400Mi
             limits:
-              cpu: 2000m
-              memory: 4Gi
+              # Caps below node allocatable (~1.4Gi on s-1vcpu-2gb) to avoid
+              # kernel OOM-kill from a runaway Chromium tab.
+              cpu: 900m
+              memory: 1300Mi
           # Liveness is intentionally lenient: a Chromium scrape can saturate
           # the Node event loop for tens of seconds at a time. Failing here
           # restarts the pod mid-scrape. 60s * 5 = 5min before kill.
