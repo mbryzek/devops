@@ -62,6 +62,36 @@ USAGE = <<~TEXT
     api result --dry-run                             # print request body, skip HTTP
 TEXT
 
+# --- Project prefix injection ---
+#
+# Scala-emitting generators (play_controller / play_api_result) derive the
+# class names of repo-wide controller infrastructure from a project prefix
+# (e.g. `core.controllers.AcumenControllerHelpers`). We read that prefix
+# from the repo's top-level `build.sbt` `name := "..."` declaration and
+# inject it as `service.attributes.project.name` on every spec we upload.
+# Spec JSON files stay clean — the attribute exists only on the uploaded
+# service.
+
+def read_project_from_build_sbt(project_root = Dir.pwd)
+  path = File.join(project_root, "build.sbt")
+  return nil unless File.exist?(path)
+  IO.foreach(path) do |line|
+    if line =~ /^name\s*:=\s*"([^"]+)"/
+      name = $1.strip
+      return name if !name.empty?
+    end
+  end
+  nil
+end
+
+def inject_project_attribute!(spec, project_name)
+  return if project_name.nil? || project_name.empty?
+  spec["attributes"] ||= {}
+  # Don't overwrite an explicitly authored project attribute
+  return if spec["attributes"].is_a?(Hash) && spec["attributes"]["project"].is_a?(Hash) && spec["attributes"]["project"]["name"]
+  spec["attributes"]["project"] = { "name" => project_name }
+end
+
 # --- Argument Parsing ---
 
 def parse_option_value(args, flag)
@@ -383,6 +413,8 @@ def run_validate(profile, file_path)
            Util.exit_with_error("Invalid JSON in #{file_path}: #{e.message}")
          end
 
+  inject_project_attribute!(spec, read_project_from_build_sbt)
+
   client = ApibuilderClient.new(profile)
   batch_client = ApiBatchClient.new(client)
 
@@ -453,7 +485,9 @@ def build_batch_form(config, org, operations, app_filter, group_filter, import_e
       if !File.exist?(file_path)
         Util.exit_with_error("Application file not found: #{file_path} (for #{app_key})")
       end
-      entry["original"] = JSON.parse(IO.read(file_path))
+      original = JSON.parse(IO.read(file_path))
+      inject_project_attribute!(original, read_project_from_build_sbt)
+      entry["original"] = original
     end
 
     if operations.include?("codegen")
