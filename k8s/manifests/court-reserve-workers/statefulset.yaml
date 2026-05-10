@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: court-reserve-workers
+  namespace: bryzek-production
+  labels:
+    app: court-reserve-workers
+    app.kubernetes.io/name: court-reserve-workers
+spec:
+  # Replicas MUST stay at 1. The persistent browser-profile PVC is RWO (DO block
+  # storage), and the in-process browser context is a singleton; a second pod
+  # would deadlock on the volume and corrupt session state.
+  replicas: 1
+  serviceName: court-reserve-workers
+  selector:
+    matchLabels:
+      app: court-reserve-workers
+  template:
+    metadata:
+      labels:
+        app: court-reserve-workers
+        app.kubernetes.io/name: court-reserve-workers
+    spec:
+      # 90s gives an in-flight Chromium scrape time to finish + closeSession()
+      # to flush profile state before SIGKILL. Tune up if scrapes get longer.
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: court-reserve-workers
+          image: registry.digitalocean.com/bryzek/court-reserve-workers:__IMAGE_TAG__
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8787
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: court-reserve-workers-secrets
+            - configMapRef:
+                name: court-reserve-workers-config
+                optional: true
+          env:
+            - name: PORT
+              value: "8787"
+          volumeMounts:
+            - name: browser-profile
+              mountPath: /app/browser-profile
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          # Liveness is intentionally lenient: a Chromium scrape can saturate
+          # the Node event loop for tens of seconds at a time. Failing here
+          # restarts the pod mid-scrape. 60s * 5 = 5min before kill.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8787
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8787
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: browser-profile
+          persistentVolumeClaim:
+            claimName: crw-browser-profile
