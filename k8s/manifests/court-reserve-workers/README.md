@@ -14,10 +14,10 @@ devops/bin/k8s-secrets --app court-reserve-workers
 
 # 3) Apply manifests
 TAG=$(git -C ~/code/court-reserve-workers tag | sort -V | tail -1)
+kubectl apply -f devops/k8s/manifests/court-reserve-workers/pvc.yaml
+kubectl apply -f devops/k8s/manifests/court-reserve-workers/service.yaml
 sed "s/__IMAGE_TAG__/${TAG}/g" devops/k8s/manifests/court-reserve-workers/statefulset.yaml \
   | kubectl apply -f -
-kubectl apply -f devops/k8s/manifests/court-reserve-workers/service.yaml
-kubectl apply -f devops/k8s/manifests/court-reserve-workers/pvc.yaml
 
 # 4) Verify
 kubectl rollout status statefulset/court-reserve-workers -n bryzek-production
