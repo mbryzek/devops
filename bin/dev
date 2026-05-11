@@ -21,11 +21,11 @@ USAGE = <<~USAGE
     invariants snoozes [--app APP] [--localhost]
         List active invariant snoozes.
 
-    invariants snooze <name> --days N --reason "TEXT" [--app APP] [--localhost]
-        Snooze an invariant for N days.
+    invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]
+        Snooze an invariant for N days. --app is required.
 
-    invariants unsnooze <name> [--app APP] [--localhost]
-        Remove an invariant snooze.
+    invariants unsnooze <name> --app APP [--localhost]
+        Remove an invariant snooze. --app is required.
 
     tasks requeue [--app APP] [--localhost]
         Requeue failed async tasks.
@@ -306,6 +306,10 @@ def cmd_invariants_snooze(args)
   days_i = Integer(days) rescue nil
   usage_exit("--days must be an integer >= 1") if days_i.nil? || days_i < 1
 
+  if app_filter.nil? || app_filter.empty?
+    Util.exit_with_error("--app is required for snooze (mutations must target a single app)")
+  end
+
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
   handle_errors do
@@ -321,6 +325,9 @@ def cmd_invariants_unsnooze(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   usage_exit("unsnooze requires an invariant name") if rest.length != 1
   name = rest.first
+  if app_filter.nil? || app_filter.empty?
+    Util.exit_with_error("--app is required for unsnooze (mutations must target a single app)")
+  end
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
   handle_errors do
