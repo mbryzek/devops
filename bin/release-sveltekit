@@ -36,6 +36,11 @@ helper.run "rm -rf build .svelte-kit/cloudflare"
 tag = Tag.ask
 helper.maybe_tag_and_push(tag)
 
+# Write .env.version so the deployed app can serve /_internal_/version
+set_version_cmd = File.expand_path("~/code/claude/bin/set-version") +
+  " --app #{helper.app} --version #{tag}"
+helper.run(set_version_cmd)
+
 # Build the project
 helper.run_system("npm run build")
 

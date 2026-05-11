@@ -127,7 +127,15 @@ Dir.chdir(helper.release_dir) do |dir|
   ni2 = rewrite_version(ni, File.read("version.txt").strip)
   helper.run "rm -f index.html"
   helper.run "mv #{ni2} index.html"
-  helper.run "git add #{files.join(" ")} version.txt"
+
+  # Write _internal_/version.json so the deployed static site can serve /_internal_/version
+  require "json"
+  require "fileutils"
+  FileUtils.mkdir_p("_internal_")
+  File.write(File.join("_internal_", "version.json"),
+             JSON.generate({ "version" => tag, "released_at" => Time.now.utc.iso8601 }))
+
+  helper.run "git add #{files.join(" ")} version.txt _internal_/version.json"
 
   helper.maybe_tag_and_push(tag)
 end
