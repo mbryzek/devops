@@ -1,0 +1,392 @@
+#!/usr/bin/env ruby
+
+require 'io/console'
+require 'json'
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+USAGE = <<~USAGE
+  Usage: dev <command> [subcommand] [options]
+
+  Commands:
+    login [--email EMAIL]
+        Log in as a platform admin (prompts for password).
+
+    logout
+        Clear the cached devops session.
+
+    invariants check [--app APP] [--localhost]
+        Check invariants across endpoints.
+
+    invariants snoozes [--app APP] [--localhost]
+        List active invariant snoozes.
+
+    invariants snooze <name> --days N --reason "TEXT" [--app APP] [--localhost]
+        Snooze an invariant for N days.
+
+    invariants unsnooze <name> [--app APP] [--localhost]
+        Remove an invariant snooze.
+
+    tasks requeue [--app APP] [--localhost]
+        Requeue failed async tasks.
+
+  Common options:
+    --app APP       Limit to a single app (acumen, platform)
+    --localhost     Hit local development servers instead of production
+USAGE
+
+def usage_exit(msg = nil)
+  warn msg if msg
+  warn USAGE
+  exit(msg ? 1 : 0)
+end
+
+def parse_common_flags(args)
+  app_filter = nil
+  use_localhost = false
+  rest = []
+  i = 0
+  while i < args.length
+    a = args[i]
+    case a
+    when "--app"
+      app_filter = args[i + 1]
+      usage_exit("--app requires a value") if app_filter.nil?
+      i += 2
+    when "--localhost"
+      use_localhost = true
+      i += 1
+    when "-h", "--help"
+      usage_exit
+    else
+      rest << a
+      i += 1
+    end
+  end
+  [rest, app_filter, use_localhost]
+end
+
+def resolve_endpoints(app_filter, use_localhost)
+  list = ApiClient.endpoints(use_localhost: use_localhost, app_filter: app_filter)
+  if list.empty?
+    valid = ApiClient::ENDPOINTS.map { |e| e[:app] }.join(", ")
+    Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{valid}")
+  end
+  list
+end
+
+def handle_errors
+  yield
+rescue SessionExpired
+  warn "session expired or invalid - run 'dev login'"
+  exit 1
+rescue ApiError => e
+  warn e.message
+  exit 1
+end
+
+def platform_endpoint(use_localhost)
+  ApiClient.endpoints(use_localhost: use_localhost, app_filter: "platform").first
+end
+
+# ---------- login / logout ----------
+
+def cmd_login(args)
+  email = nil
+  use_localhost = false
+  i = 0
+  while i < args.length
+    a = args[i]
+    case a
+    when "--email"
+      email = args[i + 1]
+      usage_exit("--email requires a value") if email.nil?
+      i += 2
+    when "--localhost"
+      use_localhost = true
+      i += 1
+    else
+      usage_exit("Unknown argument: #{a}")
+    end
+  end
+
+  if email.nil? || email.empty?
+    print "Email: "
+    email = STDIN.gets&.strip
+    usage_exit("Email is required") if email.nil? || email.empty?
+  end
+
+  print "Password: "
+  password = STDIN.noecho(&:gets)&.chomp
+  puts ""
+  Util.exit_with_error("Password is required") if password.nil? || password.empty?
+
+  endpoint = platform_endpoint(use_localhost)
+  begin
+    res = ApiClient.request(endpoint, :post, "/tenant/platform/session/logins",
+                            body: { email: email, password: password },
+                            auth_required: false)
+  rescue ApiError => e
+    Util.exit_with_error("Login failed: #{e.message}")
+  end
+
+  discriminator = res["discriminator"]
+  if discriminator && discriminator != "tenant_session"
+    Util.exit_with_error("Login failed: account status is '#{res['status'] || discriminator}'")
+  end
+
+  session = res["session"]
+  session_id = session && session["id"]
+  Util.exit_with_error("Login response missing session.id: #{res.inspect}") if session_id.nil? || session_id.empty?
+
+  ApiClient.write_session_id(session_id)
+  user = res["user"] || {}
+  puts "Logged in as #{user['email'] || email}"
+end
+
+def cmd_logout(args)
+  use_localhost = false
+  args.each do |a|
+    case a
+    when "--localhost" then use_localhost = true
+    else usage_exit("Unknown argument: #{a}")
+    end
+  end
+
+  if ApiClient.session_id.nil?
+    puts "No active session"
+    return
+  end
+
+  endpoint = platform_endpoint(use_localhost)
+  begin
+    ApiClient.request(endpoint, :delete, "/tenant/platform/session", auth_required: true)
+  rescue SessionExpired, ApiError
+    # ignore - we'll clear locally anyway
+  end
+  ApiClient.clear_session_id
+  puts "Logged out"
+end
+
+# ---------- invariants ----------
+
+def print_invariant_failures(result)
+  (result["non_zero"] || []).each do |inv|
+    puts "  - #{inv['name']}"
+    puts "    Count: #{inv['count']}"
+    examples = inv["examples"] || []
+    unless examples.empty?
+      puts "    Examples:"
+      examples.take(3).each { |ex| puts "      * #{ex}" }
+      if examples.length > 3
+        puts "      ... and #{examples.length - 3} more"
+      end
+    end
+  end
+
+  (result["error"] || []).each do |inv|
+    puts "  - #{inv['name']}"
+    puts "    Error: #{inv['error'] || 'Unknown error'}"
+  end
+end
+
+def cmd_invariants_check(args)
+  _, app_filter, use_localhost = parse_common_flags(args)
+  endpoints = resolve_endpoints(app_filter, use_localhost)
+
+  puts ""
+  puts Util.underline("Checking Invariants#{use_localhost ? ' (localhost)' : ''}")
+  puts ""
+
+  print "Fetching #{endpoints.map { |e| e[:name] }.join(', ')}..."
+  $stdout.flush
+
+  results = endpoints.map do |endpoint|
+    Thread.new do
+      begin
+        data = ApiClient.request(endpoint, :get, "/dev/invariant/checks")
+        { endpoint: endpoint, data: data, error: nil }
+      rescue SessionExpired => e
+        { endpoint: endpoint, data: nil, error: "session expired - run 'dev login'" }
+      rescue ApiError => e
+        { endpoint: endpoint, data: nil, error: e.message }
+      rescue => e
+        { endpoint: endpoint, data: nil, error: e.message }
+      end
+    end
+  end.map(&:value)
+
+  puts " done"
+  puts ""
+
+  all_passed = true
+  results.sort_by { |r| r[:endpoint][:name] }.each do |r|
+    endpoint = r[:endpoint]
+    if r[:error]
+      puts Util.underline("#{endpoint[:name]}: ERROR - #{r[:error]}")
+      all_passed = false
+    else
+      result = r[:data] || {}
+      success = result["success"] || []
+      non_zero = result["non_zero"] || []
+      errors = result["error"] || []
+      total_count = success.length + non_zero.length + errors.length
+      failure_count = non_zero.length + errors.length
+
+      if failure_count == 0
+        puts "#{endpoint[:name]}: #{total_count} invariants passed"
+      else
+        puts Util.underline("#{endpoint[:name]}: #{failure_count} FAILURES (#{total_count} total)")
+        print_invariant_failures(result)
+        all_passed = false
+      end
+    end
+    puts ""
+  end
+
+  if all_passed
+    puts "All invariants passed"
+    exit 0
+  else
+    puts "Some invariants failed"
+    exit 1
+  end
+end
+
+def cmd_invariants_snoozes(args)
+  _, app_filter, use_localhost = parse_common_flags(args)
+  endpoints = resolve_endpoints(app_filter, use_localhost)
+
+  puts ""
+  puts Util.underline("Invariant Snoozes#{use_localhost ? ' (localhost)' : ''}")
+  puts ""
+
+  handle_errors do
+    endpoints.each do |endpoint|
+      snoozes = ApiClient.request(endpoint, :get, "/dev/invariant/snoozes") || []
+      puts "#{endpoint[:name]}: #{snoozes.length} active"
+      snoozes.each do |s|
+        puts "  - #{s['invariant_name']}"
+        puts "    Until:   #{s['snoozed_until']}"
+        puts "    Reason:  #{s['reason']}"
+        puts "    By:      #{s['created_by_user_id']} at #{s['created_at']}"
+      end
+      puts ""
+    end
+  end
+end
+
+def cmd_invariants_snooze(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  days = nil
+  reason = nil
+  positional = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--days"
+      days = rest[i + 1]
+      usage_exit("--days requires a value") if days.nil?
+      i += 2
+    when "--reason"
+      reason = rest[i + 1]
+      usage_exit("--reason requires a value") if reason.nil?
+      i += 2
+    else
+      positional << a
+      i += 1
+    end
+  end
+
+  usage_exit("snooze requires an invariant name") if positional.length != 1
+  name = positional.first
+  usage_exit("--days is required") if days.nil?
+  usage_exit("--reason is required") if reason.nil? || reason.empty?
+
+  days_i = Integer(days) rescue nil
+  usage_exit("--days must be an integer >= 1") if days_i.nil? || days_i < 1
+
+  endpoints = resolve_endpoints(app_filter, use_localhost)
+
+  handle_errors do
+    endpoints.each do |endpoint|
+      res = ApiClient.request(endpoint, :post, "/dev/invariant/snoozes",
+                              body: { invariant_name: name, days: days_i, reason: reason })
+      puts "#{endpoint[:name]}: snoozed #{res['invariant_name']} until #{res['snoozed_until']}"
+    end
+  end
+end
+
+def cmd_invariants_unsnooze(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  usage_exit("unsnooze requires an invariant name") if rest.length != 1
+  name = rest.first
+  endpoints = resolve_endpoints(app_filter, use_localhost)
+
+  handle_errors do
+    endpoints.each do |endpoint|
+      ApiClient.request(endpoint, :delete, "/dev/invariant/snoozes/#{URI.encode_www_form_component(name)}")
+      puts "#{endpoint[:name]}: removed snooze for #{name}"
+    end
+  end
+end
+
+# ---------- tasks ----------
+
+def cmd_tasks_requeue(args)
+  _, app_filter, use_localhost = parse_common_flags(args)
+  endpoints = resolve_endpoints(app_filter, use_localhost)
+
+  puts ""
+  puts Util.underline("Requeuing Failed Tasks#{use_localhost ? ' (localhost)' : ''}")
+  puts ""
+
+  endpoints.each do |endpoint|
+    begin
+      res = ApiClient.request(endpoint, :post, "/dev/task/requeues", body: {})
+      count = res && res["requeued"]
+      puts "  #{endpoint[:name]}: #{count} tasks requeued"
+    rescue SessionExpired
+      warn "session expired or invalid - run 'dev login'"
+      exit 1
+    rescue ApiError => e
+      puts "  #{endpoint[:name]}: ERROR - #{e.message}"
+    end
+  end
+
+  puts ""
+end
+
+# ---------- dispatch ----------
+
+argv = ARGV.dup
+usage_exit if argv.empty?
+usage_exit if %w[-h --help help].include?(argv.first)
+
+command = argv.shift
+case command
+when "login"
+  cmd_login(argv)
+when "logout"
+  cmd_logout(argv)
+when "invariants"
+  sub = argv.shift
+  case sub
+  when "check"     then cmd_invariants_check(argv)
+  when "snoozes"   then cmd_invariants_snoozes(argv)
+  when "snooze"    then cmd_invariants_snooze(argv)
+  when "unsnooze"  then cmd_invariants_unsnooze(argv)
+  when nil         then usage_exit("invariants requires a subcommand")
+  else                  usage_exit("Unknown invariants subcommand: #{sub}")
+  end
+when "tasks"
+  sub = argv.shift
+  case sub
+  when "requeue" then cmd_tasks_requeue(argv)
+  when nil       then usage_exit("tasks requires a subcommand")
+  else                usage_exit("Unknown tasks subcommand: #{sub}")
+  end
+else
+  usage_exit("Unknown command: #{command}")
+end
