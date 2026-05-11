@@ -6,23 +6,17 @@ only non-Scala app in the cluster — templating one app isn't a win.
 ## Deploy
 
 ```bash
-# 1) Push image (from court-reserve-workers repo)
-./bin/build-and-push.sh                     # tag = `sem-info tag latest`
+# Standard release: tag, build+push image, apply manifests, wait for rollout.
+devops/bin/release --app court-reserve-workers
 
-# 2) Sync env vars to k8s (Secret + ConfigMap)
+# If env vars changed in env/apps/court-reserve-workers/, also sync them.
+# (release does NOT touch ConfigMap/Secret — same convention as the other apps.)
 devops/bin/k8s-secrets --app court-reserve-workers
-
-# 3) Apply manifests
-TAG=$(git -C ~/code/court-reserve-workers tag | sort -V | tail -1)
-kubectl apply -f devops/k8s/manifests/court-reserve-workers/pvc.yaml
-kubectl apply -f devops/k8s/manifests/court-reserve-workers/service.yaml
-sed "s/__IMAGE_TAG__/${TAG}/g" devops/k8s/manifests/court-reserve-workers/statefulset.yaml \
-  | kubectl apply -f -
-
-# 4) Verify
-kubectl rollout status statefulset/court-reserve-workers -n bryzek-production
-kubectl get pvc -n bryzek-production crw-browser-profile
 ```
+
+The release script reads `app.docker_k8s` in `env/apps/court-reserve-workers/config.pkl`
+to find the build script, manifests dir, and rollout target. It applies every
+`*.yaml` in this directory with `__IMAGE_TAG__` substituted.
 
 ## Internal DNS
 

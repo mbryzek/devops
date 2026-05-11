@@ -24,8 +24,10 @@ files = if config.scala
     end
   elsif config.sveltekit
     ["release-sveltekit"]
+  elsif config.docker_k8s
+    ["release-docker-k8s"]
   else
-    Util.exit_with_error("Do not know how to release app that is not scala, elm, or sveltekit")
+    Util.exit_with_error("Do not know how to release app that is not scala, elm, sveltekit, or docker_k8s")
   end
 
 files.each do |file|

@@ -1,0 +1,90 @@
+#!/usr/bin/env ruby
+
+# Releases a Docker-image-based k8s app with hand-written manifests
+# (e.g. court-reserve-workers). Steps:
+#   1. Bump + push a git tag in the app's source repo (Tag.ask).
+#   2. Run <source_dir>/<build_script> <tag> to build + push the image.
+#   3. kubectl apply every *.yaml in <manifests_dir> with __IMAGE_TAG__
+#      substituted to the new tag.
+#   4. kubectl rollout status <rollout_target> in <namespace>.
+#
+# Config comes from the app's pkl: app.docker_k8s in env/apps/<app>/config.pkl.
+#
+# Usage: release-docker-k8s --app <app>
+
+require_relative '../lib/common'
+require 'fileutils'
+
+args = Args.parse(ARGV, ["app"])
+app = args.app
+config = Config.load(app)
+dk = config.docker_k8s
+
+if dk.nil?
+  Util.exit_with_error("App #{app} has no docker_k8s config")
+end
+
+source_dir = AppConfig.source_dir(app)
+unless File.directory?(source_dir)
+  Util.exit_with_error("Source directory not found: #{source_dir}")
+end
+
+devops_dir = File.expand_path("..", __dir__)
+manifests_dir = File.join(devops_dir, dk.manifests_dir)
+unless File.directory?(manifests_dir)
+  Util.exit_with_error("Manifests directory not found: #{manifests_dir}")
+end
+
+build_script = File.join(source_dir, dk.build_script)
+unless File.executable?(build_script)
+  Util.exit_with_error("Build script not found or not executable: #{build_script}")
+end
+
+# Tag in the app's source repo (Tag.ask uses cwd via `sem-info`).
+version = Dir.chdir(source_dir) { Tag.ask }
+if version.nil? || version.empty?
+  Util.exit_with_error("Could not determine release tag for #{app}")
+end
+
+puts ""
+puts Util.underline("Releasing #{app} version #{version}")
+puts ""
+
+# Step 1: build + push Docker image (script handles `docker buildx --push`).
+puts "Building + pushing Docker image..."
+Dir.chdir(source_dir) do
+  Util.run("#{build_script} #{version}")
+end
+
+# Step 2: apply manifests with __IMAGE_TAG__ substituted. sed is a no-op on
+# files that don't contain the placeholder, so this works for pvc/service/etc.
+puts ""
+puts Util.underline("Applying k8s manifests from #{dk.manifests_dir}")
+
+manifests = Dir.glob(File.join(manifests_dir, "*.yaml")).sort
+if manifests.empty?
+  Util.exit_with_error("No *.yaml manifests in #{manifests_dir}")
+end
+
+tmp_dir = "/tmp/release-docker-k8s-#{app}"
+FileUtils.rm_rf(tmp_dir)
+FileUtils.mkdir_p(tmp_dir)
+begin
+  manifests.each do |src|
+    rendered = IO.read(src).gsub("__IMAGE_TAG__", version)
+    dst = File.join(tmp_dir, File.basename(src))
+    File.write(dst, rendered)
+    Util.run("kubectl apply -n #{dk.namespace} -f #{dst}")
+  end
+ensure
+  FileUtils.rm_rf(tmp_dir)
+end
+
+# Step 3: wait for rollout.
+puts ""
+puts Util.underline("Waiting for rollout: #{dk.rollout_target} in #{dk.namespace}")
+Util.run("kubectl rollout status #{dk.rollout_target} -n #{dk.namespace} --timeout=180s")
+
+puts ""
+puts "Release complete: #{app} #{version}"
+puts ""

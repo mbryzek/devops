@@ -3,7 +3,7 @@
 require 'json'
 
 class App
-  attr_accessor :name, :scala, :port, :elm, :sveltekit
+  attr_accessor :name, :scala, :port, :elm, :sveltekit, :docker_k8s
 
   def initialize(json_data)
     @name = json_data['name']
@@ -11,6 +11,18 @@ class App
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
     @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['sveltekit']) : nil
+    @docker_k8s = json_data['docker_k8s'] ? DockerK8sConfig.new(json_data['docker_k8s']) : nil
+  end
+end
+
+class DockerK8sConfig
+  attr_accessor :build_script, :manifests_dir, :rollout_target, :namespace
+
+  def initialize(json_data)
+    @build_script = json_data['build_script']
+    @manifests_dir = json_data['manifests_dir']
+    @rollout_target = json_data['rollout_target']
+    @namespace = json_data['namespace']
   end
 end
 
