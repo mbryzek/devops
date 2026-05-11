@@ -341,20 +341,23 @@ def cmd_tasks_requeue(args)
   puts Util.underline("Requeuing Failed Tasks#{use_localhost ? ' (localhost)' : ''}")
   puts ""
 
+  all_ok = true
   endpoints.each do |endpoint|
     begin
       res = ApiClient.request(endpoint, :post, "/dev/task/requeues", body: {})
       count = res && res["requeued"]
       puts "  #{endpoint[:name]}: #{count} tasks requeued"
     rescue SessionExpired
-      warn "session expired or invalid - run 'dev login'"
-      exit 1
+      puts "  #{endpoint[:name]}: ERROR - session expired or invalid - run 'dev login'"
+      all_ok = false
     rescue ApiError => e
       puts "  #{endpoint[:name]}: ERROR - #{e.message}"
+      all_ok = false
     end
   end
 
   puts ""
+  exit 1 unless all_ok
 end
 
 # ---------- dispatch ----------
