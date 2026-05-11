@@ -48,6 +48,7 @@ kubectl get pods -n bryzek-production -o custom-columns='NAME:.metadata.name,IMA
   # View logs from all web pods
   kubectl logs -n bryzek-production -l app=platform --tail=100
   kubectl logs -n bryzek-production -l app=platform -f
+  kubectl logs -n bryzek-production -l app=court-reserve-workers -f
 
   # View logs from a specific pod
   kubectl logs -n bryzek-production platform-web-xxx -f
