@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 
+require 'fileutils'
 require 'io/console'
 require 'json'
 require 'open3'
@@ -46,6 +47,14 @@ USAGE = <<~USAGE
         Diff live ConfigMap in cluster against env/apps/<app>/env/production.env.
     config rollout [--app APP]
         Apply k8s-secrets and rollout restart workloads (picks up ConfigMap changes).
+
+    browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]
+        Shallow-clone every ~/code/* repo with a package.json into
+        ~/code/browserslist.<YYYYMMDD>/<name>, run `npx update-browserslist-db@latest`,
+        and push changes to main. Use --app NAME to limit to one repo (matched by
+        directory name under ~/code). The temp dir is deleted on success unless
+        --keep-tmp-dir is passed; it is always kept if any repo fails so output
+        can be inspected. Quiet by default; use --verbose to stream full output.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -611,6 +620,191 @@ def cmd_config_rollout(args)
   end
 end
 
+# ---------- browserslist ----------
+
+def git_current_branch(path)
+  out, status = Open3.capture2("git", "-C", path, "symbolic-ref", "--short", "HEAD")
+  status.success? ? out.strip : nil
+end
+
+def git_clean?(path)
+  out, status = Open3.capture2("git", "-C", path, "status", "--porcelain")
+  status.success? && out.strip.empty?
+end
+
+def run_step(cmd, path, verbose, captured_log)
+  if verbose
+    ok = system(*cmd, chdir: path)
+    [ok, nil]
+  else
+    out, status = Open3.capture2e(*cmd, chdir: path)
+    captured_log << out
+    [status.success?, out]
+  end
+end
+
+def report_repo_line(name, status, detail, verbose)
+  return if verbose
+  suffix = detail ? "#{status}: #{detail}" : status
+  puts "  #{name} [#{suffix}]"
+end
+
+def git_origin_url(path)
+  out, status = Open3.capture2("git", "-C", path, "config", "--get", "remote.origin.url")
+  status.success? ? out.strip : nil
+end
+
+def cmd_browserslist_update(args)
+  verbose = false
+  keep_tmp = false
+  app_filter = nil
+  i = 0
+  rest = []
+  while i < args.length
+    a = args[i]
+    case a
+    when "--verbose", "-v" then verbose = true; i += 1
+    when "--keep-tmp-dir"  then keep_tmp = true; i += 1
+    when "--app"
+      app_filter = args[i + 1]
+      usage_exit("--app requires a value") if app_filter.nil?
+      i += 2
+    else
+      rest << a
+      i += 1
+    end
+  end
+  usage_exit("browserslist update takes no positional arguments") unless rest.empty?
+
+  code_root = File.expand_path("~/code")
+  source_repos = Dir.children(code_root)
+    .map { |name| File.join(code_root, name) }
+    .select { |path| File.directory?(path) && File.exist?(File.join(path, "package.json")) && File.directory?(File.join(path, ".git")) }
+    .sort
+
+  if app_filter
+    source_repos = source_repos.select { |p| File.basename(p) == app_filter }
+    if source_repos.empty?
+      Util.exit_with_error("No repo named '#{app_filter}' with package.json + .git under #{code_root}")
+    end
+  end
+
+  if source_repos.empty?
+    puts "No repos with package.json + .git under #{code_root}"
+    return
+  end
+
+  date = Time.now.strftime("%Y%m%d")
+  workdir = File.join(code_root, "browserslist.#{date}")
+  FileUtils.mkdir_p(workdir) unless File.directory?(workdir)
+
+  puts "Working in #{workdir}"
+  puts "Processing #{source_repos.length} repo(s)..."
+  puts ""
+
+  failures = []
+  updated = []
+  no_changes = []
+  no_remote = []
+  logs = {}
+
+  source_repos.each do |src_path|
+    name = File.basename(src_path)
+    puts Util.underline(name) if verbose
+
+    origin = git_origin_url(src_path)
+    if origin.nil? || origin.empty?
+      no_remote << name
+      report_repo_line(name, "skipped", "no remote", verbose)
+      puts "" if verbose
+      next
+    end
+
+    clone_path = File.join(workdir, name)
+    captured = +""
+
+    if File.directory?(clone_path)
+      FileUtils.rm_rf(clone_path)
+    end
+
+    ok, _ = run_step(["git", "clone", "--depth=1", "--quiet", origin, clone_path], workdir, verbose, captured)
+    unless ok
+      failures << "#{name} (clone failed)"
+      logs[name] = captured unless verbose
+      report_repo_line(name, "FAIL", "git clone", verbose)
+      puts "" if verbose
+      next
+    end
+
+    ok, _ = run_step(["npx", "--yes", "update-browserslist-db@latest"], clone_path, verbose, captured)
+    unless ok
+      failures << name
+      logs[name] = captured unless verbose
+      report_repo_line(name, "FAIL", "update-browserslist-db", verbose)
+      puts "" if verbose
+      next
+    end
+
+    if git_clean?(clone_path)
+      no_changes << name
+      report_repo_line(name, "no changes", nil, verbose)
+      puts "" if verbose
+      next
+    end
+
+    msg = "Update caniuse-lite via update-browserslist-db"
+    ok, _ = run_step(["git", "-C", clone_path, "commit", "-am", msg], clone_path, verbose, captured)
+    unless ok
+      failures << "#{name} (commit failed)"
+      logs[name] = captured unless verbose
+      report_repo_line(name, "FAIL", "git commit", verbose)
+      puts "" if verbose
+      next
+    end
+
+    ok, _ = run_step(["git", "-C", clone_path, "push", "origin", "HEAD:main"], clone_path, verbose, captured)
+    unless ok
+      failures << "#{name} (push failed)"
+      logs[name] = captured unless verbose
+      report_repo_line(name, "FAIL", "git push", verbose)
+      puts "" if verbose
+      next
+    end
+
+    updated << name
+    report_repo_line(name, "done", nil, verbose)
+    puts "" if verbose
+  end
+
+  puts ""
+  puts Util.underline("Summary")
+  puts "  updated + pushed: #{updated.empty? ? '(none)' : updated.join(', ')}"
+  puts "  no changes:       #{no_changes.join(', ')}" unless no_changes.empty?
+  puts "  no remote:        #{no_remote.join(', ')}" unless no_remote.empty?
+  puts "  failed:           #{failures.join(', ')}" unless failures.empty?
+
+  unless verbose || logs.empty?
+    puts ""
+    puts "Re-run with --verbose for full output. Captured failure output:"
+    logs.each do |name, out|
+      puts ""
+      puts Util.underline(name)
+      puts out
+    end
+  end
+
+  if failures.empty? && !keep_tmp
+    FileUtils.rm_rf(workdir)
+    puts ""
+    puts "Removed #{workdir}"
+  elsif !failures.empty?
+    puts ""
+    puts "Kept #{workdir} for inspection (failures present)"
+  end
+
+  exit 1 unless failures.empty?
+end
+
 # ---------- dispatch ----------
 
 argv = ARGV.dup
@@ -651,6 +845,13 @@ when "tasks"
   when "requeue" then cmd_tasks_requeue(argv)
   when nil       then usage_exit("tasks requires a subcommand")
   else                usage_exit("Unknown tasks subcommand: #{sub}")
+  end
+when "browserslist"
+  sub = argv.shift
+  case sub
+  when "update" then cmd_browserslist_update(argv)
+  when nil      then usage_exit("browserslist requires a subcommand")
+  else               usage_exit("Unknown browserslist subcommand: #{sub}")
   end
 else
   usage_exit("Unknown command: #{command}")
