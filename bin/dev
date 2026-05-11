@@ -6,6 +6,9 @@ require 'uri'
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
+$LOAD_PATH.unshift(File.expand_path('~/code/claude/lib'))
+require 'work/registry'
+
 USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
@@ -30,6 +33,13 @@ USAGE = <<~USAGE
 
     tasks requeue [--app APP] [--localhost]
         Requeue failed async tasks.
+
+    version [--app APP] [--localhost]
+    versions [--localhost]
+        Show deployed app version(s) and release timestamp.
+
+    pending [--app APP]
+        List apps whose origin/main is ahead of the latest tag (need deploy).
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -368,6 +378,109 @@ def cmd_tasks_requeue(args)
   exit 1 unless all_ok
 end
 
+# ---------- versions ----------
+
+def fetch_version(url)
+  uri = URI.parse("#{url}/_internal_/version")
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = (uri.scheme == "https")
+  http.open_timeout = 5
+  http.read_timeout = 10
+  res = http.request(Net::HTTP::Get.new(uri.request_uri))
+  return { error: "HTTP #{res.code}" } unless res.code.to_i.between?(200, 299)
+  return { error: "empty body" } if res.body.nil? || res.body.empty?
+  JSON.parse(res.body)
+rescue => e
+  { error: e.message }
+end
+
+def cmd_versions(args)
+  _, app_filter, _ = parse_common_flags(args)
+
+  registry = Work::Registry.load
+  apps = registry.deployable.sort_by(&:name)
+  apps = apps.select { |a| a.name == app_filter } if app_filter
+
+  if apps.empty?
+    valid = registry.deployable.map(&:name).sort.join(", ")
+    Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{valid}")
+  end
+
+  rows = apps.map do |app|
+    Thread.new do
+      url = registry.prod_url(app)
+      data = url ? fetch_version(url) : { error: "no prod url" }
+      [app.name, data]
+    end
+  end.map(&:value)
+
+  name_w = rows.map { |n, _| n.length }.max
+  ver_w  = rows.map { |_, d| (d["version"] || "").to_s.length }.max
+  rows.each do |name, d|
+    if d[:error]
+      puts "#{name.ljust(name_w)}  ERROR - #{d[:error]}"
+    else
+      ver = (d["version"] || "(unknown)").ljust(ver_w)
+      puts "#{name.ljust(name_w)}  #{ver}  released #{d['released_at'] || '(unknown)'}"
+    end
+  end
+end
+
+# ---------- pending deploys ----------
+
+def pending_for(app)
+  dir = File.expand_path("~/code/#{app.name}")
+  return { error: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
+
+  fetch_err = `git -C #{dir} fetch -q origin 2>&1`
+  return { error: "fetch failed: #{fetch_err.strip}" } unless $?.success?
+
+  tag = `cd #{dir} && sem-info tag latest 2>/dev/null`.strip
+  return { error: "no tag" } if tag.empty? || tag == "0.0.0"
+
+  ref = `git -C #{dir} rev-parse --verify --quiet origin/main`.strip
+  ref = `git -C #{dir} rev-parse --verify --quiet origin/master`.strip if ref.empty?
+  return { error: "no origin/main" } if ref.empty?
+
+  count = `git -C #{dir} rev-list --count #{tag}..#{ref}`.strip.to_i
+  last = `git -C #{dir} log -1 --format=%h\\ %s #{ref}`.strip
+  { tag: tag, ahead: count, last: last }
+end
+
+def cmd_pending(args)
+  _, app_filter, _ = parse_common_flags(args)
+
+  registry = Work::Registry.load
+  apps = registry.deployable.sort_by(&:name)
+  apps = apps.select { |a| a.name == app_filter } if app_filter
+  if apps.empty?
+    valid = registry.deployable.map(&:name).sort.join(", ")
+    Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{valid}")
+  end
+
+  rows = apps.map do |app|
+    Thread.new { [app.name, pending_for(app)] }
+  end.map(&:value)
+
+  pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
+  errors  = rows.select { |_, d| d[:error] }
+
+  if pending.empty?
+    puts "All apps up to date"
+  else
+    name_w = pending.map { |n, _| n.length }.max
+    tag_w  = pending.map { |_, d| d[:tag].length }.max
+    pending.each do |name, d|
+      puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  +#{d[:ahead]}  #{d[:last]}"
+    end
+  end
+
+  unless errors.empty?
+    puts ""
+    errors.each { |name, d| puts "#{name}: #{d[:error]}" }
+  end
+end
+
 # ---------- dispatch ----------
 
 argv = ARGV.dup
@@ -390,6 +503,10 @@ when "invariants"
   when nil         then usage_exit("invariants requires a subcommand")
   else                  usage_exit("Unknown invariants subcommand: #{sub}")
   end
+when "version", "versions"
+  cmd_versions(argv)
+when "pending"
+  cmd_pending(argv)
 when "tasks"
   sub = argv.shift
   case sub
