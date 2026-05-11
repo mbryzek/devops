@@ -128,14 +128,17 @@ Dir.chdir(helper.release_dir) do |dir|
   helper.run "rm -f index.html"
   helper.run "mv #{ni2} index.html"
 
-  # Write _internal_/version.json so the deployed static site can serve /_internal_/version
+  # Write _internal_/version (extensionless, JSON content) so the deployed
+  # static site serves it at /_internal_/version — same path as the Scala /
+  # SvelteKit dynamic endpoints. Content-Type may be octet-stream but the
+  # work-versions client parses the body as JSON regardless.
   require "json"
   require "fileutils"
   FileUtils.mkdir_p("_internal_")
-  File.write(File.join("_internal_", "version.json"),
+  File.write(File.join("_internal_", "version"),
              JSON.generate({ "version" => tag, "released_at" => Time.now.utc.iso8601 }))
 
-  helper.run "git add #{files.join(" ")} version.txt _internal_/version.json"
+  helper.run "git add #{files.join(" ")} version.txt _internal_/version"
 
   helper.maybe_tag_and_push(tag)
 end
