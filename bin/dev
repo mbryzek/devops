@@ -41,6 +41,11 @@ USAGE = <<~USAGE
     pending [--app APP]
         List apps whose origin/main is ahead of the latest tag (need deploy).
 
+    config check [--app APP]
+        Diff live ConfigMap in cluster against env/apps/<app>/env/production.env.
+    config rollout [--app APP]
+        Apply k8s-secrets and rollout restart workloads (picks up ConfigMap changes).
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -481,6 +486,91 @@ def cmd_pending(args)
   end
 end
 
+# ---------- config drift ----------
+
+K8S_NAMESPACE = 'bryzek-production'
+
+def k8s_apps(app_filter)
+  registry = Work::Registry.load
+  apps = registry.deployable.map(&:name).sort
+  apps = apps.select { |n| File.exist?(File.expand_path("~/code/env/apps/#{n}/env/production.env")) }
+  apps = apps.select { |n| n == app_filter } if app_filter
+  Util.exit_with_error("No apps with production.env match '#{app_filter}'") if apps.empty?
+  apps
+end
+
+def expected_config_vars(app)
+  vars = JSON.parse(EnvironmentVariables.load(app, 'production').serialize('json'))
+  vars.select { |k, _| k.start_with?('CONF_') }
+end
+
+def live_config_vars(app)
+  out, status = Open3.capture2("kubectl", "get", "configmap", "#{app}-config",
+                                "-n", K8S_NAMESPACE, "-o", "json")
+  return nil unless status.success?
+  JSON.parse(out)["data"] || {}
+end
+
+def diff_config(app)
+  expected = expected_config_vars(app)
+  live = live_config_vars(app)
+  return { error: "ConfigMap #{app}-config not found" } if live.nil?
+
+  missing  = expected.keys - live.keys
+  extra    = live.keys - expected.keys
+  changed  = (expected.keys & live.keys).select { |k| expected[k] != live[k] }
+  { missing: missing, extra: extra, changed: changed, expected: expected, live: live }
+end
+
+def cmd_config_check(args)
+  require 'open3'
+  _, app_filter, _ = parse_common_flags(args)
+  apps = k8s_apps(app_filter)
+
+  any_drift = false
+  apps.each do |app|
+    d = diff_config(app)
+    if d[:error]
+      puts "#{app}: ERROR - #{d[:error]}"
+      any_drift = true
+      next
+    end
+    drift_count = d[:missing].length + d[:extra].length + d[:changed].length
+    if drift_count == 0
+      puts "#{app}: in sync (#{d[:expected].size} keys)"
+    else
+      any_drift = true
+      puts "#{app}: DRIFT (#{drift_count} differences)"
+      d[:missing].sort.each { |k| puts "  + #{k} (in env, not in cluster)" }
+      d[:extra].sort.each   { |k| puts "  - #{k} (in cluster, not in env)" }
+      d[:changed].sort.each do |k|
+        puts "  ~ #{k}"
+        puts "      env:     #{d[:expected][k].inspect}"
+        puts "      cluster: #{d[:live][k].inspect}"
+      end
+    end
+  end
+  exit(any_drift ? 1 : 0)
+end
+
+def cmd_config_rollout(args)
+  require 'open3'
+  _, app_filter, _ = parse_common_flags(args)
+  apps = k8s_apps(app_filter)
+  bin_dir = File.dirname(__FILE__)
+
+  apps.each do |app|
+    puts ""
+    puts Util.underline("#{app}: apply k8s-secrets")
+    Util.run("#{File.join(bin_dir, 'k8s-secrets')} --app #{app}")
+
+    puts ""
+    puts Util.underline("#{app}: rollout restart")
+    Util.run("kubectl rollout restart statefulset,deployment -l app=#{app} -n #{K8S_NAMESPACE}")
+    Util.run("kubectl rollout status statefulset,deployment -l app=#{app} -n #{K8S_NAMESPACE} --timeout=5m")
+  end
+end
+
 # ---------- dispatch ----------
 
 argv = ARGV.dup
@@ -507,6 +597,14 @@ when "version", "versions"
   cmd_versions(argv)
 when "pending"
   cmd_pending(argv)
+when "config"
+  sub = argv.shift
+  case sub
+  when "check"   then cmd_config_check(argv)
+  when "rollout" then cmd_config_rollout(argv)
+  when nil       then usage_exit("config requires a subcommand")
+  else                usage_exit("Unknown config subcommand: #{sub}")
+  end
 when "tasks"
   sub = argv.shift
   case sub
