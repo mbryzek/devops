@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 
+require 'time'
+
 # Run this script from the project root directory
 
 LOG = "/tmp/release-elm.log"
