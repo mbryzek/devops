@@ -6,6 +6,7 @@ class Application {
     scala: ScalaConfig?
     elm: ElmConfig?
     sveltekit: SvelteKit?
+    docker_k8s: DockerK8sConfig?
 
     /// Source of the production domain for version-check pings. Set exactly one
     /// of `platform_tenant_id` or `prod_domain` for deployable apps; leave both
@@ -24,6 +25,26 @@ class Application {
 }
 
 class SvelteKit {}
+
+/// Release config for hand-written-manifest k8s apps built as a Docker image
+/// (e.g. court-reserve-workers). Released via `release-docker-k8s` which:
+///   1. tags via `Tag.ask`
+///   2. runs <source_dir>/<build_script> to build + push the image
+///   3. applies every manifest under <manifests_dir>, sed-substituting
+///      `__IMAGE_TAG__` with the new tag
+///   4. waits on `kubectl rollout status <rollout_target>` in <namespace>
+class DockerK8sConfig {
+    /// Path (relative to source dir) to the build-and-push script. The script
+    /// must accept the tag as its first positional argument.
+    build_script: String = "bin/build-and-push.sh"
+    /// Directory containing k8s manifests, relative to the devops repo root.
+    /// Every *.yaml is `kubectl apply`d with __IMAGE_TAG__ substituted.
+    manifests_dir: String
+    /// Resource to wait on, e.g. "statefulset/court-reserve-workers".
+    rollout_target: String
+    /// Kubernetes namespace.
+    namespace: String = "bryzek-production"
+}
 
 class ElmConfig {
     rewrites: Listing<ElmRewrite>?
