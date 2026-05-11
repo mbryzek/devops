@@ -2,6 +2,7 @@
 
 require 'io/console'
 require 'json'
+require 'uri'
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
