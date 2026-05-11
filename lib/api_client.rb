@@ -52,7 +52,7 @@ class ApiClient
     req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
     if auth_required
-      sid = session_id or raise SessionExpired, "No session. Run create-session."
+      sid = session_id or raise SessionExpired, "No session. Run 'dev login'."
       req["session_id"] = sid
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body
@@ -63,7 +63,7 @@ class ApiClient
     when 200..299
       res.body && !res.body.empty? ? JSON.parse(res.body) : nil
     when 401
-      raise SessionExpired, "Session expired or invalid. Run create-session."
+      raise SessionExpired, "Session expired or invalid. Run 'dev login'."
     else
       raise ApiError, "HTTP #{code} #{method.to_s.upcase} #{path}: #{res.body}"
     end
