@@ -2,6 +2,7 @@
 
 require 'io/console'
 require 'json'
+require 'open3'
 require 'uri'
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
@@ -399,6 +400,49 @@ rescue => e
   { error: e.message }
 end
 
+# For docker_k8s apps with no public ingress, read the live image tag straight
+# from the cluster. The image tag is what's *actually* running and avoids
+# requiring an HTTP /_internal_/version on internal-only services.
+def fetch_k8s_version(app)
+  ns = app.docker_k8s.namespace
+  target = app.docker_k8s.rollout_target  # e.g. "statefulset/court-reserve-workers"
+  image, status = Open3.capture2(
+    "kubectl", "-n", ns, "get", target,
+    "-o", "jsonpath={.spec.template.spec.containers[0].image}"
+  )
+  return { error: "kubectl get #{target}: failed" } unless status.success?
+  image = image.strip
+  return { error: "kubectl returned empty image" } if image.empty?
+  # Tag is everything after the LAST ':' in the final path segment — this
+  # avoids treating a registry port (host:5000/...) as the tag.
+  last_segment = image.split("/").last
+  tag = last_segment.include?(":") ? last_segment.split(":", 2)[1] : nil
+  return { error: "image has no tag: #{image}" } if tag.nil? || tag.empty?
+
+  # released_at = the current pod's start time. This approximates "when this
+  # version went live" but advances on any pod restart (OOM kill, liveness
+  # failure) — not strictly the deploy time. Good enough for the versions
+  # command; we'd need a deploy annotation for a true deploy timestamp.
+  started_at, _ = Open3.capture2(
+    "kubectl", "-n", ns, "get", "pod",
+    "-l", "app=#{app.name}",
+    "-o", "jsonpath={.items[0].status.startTime}"
+  )
+  released_at = started_at.strip
+  released_at = nil if released_at.empty?
+
+  { "version" => tag, "released_at" => released_at }
+rescue => e
+  { error: e.message }
+end
+
+def fetch_app_version(registry, app)
+  url = registry.prod_url(app)
+  return fetch_version(url) if url
+  return fetch_k8s_version(app) if app.docker_k8s
+  { error: "no prod url or docker_k8s config" }
+end
+
 def cmd_versions(args)
   _, app_filter, _ = parse_common_flags(args)
 
@@ -412,11 +456,7 @@ def cmd_versions(args)
   end
 
   rows = apps.map do |app|
-    Thread.new do
-      url = registry.prod_url(app)
-      data = url ? fetch_version(url) : { error: "no prod url" }
-      [app.name, data]
-    end
+    Thread.new { [app.name, fetch_app_version(registry, app)] }
   end.map(&:value)
 
   name_w = rows.map { |n, _| n.length }.max
