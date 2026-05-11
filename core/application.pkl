@@ -6,6 +6,16 @@ class Application {
     scala: ScalaConfig?
     elm: ElmConfig?
     sveltekit: SvelteKit?
+
+    /// Source of the production domain for version-check pings. Set exactly one
+    /// of `platform_tenant_id` or `prod_domain` for deployable apps; leave both
+    /// null for non-deployable apps (archived projects, k8s workers that don't
+    /// expose an HTTP /version, etc.).
+    platform_tenant_id: String?
+    prod_domain: String?
+
+    /// GitHub repository in "owner/name" form. Null = derive from `name`.
+    repo: String?
 }
 
 class SvelteKit {}
