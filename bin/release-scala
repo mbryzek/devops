@@ -17,6 +17,11 @@ puts ""
 puts Util.underline("Releasing #{app} version #{version}")
 puts ""
 
+# Write conf/version.txt so the deployed app can serve /_internal_/version
+set_version_cmd = File.expand_path("~/code/claude/bin/set-version") +
+  " --app #{app} --version #{version}"
+Util.run(set_version_cmd)
+
 # Build Docker image
 puts "Building Docker image..."
 build_cmd = File.join(__dir__, "k8s-build") + " --app #{app} --tag #{version}"

@@ -1,6 +1,6 @@
 class ReleaseHelper
 
-  attr_reader :config, :release_dir, :pwd, :app_config
+  attr_reader :config, :release_dir, :pwd, :app_config, :app
 
   def initialize(app_type)
     @log_file = "/tmp/devops.release.log"
