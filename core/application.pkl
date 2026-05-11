@@ -16,6 +16,11 @@ class Application {
 
     /// GitHub repository in "owner/name" form. Null = derive from `name`.
     repo: String?
+
+    /// Mark a project as ignored — excluded from version checks and deploy
+    /// tracking even if it has a tenant id or prod_domain set. Use for archived
+    /// or non-HTTP-deployable apps.
+    ignored: Boolean = false
 }
 
 class SvelteKit {}
