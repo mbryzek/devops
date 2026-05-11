@@ -21,9 +21,11 @@ class ApiClient
   end
 
   def self.write_session_id(id)
-    FileUtils.mkdir_p(File.dirname(SESSION_FILE))
-    File.write(SESSION_FILE, id)
-    File.chmod(0600, SESSION_FILE)
+    dir = File.dirname(SESSION_FILE)
+    FileUtils.mkdir_p(dir, mode: 0700)
+    tmp = "#{SESSION_FILE}.tmp.#{Process.pid}"
+    File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0600) { |f| f.write(id) }
+    File.rename(tmp, SESSION_FILE)
   end
 
   def self.clear_session_id
