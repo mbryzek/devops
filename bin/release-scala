@@ -29,6 +29,14 @@ Util.run(build_cmd)
 
 puts ""
 
+# Sync ConfigMap + Secrets so the new pods load current env values.
+# release-scala used to skip this, which left stale config in the cluster.
+puts "Syncing ConfigMap + Secrets..."
+secrets_cmd = File.join(__dir__, "k8s-secrets") + " --app #{app}"
+Util.run(secrets_cmd)
+
+puts ""
+
 # Deploy to Kubernetes
 puts "Deploying to Kubernetes..."
 deploy_cmd = File.join(__dir__, "k8s-deploy") + " --app #{app} --tag #{version}"
