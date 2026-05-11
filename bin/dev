@@ -40,8 +40,13 @@ USAGE = <<~USAGE
     versions [--localhost]
         Show deployed app version(s) and release timestamp.
 
-    pending [--app APP]
+    pending [list] [--app APP]
         List apps whose origin/main is ahead of the latest tag (need deploy).
+        `list` is the default when no subcommand is given.
+    pending release [--app APP] [--concurrency N]
+        Release every app `pending list` would report, in parallel.
+        Defaults to 4 concurrent releases. Auto-confirms new git tags
+        (RELEASE_AUTO_TAG=1). Skips repos not on `main` or with a dirty tree.
 
     config check [--app APP]
         Diff live ConfigMap in cluster against env/apps/<app>/env/production.env.
@@ -489,7 +494,8 @@ def pending_for(app)
   fetch_err = `git -C #{dir} fetch -q origin 2>&1`
   return { error: "fetch failed: #{fetch_err.strip}" } unless $?.success?
 
-  tag = `cd #{dir} && sem-info tag latest 2>/dev/null`.strip
+  tag_out, tag_status = Open3.capture2("sem-info", "tag", "latest", chdir: dir)
+  tag = tag_status.success? ? tag_out.strip : ""
   return { error: "no tag" } if tag.empty? || tag == "0.0.0"
 
   ref = `git -C #{dir} rev-parse --verify --quiet origin/main`.strip
@@ -501,9 +507,7 @@ def pending_for(app)
   { tag: tag, ahead: count, last: last }
 end
 
-def cmd_pending(args)
-  _, app_filter, _ = parse_common_flags(args)
-
+def resolve_pending_apps(app_filter)
   registry = Work::Registry.load
   apps = registry.deployable.sort_by(&:name)
   apps = apps.select { |a| a.name == app_filter } if app_filter
@@ -511,10 +515,12 @@ def cmd_pending(args)
     valid = registry.deployable.map(&:name).sort.join(", ")
     Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{valid}")
   end
+  apps.map { |app| Thread.new { [app.name, pending_for(app)] } }.map(&:value)
+end
 
-  rows = apps.map do |app|
-    Thread.new { [app.name, pending_for(app)] }
-  end.map(&:value)
+def cmd_pending_list(args)
+  _, app_filter, _ = parse_common_flags(args)
+  rows = resolve_pending_apps(app_filter)
 
   pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
   errors  = rows.select { |_, d| d[:error] }
@@ -532,6 +538,117 @@ def cmd_pending(args)
   unless errors.empty?
     puts ""
     errors.each { |name, d| puts "#{name}: #{d[:error]}" }
+  end
+end
+
+def parse_pending_release_args(args)
+  app_filter = nil
+  concurrency = 4
+  i = 0
+  while i < args.length
+    a = args[i]
+    case a
+    when "--app"
+      app_filter = args[i + 1]
+      usage_exit("--app requires a value") if app_filter.nil?
+      i += 2
+    when "--concurrency"
+      raw = args[i + 1]
+      usage_exit("--concurrency requires a positive integer") if raw.nil? || raw.to_i <= 0
+      concurrency = raw.to_i
+      i += 2
+    else
+      usage_exit("Unknown argument: #{a}")
+    end
+  end
+  [app_filter, concurrency]
+end
+
+def release_one(name)
+  dir = File.expand_path("~/code/#{name}")
+  return { ok: false, log: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
+
+  branch = git_current_branch(dir)
+  unless branch == "main"
+    where = branch.nil? ? "detached HEAD" : "on #{branch.inspect}"
+    return { ok: false, log: "not on main (#{where})" }
+  end
+  return { ok: false, log: "working tree is dirty" } unless git_clean?(dir)
+
+  release_bin = File.expand_path(File.join(__dir__, "release"))
+  env = { "RELEASE_AUTO_TAG" => "1" }
+  out, status = Open3.capture2e(env, release_bin, "--app", name, chdir: dir)
+  { ok: status.success?, log: out }
+rescue => e
+  { ok: false, log: "release_one raised: #{e.class}: #{e.message}" }
+end
+
+def cmd_pending_release(args)
+  app_filter, concurrency = parse_pending_release_args(args)
+  rows = resolve_pending_apps(app_filter)
+
+  pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }.map(&:first)
+  errors  = rows.select { |_, d| d[:error] }
+
+  if pending.empty?
+    puts "All apps up to date"
+    unless errors.empty?
+      puts ""
+      errors.each { |name, d| puts "#{name}: #{d[:error]}" }
+    end
+    return
+  end
+
+  puts "Releasing #{pending.length} app(s) with concurrency=#{concurrency}: #{pending.join(', ')}"
+  puts ""
+
+  queue = Queue.new
+  pending.each { |n| queue << n }
+  results_mutex = Mutex.new
+  results = {}
+
+  workers = Array.new([concurrency, pending.length].min) do
+    Thread.new do
+      while (name = (queue.pop(true) rescue nil))
+        result =
+          begin
+            puts "  #{name} [starting]"
+            release_one(name)
+          rescue => e
+            { ok: false, log: "worker crashed: #{e.class}: #{e.message}" }
+          end
+        results_mutex.synchronize { results[name] = result }
+        puts "  #{name} [#{result[:ok] ? 'done' : 'FAIL'}]"
+      end
+    end
+  end
+  workers.each(&:join)
+
+  pending.each do |n|
+    results[n] ||= { ok: false, log: "no result recorded (worker died?)" }
+  end
+  succeeded = pending.select { |n| results[n][:ok] }
+  failed    = pending.reject { |n| results[n][:ok] }
+
+  puts ""
+  puts Util.underline("Summary")
+  puts "  released: #{succeeded.empty? ? '(none)' : succeeded.join(', ')}"
+  puts "  failed:   #{failed.join(', ')}" unless failed.empty?
+
+  unless errors.empty?
+    puts ""
+    puts "Pending-detection errors:"
+    errors.each { |name, d| puts "  #{name}: #{d[:error]}" }
+  end
+
+  unless failed.empty?
+    puts ""
+    failed.each do |name|
+      puts Util.underline(name)
+      puts results[name][:log]
+      puts ""
+    end
+    exit 1
   end
 end
 
@@ -807,12 +924,13 @@ end
 
 # ---------- dispatch ----------
 
-argv = ARGV.dup
-usage_exit if argv.empty?
-usage_exit if %w[-h --help help].include?(argv.first)
+if __FILE__ == $PROGRAM_NAME
+  argv = ARGV.dup
+  usage_exit if argv.empty?
+  usage_exit if %w[-h --help help].include?(argv.first)
 
-command = argv.shift
-case command
+  command = argv.shift
+  case command
 when "login"
   cmd_login(argv)
 when "logout"
@@ -830,7 +948,17 @@ when "invariants"
 when "version", "versions"
   cmd_versions(argv)
 when "pending"
-  cmd_pending(argv)
+  sub = argv.first
+  if sub.nil? || sub.start_with?("-")
+    cmd_pending_list(argv)
+  else
+    argv.shift
+    case sub
+    when "list"    then cmd_pending_list(argv)
+    when "release" then cmd_pending_release(argv)
+    else                usage_exit("Unknown pending subcommand: #{sub}")
+    end
+  end
 when "config"
   sub = argv.shift
   case sub
@@ -853,6 +981,7 @@ when "browserslist"
   when nil      then usage_exit("browserslist requires a subcommand")
   else               usage_exit("Unknown browserslist subcommand: #{sub}")
   end
-else
-  usage_exit("Unknown command: #{command}")
+  else
+    usage_exit("Unknown command: #{command}")
+  end
 end

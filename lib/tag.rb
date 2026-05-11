@@ -1,8 +1,18 @@
 class Tag
+  AUTO_TAG_ENV = "RELEASE_AUTO_TAG"
+
+  def Tag.auto?
+    %w[1 true yes].include?(ENV[AUTO_TAG_ENV].to_s.downcase)
+  end
+
   def Tag.ask
     next_tag = Tag.next_tag
     puts ""
-    if Ask.for_boolean("Create new tag #{next_tag}?")
+    if Tag.auto?
+      puts "Creating new tag #{next_tag} (#{AUTO_TAG_ENV} set)"
+      Util.run("git tag -a -m #{next_tag} #{next_tag}")
+      Util.run("git push --tags origin")
+    elsif Ask.for_boolean("Create new tag #{next_tag}?")
       Util.run("git tag -a -m #{next_tag} #{next_tag}")
       Util.run("git push --tags origin")
     end
