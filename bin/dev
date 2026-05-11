@@ -130,9 +130,8 @@ def cmd_login(args)
     Util.exit_with_error("Login failed: #{e.message}")
   end
 
-  discriminator = res["discriminator"]
-  if discriminator && discriminator != "tenant_session"
-    Util.exit_with_error("Login failed: account status is '#{res['status'] || discriminator}'")
+  unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
+    Util.exit_with_error("Login failed: unexpected response: #{res.inspect}")
   end
 
   session = res["session"]
