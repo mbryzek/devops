@@ -631,6 +631,9 @@ def release_one(name)
   end
   return { ok: false, log: "working tree is dirty" } unless git_clean?(dir)
 
+  pull_out = `git -C #{dir} pull --ff-only origin main 2>&1`
+  return { ok: false, log: "pull --ff-only failed: #{pull_out.strip}" } unless $?.success?
+
   release_bin = File.expand_path(File.join(__dir__, "release"))
   env = { "RELEASE_AUTO_TAG" => "1" }
   out, status = Open3.capture2e(env, release_bin, "--app", name, chdir: dir)
