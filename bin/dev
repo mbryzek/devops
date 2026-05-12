@@ -53,6 +53,10 @@ USAGE = <<~USAGE
     config rollout [--app APP]
         Apply k8s-secrets and rollout restart workloads (picks up ConfigMap changes).
 
+    docker prune [--days N] [--dry-run] [--yes]
+        Remove Docker images, build cache, and dangling volumes older than N days
+        (default 7). Useful when local disk fills from pushed-but-unused builds.
+
     browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]
         Shallow-clone every ~/code/* repo with a package.json into
         ~/code/browserslist.<YYYYMMDD>/<name>, run `npx update-browserslist-db@latest`,
@@ -396,6 +400,58 @@ def cmd_tasks_requeue(args)
 
   puts ""
   exit 1 unless all_ok
+end
+
+# ---------- docker prune ----------
+
+def cmd_docker_prune(args)
+  days = 7
+  dry_run = false
+  assume_yes = false
+  while (arg = args.shift)
+    case arg
+    when "--days"
+      raw = args.shift or usage_exit("--days requires a value")
+      days = Integer(raw) rescue usage_exit("--days must be an integer")
+    when "--dry-run" then dry_run = true
+    when "--yes", "-y" then assume_yes = true
+    when "-h", "--help" then puts USAGE; exit 0
+    else usage_exit("Unknown flag: #{arg}")
+    end
+  end
+  usage_exit("--days must be > 0") if days <= 0
+
+  hours = days * 24
+  filter = "until=#{hours}h"
+
+  puts "Pruning Docker resources older than #{days} day(s) (filter: #{filter})."
+  puts ""
+  puts "Pre-prune state:"
+  abort("docker not available or daemon not running") unless system("docker", "system", "df")
+
+  unless dry_run || assume_yes
+    print "\nProceed? [y/N] "
+    answer = STDIN.gets&.strip&.downcase
+    exit 0 unless answer == "y" || answer == "yes"
+  end
+
+  steps = [
+    ["containers",  ["docker", "container", "prune", "-f", "--filter", filter]],
+    ["images",      ["docker", "image",     "prune", "-af", "--filter", filter]],
+    ["build cache", ["docker", "builder",   "prune", "-af", "--filter", filter]],
+    ["volumes (all dangling — no age filter)", ["docker", "volume", "prune", "-f"]],
+  ]
+  steps.each do |label, cmd|
+    puts ""
+    suffix = dry_run ? "  (dry-run, skipping)" : ""
+    puts "==> #{label}: #{cmd.join(' ')}#{suffix}"
+    next if dry_run
+    abort("FAILED at step: #{label}") unless system(*cmd)
+  end
+
+  puts ""
+  puts "Post-prune state:"
+  system("docker", "system", "df")
 end
 
 # ---------- versions ----------
@@ -981,7 +1037,14 @@ when "browserslist"
   when nil      then usage_exit("browserslist requires a subcommand")
   else               usage_exit("Unknown browserslist subcommand: #{sub}")
   end
-  else
-    usage_exit("Unknown command: #{command}")
+when "docker"
+  sub = argv.shift
+  case sub
+  when "prune" then cmd_docker_prune(argv)
+  when nil     then usage_exit("docker requires a subcommand")
+  else              usage_exit("Unknown docker subcommand: #{sub}")
   end
+else
+  usage_exit("Unknown command: #{command}")
+end
 end
