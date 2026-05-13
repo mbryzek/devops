@@ -16,11 +16,12 @@ USAGE = <<~USAGE
 
   Commands:
     login [--email EMAIL] [--app APP] [--localhost]
-        Log in to platform and acumen (prompts for password; same credentials
-        assumed for both). Stores per-app session ids under ~/.platform/.
-        Per-app failures are warned but do not abort other logins. Pass
-        `--app acumen` or `--app platform` to target just one when
-        credentials differ.
+        Log in to platform and acumen. Prompts for email + password
+        separately per app (credentials differ between stacks). If
+        --email is passed it is reused for both; password is always
+        re-prompted. Per-app failures warn but do not abort others.
+        Pass `--app acumen` or `--app platform` to target just one.
+        Sessions are stored under ~/.platform/.
 
     logout [--localhost]
         Clear the cached devops sessions (platform + acumen).
@@ -146,7 +147,7 @@ end
 
 def login_acumen(use_localhost, email, password)
   acumen_ep = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "acumen").first
-  res = ApiClient.request(acumen_ep, :post, "/login",
+  res = ApiClient.request(acumen_ep, :post, "/sessions/login",
                           body: { email: email, password: password },
                           auth_required: false)
   raise ApiError, "unexpected response: #{res.inspect}" unless res.is_a?(Hash)
@@ -196,30 +197,40 @@ def cmd_login(args)
   targets = ApiClient.endpoints(use_localhost: use_localhost).select { |e| apps.include?(e[:app]) }
   puts "Logging in to: #{targets.map { |e| "#{e[:name]} (#{e[:active_url]})" }.join(', ')}"
 
-  if email.nil? || email.empty?
-    print "Email: "
-    email = STDIN.gets&.strip
-    usage_exit("Email is required") if email.nil? || email.empty?
-  end
-
-  print "Password: "
-  password = STDIN.noecho(&:gets)&.chomp
-  puts ""
-  Util.exit_with_error("Password is required") if password.nil? || password.empty?
-
   any_ok = false
-  apps.each do |app|
+  targets.each do |target|
+    puts ""
+    puts "[#{target[:name]}] (#{target[:active_url]})"
+
+    target_email = email
+    if target_email.nil? || target_email.empty?
+      print "  Email: "
+      target_email = STDIN.gets&.strip
+      if target_email.nil? || target_email.empty?
+        warn "  skipped (no email)"
+        next
+      end
+    end
+
+    print "  Password: "
+    password = STDIN.noecho(&:gets)&.chomp
+    puts ""
+    if password.nil? || password.empty?
+      warn "  skipped (no password)"
+      next
+    end
+
     begin
-      case app
-      when "platform" then login_platform(use_localhost, email, password)
-      when "acumen"   then login_acumen(use_localhost, email, password)
+      case target[:app]
+      when "platform" then login_platform(use_localhost, target_email, password)
+      when "acumen"   then login_acumen(use_localhost, target_email, password)
       else
-        warn "Unknown app: #{app}"
+        warn "  unknown app: #{target[:app]}"
         next
       end
       any_ok = true
     rescue ApiError => e
-      warn "#{app.capitalize} login failed: #{e.message}"
+      warn "  #{target[:name]} login failed: #{e.message}"
     end
   end
 
