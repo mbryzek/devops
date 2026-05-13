@@ -15,9 +15,12 @@ USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
   Commands:
-    login [--email EMAIL] [--localhost]
+    login [--email EMAIL] [--app APP] [--localhost]
         Log in to platform and acumen (prompts for password; same credentials
-        for both). Stores per-app session ids under ~/.platform/.
+        assumed for both). Stores per-app session ids under ~/.platform/.
+        Per-app failures are warned but do not abort other logins. Pass
+        `--app acumen` or `--app platform` to target just one when
+        credentials differ.
 
     logout [--localhost]
         Clear the cached devops sessions (platform + acumen).
@@ -127,9 +130,39 @@ end
 
 # ---------- login / logout ----------
 
+def login_platform(use_localhost, email, password)
+  res = ApiClient.request(platform_endpoint(use_localhost), :post, "/tenant/platform/session/logins",
+                          body: { email: email, password: password },
+                          auth_required: false)
+  raise ApiError, "unexpected response: #{res.inspect}" unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
+
+  session_id = res.dig("session", "id")
+  raise ApiError, "response missing session.id: #{res.inspect}" if session_id.nil? || session_id.empty?
+
+  ApiClient.write_session_id_for("platform", session_id)
+  user_email = res.dig("user", "email") || email
+  puts "Logged in to platform as #{user_email}"
+end
+
+def login_acumen(use_localhost, email, password)
+  acumen_ep = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "acumen").first
+  res = ApiClient.request(acumen_ep, :post, "/login",
+                          body: { email: email, password: password },
+                          auth_required: false)
+  raise ApiError, "unexpected response: #{res.inspect}" unless res.is_a?(Hash)
+
+  session_id = res["id"]
+  raise ApiError, "response missing session id: #{res.inspect}" if session_id.nil? || session_id.empty?
+
+  ApiClient.write_session_id_for("acumen", session_id)
+  user_email = res.dig("user", "email") || email
+  puts "Logged in to acumen as #{user_email}"
+end
+
 def cmd_login(args)
   email = nil
   use_localhost = false
+  app_filter = nil
   i = 0
   while i < args.length
     a = args[i]
@@ -137,6 +170,10 @@ def cmd_login(args)
     when "--email"
       email = args[i + 1]
       usage_exit("--email requires a value") if email.nil?
+      i += 2
+    when "--app"
+      app_filter = args[i + 1]
+      usage_exit("--app requires a value") if app_filter.nil?
       i += 2
     when "--localhost"
       use_localhost = true
@@ -146,8 +183,18 @@ def cmd_login(args)
     end
   end
 
-  targets = ApiClient.endpoints(use_localhost: use_localhost).map { |e| "#{e[:name]} (#{e[:active_url]})" }
-  puts "Logging in to: #{targets.join(', ')}"
+  apps = if app_filter
+           valid = ApiClient::ENDPOINTS.map { |e| e[:app] }
+           unless valid.include?(app_filter)
+             usage_exit("--app must be one of: #{valid.join(', ')}")
+           end
+           [app_filter]
+         else
+           ApiClient::ENDPOINTS.map { |e| e[:app] }
+         end
+
+  targets = ApiClient.endpoints(use_localhost: use_localhost).select { |e| apps.include?(e[:app]) }
+  puts "Logging in to: #{targets.map { |e| "#{e[:name]} (#{e[:active_url]})" }.join(', ')}"
 
   if email.nil? || email.empty?
     print "Email: "
@@ -160,46 +207,23 @@ def cmd_login(args)
   puts ""
   Util.exit_with_error("Password is required") if password.nil? || password.empty?
 
-  platform_ep = platform_endpoint(use_localhost)
-  begin
-    res = ApiClient.request(platform_ep, :post, "/tenant/platform/session/logins",
-                            body: { email: email, password: password },
-                            auth_required: false)
-  rescue ApiError => e
-    Util.exit_with_error("Platform login failed: #{e.message}")
+  any_ok = false
+  apps.each do |app|
+    begin
+      case app
+      when "platform" then login_platform(use_localhost, email, password)
+      when "acumen"   then login_acumen(use_localhost, email, password)
+      else
+        warn "Unknown app: #{app}"
+        next
+      end
+      any_ok = true
+    rescue ApiError => e
+      warn "#{app.capitalize} login failed: #{e.message}"
+    end
   end
 
-  unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
-    Util.exit_with_error("Platform login failed: unexpected response: #{res.inspect}")
-  end
-
-  session = res["session"]
-  session_id = session && session["id"]
-  Util.exit_with_error("Platform login response missing session.id: #{res.inspect}") if session_id.nil? || session_id.empty?
-
-  ApiClient.write_session_id_for("platform", session_id)
-  user = res["user"] || {}
-  puts "Logged in to platform as #{user['email'] || email}"
-
-  acumen_ep = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "acumen").first
-  begin
-    res = ApiClient.request(acumen_ep, :post, "/login",
-                            body: { email: email, password: password },
-                            auth_required: false)
-  rescue ApiError => e
-    warn "Acumen login failed: #{e.message}"
-    return
-  end
-
-  acumen_session_id = res.is_a?(Hash) && res["id"]
-  if acumen_session_id.nil? || acumen_session_id.empty?
-    warn "Acumen login response missing session id: #{res.inspect}"
-    return
-  end
-
-  ApiClient.write_session_id_for("acumen", acumen_session_id)
-  acumen_user = (res["user"] || {})
-  puts "Logged in to acumen as #{acumen_user['email'] || email}"
+  Util.exit_with_error("No logins succeeded") unless any_ok
 end
 
 def cmd_logout(args)
