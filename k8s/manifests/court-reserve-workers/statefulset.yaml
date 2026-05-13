@@ -51,22 +51,29 @@ spec:
           volumeMounts:
             - name: browser-profile
               mountPath: /app/browser-profile
-          # Sized for actual Chromium-headless usage: ~250Mi idle, ~500-900Mi
-          # during a scrape, ~1.5Gi peak on heavy admin grids. The original
-          # 2Gi/4Gi was inherited from Fly's performance-2x and never measured.
-          # Request fits in the existing job node pool without scale-out;
-          # bursts borrow from acumen-job's unused headroom. Under contention
-          # CRW (Burstable) is OOM-killed first — acceptable for a retryable
-          # background scraper.
+          # Sized for actual Chromium-headful usage: ~250Mi idle, ~500-900Mi
+          # during a scrape, ~1.2Gi observed peak on a 3-year members batch
+          # (picklejar, wrq-138672cd2b364b5a85c3c04157c027b1, 2026-05-12).
+          # The request previously sat at 400Mi, which made CRW the preferred
+          # eviction victim under node memory pressure (kubelet evicts the
+          # container whose usage most exceeds request). 1Gi keeps the kubelet
+          # eviction picker honest while leaving headroom on the s-1vcpu-2gb
+          # node (~1.4Gi allocatable). Limit bumped 1300Mi -> 1400Mi: the
+          # observed 1.18Gi peak left only ~120Mi before kernel OOMKill, and
+          # an OOMKill mid-scrape is worse than the eviction we fixed — no
+          # closeSession() flush, browser-profile PVC may corrupt. 1400Mi
+          # still sits at the node allocatable ceiling, so a runaway tab
+          # still terminates cleanly via OOMKill rather than starving the
+          # node. NOTE: a 1Gi request on a 1.4Gi-allocatable node leaves
+          # ~400Mi for system processes; if this pool ever grows past one
+          # app we need to bump the node class (s-1vcpu-3gb / s-2vcpu-4gb).
           resources:
             requests:
               cpu: 200m
-              memory: 400Mi
+              memory: 1Gi
             limits:
-              # Caps below node allocatable (~1.4Gi on s-1vcpu-2gb) to avoid
-              # kernel OOM-kill from a runaway Chromium tab.
               cpu: 900m
-              memory: 1300Mi
+              memory: 1400Mi
           # Liveness is intentionally lenient: a Chromium scrape can saturate
           # the Node event loop for tens of seconds at a time. Failing here
           # restarts the pod mid-scrape. 60s * 5 = 5min before kill.
