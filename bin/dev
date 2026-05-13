@@ -146,6 +146,9 @@ def cmd_login(args)
     end
   end
 
+  targets = ApiClient.endpoints(use_localhost: use_localhost).map { |e| "#{e[:name]} (#{e[:active_url]})" }
+  puts "Logging in to: #{targets.join(', ')}"
+
   if email.nil? || email.empty?
     print "Email: "
     email = STDIN.gets&.strip
