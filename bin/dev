@@ -15,11 +15,12 @@ USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
   Commands:
-    login [--email EMAIL]
-        Log in as a platform admin (prompts for password).
+    login [--email EMAIL] [--localhost]
+        Log in to platform and acumen (prompts for password; same credentials
+        for both). Stores per-app session ids under ~/.platform/.
 
-    logout
-        Clear the cached devops session.
+    logout [--localhost]
+        Clear the cached devops sessions (platform + acumen).
 
     invariants check [--app APP] [--localhost]
         Check invariants across endpoints.
@@ -156,26 +157,46 @@ def cmd_login(args)
   puts ""
   Util.exit_with_error("Password is required") if password.nil? || password.empty?
 
-  endpoint = platform_endpoint(use_localhost)
+  platform_ep = platform_endpoint(use_localhost)
   begin
-    res = ApiClient.request(endpoint, :post, "/tenant/platform/session/logins",
+    res = ApiClient.request(platform_ep, :post, "/tenant/platform/session/logins",
                             body: { email: email, password: password },
                             auth_required: false)
   rescue ApiError => e
-    Util.exit_with_error("Login failed: #{e.message}")
+    Util.exit_with_error("Platform login failed: #{e.message}")
   end
 
   unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
-    Util.exit_with_error("Login failed: unexpected response: #{res.inspect}")
+    Util.exit_with_error("Platform login failed: unexpected response: #{res.inspect}")
   end
 
   session = res["session"]
   session_id = session && session["id"]
-  Util.exit_with_error("Login response missing session.id: #{res.inspect}") if session_id.nil? || session_id.empty?
+  Util.exit_with_error("Platform login response missing session.id: #{res.inspect}") if session_id.nil? || session_id.empty?
 
-  ApiClient.write_session_id(session_id)
+  ApiClient.write_session_id_for("platform", session_id)
   user = res["user"] || {}
-  puts "Logged in as #{user['email'] || email}"
+  puts "Logged in to platform as #{user['email'] || email}"
+
+  acumen_ep = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "acumen").first
+  begin
+    res = ApiClient.request(acumen_ep, :post, "/login",
+                            body: { email: email, password: password },
+                            auth_required: false)
+  rescue ApiError => e
+    warn "Acumen login failed: #{e.message}"
+    return
+  end
+
+  acumen_session_id = res.is_a?(Hash) && res["id"]
+  if acumen_session_id.nil? || acumen_session_id.empty?
+    warn "Acumen login response missing session id: #{res.inspect}"
+    return
+  end
+
+  ApiClient.write_session_id_for("acumen", acumen_session_id)
+  acumen_user = (res["user"] || {})
+  puts "Logged in to acumen as #{acumen_user['email'] || email}"
 end
 
 def cmd_logout(args)
@@ -187,18 +208,33 @@ def cmd_logout(args)
     end
   end
 
-  if ApiClient.session_id.nil?
+  platform_sid = ApiClient.session_id_for("platform")
+  acumen_sid   = ApiClient.session_id_for("acumen")
+
+  if platform_sid.nil? && acumen_sid.nil?
     puts "No active session"
     return
   end
 
-  endpoint = platform_endpoint(use_localhost)
-  begin
-    ApiClient.request(endpoint, :delete, "/tenant/platform/session", auth_required: true)
-  rescue SessionExpired, ApiError
-    # ignore - we'll clear locally anyway
+  if platform_sid
+    begin
+      ApiClient.request(platform_endpoint(use_localhost), :delete, "/tenant/platform/session", auth_required: true)
+    rescue SessionExpired, ApiError
+      # ignore - we'll clear locally anyway
+    end
+    ApiClient.clear_session_id_for("platform")
   end
-  ApiClient.clear_session_id
+
+  if acumen_sid
+    begin
+      acumen_ep = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "acumen").first
+      ApiClient.request(acumen_ep, :post, "/logout", auth_required: true)
+    rescue SessionExpired, ApiError
+      # ignore - we'll clear locally anyway
+    end
+    ApiClient.clear_session_id_for("acumen")
+  end
+
   puts "Logged out"
 end
 

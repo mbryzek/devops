@@ -12,24 +12,32 @@ class ApiClient
     { name: "Platform", url: "https://idempotent.io",      localhost: "http://localhost:9300", app: "platform" }
   ].freeze
 
-  SESSION_FILE = File.expand_path("~/.platform/devops")
+  # Each app gets its own session file + session header. Platform's session
+  # cookie is named `session_id`; acumen's is `acumen_session_id`.
+  SESSION_CONFIG = {
+    "platform" => { file: File.expand_path("~/.platform/devops"),        header: "session_id" },
+    "acumen"   => { file: File.expand_path("~/.platform/devops_acumen"), header: "acumen_session_id" },
+  }.freeze
 
-  def self.session_id
-    return nil unless File.exist?(SESSION_FILE)
-    id = File.read(SESSION_FILE).strip
+  def self.session_id_for(app)
+    cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
+    return nil unless File.exist?(cfg[:file])
+    id = File.read(cfg[:file]).strip
     id.empty? ? nil : id
   end
 
-  def self.write_session_id(id)
-    dir = File.dirname(SESSION_FILE)
+  def self.write_session_id_for(app, id)
+    cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
+    dir = File.dirname(cfg[:file])
     FileUtils.mkdir_p(dir, mode: 0700)
-    tmp = "#{SESSION_FILE}.tmp.#{Process.pid}"
+    tmp = "#{cfg[:file]}.tmp.#{Process.pid}"
     File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0600) { |f| f.write(id) }
-    File.rename(tmp, SESSION_FILE)
+    File.rename(tmp, cfg[:file])
   end
 
-  def self.clear_session_id
-    File.delete(SESSION_FILE) if File.exist?(SESSION_FILE)
+  def self.clear_session_id_for(app)
+    cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
+    File.delete(cfg[:file]) if File.exist?(cfg[:file])
   end
 
   def self.endpoints(use_localhost:, app_filter: nil)
@@ -52,8 +60,10 @@ class ApiClient
     req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
     if auth_required
-      sid = session_id or raise SessionExpired, "No session. Run 'dev login'."
-      req["session_id"] = sid
+      cfg = SESSION_CONFIG.fetch(endpoint[:app])
+      sid = session_id_for(endpoint[:app]) or
+        raise SessionExpired, "No session for #{endpoint[:app]}. Run 'dev login'."
+      req[cfg[:header]] = sid
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body
 
