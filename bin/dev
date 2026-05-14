@@ -26,8 +26,9 @@ USAGE = <<~USAGE
     logout [--localhost]
         Clear the cached devops sessions (platform + acumen).
 
-    invariants check [--app APP] [--localhost]
-        Check invariants across endpoints.
+    invariants check [--app APP] [--localhost] [--examples N | --all-examples]
+        Check invariants across endpoints. Shows up to N examples per failure
+        (default 10), or all with --all-examples.
 
     invariants snoozes [--app APP] [--localhost]
         List active invariant snoozes.
@@ -278,16 +279,17 @@ end
 
 # ---------- invariants ----------
 
-def print_invariant_failures(result)
+def print_invariant_failures(result, example_limit: 10)
   (result["non_zero"] || []).each do |inv|
     puts "  - #{inv['name']}"
     puts "    Count: #{inv['count']}"
     examples = inv["examples"] || []
     unless examples.empty?
       puts "    Examples:"
-      examples.take(3).each { |ex| puts "      * #{ex}" }
-      if examples.length > 3
-        puts "      ... and #{examples.length - 3} more"
+      shown = example_limit.nil? ? examples : examples.take(example_limit)
+      shown.each { |ex| puts "      * #{ex}" }
+      if !example_limit.nil? && examples.length > example_limit
+        puts "      ... and #{examples.length - example_limit} more"
       end
     end
   end
@@ -299,7 +301,21 @@ def print_invariant_failures(result)
 end
 
 def cmd_invariants_check(args)
-  _, app_filter, use_localhost = parse_common_flags(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  example_limit = 10
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--examples"
+      example_limit = Integer(rest[i + 1] || usage_exit("--examples requires a value"))
+      i += 2
+    when "--all-examples"
+      example_limit = nil
+      i += 1
+    else
+      usage_exit("Unknown flag: #{rest[i]}")
+    end
+  end
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
   puts ""
@@ -345,7 +361,7 @@ def cmd_invariants_check(args)
         puts "#{endpoint[:name]}: #{total_count} invariants passed"
       else
         puts Util.underline("#{endpoint[:name]}: #{failure_count} FAILURES (#{total_count} total)")
-        print_invariant_failures(result)
+        print_invariant_failures(result, example_limit: example_limit)
         all_passed = false
       end
     end
