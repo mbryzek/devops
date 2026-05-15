@@ -5,6 +5,7 @@
 ///   Name: platform-lb
 ///   Certificate: idempotent-io-ssl-certificate (a8487391-c0d5-4a33-9ded-408fea25b075)
 ///   Hostname: idempotent.io
+///   Targets: droplets tagged `web-lb-target` (auto-tracks pool replacement)
 
 module platform
 
