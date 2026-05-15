@@ -134,7 +134,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "\(javaAgentFlags("web"))-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlags("web"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=65.0 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc*:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -198,6 +198,22 @@ resources: Listing<K8sResource> = new {
                     command = new { "/bin/sh"; "-c"; "sleep 10" }
                   }
                 }
+              }
+              volumeMounts = new {
+                new {
+                  name = "heap-dumps"
+                  mountPath = "/heap-dumps"
+                }
+              }
+            }
+          }
+          volumes = new {
+            new {
+              name = "heap-dumps"
+              emptyDir {
+                // Heap dump cannot exceed the heap size (65% of 1500Mi ≈ 975Mi).
+                // Cap at 1500Mi to prevent filling node ephemeral storage.
+                sizeLimit = "1500Mi"
               }
             }
           }
