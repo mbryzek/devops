@@ -10,5 +10,5 @@ module platform
 
 appName = "platform"
 appPort = 9300
-webMemory = "4900Mi"
+webMemory = "3000Mi"
 javaAgent = "/opt/newrelic/newrelic.jar"
