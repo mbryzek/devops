@@ -210,7 +210,11 @@ resources: Listing<K8sResource> = new {
           volumes = new {
             new {
               name = "heap-dumps"
-              emptyDir {}
+              emptyDir {
+                // Heap dump cannot exceed the heap size (65% of 1500Mi ≈ 975Mi).
+                // Cap at 1500Mi to prevent filling node ephemeral storage.
+                sizeLimit = "1500Mi"
+              }
             }
           }
           terminationGracePeriodSeconds = 30
