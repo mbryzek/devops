@@ -90,13 +90,16 @@ resources: Listing<K8sResource> = new {
           ["tier"] = "web"
         }
       }
-      // RollingUpdate: start new pod before killing old to prevent broadcast
-      // failures when job server cannot reach web during replacement.
+      // RollingUpdate strategy:
+      //   - replicas=1: surge=1/unavailable=0 — must surge to avoid going to 0 pods.
+      //   - replicas>=2: surge=0/unavailable=1 — tolerate one pod down (others keep
+      //     serving). Surge=0 keeps peak pod count == replicas, required when web
+      //     nodes are memory-saturated and cannot host an extra surge pod.
       strategy {
         type = "RollingUpdate"
         rollingUpdate {
-          maxSurge = 1
-          maxUnavailable = 0
+          maxSurge = if (webReplicas >= 2) 0 else 1
+          maxUnavailable = if (webReplicas >= 2) 1 else 0
         }
       }
       template {
