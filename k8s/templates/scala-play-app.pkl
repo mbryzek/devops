@@ -47,7 +47,13 @@ local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-jav
 // with another app's pod); at webReplicas>=2 we swap in place (see strategy
 // block below).
 local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
-local memoryJobServer = read?("env:JOB_MEMORY") ?? "11000Mi"
+// 13000Mi sits comfortably under the ~14300Mi allocatable on s-4vcpu-16gb-amd
+// (leaves ~1300Mi for kube-system DaemonSets) and yields a ~9750MB JVM heap
+// at -XX:MaxRAMPercentage=75.0 — up from 8256MB at 11000Mi. Sized for the
+// clubaid generate/upload pipeline where peak inflight CSV byte arrays land in
+// G1 humongous regions; the earlier 8GB heap entered a GC death spiral around
+// the same 8 GB of inflight bytea, causing 5-15 min restart loops on 2026-05-18.
+local memoryJobServer = read?("env:JOB_MEMORY") ?? "13000Mi"
 local memoryLimit = memoryDefault
 local memoryLimitJobServer = memoryJobServer
 local cpuLimit = "1800m"

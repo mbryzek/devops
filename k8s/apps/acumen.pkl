@@ -12,3 +12,7 @@ module acumen
 appName = "acumen"
 appPort = 9200
 webMemory = "1100Mi"
+// Pin acumen-job to its proven-working footprint. The scala-play-app template
+// default is now sized for platform-job's clubaid pipeline (13000Mi) and would
+// be far more than acumen-job needs on its next redeploy.
+jobMemory = "5600Mi"
