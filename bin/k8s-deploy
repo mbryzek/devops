@@ -32,8 +32,10 @@ if tag.nil? || tag.empty?
   puts "Using latest tag: #{tag}"
 end
 
-# Timeout defaults to 180 seconds (3 minutes)
-timeout = args.timeout || 180
+# Timeout defaults to 360 seconds (6 minutes)
+# JVM apps with NewRelic agent + 45s liveness initialDelay regularly exceed 180s
+# when combined with a ~13s image pull on a cold node.
+timeout = args.timeout || 360
 
 puts ""
 puts "=" * 60
