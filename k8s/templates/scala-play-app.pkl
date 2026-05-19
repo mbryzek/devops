@@ -47,7 +47,7 @@ local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-jav
 // with another app's pod); at webReplicas>=2 we swap in place (see strategy
 // block below).
 local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
-local memoryJobServer = read?("env:JOB_MEMORY") ?? "6000Mi"
+local memoryJobServer = read?("env:JOB_MEMORY") ?? "5600Mi"
 local memoryLimit = memoryDefault
 local memoryLimitJobServer = memoryJobServer
 local cpuLimit = "1800m"
