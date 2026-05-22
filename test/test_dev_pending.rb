@@ -65,26 +65,34 @@ class TestDevPending < Minitest::Test
   ensure
     ENV.delete(Tag::AUTO_TAG_ENV)
   end
+
+  def test_db_repo_identifies_postgresql_suffix
+    assert db_repo?("platform-postgresql")
+    assert db_repo?("acumen-postgresql")
+    refute db_repo?("platform")
+    refute db_repo?("acumen")
+    refute db_repo?("postgresql-tools")
+  end
 end
 
-# cmd_pending_release orchestrates parallel worker threads. Stub
-# resolve_pending_apps + release_one so the test does no real I/O.
+# cmd_pending_release orchestrates DB-first + parallel-app workers.
+# Stub resolve_pending_items + release_one so tests do no real I/O.
 class TestPendingReleaseOrchestration < Minitest::Test
   def setup
-    @apps_rows = []
+    @rows = []
     @release_results = {}
     @released = []
     @released_mutex = Mutex.new
 
-    @orig_resolve = Object.instance_method(:resolve_pending_apps)
+    @orig_resolve = Object.instance_method(:resolve_pending_items)
     @orig_release = Object.instance_method(:release_one)
 
-    rows_ref = -> { @apps_rows }
+    rows_ref = -> { @rows }
     results_ref = -> { @release_results }
     released_ref = -> { @released }
     released_mutex = @released_mutex
 
-    Object.send(:define_method, :resolve_pending_apps) { |_| rows_ref.call }
+    Object.send(:define_method, :resolve_pending_items) { |_| rows_ref.call }
     Object.send(:define_method, :release_one) do |name|
       released_mutex.synchronize { released_ref.call << name }
       results_ref.call.fetch(name) { { ok: true, log: "ok" } }
@@ -92,7 +100,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
   end
 
   def teardown
-    Object.send(:define_method, :resolve_pending_apps, @orig_resolve)
+    Object.send(:define_method, :resolve_pending_items, @orig_resolve)
     Object.send(:define_method, :release_one, @orig_release)
   end
 
@@ -105,8 +113,26 @@ class TestPendingReleaseOrchestration < Minitest::Test
     $stdout = old_stdout
   end
 
+  # Like capture_io, but tolerates SystemExit (cmd_pending_release calls
+  # `exit 1` on failure). Returns [output, system_exit_or_nil] so callers
+  # can assert on both.
+  def capture_io_with_exit
+    buf = StringIO.new
+    old_stdout = $stdout
+    $stdout = buf
+    exc = nil
+    begin
+      yield
+    rescue SystemExit => e
+      exc = e
+    end
+    [buf.string, exc]
+  ensure
+    $stdout = old_stdout
+  end
+
   def test_releases_only_apps_with_ahead_gt_zero
-    @apps_rows = [
+    @rows = [
       ["acumen",   { tag: "0.0.1", ahead: 1, last: "abc msg" }],
       ["rallyd",   { tag: "0.0.2", ahead: 0, last: "def msg" }],
       ["michaelb", { tag: "0.0.3", ahead: 2, last: "ghi msg" }],
@@ -117,7 +143,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
   end
 
   def test_skips_pending_detection_errors_but_continues
-    @apps_rows = [
+    @rows = [
       ["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }],
       ["broken", { error: "no checkout" }],
     ]
@@ -128,7 +154,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
   end
 
   def test_exits_nonzero_when_any_release_fails
-    @apps_rows = [
+    @rows = [
       ["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }],
       ["rallyd", { tag: "0.0.2", ahead: 1, last: "def" }],
     ]
@@ -143,18 +169,116 @@ class TestPendingReleaseOrchestration < Minitest::Test
   end
 
   def test_no_pending_prints_up_to_date_and_does_not_release
-    @apps_rows = [["acumen", { tag: "0.0.1", ahead: 0, last: "abc" }]]
+    @rows = [["acumen", { tag: "0.0.1", ahead: 0, last: "abc" }]]
     out = capture_io { cmd_pending_release([]) }
     assert_empty @released
     assert_match(/All apps up to date/, out)
   end
 
   def test_handles_release_one_raising
-    @apps_rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }]]
+    @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }]]
     Object.send(:define_method, :release_one) { |_| raise "kaboom" }
     err = assert_raises(SystemExit) do
       capture_io { cmd_pending_release([]) }
     end
     assert_equal 1, err.status
+  end
+
+  # ---- Two-phase ordering + DB-failure skip ----
+
+  def test_dbs_release_before_apps
+    @rows = [
+      ["acumen",              { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql",   { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["platform",            { tag: "0.0.3", ahead: 1, last: "c" }],
+      ["platform-postgresql", { tag: "0.0.4", ahead: 1, last: "d" }],
+    ]
+    capture_io { cmd_pending_release([]) }
+    db_idx = @released.each_index.select { |i| @released[i].end_with?("-postgresql") }
+    app_idx = @released.each_index.reject { |i| @released[i].end_with?("-postgresql") }
+    assert db_idx.max < app_idx.min, "expected all DBs before any app, got #{@released.inspect}"
+  end
+
+  def test_db_releases_run_serially
+    order = []
+    order_mutex = Mutex.new
+    @rows = [
+      ["acumen-postgresql",   { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    Object.send(:define_method, :release_one) do |name|
+      order_mutex.synchronize { order << "start:#{name}" }
+      sleep 0.02 # let other workers race — they shouldn't
+      order_mutex.synchronize { order << "end:#{name}" }
+      { ok: true, log: "" }
+    end
+    capture_io { cmd_pending_release(["--concurrency", "8"]) }
+    # Serial: every start is immediately followed by its end with no other start
+    # interleaved between them.
+    pairs = order.each_slice(2).to_a
+    pairs.each do |start_evt, end_evt|
+      assert_match(/^start:/, start_evt)
+      assert_match(/^end:/, end_evt)
+      assert_equal start_evt.sub("start:", ""), end_evt.sub("end:", "")
+    end
+  end
+
+  def test_failed_db_skips_matching_app_but_releases_unrelated_apps
+    @rows = [
+      ["acumen",              { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql",   { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["platform",            { tag: "0.0.3", ahead: 1, last: "c" }],
+    ]
+    @release_results = {
+      "acumen-postgresql" => { ok: false, log: "migration died" },
+    }
+    _, exc = capture_io_with_exit { cmd_pending_release([]) }
+    refute_nil exc
+    assert_equal 1, exc.status
+    # acumen-postgresql attempted (and failed); platform attempted; acumen skipped.
+    assert_includes @released, "acumen-postgresql"
+    assert_includes @released, "platform"
+    refute_includes @released, "acumen"
+  end
+
+  def test_skipped_app_appears_in_summary
+    @rows = [
+      ["acumen",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    @release_results = {
+      "acumen-postgresql" => { ok: false, log: "boom" },
+    }
+    out, exc = capture_io_with_exit { cmd_pending_release([]) }
+    refute_nil exc
+    assert_match(/skipped:\s+acumen \(db release failed/, out)
+  end
+
+  def test_db_pending_with_no_matching_app_does_not_skip_anything
+    @rows = [
+      ["athena-postgresql", { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform",          { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    @release_results = {
+      "athena-postgresql" => { ok: false, log: "boom" },
+    }
+    out, exc = capture_io_with_exit { cmd_pending_release([]) }
+    refute_nil exc
+    assert_includes @released, "platform"
+    refute_match(/skipped:/, out)
+  end
+
+  def test_only_apps_pending_no_phase_1_header
+    @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    out = capture_io { cmd_pending_release([]) }
+    refute_match(/Phase 1/, out)
+    assert_match(/Phase 2/, out)
+  end
+
+  def test_only_dbs_pending_no_phase_2_header
+    @rows = [["platform-postgresql", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    out = capture_io { cmd_pending_release([]) }
+    assert_match(/Phase 1/, out)
+    refute_match(/Phase 2/, out)
   end
 end
