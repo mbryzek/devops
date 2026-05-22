@@ -14,6 +14,15 @@
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'securerandom'
 
+# When RELEASE_DB_AUTO_CONFIRM=1 (or true/yes), both the tarball-overwrite
+# prompt and the "Ready to apply migrations" gate are answered "yes". Lets
+# `dev pending release` drive release-db from a worker without a TTY. Any
+# new interactive prompt added to release-db must respect this same flag.
+AUTO_CONFIRM_ENV = "RELEASE_DB_AUTO_CONFIRM"
+def auto_confirm?
+  %w[1 true yes].include?(ENV[AUTO_CONFIRM_ENV].to_s.downcase)
+end
+
 args = Args.parse(ARGV, ["app"])
 
 # Determine the postgresql repo directory
@@ -93,7 +102,10 @@ Dir.chdir(repo_dir) do
     tarball = File.join(repo_dir, "dist", "#{db_name}-#{current_tag}.tar.gz")
 
     if File.exist?(tarball)
-      if Ask.for_boolean("Tarball already exists. Do you want to overwrite it?")
+      if auto_confirm?
+        puts "#{AUTO_CONFIRM_ENV}=1: overwriting existing tarball #{tarball}"
+        File.delete(tarball)
+      elsif Ask.for_boolean("Tarball already exists. Do you want to overwrite it?")
         File.delete(tarball)
       end
     end
@@ -137,7 +149,9 @@ deployed = false
 begin
   puts ""
   puts "Ready to apply migrations on #{node_ip}"
-  if Ask.for_boolean("Continue?")
+  proceed = auto_confirm?
+  puts "#{AUTO_CONFIRM_ENV}=1: proceeding with apply" if proceed
+  if proceed || Ask.for_boolean("Continue?")
     puts ""
     remote_cmd = [
         "cd ~",

@@ -47,12 +47,19 @@ USAGE = <<~USAGE
         Show deployed app version(s) and release timestamp.
 
     pending [list] [--app APP]
-        List apps whose origin/main is ahead of the latest tag (need deploy).
-        `list` is the default when no subcommand is given.
+        List apps and *-postgresql repos whose origin/main is ahead of the
+        latest tag (need deploy). `list` is the default when no subcommand
+        is given. --app APP matches an app or DB name exactly (e.g.
+        `platform` vs `platform-postgresql`).
     pending release [--app APP] [--concurrency N]
-        Release every app `pending list` would report, in parallel.
-        Defaults to 4 concurrent releases. Auto-confirms new git tags
-        (RELEASE_AUTO_TAG=1). Skips repos not on `main` or with a dirty tree.
+        Release every item `pending list` would report. Two phases:
+          1. DB repos (*-postgresql) release serially via `release-db`,
+             with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
+          2. Apps release in parallel (concurrency defaults to 4) via
+             `release` with RELEASE_AUTO_TAG=1.
+        If a DB release fails, the matching app (foo for foo-postgresql)
+        is skipped to avoid deploying an app against an unmigrated schema.
+        Skips repos not on `main` or with a dirty tree.
 
     config check [--app APP]
         Diff live ConfigMap in cluster against env/apps/<app>/env/production.env.
@@ -633,8 +640,15 @@ end
 
 # ---------- pending deploys ----------
 
-def pending_for(app)
-  dir = File.expand_path("~/code/#{app.name}")
+# Glob pattern for *-postgresql checkouts. Lives next to apps under ~/code/.
+# DB repos are not in env/apps/, so we discover them from the filesystem.
+POSTGRES_REPO_GLOB = "~/code/*-postgresql"
+
+def db_repo?(name)
+  name.end_with?("-postgresql")
+end
+
+def pending_for(name, dir)
   return { error: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
   fetch_err = `git -C #{dir} fetch -q origin 2>&1`
@@ -653,20 +667,30 @@ def pending_for(app)
   { tag: tag, ahead: count, last: last }
 end
 
-def resolve_pending_apps(app_filter)
+def pending_items
   registry = Work::Registry.load
-  apps = registry.deployable.sort_by(&:name)
-  apps = apps.select { |a| a.name == app_filter } if app_filter
-  if apps.empty?
-    valid = registry.deployable.map(&:name).sort.join(", ")
-    Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{valid}")
+  items = registry.deployable.map { |app| [app.name, File.expand_path("~/code/#{app.name}")] }
+  Dir.glob(File.expand_path(POSTGRES_REPO_GLOB)).each do |dir|
+    items << [File.basename(dir), dir]
   end
-  apps.map { |app| Thread.new { [app.name, pending_for(app)] } }.map(&:value)
+  # Array#uniq keeps the first occurrence, so registry entries win over the
+  # filesystem glob if a name collides (richer metadata). Don't reorder.
+  items.uniq { |name, _| name }.sort_by { |name, _| name }
+end
+
+def resolve_pending_items(name_filter)
+  all_items = pending_items
+  items = name_filter ? all_items.select { |name, _| name == name_filter } : all_items
+  if items.empty?
+    valid = all_items.map(&:first).join(", ")
+    Util.exit_with_error("Unknown app '#{name_filter}'. Valid names: #{valid}")
+  end
+  items.map { |name, dir| Thread.new { [name, pending_for(name, dir)] } }.map(&:value)
 end
 
 def cmd_pending_list(args)
-  _, app_filter, _ = parse_common_flags(args)
-  rows = resolve_pending_apps(app_filter)
+  _, name_filter, _ = parse_common_flags(args)
+  rows = resolve_pending_items(name_filter)
 
   pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
   errors  = rows.select { |_, d| d[:error] }
@@ -724,39 +748,40 @@ def release_one(name)
   pull_out = `git -C #{dir} pull --ff-only origin main 2>&1`
   return { ok: false, log: "pull --ff-only failed: #{pull_out.strip}" } unless $?.success?
 
-  release_bin = File.expand_path(File.join(__dir__, "release"))
-  env = { "RELEASE_AUTO_TAG" => "1" }
+  if db_repo?(name)
+    release_bin = File.expand_path(File.join(__dir__, "release-db"))
+    env = { "RELEASE_AUTO_TAG" => "1", "RELEASE_DB_AUTO_CONFIRM" => "1" }
+  else
+    release_bin = File.expand_path(File.join(__dir__, "release"))
+    env = { "RELEASE_AUTO_TAG" => "1" }
+  end
+  # release-db accepts either `foo` or `foo-postgresql` as --app; pass the full
+  # name so the script doesn't have to guess.
   out, status = Open3.capture2e(env, release_bin, "--app", name, chdir: dir)
   { ok: status.success?, log: out }
 rescue => e
   { ok: false, log: "release_one raised: #{e.class}: #{e.message}" }
 end
 
-def cmd_pending_release(args)
-  app_filter, concurrency = parse_pending_release_args(args)
-  rows = resolve_pending_apps(app_filter)
-
-  pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }.map(&:first)
-  errors  = rows.select { |_, d| d[:error] }
-
-  if pending.empty?
-    puts "All apps up to date"
-    unless errors.empty?
-      puts ""
-      errors.each { |name, d| puts "#{name}: #{d[:error]}" }
-    end
-    return
+def release_serial(names, results, results_mutex)
+  names.each do |name|
+    puts "  #{name} [starting]"
+    result =
+      begin
+        release_one(name)
+      rescue => e
+        { ok: false, log: "worker crashed: #{e.class}: #{e.message}" }
+      end
+    results_mutex.synchronize { results[name] = result }
+    puts "  #{name} [#{result[:ok] ? 'done' : 'FAIL'}]"
   end
+end
 
-  puts "Releasing #{pending.length} app(s) with concurrency=#{concurrency}: #{pending.join(', ')}"
-  puts ""
-
+def release_concurrent(names, concurrency, results, results_mutex)
+  return if names.empty?
   queue = Queue.new
-  pending.each { |n| queue << n }
-  results_mutex = Mutex.new
-  results = {}
-
-  workers = Array.new([concurrency, pending.length].min) do
+  names.each { |n| queue << n }
+  workers = Array.new([concurrency, names.length].min) do
     Thread.new do
       while (name = (queue.pop(true) rescue nil))
         result =
@@ -772,17 +797,75 @@ def cmd_pending_release(args)
     end
   end
   workers.each(&:join)
+end
+
+def cmd_pending_release(args)
+  name_filter, concurrency = parse_pending_release_args(args)
+  rows = resolve_pending_items(name_filter)
+
+  pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }.map(&:first)
+  errors  = rows.select { |_, d| d[:error] }
+
+  if pending.empty?
+    puts "All apps up to date"
+    unless errors.empty?
+      puts ""
+      errors.each { |name, d| puts "#{name}: #{d[:error]}" }
+    end
+    return
+  end
+
+  db_pending  = pending.select { |n| db_repo?(n) }
+  app_pending = pending.reject { |n| db_repo?(n) }
+
+  results_mutex = Mutex.new
+  results = {}
+  skipped = {}
+
+  unless db_pending.empty?
+    puts "Phase 1: releasing #{db_pending.length} database(s) serially: #{db_pending.join(', ')}"
+    puts ""
+    release_serial(db_pending, results, results_mutex)
+    puts ""
+  end
+
+  # Skip an app whose matching DB just failed: deploying an app against an
+  # unmigrated schema is exactly the failure mode the DB-first ordering is
+  # meant to prevent.
+  failed_db_apps = db_pending.reject { |n| results[n] && results[n][:ok] }.map { |n| n.sub(/-postgresql\z/, "") }
+  to_run = app_pending.reject do |n|
+    if failed_db_apps.include?(n)
+      skipped[n] = "db release failed (#{n}-postgresql)"
+      true
+    else
+      false
+    end
+  end
+
+  if to_run.empty? && !app_pending.empty?
+    puts "Phase 2: all #{app_pending.length} app(s) skipped due to DB failures"
+    puts ""
+  elsif !to_run.empty?
+    puts "Phase 2: releasing #{to_run.length} app(s) with concurrency=#{concurrency}: #{to_run.join(', ')}"
+    puts ""
+    release_concurrent(to_run, concurrency, results, results_mutex)
+  end
 
   pending.each do |n|
+    next if skipped.key?(n)
     results[n] ||= { ok: false, log: "no result recorded (worker died?)" }
   end
-  succeeded = pending.select { |n| results[n][:ok] }
-  failed    = pending.reject { |n| results[n][:ok] }
+  attempted = pending.reject { |n| skipped.key?(n) }
+  succeeded = attempted.select { |n| results[n][:ok] }
+  failed    = attempted.reject { |n| results[n][:ok] }
 
   puts ""
   puts Util.underline("Summary")
   puts "  released: #{succeeded.empty? ? '(none)' : succeeded.join(', ')}"
   puts "  failed:   #{failed.join(', ')}" unless failed.empty?
+  unless skipped.empty?
+    skipped.each { |n, reason| puts "  skipped:  #{n} (#{reason})" }
+  end
 
   unless errors.empty?
     puts ""
@@ -799,6 +882,11 @@ def cmd_pending_release(args)
     end
     exit 1
   end
+
+  # Defensive: today every skip implies a failed DB (which already triggers
+  # exit 1 above). Future skip paths that don't correspond to a failure must
+  # still surface a non-zero exit.
+  exit 1 unless skipped.empty?
 end
 
 # ---------- config drift ----------
