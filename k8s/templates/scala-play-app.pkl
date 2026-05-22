@@ -57,7 +57,11 @@ local memoryJobServer = read?("env:JOB_MEMORY") ?? "13000Mi"
 local memoryLimit = memoryDefault
 local memoryLimitJobServer = memoryJobServer
 local cpuLimit = "1800m"
-local cpuLimitJobServer = "1800m"
+// 3500m fits under s-4vcpu-16gb-amd allocatable (~3890m). The clubaid CSV
+// ingest path (Apache POI / scala-csv) is CPU-bound; at 1800m the JVM ran G1
+// concurrent-mark single-threaded (5-6s cycles) and throughput stalled at
+// ~1 task/min — the bounce-philadelphia onboarding queue backed up 2026-05-22.
+local cpuLimitJobServer = "3500m"
 
 // ImagePullPolicy: IfNotPresent since we require explicit versions
 local pullPolicy = "IfNotPresent"
@@ -313,7 +317,7 @@ resources: Listing<K8sResource> = new {
               resources {
                 requests {
                   ["memory"] = memoryJobServer
-                  ["cpu"] = "100m"
+                  ["cpu"] = "500m"
                 }
                 limits {
                   ["memory"] = memoryLimitJobServer
