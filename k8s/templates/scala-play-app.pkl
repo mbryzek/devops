@@ -38,6 +38,41 @@ local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 local javaAgent = read?("env:JAVA_AGENT") ?? ""
 local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-javaagent:\(javaAgent) -Dnewrelic.config.app_name=\(appName)-\(tier) "
 
+// Idle old-gen reclamation for the JOB tier (JEP 346). G1 only evacuates the
+// old generation during mixed-GC cycles, and those only make progress while
+// young GCs keep firing — i.e. while the app allocates. When platform-job goes
+// idle between batches, allocation drops to ~nothing, mixed cycles stall, and
+// the transient codegen garbage promoted during the last batch burst stays
+// pinned in old-gen. On 2026-05-24 platform-job-0 sat at oldGenUsedMb=6632 for
+// 3+ hours with ZERO batches running; the per-minute eden sawtooth rode on top
+// of that stranded floor and tripped the "heap pressure detected" alert (>=80%
+// of the 9750MB heap) ~179 times in 24h — all false pressure, since the old-gen
+// is collectible (heap drops to ~3.5GB true-live whenever a cycle actually runs).
+//
+// G1PeriodicGCInterval makes G1 reclaim once this many ms elapse with no GC
+// pause, so an idle JVM returns to its ~3.5GB live baseline instead of carrying
+// dead bytes for hours (or until restart). The post-GC floor is the new
+// leak-detection signal: if it trends up week-over-week under similar load,
+// that's a real leak, not stranded garbage.
+//
+// -G1PeriodicGCInvokesConcurrent forces a Full GC rather than a concurrent
+// cycle. Verified locally on OpenJDK (1.5GB stranded, 4GB heap): the Full-GC
+// variant reclaims completely in ONE STW pause at the first interval (~sub-second
+// at that size; expect a few seconds at the ~9750MB prod heap, scaling with the
+// reclaimed set), whereas the concurrent variant drains in stages across many
+// cycles (15-25 min at a 5-min interval) because old-region evacuation still
+// waits on mixed GCs that never come while idle. That trade-off is why Full GC
+// wins HERE specifically: the job tier is a background batch processor with no
+// request-latency SLA and the pause only ever lands while idle, so even a
+// multi-second Full GC is free. It is deliberately NOT on the web tier, whose
+// pauses are user-facing (and which is healthy at 30-43% heap anyway). It never
+// fires during active batches — back-to-back GCs keep resetting the timer
+// (confirmed via gc+periodic logs: "Last GC occurred Nms before ... Skipping")
+// — so there is no throughput cost. Applies to every app's job tier rendered
+// from this template (e.g. acumen-job); idle reclamation is universally safe for
+// a no-SLA background tier, so no per-app gating is needed.
+local jobIdleGcFlags = "-XX:G1PeriodicGCInterval=300000 -XX:-G1PeriodicGCInvokesConcurrent"
+
 // Resource configuration - sized for dedicated node pools
 // Web nodes: s-2vcpu-4gb (4GB RAM, ~3003Mi allocatable, ~675Mi for kube-system)
 // Job nodes: s-4vcpu-16gb-amd (16GB RAM, ~14300Mi allocatable, ~1000Mi for kube-system)
@@ -285,7 +320,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "\(javaAgentFlags("job"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=75.0 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc*:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlags("job"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=75.0 \(jobIdleGcFlags) -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc*:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
