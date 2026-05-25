@@ -572,7 +572,7 @@ end
 # requiring an HTTP /_internal_/version on internal-only services.
 def fetch_k8s_version(app)
   ns = app.docker_k8s.namespace
-  target = app.docker_k8s.rollout_target  # e.g. "statefulset/court-reserve-workers"
+  target = app.docker_k8s.rollout_target  # e.g. "statefulset/workers"
   image, status = Open3.capture2(
     "kubectl", "-n", ns, "get", target,
     "-o", "jsonpath={.spec.template.spec.containers[0].image}"

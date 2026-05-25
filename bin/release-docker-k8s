@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 
 # Releases a Docker-image-based k8s app with hand-written manifests
-# (e.g. court-reserve-workers). Steps:
+# (e.g. workers). Steps:
 #   1. Bump + push a git tag in the app's source repo (Tag.ask).
 #   2. Run <source_dir>/<build_script> <tag> to build + push the image.
 #   3. kubectl apply every *.yaml in <manifests_dir> with __IMAGE_TAG__

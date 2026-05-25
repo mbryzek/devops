@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: workers
+  namespace: bryzek-production
+  labels:
+    app: workers
+    app.kubernetes.io/name: workers
+spec:
+  # Replicas MUST stay at 1. The persistent browser-profile PVC is RWO (DO block
+  # storage), and the in-process browser context is a singleton; a second pod
+  # would deadlock on the volume and corrupt session state.
+  replicas: 1
+  serviceName: workers
+  selector:
+    matchLabels:
+      app: workers
+  template:
+    metadata:
+      labels:
+        app: workers
+        app.kubernetes.io/name: workers
+    spec:
+      # Dedicated `tier: crawler` node pool so a Chromium scrape doesn't
+      # compete with web traffic (tier: web) or backend jobs (tier: job).
+      # Currently a single s-1vcpu-2gb node — bump pool size or size class
+      # if the crawler queue grows.
+      nodeSelector:
+        tier: crawler
+      # 90s gives an in-flight Chromium scrape time to finish + closeSession()
+      # to flush profile state before SIGKILL. Tune up if scrapes get longer.
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: workers
+          image: registry.digitalocean.com/bryzek/workers:__IMAGE_TAG__
+          # Image tags from `sem-info tag latest` are immutable semver, so
+          # IfNotPresent is safe and avoids redundant registry pulls on restart.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8787
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: workers-secrets
+            - configMapRef:
+                name: workers-config
+                optional: true
+          env:
+            - name: PORT
+              value: "8787"
+          volumeMounts:
+            - name: browser-profile
+              mountPath: /app/browser-profile
+          # Sized for actual Chromium-headful usage: ~250Mi idle, ~500-900Mi
+          # during a scrape, ~1.2Gi observed peak on a 3-year members batch
+          # (picklejar, wrq-138672cd2b364b5a85c3c04157c027b1, 2026-05-12).
+          # The s-1vcpu-2gb crawler node has ~1.4Gi allocatable, of which
+          # ~500Mi is already requested by system daemonsets — leaving only
+          # ~960Mi schedulable. A 1Gi request therefore left the pod Pending
+          # forever. 800Mi fits with headroom; 1200Mi limit still gives the
+          # scrape room above its observed 1.18Gi peak before OOMKill. If we
+          # need more than this, bump the node class (s-1vcpu-3gb / s-2vcpu-4gb).
+          resources:
+            requests:
+              cpu: 200m
+              memory: 800Mi
+            limits:
+              cpu: 900m
+              memory: 1200Mi
+          # Liveness is intentionally lenient: a Chromium scrape can saturate
+          # the Node event loop for tens of seconds at a time. Failing here
+          # restarts the pod mid-scrape. 60s * 5 = 5min before kill.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8787
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8787
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: browser-profile
+          persistentVolumeClaim:
+            claimName: workers-browser-profile
