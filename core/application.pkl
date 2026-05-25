@@ -27,7 +27,7 @@ class Application {
 class SvelteKit {}
 
 /// Release config for hand-written-manifest k8s apps built as a Docker image
-/// (e.g. court-reserve-workers). Released via `release-docker-k8s` which:
+/// (e.g. workers). Released via `release-docker-k8s` which:
 ///   1. tags via `Tag.ask`
 ///   2. runs <source_dir>/<build_script> to build + push the image
 ///   3. applies every manifest under <manifests_dir>, sed-substituting
@@ -40,7 +40,7 @@ class DockerK8sConfig {
     /// Directory containing k8s manifests, relative to the devops repo root.
     /// Every *.yaml is `kubectl apply`d with __IMAGE_TAG__ substituted.
     manifests_dir: String
-    /// Resource to wait on, e.g. "statefulset/court-reserve-workers".
+    /// Resource to wait on, e.g. "statefulset/workers".
     rollout_target: String
     /// Kubernetes namespace.
     namespace: String = "bryzek-production"

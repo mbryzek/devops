@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workers-browser-profile
+  namespace: bryzek-production
+  labels:
+    app: workers
+    app.kubernetes.io/name: workers
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 10Gi
