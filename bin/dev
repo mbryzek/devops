@@ -124,10 +124,13 @@ def levenshtein(a, b)
   prev[b.length]
 end
 
-# Closest candidate to `input`: a *unique* prefix wins (handles `inv` ->
-# `invariants`), but an ambiguous prefix like `lo` (login/logout) falls through
-# rather than guessing. Otherwise pick the nearest by edit distance within a
-# small, length-scaled threshold so unrelated typos don't get bogus suggestions.
+# Closest candidate to `input`. A *unique* prefix wins outright (handles `inv`
+# -> `invariants`); an ambiguous prefix (2+ matches, e.g. `lo` for login/logout)
+# is not resolved on the prefix branch. Everything else — including ambiguous
+# prefixes — falls to nearest-by-edit-distance within a small, length-scaled
+# threshold, so `lo` (distance 3 to `login`, over threshold) yields nothing
+# while `versio` (distance 1) still resolves to `version`. The threshold keeps
+# unrelated typos from getting bogus suggestions.
 def suggest(input, candidates)
   s = input.to_s.downcase
   return nil if s.empty?
