@@ -83,10 +83,70 @@ USAGE = <<~USAGE
     --localhost     Hit local development servers instead of production
 USAGE
 
+# No message => the user asked for help (`dev`, `dev help`, `-h`); print the
+# full usage and exit 0. With a message it's an error: keep it short and point
+# at `dev help` rather than dumping the whole usage block on every mistake.
 def usage_exit(msg = nil)
-  warn msg if msg
-  warn USAGE
-  exit(msg ? 1 : 0)
+  if msg
+    warn msg
+    warn "Run `dev help` for usage."
+    exit 1
+  else
+    warn USAGE
+    exit 0
+  end
+end
+
+# Known commands and their subcommands, used to suggest a correction when the
+# user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
+COMMANDS = %w[login logout invariants tasks version versions pending config docker browserslist].freeze
+SUBCOMMANDS = {
+  "invariants"   => %w[check snoozes snooze unsnooze],
+  "tasks"        => %w[requeue],
+  "pending"      => %w[list release],
+  "config"       => %w[check rollout],
+  "docker"       => %w[prune],
+  "browserslist" => %w[update],
+}.freeze
+
+def levenshtein(a, b)
+  return b.length if a.empty?
+  return a.length if b.empty?
+  prev = (0..b.length).to_a
+  a.each_char.with_index do |ca, i|
+    curr = [i + 1]
+    b.each_char.with_index do |cb, j|
+      cost = ca == cb ? 0 : 1
+      curr << [curr[j] + 1, prev[j + 1] + 1, prev[j] + cost].min
+    end
+    prev = curr
+  end
+  prev[b.length]
+end
+
+# Closest candidate to `input`. A *unique* prefix wins outright (handles `inv`
+# -> `invariants`); an ambiguous prefix (2+ matches, e.g. `lo` for login/logout)
+# is not resolved on the prefix branch. Everything else — including ambiguous
+# prefixes — falls to nearest-by-edit-distance within a small, length-scaled
+# threshold, so `lo` (distance 3 to `login`, over threshold) yields nothing
+# while `versio` (distance 1) still resolves to `version`. The threshold keeps
+# unrelated typos from getting bogus suggestions.
+def suggest(input, candidates)
+  s = input.to_s.downcase
+  return nil if s.empty?
+
+  prefix_matches = candidates.select { |c| c.downcase != s && c.downcase.start_with?(s) }
+  return prefix_matches.first if prefix_matches.length == 1 && s.length >= 2
+
+  best, dist = candidates.map { |c| [c, levenshtein(s, c.downcase)] }.min_by { |_, d| d }
+  best if dist <= [2, s.length / 3].max
+end
+
+def unknown(kind, value, candidates)
+  hint = suggest(value, candidates)
+  msg = "Unknown #{kind}: #{value}"
+  msg += " (did you mean '#{hint}'?)" if hint
+  usage_exit(msg)
 end
 
 def parse_common_flags(args)
@@ -1180,7 +1240,7 @@ when "invariants"
   when "snooze"    then cmd_invariants_snooze(argv)
   when "unsnooze"  then cmd_invariants_unsnooze(argv)
   when nil         then usage_exit("invariants requires a subcommand")
-  else                  usage_exit("Unknown invariants subcommand: #{sub}")
+  else                  unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
   end
 when "version", "versions"
   cmd_versions(argv)
@@ -1193,7 +1253,7 @@ when "pending"
     case sub
     when "list"    then cmd_pending_list(argv)
     when "release" then cmd_pending_release(argv)
-    else                usage_exit("Unknown pending subcommand: #{sub}")
+    else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
     end
   end
 when "config"
@@ -1202,30 +1262,30 @@ when "config"
   when "check"   then cmd_config_check(argv)
   when "rollout" then cmd_config_rollout(argv)
   when nil       then usage_exit("config requires a subcommand")
-  else                usage_exit("Unknown config subcommand: #{sub}")
+  else                unknown("config subcommand", sub, SUBCOMMANDS["config"])
   end
 when "tasks"
   sub = argv.shift
   case sub
   when "requeue" then cmd_tasks_requeue(argv)
   when nil       then usage_exit("tasks requires a subcommand")
-  else                usage_exit("Unknown tasks subcommand: #{sub}")
+  else                unknown("tasks subcommand", sub, SUBCOMMANDS["tasks"])
   end
 when "browserslist"
   sub = argv.shift
   case sub
   when "update" then cmd_browserslist_update(argv)
   when nil      then usage_exit("browserslist requires a subcommand")
-  else               usage_exit("Unknown browserslist subcommand: #{sub}")
+  else               unknown("browserslist subcommand", sub, SUBCOMMANDS["browserslist"])
   end
 when "docker"
   sub = argv.shift
   case sub
   when "prune" then cmd_docker_prune(argv)
   when nil     then usage_exit("docker requires a subcommand")
-  else              usage_exit("Unknown docker subcommand: #{sub}")
+  else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
   end
 else
-  usage_exit("Unknown command: #{command}")
+  unknown("command", command, COMMANDS)
 end
 end
