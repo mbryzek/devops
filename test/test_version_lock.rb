@@ -61,6 +61,15 @@ class TestVersionLock < Minitest::Test
     end
   end
 
+  def test_read_wrong_shape_json_returns_empty
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "versions.lock")
+      ENV["APIBUILDER_VERSION_LOCK"] = path
+      IO.write(path, "[1, 2, 3]")
+      assert_equal({}, VersionLock.read("/x"))
+    end
+  end
+
   def test_feature_root_falls_back_to_parent_when_not_a_git_repo
     Dir.mktmpdir do |dir|
       repo = File.join(dir, "repo")

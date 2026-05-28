@@ -35,11 +35,12 @@ module VersionLock
     File.dirname(File.expand_path(base))
   end
 
-  # Returns { "org/app" => version } (empty if no lock yet / unreadable).
+  # Returns { "org/app" => version } (empty if no lock yet / unreadable / wrong shape).
   def self.read(project_root)
     p = path(project_root)
     return {} unless File.exist?(p)
-    JSON.parse(IO.read(p))
+    parsed = JSON.parse(IO.read(p))
+    parsed.is_a?(Hash) ? parsed : {}
   rescue JSON::ParserError
     {}
   end
