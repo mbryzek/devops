@@ -457,7 +457,7 @@ end
 
 # --- Batch Operations ---
 
-def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
+def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion, version_pins = {})
   blocks = config.blocks_for_org(org)
   blocks = blocks.select { |b| b.group == group_filter } if group_filter
 
@@ -492,6 +492,10 @@ def build_batch_form(config, org, operations, app_filter, group_filter, import_e
 
     if operations.include?("codegen")
       entry["generators"] = data[:generators]
+      # Pin to a recorded version when one exists for this app, so codegen targets
+      # that immutable version instead of `latest` (see VersionLock).
+      pinned = version_pins[VersionLock.key(org, app_key)]
+      entry["version"] = pinned if pinned
     end
 
     entry
@@ -611,9 +615,14 @@ def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag
 
   import_expansion = resolve_import_expansion(app_filter, expand_imports_flag)
 
+  # Consumer codegen (no upload of our own): pin each app to the version a producer
+  # run recorded, isolating us from concurrent uploads moving `latest`. A producer
+  # batch (upload) ignores the lock — the server stamps the fresh version it creates.
+  version_pins = (operations.include?("codegen") && !operations.include?("upload")) ? VersionLock.read(project_root) : {}
+
   config.orgs.each do |org|
     puts "==> Building batch for #{org}"
-    form = build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
+    form = build_batch_form(config, org, operations, app_filter, group_filter, import_expansion, version_pins)
     next if form["applications"].empty?
 
     num_apps = form["applications"].size
@@ -638,6 +647,20 @@ def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag
       exit 1
     when "done"
       puts "==> Batch #{batch_id} completed"
+
+      if operations.include?("upload")
+        # The server stamped each uploaded application with the immutable version it
+        # created; record them so consumer repos can pin their codegen to this version.
+        pins = (result["applications"] || []).each_with_object({}) do |app, acc|
+          version = app["version"]
+          acc[VersionLock.key(app["organization_key"], app["application_key"])] = version if version
+        end
+        if (lock_path = VersionLock.write(project_root, pins))
+          puts "==> Recorded #{pins.size} version pin(s) to #{lock_path}"
+        elsif !(result["applications"] || []).empty?
+          $stderr.puts "WARNING: upload returned no application versions; consumer codegen won't be version-pinned (is the apibuilder server up to date?)"
+        end
+      end
 
       if operations.include?("codegen") && result["zip_file"].nil?
         $stderr.puts "WARNING: Batch completed but no zip_file in response. Full result: #{JSON.generate(result.reject { |k,_| k == "applications" })}"

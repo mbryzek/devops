@@ -69,49 +69,6 @@ class ApibuilderClient
     handle_response(response, "POST /apibuilder/anonymous")
   end
 
-  # Upload a spec file as a new version.
-  # POST /apibuilder/{org}/{app}
-  def upload_version(org, app, spec_path)
-    data = IO.read(spec_path)
-    body = {
-      "original_form" => {
-        "type" => "api_json",
-        "data" => data,
-      }
-    }
-    request(:post, "/apibuilder/#{org}/#{app}", body)
-  end
-
-  # Get generated code for a specific generator.
-  # GET /apibuilder/{org}/{app}/{version}/{generator_key}
-  def get_code(org, app, version, generator_key, attributes = nil)
-    path = "/apibuilder/#{org}/#{app}/#{version}/#{generator_key}"
-    if attributes && !attributes.empty?
-      encoded = URI.encode_www_form_component(JSON.generate(attributes))
-      path = "#{path}?attributes=#{encoded}"
-    end
-    request(:get, path)
-  end
-
-  # Get latest version for an app.
-  # GET /apibuilder/{org}/{app}?limit=1
-  def get_latest_version(org, app)
-    path = "/apibuilder/#{org}/#{app}?limit=1"
-    response = raw_request(:get, path)
-    case response.code.to_i
-    when 200
-      JSON.parse(response.body).first
-    when 404
-      nil
-    when 401
-      Util.warning("Unauthorized fetching #{org}/#{app} versions; skipping version guard")
-      nil
-    else
-      Util.warning("HTTP #{response.code.to_i} fetching #{org}/#{app} versions; skipping version guard")
-      nil
-    end
-  end
-
   # Reads a value from the global config for a given profile and key.
   # Returns nil if the config file, profile, or key is not found.
   def self.read_config_value(profile, key)
