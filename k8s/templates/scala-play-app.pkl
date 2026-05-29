@@ -91,6 +91,33 @@ local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
 local memoryJobServer = read?("env:JOB_MEMORY") ?? "13000Mi"
 local memoryLimit = memoryDefault
 local memoryLimitJobServer = memoryJobServer
+
+// -XX:MaxRAMPercentage per tier. Single source of truth: these feed BOTH the
+// JVM flag (the JVM caps the heap at this % of the container memory limit) and
+// the heap-dump volume sizing below, so the dump volume can never silently
+// drift below the heap it has to hold.
+local webRamPercent = 65
+local jobRamPercent = 75
+
+// Size the heap-dump emptyDir to comfortably hold a full OOM heap dump. The
+// hprof written by -XX:+HeapDumpOnOutOfMemoryError is ~the live heap, which at
+// OOM is ~the max heap (= ramPercent% of the container memory limit). If the
+// emptyDir sizeLimit is below that, the dump is truncated (useless for
+// diagnosis) AND the kubelet evicts the pod mid-write — turning a clean OOM
+// into a confusing eviction. We size to heap * 1.2 (20% headroom for hprof
+// format overhead). emptyDir (medium unset) is backed by node ephemeral DISK,
+// not pod RAM, so this does not compete with the JVM heap; job/web DO nodes
+// have ample SSD. Derived from the same {memory, ramPercent} as the heap, so it
+// always tracks: e.g. job 13000Mi*75% = 9750MB heap -> 11700Mi dump volume.
+// All memory values in this template are expressed in Mi (see memoryDefault /
+// memoryJobServer). Fail loudly on any other unit rather than silently
+// miscomputing the heap-dump volume size.
+local function parseMi(memory: String): Int =
+  if (memory.endsWith("Mi")) memory.dropLast(2).toInt()
+  else throw("Memory must be expressed in Mi (e.g. \"13000Mi\"), got: \(memory)")
+local function heapMb(memory: String, ramPercent: Int): Int = parseMi(memory) * ramPercent ~/ 100
+local function heapDumpSizeLimit(memory: String, ramPercent: Int): String = "\(heapMb(memory, ramPercent) * 12 ~/ 10)Mi"
+
 local cpuLimit = "1800m"
 // 3500m fits under s-4vcpu-16gb-amd allocatable (~3890m). The clubaid CSV
 // ingest path (Apache POI / scala-csv) is CPU-bound; at 1800m the JVM ran G1
@@ -184,7 +211,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "\(javaAgentFlags("web"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=65.0 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc,gc+periodic:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlags("web"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=\(webRamPercent).0 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc,gc+periodic:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=false -Ddeployment.node.index=1 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -261,9 +288,9 @@ resources: Listing<K8sResource> = new {
             new {
               name = "heap-dumps"
               emptyDir {
-                // Heap dump cannot exceed the heap size (65% of 1500Mi ≈ 975Mi).
-                // Cap at 1500Mi to prevent filling node ephemeral storage.
-                sizeLimit = "1500Mi"
+                // Sized to hold a full OOM heap dump (heap * 1.2); see
+                // heapDumpSizeLimit. heap = webRamPercent% of memoryDefault.
+                sizeLimit = heapDumpSizeLimit(memoryDefault, webRamPercent)
               }
             }
           }
@@ -320,7 +347,7 @@ resources: Listing<K8sResource> = new {
               env = new {
                 new {
                   name = "JAVA_OPTS"
-                  value = "\(javaAgentFlags("job"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=75.0 \(jobIdleGcFlags) -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc,gc+periodic:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
+                  value = "\(javaAgentFlags("job"))-XX:+UseContainerSupport -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:MaxRAMPercentage=\(jobRamPercent).0 \(jobIdleGcFlags) -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/ -XX:+ExitOnOutOfMemoryError -Xlog:gc,gc+periodic:stderr:time,level,tags -Dhttp.port=\(appPort) -Ddeployment.job.server=true -Ddeployment.node.index=0 -Ddeployment.nodes=\(appName)-job-0.\(appName)-job:\(appPort),\(appName)-web:\(appPort)"
                 }
               }
               ports = new {
@@ -397,9 +424,9 @@ resources: Listing<K8sResource> = new {
             new {
               name = "heap-dumps"
               emptyDir {
-                // Heap dump cannot exceed the heap size (75% of memoryLimitJobServer).
-                // Cap at 6000Mi to bound node ephemeral storage if the limit is bumped.
-                sizeLimit = "6000Mi"
+                // Sized to hold a full OOM heap dump (heap * 1.2); see
+                // heapDumpSizeLimit. heap = jobRamPercent% of memoryJobServer.
+                sizeLimit = heapDumpSizeLimit(memoryJobServer, jobRamPercent)
               }
             }
           }
