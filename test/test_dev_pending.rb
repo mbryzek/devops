@@ -75,6 +75,91 @@ class TestDevPending < Minitest::Test
   end
 end
 
+# pending_items derives DB repos from the apps registry (scala apps ship a
+# "<app>-postgresql" repo), NOT from a filesystem glob — so abandoned
+# *-postgresql checkouts next to the apps are never picked up.
+class TestPendingItems < Minitest::Test
+  FakeApp = Struct.new(:name, :stack, keyword_init: true)
+
+  class FakeRegistry
+    def initialize(apps, deployable)
+      @apps = apps
+      @deployable = deployable
+    end
+    attr_reader :apps
+    def deployable = @deployable
+  end
+
+  def with_registry(apps, deployable = nil)
+    deployable ||= apps
+    orig = Work::Registry.method(:load)
+    Work::Registry.define_singleton_method(:load) { FakeRegistry.new(apps, deployable) }
+    yield
+  ensure
+    Work::Registry.define_singleton_method(:load, orig)
+  end
+
+  def names = pending_items.map(&:first)
+
+  def test_derives_db_repo_per_scala_app
+    apps = [
+      FakeApp.new(name: "platform", stack: :scala),
+      FakeApp.new(name: "acumen",   stack: :scala),
+    ]
+    with_registry(apps) do
+      assert_includes names, "platform-postgresql"
+      assert_includes names, "acumen-postgresql"
+    end
+  end
+
+  def test_non_scala_apps_get_no_db_repo
+    apps = [
+      FakeApp.new(name: "rallyd",    stack: :sveltekit),
+      FakeApp.new(name: "acumen-ui", stack: :elm),
+    ]
+    with_registry(apps) do
+      refute(names.any? { |n| n.end_with?("-postgresql") })
+    end
+  end
+
+  def test_non_deployable_scala_app_gets_no_db_repo
+    # An ignored/archived scala app is in `apps` but not in `deployable`; its
+    # DB repo must not show up as a phantom pending entry.
+    scala = FakeApp.new(name: "archived", stack: :scala)
+    with_registry([scala], []) do
+      refute_includes names, "archived-postgresql"
+    end
+  end
+
+  def test_ignores_stray_postgresql_checkouts_on_disk
+    # Even if e.g. ~/code/dependency-postgresql exists on disk, it is not in the
+    # registry as a scala app, so it must not appear.
+    apps = [FakeApp.new(name: "platform", stack: :scala)]
+    with_registry(apps) do
+      refute_includes names, "dependency-postgresql"
+    end
+  end
+
+  def test_db_repo_path_is_sibling_of_apps
+    apps = [FakeApp.new(name: "platform", stack: :scala)]
+    with_registry(apps) do
+      _, dir = pending_items.find { |n, _| n == "platform-postgresql" }
+      assert_equal File.expand_path("~/code/platform-postgresql"), dir
+    end
+  end
+
+  def test_results_sorted_and_unique
+    apps = [
+      FakeApp.new(name: "platform", stack: :scala),
+      FakeApp.new(name: "acumen",   stack: :scala),
+    ]
+    with_registry(apps) do
+      assert_equal names, names.sort
+      assert_equal names, names.uniq
+    end
+  end
+end
+
 # cmd_pending_release orchestrates DB-first + parallel-app workers.
 # Stub resolve_pending_items + release_one so tests do no real I/O.
 class TestPendingReleaseOrchestration < Minitest::Test

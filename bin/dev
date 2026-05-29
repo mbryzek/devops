@@ -700,10 +700,6 @@ end
 
 # ---------- pending deploys ----------
 
-# Glob pattern for *-postgresql checkouts. Lives next to apps under ~/code/.
-# DB repos are not in env/apps/, so we discover them from the filesystem.
-POSTGRES_REPO_GLOB = "~/code/*-postgresql"
-
 def db_repo?(name)
   name.end_with?("-postgresql")
 end
@@ -730,11 +726,17 @@ end
 def pending_items
   registry = Work::Registry.load
   items = registry.deployable.map { |app| [app.name, File.expand_path("~/code/#{app.name}")] }
-  Dir.glob(File.expand_path(POSTGRES_REPO_GLOB)).each do |dir|
-    items << [File.basename(dir), dir]
+  # DB repos are derived from the apps registry, not a filesystem glob: every
+  # deployable scala app declares a database in its config.pkl and ships a
+  # conventional "<app>-postgresql" repo checked out next to it. Driving
+  # discovery from the registry keeps stray/abandoned *-postgresql checkouts
+  # out of the list; scoping to `deployable` excludes ignored/archived apps.
+  registry.deployable.select { |app| app.stack == :scala }.each do |app|
+    db = "#{app.name}-postgresql"
+    items << [db, File.expand_path("~/code/#{db}")]
   end
-  # Array#uniq keeps the first occurrence, so registry entries win over the
-  # filesystem glob if a name collides (richer metadata). Don't reorder.
+  # Array#uniq keeps the first occurrence, so deployable-app entries win over a
+  # DB entry if a name collides. Don't reorder.
   items.uniq { |name, _| name }.sort_by { |name, _| name }
 end
 
