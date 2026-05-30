@@ -1,0 +1,11 @@
+name = "clubaid-owner-spike"
+main = "src/index.ts"
+compatibility_date = "2026-02-08"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Wildcard route: every *.clubaid.co host (that has no more-specific route /
+# Pages custom domain) dispatches to this one Worker. No per-club provisioning.
+routes = [
+  { pattern = "*.clubaid.co/*", zone_name = "clubaid.co" },
+]

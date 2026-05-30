@@ -1,0 +1,12 @@
+name = "clubaid-reserved-spike"
+main = "src/index.ts"
+compatibility_date = "2026-02-08"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+# More-specific routes than *.clubaid.co/* — these WIN by route specificity, so
+# admin/www are protected from the wildcard owner Worker.
+routes = [
+  { pattern = "admin.clubaid.co/*", zone_name = "clubaid.co" },
+  { pattern = "www.clubaid.co/*", zone_name = "clubaid.co" },
+]
