@@ -55,8 +55,6 @@ else
   exit 1
 end
 
-puts "Deploying from #{output_dir}"
-
 # Deploy mechanism: Cloudflare Pages vs. Workers.
 #
 # Most SvelteKit apps here deploy to Cloudflare Pages. The owner app
@@ -79,7 +77,9 @@ is_worker = toml.match?(/^\s*(?!#)main\s*=/) &&
   !toml.match?(/^\s*(?!#)pages_build_output_dir\s*=/)
 
 if is_worker
+  puts "Deploying #{output_dir} as a Cloudflare Worker (wrangler deploy)"
   helper.run_system("wrangler deploy")
 else
+  puts "Deploying #{output_dir} to Cloudflare Pages"
   helper.run_system("wrangler pages deploy #{output_dir}")
 end
