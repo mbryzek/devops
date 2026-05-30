@@ -56,4 +56,28 @@ else
 end
 
 puts "Deploying from #{output_dir}"
-helper.run_system("wrangler pages deploy #{output_dir}")
+
+# Deploy mechanism: Cloudflare Pages vs. Workers.
+#
+# Most SvelteKit apps here deploy to Cloudflare Pages. The owner app
+# (`clubaid`, see SP-A/SP-B of the club-subdomains program) must deploy as a
+# *Worker* so it can bind the wildcard route `*.clubaid.co/*` (Pages custom
+# domains are not wildcard-capable). The signal is wrangler.toml: a Pages
+# project declares `pages_build_output_dir`; a Worker declares `main` (its
+# entry) and `routes`. `wrangler deploy` reads wrangler.toml directly, so no
+# output_dir argument is passed for the Worker path.
+#
+# NOTE (SP-A spike sketch — SP-B owns the production version): SP-B will pin
+# the exact adapter-cloudflare Worker wrangler.toml (`main` =
+# `.svelte-kit/cloudflare/_worker.js`, an `assets` binding to the build dir,
+# and the `routes` block) when it scaffolds the new repo. This branch only
+# routes the deploy command; it does not yet generate that config.
+is_worker = File.exist?("wrangler.toml") &&
+  File.read("wrangler.toml").match?(/^\s*main\s*=/) &&
+  !File.read("wrangler.toml").match?(/^\s*pages_build_output_dir\s*=/)
+
+if is_worker
+  helper.run_system("wrangler deploy")
+else
+  helper.run_system("wrangler pages deploy #{output_dir}")
+end
