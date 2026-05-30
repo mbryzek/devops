@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# restore-mongodb — restore the local MongoDB instance from a WiredTiger
+# physical backup tarball (e.g. a snapshooter.com backup of club_aid).
+#
+# The backup is expected to be a tar of the raw WiredTiger data directory
+# (collection-*.wt / index-*.wt / WiredTiger.backup / journal/ ...), NOT a
+# mongodump BSON dump. Restoring such a backup means stopping mongod,
+# replacing its dbPath with the snapshot files, and starting it again
+# (WiredTiger runs recovery on boot).
+#
+# Usage: ./restore-mongodb
+#   - Lists backup files in ~/Downloads and lets you pick one (or enter a path)
+#   - Confirms before permanently deleting the current data directory
+#   - Stops mongod, extracts the snapshot, restarts, and verifies
+#
+set -eu
+
+SERVICE="mongodb-community@8.0"
+CONF="/opt/homebrew/etc/mongod.conf"
+LOG="/opt/homebrew/var/log/mongodb/mongo.log"
+DOWNLOADS="$HOME/Downloads"
+
+err() { printf 'Error: %s\n' "$1" >&2; exit 1; }
+
+command -v brew    >/dev/null 2>&1 || err "brew not found"
+command -v mongosh >/dev/null 2>&1 || err "mongosh not found"
+[ -f "$CONF" ] || err "mongod config not found at $CONF"
+
+# Determine the data directory from the mongod config.
+DBPATH=$(awk '/dbPath:/{print $2}' "$CONF")
+[ -n "$DBPATH" ] || err "could not determine dbPath from $CONF"
+
+echo "MongoDB service : $SERVICE"
+echo "Data directory  : $DBPATH"
+echo
+
+# --- choose the backup file -------------------------------------------------
+candidates=()
+while IFS= read -r f; do
+  [ -n "$f" ] && candidates+=("$f")
+done < <(find "$DOWNLOADS" -maxdepth 1 -type f \
+           \( -name '*.tar' -o -name '*.tgz' -o -name '*.tar.gz' -o -name 'restore-*' \) \
+           2>/dev/null | sort)
+
+BACKUP=""
+if [ "${#candidates[@]}" -gt 0 ]; then
+  echo "Backup files found in $DOWNLOADS:"
+  i=1
+  for f in "${candidates[@]}"; do
+    printf "  %2d) %s  (%s)\n" "$i" "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+    i=$((i + 1))
+  done
+  echo "   0) Enter a path manually"
+  echo
+  read -r -p "Select a file [1]: " choice
+  choice="${choice:-1}"
+  if [ "$choice" = "0" ]; then
+    read -r -p "Full path to backup file: " BACKUP
+  elif printf '%s' "$choice" | grep -qE '^[0-9]+$' \
+       && [ "$choice" -ge 1 ] && [ "$choice" -le "${#candidates[@]}" ]; then
+    BACKUP="${candidates[$((choice - 1))]}"
+  else
+    err "invalid selection: $choice"
+  fi
+else
+  echo "No backup files found in $DOWNLOADS."
+  read -r -p "Full path to backup file: " BACKUP
+fi
+
+# Expand a leading ~ if the user typed one.
+BACKUP="${BACKUP/#\~/$HOME}"
+[ -f "$BACKUP" ] || err "file not found: $BACKUP"
+
+echo
+echo "Selected backup : $BACKUP  ($(du -h "$BACKUP" | cut -f1))"
+echo
+
+# --- sanity check: does it look like a WiredTiger physical backup? ----------
+if tar -tf "$BACKUP" 2>/dev/null | grep -q 'WiredTiger'; then
+  :
+else
+  echo "Warning: this archive does not appear to contain WiredTiger data files."
+  echo "It may be a mongodump (BSON) backup, which this script cannot restore."
+  read -r -p "Continue anyway? [y/N]: " ok
+  case "$ok" in [Yy]*) ;; *) err "aborted" ;; esac
+fi
+
+# --- confirm the destructive replace ----------------------------------------
+if [ -d "$DBPATH" ]; then
+  cur=$(du -sh "$DBPATH" 2>/dev/null | cut -f1)
+  echo "This will PERMANENTLY DELETE the current data directory ($cur)"
+  echo "and replace it with the selected snapshot. This cannot be undone."
+else
+  echo "Data directory does not exist yet; it will be created."
+fi
+read -r -p "Type 'yes' to proceed: " confirm
+[ "$confirm" = "yes" ] || err "aborted"
+
+# --- do it ------------------------------------------------------------------
+echo
+echo "==> Stopping $SERVICE ..."
+brew services stop "$SERVICE"
+sleep 2
+
+echo "==> Removing old data directory ..."
+command rm -rf "$DBPATH"   # 'command' bypasses any rm='rm -i' alias
+mkdir -p "$DBPATH"
+
+echo "==> Extracting snapshot (this may take a minute) ..."
+case "$BACKUP" in
+  *.tar.gz | *.tgz) tar -xzf "$BACKUP" -C "$DBPATH" --strip-components=1 ;;
+  *)                tar -xf  "$BACKUP" -C "$DBPATH" --strip-components=1 ;;
+esac
+
+count=$(ls -1 "$DBPATH" | wc -l | tr -d ' ')
+echo "    Extracted $count entries into $DBPATH"
+[ "$count" -gt 0 ] || err "extraction produced no files"
+
+echo "==> Starting $SERVICE ..."
+brew services start "$SERVICE"
+
+echo "==> Waiting for mongod to accept connections ..."
+up=0
+for _ in $(seq 1 30); do
+  if mongosh --quiet --eval 'quit(db.runCommand({ping:1}).ok ? 0 : 1)' >/dev/null 2>&1; then
+    up=1
+    break
+  fi
+  sleep 1
+done
+[ "$up" = "1" ] || err "mongod did not come up — check $LOG"
+
+echo
+echo "==> Databases now present:"
+mongosh --quiet --eval \
+  'db.adminCommand({listDatabases:1}).databases.forEach(d=>print("   "+d.name, (d.sizeOnDisk/1048576).toFixed(1)+"MB"))'
+
+echo
+echo "Done. Restore complete."
