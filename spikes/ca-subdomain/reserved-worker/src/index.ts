@@ -22,11 +22,16 @@ export default {
     }
 
     if (host === 'admin.clubaid.co') {
-      // Transparent reverse proxy to the admin Pages origin, preserving everything.
+      // Transparent reverse proxy to the admin Pages origin, preserving method/headers/body.
       const upstream = new URL(url.pathname + url.search, ADMIN_ORIGIN);
-      const proxied = new Request(upstream.toString(), request);
-      proxied.headers.set('host', 'clubaid.pages.dev');
-      return fetch(proxied, { redirect: 'manual' });
+      const headers = new Headers(request.headers);
+      headers.set('host', 'clubaid.pages.dev');
+      return fetch(upstream.toString(), {
+        method: request.method,
+        headers,
+        body: request.body,
+        redirect: 'manual',
+      });
     }
 
     return new Response('reserved host: no handler\n', { status: 404 });

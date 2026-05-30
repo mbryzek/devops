@@ -72,9 +72,11 @@ puts "Deploying from #{output_dir}"
 # `.svelte-kit/cloudflare/_worker.js`, an `assets` binding to the build dir,
 # and the `routes` block) when it scaffolds the new repo. This branch only
 # routes the deploy command; it does not yet generate that config.
-is_worker = File.exist?("wrangler.toml") &&
-  File.read("wrangler.toml").match?(/^\s*main\s*=/) &&
-  !File.read("wrangler.toml").match?(/^\s*pages_build_output_dir\s*=/)
+# Read once; ignore commented-out lines so a `# main = ...` note in a Pages
+# wrangler.toml is not misread as a Worker.
+toml = File.exist?("wrangler.toml") ? File.read("wrangler.toml") : ""
+is_worker = toml.match?(/^\s*(?!#)main\s*=/) &&
+  !toml.match?(/^\s*(?!#)pages_build_output_dir\s*=/)
 
 if is_worker
   helper.run_system("wrangler deploy")
