@@ -47,25 +47,26 @@ class ApibuilderClient
   # signed DigitalOcean Spaces URL. build_http is rebuilt per iteration for the new
   # uri's host/port, so cross-host redirects (idempotent.io → Spaces) work.
   def download(url)
+    original_url = url
     5.times do
       uri = URI.parse(url)
       http = build_http(uri)
       response = http.request(Net::HTTP::Get.new(uri.request_uri))
       code = response.code.to_i
-      if code == 200
+      case code
+      when 200
         return response.body
-      elsif code == 404 || code == 410
+      when 404, 410
         return nil
-      elsif [301, 302, 303, 307, 308].include?(code)
+      when 301, 302, 303, 307, 308
         location = response['location']
         Util.exit_with_error("Redirect (#{code}) with no Location for #{url}") if location.nil? || location.empty?
         url = location
-        next
       else
         Util.exit_with_error("Failed to download #{url}: HTTP #{code}")
       end
     end
-    Util.exit_with_error("Too many redirects downloading #{url}")
+    Util.exit_with_error("Too many redirects downloading #{original_url}")
   end
 
   # Create an anonymous org and token (no auth sent).
