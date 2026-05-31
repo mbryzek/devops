@@ -33,3 +33,10 @@ the wildcard owner-app routing for the club-subdomains program. Full findings li
 ## Deploy (reference)
 `wrangler deploy` from each dir (reads its `wrangler.toml`). Requires Workers write; the
 wildcard DNS record (`AAAA * → 100::`, proxied) requires a separate `Zone:DNS:Edit` token.
+
+## SP-B (production)
+SP-B (plan: `~/code/claude/plans/2026-05-30-ca-repo-split-sp-b.md`) replaces the
+`clubaid-reserved-spike` stopgap (`reserved-worker/` above): it deploys the admin app as a
+Worker on the specific route `admin.clubaid.co/*` plus a native www→apex redirect, and
+deploys the owner app as a Worker (its wildcard `*.clubaid.co/*` route is bound later in
+SP-E).
