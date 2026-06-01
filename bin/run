@@ -34,13 +34,16 @@ if [ "$1" = "test" ]; then
   # launch a claude session (ccd == claude --dangerously-skip-permissions) to
   # investigate and fix them. The flag is stripped before passing args to sbt.
   AUTOFIX=0
-  set --
-  for arg in "$@"; do
+  argc=$#
+  while [ "$argc" -gt 0 ]; do
+    arg="$1"
+    shift
     if [ "$arg" = "--fix" ]; then
       AUTOFIX=1
     else
       set -- "$@" "$arg"
     fi
+    argc=$((argc - 1))
   done
 
   LOG="/tmp/$PROJECT-test-$(date +%Y%m%d-%H%M%S).log"
@@ -67,12 +70,12 @@ if [ "$1" = "test" ]; then
     if [ "$AUTOFIX" -eq 1 ]; then
       echo "Found $PROBLEMS problem(s)."
       launch_fix
-    elif [ -t 0 ] || [ -e /dev/tty ]; then
+    elif [ -t 0 ] && [ -e /dev/tty ]; then
       # Interactive: ask before exiting so the user can fix without re-running.
       printf "Found %s problem(s). Launch claude to investigate and fix? [y/N] " "$PROBLEMS"
-      read REPLY < /dev/tty
-      case "$REPLY" in
-        [yY] | [yY][eE][sS]) launch_fix ;;
+      read -r reply < /dev/tty
+      case "$reply" in
+        [yY]|[yY][eE][sS]) launch_fix ;;
         *) echo "Skipping. Re-run with '--fix' to auto-launch claude next time." ;;
       esac
     else
