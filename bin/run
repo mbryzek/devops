@@ -22,9 +22,9 @@ launch_fix() {
 Investigate and fix the errors:
 - Read $LOG and identify each distinct failure/error and its root cause (grep for '[error]', 'TESTS FAILED', 'Tests:', and stack traces).
 - Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
-- Do NOT change production behavior just to make a test pass — diagnose why the test environment differs first.
+- Do NOT change production behavior unless you first prove it is in fact a production bug. Starting assumptino is the tests need to be updated.
 - After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
-- Work on a feature branch per CLAUDE.md; do not commit to main."
+- Work on a feature branch and directory per CLAUDE.md; do not commit to main."
 }
 
 if [ "$1" = "test" ]; then
