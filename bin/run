@@ -1,0 +1,70 @@
+#!/bin/sh
+
+# Shared sbt run/test wrapper for the scala projects (platform, acumen, ...).
+# Each project root keeps a thin ./run.sh that execs this script, so the logic
+# lives in one place. The project name (used for log file naming) is derived
+# from the directory ./run.sh was invoked in.
+#
+# Usage (from a project root):
+#   ./run.sh run
+#   ./run.sh test
+#   ./run.sh test --fix     # on failures/errors, launch claude to investigate
+
+PROJECT=$(basename "$PWD")
+
+if [ "$1" = "test" ]; then
+  rm -f "/tmp/$PROJECT-test-"*.log
+
+  # --fix: after the run, parse the log and, if there are any failures/errors,
+  # launch a claude session (ccd == claude --dangerously-skip-permissions) to
+  # investigate and fix them. The flag is stripped before passing args to sbt.
+  AUTOFIX=0
+  set --
+  for arg in "$@"; do
+    if [ "$arg" = "--fix" ]; then
+      AUTOFIX=1
+    else
+      set -- "$@" "$arg"
+    fi
+  done
+
+  LOG="/tmp/$PROJECT-test-$(date +%Y%m%d-%H%M%S).log"
+  echo "Logging to $LOG"
+  eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\"" 2>&1 | tee "$LOG"
+
+  # Summarize results from the log.
+  # Test failures/canceled: summed across each subproject's ScalaTest summary line.
+  FAILURES=$(grep -hEo 'failed [0-9]+'   "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  CANCELED=$(grep -hEo 'canceled [0-9]+' "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  # Compile errors: [error] lines pointing at a source location (skips sbt's generic noise).
+  COMPILE_ERRORS=$(grep -cE '^\[error\] .*\.(scala|java):[0-9]+' "$LOG")
+  PROBLEMS=$((FAILURES + CANCELED + COMPILE_ERRORS))
+
+  echo ""
+  echo "================ test summary ================"
+  echo "  project:        $PROJECT"
+  echo "  failed:         $FAILURES"
+  echo "  canceled:       $CANCELED"
+  echo "  compile errors: $COMPILE_ERRORS"
+  echo "============================================="
+
+  if [ "$PROBLEMS" -gt 0 ]; then
+    if [ "$AUTOFIX" -eq 1 ]; then
+      echo "Found $PROBLEMS problem(s) — launching claude to investigate and fix..."
+      claude --dangerously-skip-permissions "The $PROJECT test suite was just run and reported $FAILURES test failure(s), $CANCELED canceled test(s), and $COMPILE_ERRORS compile error(s). The full sbt/ScalaTest output is in $LOG.
+
+Investigate and fix the errors:
+- Read $LOG and identify each distinct failure/error and its root cause (grep for '[error]', 'TESTS FAILED', 'Tests:', and stack traces).
+- Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
+- Do NOT change production behavior just to make a test pass — diagnose why the test environment differs first.
+- After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
+- Work on a feature branch per CLAUDE.md; do not commit to main."
+    else
+      echo "Found $PROBLEMS problem(s). Re-run with '--fix' to auto-launch claude to investigate."
+    fi
+  else
+    echo "All green — no failures or errors."
+  fi
+else
+  eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\""
+fi
