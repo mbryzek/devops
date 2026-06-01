@@ -9,8 +9,23 @@
 #   ./run.sh run
 #   ./run.sh test
 #   ./run.sh test --fix     # on failures/errors, launch claude to investigate
+#                           # (without --fix, you're prompted before exiting)
 
 PROJECT=$(basename "$PWD")
+
+# Launch a claude session (--dangerously-skip-permissions) to investigate and
+# fix the failures/errors captured in the test log.
+launch_fix() {
+  echo "Launching claude to investigate and fix..."
+  claude --dangerously-skip-permissions "The $PROJECT test suite was just run and reported $FAILURES test failure(s), $CANCELED canceled test(s), and $COMPILE_ERRORS compile error(s). The full sbt/ScalaTest output is in $LOG.
+
+Investigate and fix the errors:
+- Read $LOG and identify each distinct failure/error and its root cause (grep for '[error]', 'TESTS FAILED', 'Tests:', and stack traces).
+- Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
+- Do NOT change production behavior just to make a test pass — diagnose why the test environment differs first.
+- After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
+- Work on a feature branch per CLAUDE.md; do not commit to main."
+}
 
 if [ "$1" = "test" ]; then
   rm -f "/tmp/$PROJECT-test-"*.log
@@ -19,13 +34,16 @@ if [ "$1" = "test" ]; then
   # launch a claude session (ccd == claude --dangerously-skip-permissions) to
   # investigate and fix them. The flag is stripped before passing args to sbt.
   AUTOFIX=0
-  set --
-  for arg in "$@"; do
+  argc=$#
+  while [ "$argc" -gt 0 ]; do
+    arg="$1"
+    shift
     if [ "$arg" = "--fix" ]; then
       AUTOFIX=1
     else
       set -- "$@" "$arg"
     fi
+    argc=$((argc - 1))
   done
 
   LOG="/tmp/$PROJECT-test-$(date +%Y%m%d-%H%M%S).log"
@@ -50,16 +68,18 @@ if [ "$1" = "test" ]; then
 
   if [ "$PROBLEMS" -gt 0 ]; then
     if [ "$AUTOFIX" -eq 1 ]; then
-      echo "Found $PROBLEMS problem(s) — launching claude to investigate and fix..."
-      claude --dangerously-skip-permissions "The $PROJECT test suite was just run and reported $FAILURES test failure(s), $CANCELED canceled test(s), and $COMPILE_ERRORS compile error(s). The full sbt/ScalaTest output is in $LOG.
-
-Investigate and fix the errors:
-- Read $LOG and identify each distinct failure/error and its root cause (grep for '[error]', 'TESTS FAILED', 'Tests:', and stack traces).
-- Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
-- Do NOT change production behavior just to make a test pass — diagnose why the test environment differs first.
-- After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
-- Work on a feature branch per CLAUDE.md; do not commit to main."
+      echo "Found $PROBLEMS problem(s)."
+      launch_fix
+    elif [ -t 0 ] && [ -e /dev/tty ]; then
+      # Interactive: ask before exiting so the user can fix without re-running.
+      printf "Found %s problem(s). Launch claude to investigate and fix? [y/N] " "$PROBLEMS"
+      read -r reply < /dev/tty
+      case "$reply" in
+        [yY]|[yY][eE][sS]) launch_fix ;;
+        *) echo "Skipping. Re-run with '--fix' to auto-launch claude next time." ;;
+      esac
     else
+      # Non-interactive (CI, pipe): don't block; just report.
       echo "Found $PROBLEMS problem(s). Re-run with '--fix' to auto-launch claude to investigate."
     fi
   else
