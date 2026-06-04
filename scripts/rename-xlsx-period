@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# dev-script: targets=local
+# Rename xlsx report files by the period their data covers. Wraps ~/code/misc/rename-xlsx-period.scala.
+#
+# Operates on the current directory by default (dry-run unless --apply), so run it
+# from the folder holding the xlsx files. Args are forwarded to the script:
+#
+#   dev scripts run rename-xlsx-period            # dry-run on the current dir
+#   dev scripts run rename-xlsx-period --apply    # actually rename
+#   dev scripts run rename-xlsx-period -r /some/dir
+set -euo pipefail
+target="$HOME/code/misc/rename-xlsx-period.scala"
+[[ -f "$target" ]] || { echo "ERROR: not found: $target" >&2; exit 1; }
+exec scala-cli run "$target" -- "$@"

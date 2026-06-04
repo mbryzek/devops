@@ -126,6 +126,13 @@ class TestDevScripts < Minitest::Test
     assert_match(/requires a script name/, out)
   end
 
+  def test_run_rejects_leading_flag_as_name
+    # The name must come first; a leading flag is not a script name.
+    out, status = capture { cmd_scripts_run(["--prod", "delete-test-uploads"]) }
+    assert_equal 1, status
+    assert_match(/requires a script name/, out)
+  end
+
   def test_run_env_without_value_is_rejected
     out, status = capture { cmd_scripts_run(["truncate-court-reserve-data", "--env"]) }
     assert_equal 1, status
@@ -133,9 +140,9 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_run_rejects_args_for_sql_script
-    out, status = capture { cmd_scripts_run(["delete-test-uploads", "--", "foo"]) }
+    out, status = capture { cmd_scripts_run(["delete-test-uploads", "foo"]) }
     assert_equal 1, status
-    assert_match(/takes no arguments/, out)
+    assert_match(/is a SQL script; unexpected argument 'foo'/, out)
   end
 
   def test_run_unknown_script_suggests

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# dev-script: targets=local
+# Verify clubaid data integrity (picklejar tripwire + related checks). Wraps ~/code/env/verify/verify-data.scala.
+#
+# (Formerly verify-picklejar.scala.) Runs from ~/code/env/verify so it can resolve
+# its sibling helpers. Any args are forwarded to the script.
+#
+#   dev scripts run verify-data
+set -euo pipefail
+dir="$HOME/code/env/verify"
+[[ -f "$dir/verify-data.scala" ]] || { echo "ERROR: not found: $dir/verify-data.scala (is the env repo cloned at ~/code/env?)" >&2; exit 1; }
+cd "$dir"
+exec scala-cli run ./verify-data.scala -- "$@"

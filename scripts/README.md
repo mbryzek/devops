@@ -1,15 +1,22 @@
 # Utility scripts
 
-One home for ad-hoc developer/operations scripts, surfaced through the `dev` CLI:
+One index for developer/operations scripts, surfaced through the `dev` CLI:
 
 ```
-dev scripts list                    # every script here, with allowed targets + description
-dev scripts run <name>              # run against the LOCAL platformdb (default)
-dev scripts run <name> --prod       # run against production (if the script allows it)
-dev scripts run <name> --env development
+dev scripts list                    # every script here, with targets + description
+dev scripts run <name> [args...]    # the name comes FIRST, then any arguments
 ```
 
-Adding a script = drop a file here. No `dev` CLI changes required.
+Two kinds of scripts live here:
+
+- **First-class scripts** — `.sql` files (and standalone executables) that *are*
+  the utility. Example: `delete-test-uploads.sql`.
+- **Wrappers** — thin executables that invoke a script living in another repo
+  (it's coupled to that repo's helpers/config, so it stays there). Example:
+  `clubaid-data-diff` wraps `platform/scripts/clubaid-data-diff.scala`. This lets
+  `dev scripts list` index *every* utility without relocating coupled suites.
+
+Adding a script (or wrapper) = drop a file here. No `dev` CLI changes required.
 
 ## The `dev-script:` header
 
@@ -30,11 +37,19 @@ The first non-shebang, non-`dev-script:` comment line is the description shown b
 
 ## How runs execute
 
-- **Local `.sql`** → `psql -U api -f <file> platformdb` with `ON_ERROR_STOP=1`.
-  The runner refuses if `PGHOST` points at a non-local host, so a stray env var
-  can't redirect a local script at production. Wrap multi-statement SQL in
-  `begin; ... commit;` so a failure rolls back cleanly.
-- **Production / development `.sql`** → delegated to `db exec`, which tunnels
-  through the bastion. Production runs prompt for typed confirmation first.
-- **Executable files** (shell/Ruby with a shebang + executable bit) → exec'd
-  directly, local only; args after `--` are passed through.
+The script **name is always the first token**; how the rest is handled depends on
+the script type:
+
+- **`.sql` scripts** — the remaining tokens are the runner's own env flags:
+  - Local (default) → `psql -U api -f <file> platformdb` with `ON_ERROR_STOP=1`.
+    The runner refuses if `PGHOST` points at a non-local host, so a stray env var
+    can't redirect a local script at production. Wrap multi-statement SQL in
+    `begin; ... commit;` so a failure rolls back cleanly.
+  - `--prod` / `--env development` → delegated to `db exec` (bastion tunnel);
+    production prompts for typed confirmation first. Allowed only if the env is in
+    the script's `targets`. SQL scripts take no positional arguments.
+- **Executable scripts / wrappers** — run locally; **every argument after the name
+  is forwarded verbatim** (no `--` separator needed, and `--env`/`--prod` belong to
+  the inner script, not the runner). A wrapper manages its own environment and
+  confirms before production itself. Their `targets=local` just means "the wrapper
+  runs on your machine" — see each wrapper's header for how to reach prod.

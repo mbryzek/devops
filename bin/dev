@@ -82,12 +82,13 @@ USAGE = <<~USAGE
         List utility scripts in devops/scripts/ with their allowed targets and
         a one-line description. `list` is the default when no subcommand given.
 
-    scripts run <name> [--prod | --env ENV] [-- ARGS...]
-        Run a utility script. Defaults to the LOCAL platformdb. `.sql` scripts
-        run via psql locally, or via `db exec` for --prod / --env development
-        (production prompts for confirmation). A script's `dev-script:` header
-        declares which targets it allows; non-local targets are refused unless
-        listed. Executable (non-SQL) scripts run locally with ARGS passed through.
+    scripts run <name> [args...]
+        Run a utility script (or wrapper) — the NAME comes first. For `.sql`
+        scripts the args are env flags: local platformdb by default, or `--prod` /
+        `--env development` to run via `db exec` (production prompts for
+        confirmation; non-local targets must be listed in the script's
+        `dev-script:` header). Executable scripts/wrappers run locally with every
+        arg forwarded verbatim — including their own `--env`/`--prod` flags.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -1245,7 +1246,8 @@ end
 # names the app for `db exec` when a non-local target is used. A local run of a
 # `.sql` script goes straight at the local platformdb via psql; a production /
 # development run delegates to `db exec`, which tunnels through the bastion.
-# Non-SQL scripts that are executable are exec'd directly (local only).
+# Executable scripts (including thin wrappers around scripts that live in other
+# repos) are exec'd directly with all args forwarded; they own their environment.
 # Adding a script needs no code change here.
 
 SCRIPTS_DIR = File.expand_path(File.join(__dir__, "..", "scripts")).freeze
@@ -1324,7 +1326,7 @@ def cmd_scripts_list(_args)
     end
   end
   puts ""
-  puts "Run with: dev scripts run <name> [--prod | --env ENV]"
+  puts "Run with: dev scripts run <name> [args...]   (.sql: [--prod | --env ENV])"
   puts ""
 end
 
@@ -1367,53 +1369,58 @@ def run_remote_sql(path, env, meta)
   Util.exit_with_error("Script failed: #{File.basename(path)}") unless system(*cmd)
 end
 
+# The script NAME is always the first token. How the rest is handled depends on
+# the script type:
+#   - .sql     -> the remaining tokens are OUR env-selection flags (--env/--prod/
+#                 --localhost); the dev runner routes local psql vs `db exec`.
+#   - executable (wrapper) -> the script manages its own environment, so every
+#                 remaining token is passed straight through to it, verbatim
+#                 (including any --env/--prod, which are the inner script's flags).
 def cmd_scripts_run(args)
+  name = args.shift
+  if name.nil? || name.start_with?("-")
+    usage_exit("scripts run requires a script name first (see 'dev scripts list')")
+  end
+  path = resolve_script(name)
+
+  if File.extname(path) == ".sql"
+    run_sql_script(path, name, args)
+  elsif File.executable?(path)
+    # Wrapper scripts run locally and own their environment; forward all args.
+    exec(path, *args)
+  else
+    Util.exit_with_error("#{File.basename(path)} has no runner: not a .sql file and not executable. Add a shebang and `chmod +x`, or rename to .sql.")
+  end
+end
+
+# Parse OUR env-selection flags for a .sql script and route it. SQL scripts take
+# no positional arguments — anything unexpected is an error.
+def run_sql_script(path, name, args)
   env = "local"
-  name = nil
-  passthrough = []
-  after_ddash = false # everything past `--` is passed verbatim to the script
   i = 0
   while i < args.length
-    a = args[i]
-    if after_ddash
-      passthrough << a
-    elsif a == "--"
-      after_ddash = true
+    case args[i]
+    when "--env"
+      usage_exit("--env requires a value (local, development, or production)") if i + 1 >= args.length
+      env = args[i + 1]; i += 1
+    when "--prod", "--production" then env = "production"
+    when "--dev", "--development" then env = "development"
+    when "--localhost", "--local" then env = "local"
     else
-      case a
-      when "--env"
-        usage_exit("--env requires a value (local, development, or production)") if i + 1 >= args.length
-        env = args[i + 1]; i += 1
-      when "--prod", "--production" then env = "production"
-      when "--dev", "--development" then env = "development"
-      when "--localhost", "--local" then env = "local"
-      else (name.nil? ? (name = a) : passthrough << a)
-      end
+      Util.exit_with_error("#{File.basename(path)} is a SQL script; unexpected argument '#{args[i]}' (only --env/--prod/--localhost are accepted).")
     end
     i += 1
   end
-  usage_exit("scripts run requires a script name (see 'dev scripts list')") if name.nil?
 
   env = "local" if LOCAL_ENVS.include?(env)
-  path = resolve_script(name)
   meta = script_metadata(path)
   targets = script_targets(meta)
   unless targets.include?(env) || (env == "local" && targets.any? { |t| LOCAL_ENVS.include?(t) })
     Util.exit_with_error("Script '#{name}' does not support env '#{env}'. Allowed: #{targets.join(', ')}")
   end
 
-  if File.extname(path) == ".sql" && !passthrough.empty?
-    Util.exit_with_error("#{File.basename(path)} is a SQL script and takes no arguments (got: #{passthrough.join(' ')}).")
-  end
-
   if env == "local"
-    if File.extname(path) == ".sql"
-      run_local_sql(path)
-    elsif File.executable?(path)
-      exec(path, *passthrough)
-    else
-      Util.exit_with_error("#{File.basename(path)} has no runner: not a .sql file and not executable. Add a shebang and `chmod +x`, or rename to .sql.")
-    end
+    run_local_sql(path)
   else
     run_remote_sql(path, env, meta)
   end
