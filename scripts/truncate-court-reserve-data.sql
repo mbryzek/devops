@@ -13,9 +13,12 @@
 -- event_summaries is intentionally omitted: it is dropped + recreated by the
 -- structural migration in scripts/, so it is already empty.
 --
--- Run against the target DB (pin local platformdb explicitly; never prod
--- without intent). All listed tables are truncated together so FKs among
--- them are satisfied in one statement.
+-- Run via `dev scripts run truncate-court-reserve-data` (local by default, or
+-- `--prod` with confirmation). All TRUNCATEs run in one transaction so a partial
+-- failure rolls back cleanly; the court_reserve tables are truncated together so
+-- FKs among them are satisfied in one statement.
+
+begin;
 
 set search_path to court_reserve;
 
@@ -39,6 +42,8 @@ set search_path to public;
 
 truncate table clubaid.uploads, clubaid.upload_logs, clubaid.export_watermarks;
 truncate table playbook.revenue_categories, playbook.revenue_entries, playbook.transaction_types, playbook.watermarks;
+
+commit;
 
 -- NOT truncated — operational config / credentials / crawler state, NOT
 -- re-derived by a data upload. Wiping these would break the integration

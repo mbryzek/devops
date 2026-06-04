@@ -70,6 +70,7 @@ class TestDevScripts < Minitest::Test
 
   # ---- discovery against the real scripts dir ----
 
+  # These names must match the files committed in scripts/ — update if renamed.
   def test_available_scripts_include_seeded_and_exclude_readme
     names = scripts_available
     assert_includes names, "delete-test-uploads.sql"
@@ -123,6 +124,12 @@ class TestDevScripts < Minitest::Test
     out, status = capture { cmd_scripts_run([]) }
     assert_equal 1, status
     assert_match(/requires a script name/, out)
+  end
+
+  def test_run_env_without_value_is_rejected
+    out, status = capture { cmd_scripts_run(["truncate-court-reserve-data", "--env"]) }
+    assert_equal 1, status
+    assert_match(/--env requires a value/, out)
   end
 
   def test_run_unknown_script_suggests

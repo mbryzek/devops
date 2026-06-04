@@ -190,6 +190,9 @@ def do_exec(args, env_explicit = false)
     # --env defaults to production (see Args). Never silently apply to prod: if
     # the user did not explicitly pass --env, require typed confirmation first.
     if args.env == "production" && !env_explicit
+        unless $stdin.tty?
+            Util.exit_with_error("Refusing to run against production without an explicit --env in a non-interactive shell. Pass --env production to confirm intent.")
+        end
         puts "No --env specified, so this defaults to PRODUCTION (#{db.name}@#{db.host})."
         print "Type 'yes' to run against production, or Ctrl-C and re-run with --env development: "
         unless $stdin.gets&.strip == "yes"
@@ -225,7 +228,7 @@ def do_exec(args, env_explicit = false)
 
         remote_cmd = [
             "chmod 600 #{pgpass_remote}",
-            "PGPASSFILE=#{pgpass_remote} psql --set=sslmode=require -h #{db.host} -p #{db.port} -U #{db.user} #{db.name} -f #{sql_remote}"
+            "PGPASSFILE=#{pgpass_remote} psql --set=sslmode=require --set=ON_ERROR_STOP=1 -h #{db.host} -p #{db.port} -U #{db.user} #{db.name} -f #{sql_remote}"
         ].join(" && ")
 
         Util.run("ssh root@#{node_ip} '#{remote_cmd}'")

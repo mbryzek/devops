@@ -1378,7 +1378,9 @@ def cmd_scripts_run(args)
       after_ddash = true
     else
       case a
-      when "--env"                  then env = args[i + 1].to_s; i += 1
+      when "--env"
+        usage_exit("--env requires a value (local, development, or production)") if i + 1 >= args.length
+        env = args[i + 1]; i += 1
       when "--prod", "--production" then env = "production"
       when "--dev", "--development" then env = "development"
       when "--localhost", "--local" then env = "local"
