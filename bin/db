@@ -163,7 +163,7 @@ PGPASSFILE="$PGPASS_FILE" psql --set=sslmode=require -h #{db.host} -p #{db.port}
     end
 end
 
-def do_exec(args)
+def do_exec(args, env_explicit = false)
     if args.path.nil? || args.path.empty?
         Util.exit_with_error("Missing required argument: --sql PATH")
     end
@@ -186,6 +186,18 @@ def do_exec(args)
     puts "  DB:     #{db.name}@#{db.host}:#{db.port}"
     puts "  Script: #{sql_file}"
     puts ""
+
+    # --env defaults to production (see Args). Never silently apply to prod: if
+    # the user did not explicitly pass --env, require typed confirmation first.
+    if args.env == "production" && !env_explicit
+        puts "No --env specified, so this defaults to PRODUCTION (#{db.name}@#{db.host})."
+        print "Type 'yes' to run against production, or Ctrl-C and re-run with --env development: "
+        unless $stdin.gets&.strip == "yes"
+            puts "Aborted."
+            exit 1
+        end
+        puts ""
+    end
 
     # Generate unique identifiers for this session
     session_id = SecureRandom.hex(8)
@@ -243,8 +255,9 @@ when "exec"
     # For exec, we need --sql which maps to --path in Args
     # Replace --sql with --path for compatibility
     modified_argv = ARGV.map { |arg| arg == "--sql" ? "--path" : arg }
+    env_explicit = ARGV.include?("--env")
     args = Args.parse(modified_argv, ["app", "path"])
-    do_exec(args)
+    do_exec(args, env_explicit)
 when "-h", "--help", "help"
     show_usage
 else

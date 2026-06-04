@@ -78,6 +78,17 @@ USAGE = <<~USAGE
         --keep-tmp-dir is passed; it is always kept if any repo fails so output
         can be inspected. Quiet by default; use --verbose to stream full output.
 
+    scripts [list]
+        List utility scripts in devops/scripts/ with their allowed targets and
+        a one-line description. `list` is the default when no subcommand given.
+
+    scripts run <name> [--prod | --env ENV] [-- ARGS...]
+        Run a utility script. Defaults to the LOCAL platformdb. `.sql` scripts
+        run via psql locally, or via `db exec` for --prod / --env development
+        (production prompts for confirmation). A script's `dev-script:` header
+        declares which targets it allows; non-local targets are refused unless
+        listed. Executable (non-SQL) scripts run locally with ARGS passed through.
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -99,7 +110,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks version versions pending config docker browserslist].freeze
+COMMANDS = %w[login logout invariants tasks version versions pending config docker browserslist scripts].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
@@ -107,6 +118,7 @@ SUBCOMMANDS = {
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "browserslist" => %w[update],
+  "scripts"      => %w[list run],
 }.freeze
 
 def levenshtein(a, b)
@@ -1221,6 +1233,183 @@ def cmd_browserslist_update(args)
   exit 1 unless failures.empty?
 end
 
+# ---------- scripts ----------
+#
+# `scripts/` is the single home for ad-hoc developer/ops utility scripts (see
+# scripts/README.md). `dev scripts list` discovers them; `dev scripts run <name>`
+# runs one. Each script may declare a `dev-script:` metadata header:
+#
+#   -- dev-script: targets=local,production app=platform
+#
+# `targets` (default `local`) lists the environments it may run against; `app`
+# names the app for `db exec` when a non-local target is used. A local run of a
+# `.sql` script goes straight at the local platformdb via psql; a production /
+# development run delegates to `db exec`, which tunnels through the bastion.
+# Non-SQL scripts that are executable are exec'd directly (local only).
+# Adding a script needs no code change here.
+
+SCRIPTS_DIR = File.expand_path(File.join(__dir__, "..", "scripts")).freeze
+SCRIPT_META_RE = /\A(?:--+|#+)\s*dev-script:\s*(.*)\z/.freeze
+LOCAL_ENVS = %w[local localhost].freeze
+
+def scripts_available
+  return [] unless Dir.exist?(SCRIPTS_DIR)
+  Dir.children(SCRIPTS_DIR).select { |f| File.file?(File.join(SCRIPTS_DIR, f)) }
+     .reject { |f| f.start_with?(".") || f.casecmp?("readme.md") }
+     .sort
+end
+
+def script_base(filename)
+  filename.sub(/\.[^.]+\z/, "")
+end
+
+# Scan leading comment lines for `dev-script:` key=value pairs.
+def script_metadata(path)
+  meta = {}
+  File.foreach(path) do |line|
+    s = line.strip
+    next if s.empty? || s.start_with?("#!")
+    if (m = SCRIPT_META_RE.match(s))
+      m[1].split(/\s+/).each { |pair| k, v = pair.split("=", 2); meta[k] = v }
+      next
+    end
+    break unless s.start_with?("--", "#")
+  end
+  meta
+end
+
+def script_targets(meta)
+  (meta["targets"] || "local").split(",").map(&:strip).reject(&:empty?)
+end
+
+# First non-blank, non-shebang, non-metadata comment line — shown by `list`.
+def script_description(path)
+  File.foreach(path) do |line|
+    s = line.strip
+    next if s.empty? || s.start_with?("#!") || SCRIPT_META_RE.match?(s)
+    return s.sub(/\A(--+|#+)\s*/, "").strip if s.start_with?("--", "#")
+    break
+  end
+  ""
+end
+
+def resolve_script(name)
+  scripts = scripts_available
+  matches = scripts.select { |f| f == name || script_base(f) == name }
+  if matches.empty?
+    unknown("script", name, scripts.map { |f| script_base(f) }.uniq)
+  elsif matches.length > 1
+    usage_exit("Ambiguous script '#{name}' matches: #{matches.join(', ')}")
+  end
+  File.join(SCRIPTS_DIR, matches.first)
+end
+
+def cmd_scripts_list(_args)
+  scripts = scripts_available
+  puts ""
+  puts Util.underline("Utility Scripts")
+  puts ""
+  if scripts.empty?
+    puts "  (none yet — drop a file in #{Util.cleanpath(SCRIPTS_DIR)})"
+  else
+    name_w = scripts.map { |f| script_base(f).length }.max
+    rows = scripts.map do |f|
+      full = File.join(SCRIPTS_DIR, f)
+      [script_base(f), script_targets(script_metadata(full)).join(","), script_description(full)]
+    end
+    tgt_w = rows.map { |r| r[1].length }.max
+    rows.each do |name, targets, desc|
+      desc = "#{desc[0, 69]}…" if desc.length > 70
+      puts "  #{name.ljust(name_w)}  [#{targets.ljust(tgt_w)}]  #{desc}".rstrip
+    end
+  end
+  puts ""
+  puts "Run with: dev scripts run <name> [--prod | --env ENV]"
+  puts ""
+end
+
+# Local .sql run: mirrors the working local invocation (unix socket / user api),
+# adds ON_ERROR_STOP so a mid-script failure aborts and rolls back, and refuses
+# to run if PGHOST points at a non-local host so a stray env var can't redirect a
+# destructive script at production.
+def run_local_sql(path)
+  host = ENV["PGHOST"]
+  if host && !host.empty? && !host.start_with?("/") && !%w[localhost 127.0.0.1 ::1].include?(host)
+    Util.exit_with_error("PGHOST=#{host} points at a non-local host. Local scripts only run against the local platformdb — unset PGHOST and retry.")
+  end
+  cmd = ["psql", "-U", "api", "-v", "ON_ERROR_STOP=1", "-f", path, "platformdb"]
+  puts "==> #{cmd.join(' ')}"
+  Util.exit_with_error("Script failed: #{File.basename(path)}") unless system(*cmd)
+end
+
+# Non-local .sql run: delegate to `db exec`, which tunnels through the bastion.
+# Production is destructive on real data, so confirm explicitly first.
+def run_remote_sql(path, env, meta)
+  unless File.extname(path) == ".sql"
+    Util.exit_with_error("Only .sql scripts can run against #{env}; #{File.basename(path)} is not SQL.")
+  end
+  app = meta["app"]
+  if app.nil? || app.empty?
+    Util.exit_with_error("Script targets #{env} but its dev-script header has no app= (needed for db exec).")
+  end
+  if env == "production"
+    print "About to run #{File.basename(path)} against #{app} PRODUCTION. Type 'yes' to continue: "
+    unless $stdin.gets&.strip == "yes"
+      puts "Aborted."
+      exit 1
+    end
+  end
+  cmd = [File.join(__dir__, "db"), "exec", "--app", app, "--env", env, "--sql", path]
+  puts "==> #{cmd.join(' ')}"
+  Util.exit_with_error("Script failed: #{File.basename(path)}") unless system(*cmd)
+end
+
+def cmd_scripts_run(args)
+  env = "local"
+  name = nil
+  passthrough = []
+  after_ddash = false # everything past `--` is passed verbatim to the script
+  i = 0
+  while i < args.length
+    a = args[i]
+    if after_ddash
+      passthrough << a
+    elsif a == "--"
+      after_ddash = true
+    else
+      case a
+      when "--env"                  then env = args[i + 1].to_s; i += 1
+      when "--prod", "--production" then env = "production"
+      when "--dev", "--development" then env = "development"
+      when "--localhost", "--local" then env = "local"
+      else (name.nil? ? (name = a) : passthrough << a)
+      end
+    end
+    i += 1
+  end
+  usage_exit("scripts run requires a script name (see 'dev scripts list')") if name.nil?
+
+  env = "local" if LOCAL_ENVS.include?(env)
+  path = resolve_script(name)
+  meta = script_metadata(path)
+  targets = script_targets(meta)
+  unless targets.include?(env) || (env == "local" && targets.any? { |t| LOCAL_ENVS.include?(t) })
+    Util.exit_with_error("Script '#{name}' does not support env '#{env}'. Allowed: #{targets.join(', ')}")
+  end
+
+  if env == "local"
+    if File.extname(path) == ".sql"
+      run_local_sql(path)
+    elsif File.executable?(path)
+      exec(path, *passthrough)
+    else
+      Util.exit_with_error("#{File.basename(path)} has no runner: not a .sql file and not executable. Add a shebang and `chmod +x`, or rename to .sql.")
+    end
+  else
+    run_remote_sql(path, env, meta)
+  end
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -1286,6 +1475,14 @@ when "docker"
   when "prune" then cmd_docker_prune(argv)
   when nil     then usage_exit("docker requires a subcommand")
   else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
+  end
+when "scripts"
+  sub = argv.shift
+  case sub
+  when "list"      then cmd_scripts_list(argv)
+  when "run"       then cmd_scripts_run(argv)
+  when nil         then cmd_scripts_list(argv)
+  else                  unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
   end
 else
   unknown("command", command, COMMANDS)
