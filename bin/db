@@ -163,7 +163,7 @@ PGPASSFILE="$PGPASS_FILE" psql --set=sslmode=require -h #{db.host} -p #{db.port}
     end
 end
 
-def do_exec(args)
+def do_exec(args, env_explicit = false)
     if args.path.nil? || args.path.empty?
         Util.exit_with_error("Missing required argument: --sql PATH")
     end
@@ -186,6 +186,21 @@ def do_exec(args)
     puts "  DB:     #{db.name}@#{db.host}:#{db.port}"
     puts "  Script: #{sql_file}"
     puts ""
+
+    # --env defaults to production (see Args). Never silently apply to prod: if
+    # the user did not explicitly pass --env, require typed confirmation first.
+    if args.env == "production" && !env_explicit
+        unless $stdin.tty?
+            Util.exit_with_error("Refusing to run against production without an explicit --env in a non-interactive shell. Pass --env production to confirm intent.")
+        end
+        puts "No --env specified, so this defaults to PRODUCTION (#{db.name}@#{db.host})."
+        print "Type 'yes' to run against production, or Ctrl-C and re-run with an explicit --env (development or production): "
+        unless $stdin.gets&.strip == "yes"
+            puts "Aborted."
+            exit 1
+        end
+        puts ""
+    end
 
     # Generate unique identifiers for this session
     session_id = SecureRandom.hex(8)
@@ -213,7 +228,7 @@ def do_exec(args)
 
         remote_cmd = [
             "chmod 600 #{pgpass_remote}",
-            "PGPASSFILE=#{pgpass_remote} psql --set=sslmode=require -h #{db.host} -p #{db.port} -U #{db.user} #{db.name} -f #{sql_remote}"
+            "PGPASSFILE=#{pgpass_remote} psql --set=sslmode=require --set=ON_ERROR_STOP=1 -h #{db.host} -p #{db.port} -U #{db.user} #{db.name} -f #{sql_remote}"
         ].join(" && ")
 
         Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
@@ -243,8 +258,9 @@ when "exec"
     # For exec, we need --sql which maps to --path in Args
     # Replace --sql with --path for compatibility
     modified_argv = ARGV.map { |arg| arg == "--sql" ? "--path" : arg }
+    env_explicit = ARGV.include?("--env")
     args = Args.parse(modified_argv, ["app", "path"])
-    do_exec(args)
+    do_exec(args, env_explicit)
 when "-h", "--help", "help"
     show_usage
 else
