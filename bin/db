@@ -194,7 +194,7 @@ def do_exec(args, env_explicit = false)
             Util.exit_with_error("Refusing to run against production without an explicit --env in a non-interactive shell. Pass --env production to confirm intent.")
         end
         puts "No --env specified, so this defaults to PRODUCTION (#{db.name}@#{db.host})."
-        print "Type 'yes' to run against production, or Ctrl-C and re-run with --env development: "
+        print "Type 'yes' to run against production, or Ctrl-C and re-run with an explicit --env (development or production): "
         unless $stdin.gets&.strip == "yes"
             puts "Aborted."
             exit 1

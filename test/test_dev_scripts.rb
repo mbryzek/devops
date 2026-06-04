@@ -132,6 +132,12 @@ class TestDevScripts < Minitest::Test
     assert_match(/--env requires a value/, out)
   end
 
+  def test_run_rejects_args_for_sql_script
+    out, status = capture { cmd_scripts_run(["delete-test-uploads", "--", "foo"]) }
+    assert_equal 1, status
+    assert_match(/takes no arguments/, out)
+  end
+
   def test_run_unknown_script_suggests
     out, status = capture { cmd_scripts_run(["delete-test-upload"]) }
     assert_equal 1, status

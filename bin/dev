@@ -1353,6 +1353,9 @@ def run_remote_sql(path, env, meta)
     Util.exit_with_error("Script targets #{env} but its dev-script header has no app= (needed for db exec).")
   end
   if env == "production"
+    unless $stdin.tty?
+      Util.exit_with_error("Refusing to run #{File.basename(path)} against #{app} production in a non-interactive shell (confirmation required).")
+    end
     print "About to run #{File.basename(path)} against #{app} PRODUCTION. Type 'yes' to continue: "
     unless $stdin.gets&.strip == "yes"
       puts "Aborted."
@@ -1397,6 +1400,10 @@ def cmd_scripts_run(args)
   targets = script_targets(meta)
   unless targets.include?(env) || (env == "local" && targets.any? { |t| LOCAL_ENVS.include?(t) })
     Util.exit_with_error("Script '#{name}' does not support env '#{env}'. Allowed: #{targets.join(', ')}")
+  end
+
+  if File.extname(path) == ".sql" && !passthrough.empty?
+    Util.exit_with_error("#{File.basename(path)} is a SQL script and takes no arguments (got: #{passthrough.join(' ')}).")
   end
 
   if env == "local"
@@ -1479,12 +1486,18 @@ when "docker"
   else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
   end
 when "scripts"
-  sub = argv.shift
-  case sub
-  when "list"      then cmd_scripts_list(argv)
-  when "run"       then cmd_scripts_run(argv)
-  when nil         then cmd_scripts_list(argv)
-  else                  unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
+  # Peek (don't shift) so a bare `dev scripts` or a stray flag falls through to
+  # the default `list`, matching the `pending` dispatch pattern.
+  sub = argv.first
+  if sub.nil? || sub.start_with?("-")
+    cmd_scripts_list(argv)
+  else
+    argv.shift
+    case sub
+    when "list" then cmd_scripts_list(argv)
+    when "run"  then cmd_scripts_run(argv)
+    else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
+    end
   end
 else
   unknown("command", command, COMMANDS)
