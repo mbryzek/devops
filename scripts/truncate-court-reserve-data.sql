@@ -26,6 +26,7 @@ truncate table
   court_reserve.audit_events,
   court_reserve.courts,
   court_reserve.event_registrations,
+  court_reserve.event_summaries,
   court_reserve.events,
   court_reserve.families,
   court_reserve.members,
