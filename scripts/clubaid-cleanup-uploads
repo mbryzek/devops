@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# dev-script: targets=local
+# Delete IMPORTED clubaid org data (members/reservations/transactions/etc.) for a whitelist of org slugs, leaving each org as an empty shell. Dry run by default.
+#
+# Access model (see ~/code/env/clubaid-access.md, the single source of truth):
+#   --env local      mongodb://localhost:27017/club_aid   (your local mongod)
+#   --env production  Atlas clubaid-prod, from ~/code/env/clubaid-mongo.env
+#                     (MONGO_URI; db `club_aid` injected into the path)
+# This script owns its own environment via --env and confirms before any
+# PRODUCTION delete. `targets=local` just means the wrapper runs on your machine.
+#
+# It only ever touches the explicit DELETE_COLLECTIONS allow-list below; every
+# other collection (organizations, users, auths, userorganizations,
+# rolepermissions, kpithresholds, suggestions, summarycheckboxes, workflowitems,
+# scrape_history, scheduleimports, clubonboardings, organizationinvitations) is
+# preserved by construction. It fails loud if any whitelisted slug is missing
+# from `organizations`, or if any allow-list collection is absent from the DB.
+#
+# Usage (via the dev CLI, from the devops repo):
+#   dev scripts run clubaid-cleanup-uploads --slugs picklejar-3              # dry run, local
+#   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3
+#   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3 --execute
+#
+# PRODUCTION checklist: take a fresh backup first (snapshooter.com / mongodump),
+# run the dry run, confirm the slug -> org/_id mapping + totals, THEN --execute.
+set -euo pipefail
+
+ENV="local"
+SLUGS="picklejar-3"
+EXECUTE="false"
+
+usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env)      ENV="${2:?--env needs a value}"; shift 2 ;;
+    --slugs)    SLUGS="${2:?--slugs needs a value}"; shift 2 ;;
+    --execute)  EXECUTE="true"; shift ;;
+    -h|--help)  usage 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage 1 ;;
+  esac
+done
+
+# --- resolve the connection target ------------------------------------------
+MONGO_ENV_FILE="$HOME/code/env/clubaid-mongo.env"
+case "$ENV" in
+  local)
+    URI="mongodb://localhost:27017/club_aid"
+    TARGET_DESC="LOCAL mongod (mongodb://localhost:27017/club_aid)"
+    ;;
+  production|prod)
+    ENV="production"
+    [[ -f "$MONGO_ENV_FILE" ]] || { echo "ERROR: missing $MONGO_ENV_FILE (see ~/code/env/clubaid-access.md)" >&2; exit 1; }
+    set -a; . "$MONGO_ENV_FILE"; set +a
+    [[ -n "${MONGO_URI:-}" ]] || { echo "ERROR: MONGO_URI not set by $MONGO_ENV_FILE" >&2; exit 1; }
+    # MONGO_URI has no db in the path; inject /club_aid before any query string.
+    if [[ "$MONGO_URI" == *\?* ]]; then
+      URI="${MONGO_URI%%\?*}/club_aid?${MONGO_URI#*\?}"
+    else
+      URI="${MONGO_URI%/}/club_aid"
+    fi
+    # Mask credentials for display.
+    TARGET_DESC="PRODUCTION Atlas clubaid-prod ($(printf '%s' "$URI" | sed -E 's#://[^@]*@#://***:***@#'))"
+    ;;
+  *)
+    echo "ERROR: --env must be 'local' or 'production' (got '$ENV')" >&2; exit 1 ;;
+esac
+
+command -v mongosh >/dev/null 2>&1 || { echo "ERROR: mongosh not found" >&2; exit 1; }
+
+echo "========================================================================"
+echo "Mode:    $([[ "$EXECUTE" == true ]] && echo '*** EXECUTE (will DELETE) ***' || echo 'DRY RUN (no changes)')"
+echo "Target:  $TARGET_DESC"
+echo "Slugs:   $SLUGS"
+echo "========================================================================"
+
+# Typed confirmation before any PRODUCTION delete.
+if [[ "$ENV" == "production" && "$EXECUTE" == "true" ]]; then
+  printf 'Type exactly "yes, execute against production" to proceed: '
+  read -r reply
+  [[ "$reply" == "yes, execute against production" ]] || { echo "Aborted."; exit 1; }
+fi
+
+# --- run the cleanup in mongosh ---------------------------------------------
+# SLUGS/EXECUTE are passed in via a prelude so the JS body stays static.
+PRELUDE="const SLUGS = $(printf '%s' "$SLUGS" | awk -F',' '{printf "["; for(i=1;i<=NF;i++){gsub(/^ +| +$/,"",$i); if($i!=""){printf "%s\"%s\"",(i>1?",":""),$i}}; printf "]"}'); const EXECUTE = $EXECUTE;"
+
+mongosh "$URI" --quiet --eval "$PRELUDE" --eval '
+const DELETE_COLLECTIONS = [
+  // Members & rosters
+  "members", "families", "courts", "membershiptypes",
+  // Reservations
+  "reservations", "reservationplayers", "reservationtypes",
+  // Financials
+  "transactions", "sales_summary", "revenuerecognitions",
+  // Events
+  "events", "eventregistrations", "eventcategories", "eventsummaries",
+  // Reports / AI / analytics
+  "playerreports", "aisummaries", "analytics_events",
+  // Import bookkeeping
+  "import_history",
+  // Audit + billing
+  "audits", "subscriptions",
+];
+
+const pad = (s, n) => String(s).padEnd(n);
+const padL = (s, n) => String(s).padStart(n);
+
+// 1. Resolve slugs -> orgs; fail loud on any miss.
+const orgs = db.organizations.find({ slug: { $in: SLUGS } }, { slug: 1, name: 1 }).toArray();
+const found = new Set(orgs.map((o) => o.slug));
+const missingSlugs = SLUGS.filter((s) => !found.has(s));
+if (missingSlugs.length) {
+  print("\nABORT: slugs not found in organizations: " + missingSlugs.join(", "));
+  quit(1);
+}
+const ids = orgs.map((o) => o._id);
+print("\nResolved organizations:");
+orgs.forEach((o) => print("  - " + pad(o.slug, 28) + " " + o._id + "  " + (o.name || "")));
+
+// 2. Guard: every allow-list collection must exist (typo must not silently no-op).
+const existing = new Set(db.getCollectionNames());
+const missingColls = DELETE_COLLECTIONS.filter((c) => !existing.has(c));
+if (missingColls.length) {
+  print("\nABORT: allow-list collections missing from DB: " + missingColls.join(", "));
+  quit(1);
+}
+
+// 3. Breakdown + grand total (allow-list only).
+print("\nDocuments that match the whitelisted orgs (would be deleted):");
+let grandTotal = 0;
+DELETE_COLLECTIONS.forEach((name) => {
+  const count = db.getCollection(name).countDocuments({ organization_id: { $in: ids } });
+  const perOrg = [];
+  orgs.forEach((o) => {
+    const c = db.getCollection(name).countDocuments({ organization_id: o._id });
+    if (c > 0) perOrg.push(o.slug + "=" + c);
+  });
+  grandTotal += count;
+  print("  " + pad(name, 26) + " " + padL(count, 8) + (perOrg.length ? "   (" + perOrg.join(", ") + ")" : ""));
+});
+print("  " + pad("TOTAL", 26) + " " + padL(grandTotal, 8));
+
+if (!EXECUTE) {
+  print("\nDRY RUN complete. Re-run with --execute to delete the above.");
+  quit(0);
+}
+
+// 4. Execute.
+print("\nDeleting...");
+let deleted = 0;
+DELETE_COLLECTIONS.forEach((name) => {
+  const res = db.getCollection(name).deleteMany({ organization_id: { $in: ids } });
+  deleted += res.deletedCount;
+  if (res.deletedCount > 0) print("  " + pad(name, 26) + " " + padL(res.deletedCount, 8) + " deleted");
+});
+print("  " + pad("TOTAL", 26) + " " + padL(deleted, 8) + " deleted");
+
+// 5. Verify 0 remaining + org shell preserved.
+let remaining = 0;
+DELETE_COLLECTIONS.forEach((name) => {
+  remaining += db.getCollection(name).countDocuments({ organization_id: { $in: ids } });
+});
+if (remaining !== 0) { print("\nABORT: " + remaining + " docs still remain after delete -- investigate."); quit(1); }
+print("\nVerified: all allow-list collections show 0 remaining docs.");
+const survivingOrgs = db.organizations.countDocuments({ _id: { $in: ids } });
+print("Org docs preserved: " + survivingOrgs + "/" + ids.length);
+'
