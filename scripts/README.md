@@ -49,7 +49,9 @@ the script type:
     production prompts for typed confirmation first. Allowed only if the env is in
     the script's `targets`. SQL scripts take no positional arguments.
 - **Executable scripts / wrappers** — run locally; **every argument after the name
-  is forwarded verbatim** (no `--` separator needed, and `--env`/`--prod` belong to
-  the inner script, not the runner). A wrapper manages its own environment and
-  confirms before production itself. Their `targets=local` just means "the wrapper
-  runs on your machine" — see each wrapper's header for how to reach prod.
+  is forwarded to the script** (an optional leading `--` separator is dropped, and
+  `--env`/`--prod` belong to the inner script, not the runner). A wrapper owns its
+  own environment — see its header for how it reaches prod and whether it prompts
+  first (e.g. `clubaid-credentials` confirms before a prod write; `clubaid-data-diff`
+  is a read-only prod diff and does not). Their `targets=local` just means "the
+  wrapper runs on your machine."
