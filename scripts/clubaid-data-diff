@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dev-script: targets=local
-# Diff clubaid mongo source counts vs the platform data-availability report. Wraps platform/scripts/clubaid-data-diff.scala.
+# Diff clubaid mongo source counts vs the platform report (defaults to PRODUCTION). Wraps platform/scripts/clubaid-data-diff.scala.
 #
 # Runs from the platform repo root (the script reads ~/code/env/clubaid.txt and
 # opens an ssh mongo tunnel). Defaults to production; pass its flags through:

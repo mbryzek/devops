@@ -75,7 +75,17 @@ class TestDevScripts < Minitest::Test
     names = scripts_available
     assert_includes names, "delete-test-uploads.sql"
     assert_includes names, "truncate-court-reserve-data.sql"
+    # Wrappers (executables) are discovered the same as first-class scripts.
+    assert_includes names, "clubaid-credentials"
+    assert_includes names, "clubaid-data-diff"
+    assert_includes names, "rename-xlsx-period"
+    assert_includes names, "verify-data"
     refute_includes names, "README.md"
+  end
+
+  def test_resolve_wrapper_by_exact_name
+    assert_equal File.join(SCRIPTS_DIR, "clubaid-data-diff"),
+                 resolve_script("clubaid-data-diff")
   end
 
   def test_resolve_by_base_name

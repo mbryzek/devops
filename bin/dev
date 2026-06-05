@@ -1346,10 +1346,8 @@ end
 
 # Non-local .sql run: delegate to `db exec`, which tunnels through the bastion.
 # Production is destructive on real data, so confirm explicitly first.
+# Only ever called for a .sql script (run_sql_script gates on the extension).
 def run_remote_sql(path, env, meta)
-  unless File.extname(path) == ".sql"
-    Util.exit_with_error("Only .sql scripts can run against #{env}; #{File.basename(path)} is not SQL.")
-  end
   app = meta["app"]
   if app.nil? || app.empty?
     Util.exit_with_error("Script targets #{env} but its dev-script header has no app= (needed for db exec).")
@@ -1387,6 +1385,7 @@ def cmd_scripts_run(args)
     run_sql_script(path, name, args)
   elsif File.executable?(path)
     # Wrapper scripts run locally and own their environment; forward all args.
+    args.shift if args.first == "--" # tolerate a legacy `--` separator
     exec(path, *args)
   else
     Util.exit_with_error("#{File.basename(path)} has no runner: not a .sql file and not executable. Add a shebang and `chmod +x`, or rename to .sql.")
