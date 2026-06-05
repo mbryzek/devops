@@ -16,9 +16,10 @@
 # preserved by construction. It fails loud if any whitelisted slug is missing
 # from `organizations`, or if any allow-list collection is absent from the DB.
 #
-# Usage (via the dev CLI, from the devops repo):
-#   dev scripts run clubaid-cleanup-uploads --slugs picklejar-3              # dry run, local
-#   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3
+# Usage (via the dev CLI, from the devops repo). Do not append inline `#`
+# comments -- the runner forwards them as arguments.
+#   dev scripts run clubaid-cleanup-uploads --slugs picklejar-3                        (dry run, local)
+#   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3       (dry run, prod)
 #   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3 --execute
 #
 # PRODUCTION checklist: take a fresh backup first (snapshooter.com / mongodump),
@@ -53,11 +54,14 @@ case "$ENV" in
     [[ -f "$MONGO_ENV_FILE" ]] || { echo "ERROR: missing $MONGO_ENV_FILE (see ~/code/env/clubaid-access.md)" >&2; exit 1; }
     set -a; . "$MONGO_ENV_FILE"; set +a
     [[ -n "${MONGO_URI:-}" ]] || { echo "ERROR: MONGO_URI not set by $MONGO_ENV_FILE" >&2; exit 1; }
-    # MONGO_URI has no db in the path; inject /club_aid before any query string.
+    # MONGO_URI has no db in the path (typically `.../net/?appName=...`); inject
+    # /club_aid before any query string, stripping a trailing slash so we don't
+    # produce `.net//club_aid` (which mongosh reads as the db name `/club_aid`).
+    base="${MONGO_URI%%\?*}"; base="${base%/}"
     if [[ "$MONGO_URI" == *\?* ]]; then
-      URI="${MONGO_URI%%\?*}/club_aid?${MONGO_URI#*\?}"
+      URI="${base}/club_aid?${MONGO_URI#*\?}"
     else
-      URI="${MONGO_URI%/}/club_aid"
+      URI="${base}/club_aid"
     fi
     # Mask credentials for display.
     TARGET_DESC="PRODUCTION Atlas clubaid-prod ($(printf '%s' "$URI" | sed -E 's#://[^@]*@#://***:***@#'))"
