@@ -88,7 +88,8 @@ USAGE = <<~USAGE
         `--env development` to run via `db exec` (production prompts for
         confirmation; non-local targets must be listed in the script's
         `dev-script:` header). Executable scripts/wrappers run locally with every
-        arg forwarded verbatim — including their own `--env`/`--prod` flags.
+        arg forwarded to them (a leading `--` separator is dropped) — including
+        their own `--env`/`--prod` flags.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
