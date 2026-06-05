@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# dev-script: targets=local
+# Diff clubaid mongo source counts vs the platform report (defaults to PRODUCTION). Wraps platform/scripts/clubaid-data-diff.scala.
+#
+# Runs from the platform repo root (the script reads ~/code/env/clubaid.txt and
+# opens an ssh mongo tunnel). Defaults to production; pass its flags through:
+#
+#   dev scripts run clubaid-data-diff                                  # production, all clubs
+#   dev scripts run clubaid-data-diff --club picklejar-2               # one club
+#   dev scripts run clubaid-data-diff --platform_uri http://localhost:9300
+set -euo pipefail
+target="$HOME/code/platform/scripts/clubaid-data-diff.scala"
+[[ -f "$target" ]] || { echo "ERROR: not found: $target (is the platform repo cloned at ~/code/platform?)" >&2; exit 1; }
+cd "$HOME/code/platform"
+exec scala-cli run scripts/clubaid-data-diff.scala -- "$@"
