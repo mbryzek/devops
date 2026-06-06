@@ -83,28 +83,33 @@ if [[ -n "$PARENT_IDS" ]]; then
   # SQL is fed via stdin (not -c) because psql only interpolates :'parents' from
   # stdin / -f, never from -c command strings.
   PSQL=(psql -U api -d platformdb -X -q -t -A -v ON_ERROR_STOP=1 -v parents="$PARENT_IDS")
+  # Each query runs as the condition of `if !` so a psql failure (DB down,
+  # permission, SQL error -- ON_ERROR_STOP makes those non-zero) aborts loudly;
+  # a bare `VAR=$(...)` assignment would swallow that exit under `set -e`.
+  # psql stderr is left on the terminal (not merged into the captured output)
+  # so a diagnostic can never masquerade as query data.
 
   # Typo protection: every supplied parent id must exist as a club.
-  unknown="$("${PSQL[@]}" <<'SQL' 2>&1
+  if ! unknown="$("${PSQL[@]}" <<'SQL'
 select unnest(string_to_array(:'parents', ',')) except select id from rallyd.clubs order by 1;
 SQL
-)" || { echo "ERROR: failed to query local platformdb: $unknown" >&2; exit 1; }
+)"; then echo "ERROR: failed to query local platformdb" >&2; exit 1; fi
   if [[ -n "$unknown" ]]; then
     echo "ERROR: parent ids not found in rallyd.clubs: $(printf '%s' "$unknown" | paste -sd, -)" >&2; exit 1
   fi
 
   # Each child club's id IS its clubaid org slug.
-  PARENT_SLUGS="$("${PSQL[@]}" <<'SQL' | paste -sd, -
+  if ! PARENT_SLUGS="$("${PSQL[@]}" <<'SQL' | paste -sd, -
 select distinct id from rallyd.clubs where parent_id = any(string_to_array(:'parents', ',')) order by id;
 SQL
-)"
+)"; then echo "ERROR: failed to query local platformdb" >&2; exit 1; fi
 
   # Warn about parents that have no children (likely a leaf passed as a parent).
-  childless="$("${PSQL[@]}" <<'SQL' | paste -sd, -
+  if ! childless="$("${PSQL[@]}" <<'SQL' | paste -sd, -
 select p from (select unnest(string_to_array(:'parents', ',')) as p) s
 except select distinct parent_id from rallyd.clubs where parent_id is not null order by 1;
 SQL
-)"
+)"; then echo "ERROR: failed to query local platformdb" >&2; exit 1; fi
   [[ -n "$childless" ]] && echo "WARNING: parent ids with no child clubs (nothing to expand): $childless" >&2
 
   if [[ -z "$PARENT_SLUGS" && -z "$SLUGS" ]]; then
@@ -145,9 +150,11 @@ command -v mongosh >/dev/null 2>&1 || { echo "ERROR: mongosh not found" >&2; exi
 echo "========================================================================"
 echo "Mode:        $([[ "$EXECUTE" == true ]] && echo '*** EXECUTE (will DELETE) ***' || echo 'DRY RUN (no changes)')"
 echo "Target:      $TARGET_DESC"
-echo "Slugs:       ${SLUGS:-(none)}"
-echo "Parent ids:  ${PARENT_IDS:-(none)}"
-[[ -n "$PARENT_IDS" ]] && echo "  -> clubs:  ${PARENT_SLUGS:-(none)}"
+[[ -n "$SLUGS" ]] && echo "Slugs:       $SLUGS"
+if [[ -n "$PARENT_IDS" ]]; then
+  echo "Parent ids:  $PARENT_IDS"
+  echo "  -> clubs:  ${PARENT_SLUGS:-(none resolved)}"
+fi
 echo "========================================================================"
 
 # Typed confirmation before any PRODUCTION delete.
