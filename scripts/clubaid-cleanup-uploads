@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # dev-script: targets=local
-# Delete IMPORTED clubaid org data (members/reservations/transactions/etc.) for a whitelist of org slugs, leaving each org as an empty shell. Dry run by default.
+# Delete IMPORTED clubaid org data (members/reservations/transactions/etc.) for a whitelist of orgs, leaving each org as an empty shell. Dry run by default.
+#
+# Orgs are selected two ways (combine freely; at least one is required):
+#   --slugs       one or more clubaid org slugs (comma-separated, and/or the
+#                 flag repeated). These MUST exist in `organizations` -- a miss
+#                 aborts (typo protection).
+#   --parent-ids  one or more PARENT club ids in the LOCAL platformdb
+#                 (`rallyd.clubs.parent_id`). Each parent expands to its child
+#                 clubs; a child club's id IS its clubaid org slug. Children
+#                 with no clubaid org are reported and skipped (best-effort),
+#                 since not every club has imported data. Unknown parent ids
+#                 abort. Resolution ALWAYS runs against the local platformdb
+#                 (never production), even when --env production.
 #
 # Access model (see ~/code/env/clubaid-access.md, the single source of truth):
 #   --env local      mongodb://localhost:27017/club_aid   (your local mongod)
@@ -13,34 +25,97 @@
 # other collection (organizations, users, auths, userorganizations,
 # rolepermissions, kpithresholds, suggestions, summarycheckboxes, workflowitems,
 # scrape_history, scheduleimports, clubonboardings, organizationinvitations) is
-# preserved by construction. It fails loud if any whitelisted slug is missing
-# from `organizations`, or if any allow-list collection is absent from the DB.
+# preserved by construction. It fails loud if any allow-list collection is
+# absent from the DB.
 #
 # Usage (via the dev CLI, from the devops repo). Do not append inline `#`
 # comments -- the runner forwards them as arguments.
-#   dev scripts run clubaid-cleanup-uploads --slugs picklejar-3                        (dry run, local)
-#   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3       (dry run, prod)
-#   dev scripts run clubaid-cleanup-uploads --env production --slugs picklejar-3 --execute
+#   dev scripts run clubaid-cleanup-uploads --slugs picklejar-3                          (dry run, local)
+#   dev scripts run clubaid-cleanup-uploads --slugs picklejar-3,picklejar-2              (multiple slugs)
+#   dev scripts run clubaid-cleanup-uploads --parent-ids bounce                          (all child clubs of `bounce`)
+#   dev scripts run clubaid-cleanup-uploads --parent-ids bounce --slugs picklejar-3      (combine both)
+#   dev scripts run clubaid-cleanup-uploads --env production --parent-ids bounce --execute
 #
 # PRODUCTION checklist: take a fresh backup first (snapshooter.com / mongodump),
 # run the dry run, confirm the slug -> org/_id mapping + totals, THEN --execute.
 set -euo pipefail
 
 ENV="local"
-SLUGS="picklejar-3"
+SLUGS=""
+PARENT_IDS=""
 EXECUTE="false"
 
-usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# Append a (possibly comma-separated) value onto an accumulator, comma-joined.
+append_csv() { local acc="$1" val="$2"; [[ -z "$acc" ]] && printf '%s' "$val" || printf '%s,%s' "$acc" "$val"; }
+
+# Turn a comma-separated string into a JSON array literal, trimming blanks.
+to_js_array() {
+  [[ -z "$1" ]] && { printf '[]'; return; }
+  printf '%s' "$1" | awk -F',' '{printf "["; n=0; for(i=1;i<=NF;i++){gsub(/^ +| +$/,"",$i); if($i!=""){printf "%s\"%s\"",(n++>0?",":""),$i}}; printf "]"}'
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --env)      ENV="${2:?--env needs a value}"; shift 2 ;;
-    --slugs)    SLUGS="${2:?--slugs needs a value}"; shift 2 ;;
-    --execute)  EXECUTE="true"; shift ;;
-    -h|--help)  usage 0 ;;
+    --env)         ENV="${2:?--env needs a value}"; shift 2 ;;
+    --slugs)       SLUGS="$(append_csv "$SLUGS" "${2:?--slugs needs a value}")"; shift 2 ;;
+    --parent-ids)  PARENT_IDS="$(append_csv "$PARENT_IDS" "${2:?--parent-ids needs a value}")"; shift 2 ;;
+    --execute)     EXECUTE="true"; shift ;;
+    -h|--help)     usage 0 ;;
     *) echo "Unknown argument: $1" >&2; usage 1 ;;
   esac
 done
+
+# Strip spaces around commas so downstream array/SQL parsing is clean.
+SLUGS="$(printf '%s' "$SLUGS" | tr -d '[:space:]')"
+PARENT_IDS="$(printf '%s' "$PARENT_IDS" | tr -d '[:space:]')"
+
+if [[ -z "$SLUGS" && -z "$PARENT_IDS" ]]; then
+  echo "ERROR: provide at least one of --slugs or --parent-ids" >&2; usage 1
+fi
+
+# --- resolve parent club ids -> child club slugs (LOCAL platformdb only) -----
+PARENT_SLUGS=""
+if [[ -n "$PARENT_IDS" ]]; then
+  command -v psql >/dev/null 2>&1 || { echo "ERROR: psql not found (needed for --parent-ids)" >&2; exit 1; }
+  # Pin the local platformdb explicitly; never inherit CONF_DB_DEFAULT_URL (could be prod).
+  # SQL is fed via stdin (not -c) because psql only interpolates :'parents' from
+  # stdin / -f, never from -c command strings.
+  PSQL=(psql -U api -d platformdb -X -q -t -A -v ON_ERROR_STOP=1 -v parents="$PARENT_IDS")
+  # Each query runs as the condition of `if !` so a psql failure (DB down,
+  # permission, SQL error -- ON_ERROR_STOP makes those non-zero) aborts loudly;
+  # a bare `VAR=$(...)` assignment would swallow that exit under `set -e`.
+  # psql stderr is left on the terminal (not merged into the captured output)
+  # so a diagnostic can never masquerade as query data.
+
+  # Typo protection: every supplied parent id must exist as a club.
+  if ! unknown="$("${PSQL[@]}" <<'SQL'
+select unnest(string_to_array(:'parents', ',')) except select id from rallyd.clubs order by 1;
+SQL
+)"; then echo "ERROR: failed to query local platformdb" >&2; exit 1; fi
+  if [[ -n "$unknown" ]]; then
+    echo "ERROR: parent ids not found in rallyd.clubs: $(printf '%s' "$unknown" | paste -sd, -)" >&2; exit 1
+  fi
+
+  # Each child club's id IS its clubaid org slug.
+  if ! PARENT_SLUGS="$("${PSQL[@]}" <<'SQL' | paste -sd, -
+select distinct id from rallyd.clubs where parent_id = any(string_to_array(:'parents', ',')) order by id;
+SQL
+)"; then echo "ERROR: failed to query local platformdb" >&2; exit 1; fi
+
+  # Warn about parents that have no children (likely a leaf passed as a parent).
+  if ! childless="$("${PSQL[@]}" <<'SQL' | paste -sd, -
+select p from (select unnest(string_to_array(:'parents', ',')) as p) s
+except select distinct parent_id from rallyd.clubs where parent_id is not null order by 1;
+SQL
+)"; then echo "ERROR: failed to query local platformdb" >&2; exit 1; fi
+  [[ -n "$childless" ]] && echo "WARNING: parent ids with no child clubs (nothing to expand): $childless" >&2
+
+  if [[ -z "$PARENT_SLUGS" && -z "$SLUGS" ]]; then
+    echo "ERROR: --parent-ids resolved to no child clubs and no --slugs given; nothing to do" >&2; exit 1
+  fi
+fi
 
 # --- resolve the connection target ------------------------------------------
 MONGO_ENV_FILE="$HOME/code/env/clubaid-mongo.env"
@@ -73,9 +148,13 @@ esac
 command -v mongosh >/dev/null 2>&1 || { echo "ERROR: mongosh not found" >&2; exit 1; }
 
 echo "========================================================================"
-echo "Mode:    $([[ "$EXECUTE" == true ]] && echo '*** EXECUTE (will DELETE) ***' || echo 'DRY RUN (no changes)')"
-echo "Target:  $TARGET_DESC"
-echo "Slugs:   $SLUGS"
+echo "Mode:        $([[ "$EXECUTE" == true ]] && echo '*** EXECUTE (will DELETE) ***' || echo 'DRY RUN (no changes)')"
+echo "Target:      $TARGET_DESC"
+[[ -n "$SLUGS" ]] && echo "Slugs:       $SLUGS"
+if [[ -n "$PARENT_IDS" ]]; then
+  echo "Parent ids:  $PARENT_IDS"
+  echo "  -> clubs:  ${PARENT_SLUGS:-(none resolved)}"
+fi
 echo "========================================================================"
 
 # Typed confirmation before any PRODUCTION delete.
@@ -86,8 +165,9 @@ if [[ "$ENV" == "production" && "$EXECUTE" == "true" ]]; then
 fi
 
 # --- run the cleanup in mongosh ---------------------------------------------
-# SLUGS/EXECUTE are passed in via a prelude so the JS body stays static.
-PRELUDE="const SLUGS = $(printf '%s' "$SLUGS" | awk -F',' '{printf "["; for(i=1;i<=NF;i++){gsub(/^ +| +$/,"",$i); if($i!=""){printf "%s\"%s\"",(i>1?",":""),$i}}; printf "]"}'); const EXECUTE = $EXECUTE;"
+# SLUGS (fail-loud) / PARENT_SLUGS (best-effort) / EXECUTE are passed in via a
+# prelude so the JS body stays static.
+PRELUDE="const SLUGS = $(to_js_array "$SLUGS"); const PARENT_SLUGS = $(to_js_array "$PARENT_SLUGS"); const EXECUTE = $EXECUTE;"
 
 mongosh "$URI" --quiet --eval "$PRELUDE" --eval '
 const DELETE_COLLECTIONS = [
@@ -110,16 +190,34 @@ const DELETE_COLLECTIONS = [
 const pad = (s, n) => String(s).padEnd(n);
 const padL = (s, n) => String(s).padStart(n);
 
-// 1. Resolve slugs -> orgs; fail loud on any miss.
-const orgs = db.organizations.find({ slug: { $in: SLUGS } }, { slug: 1, name: 1 }).toArray();
-const found = new Set(orgs.map((o) => o.slug));
-const missingSlugs = SLUGS.filter((s) => !found.has(s));
+// 1. Resolve slugs -> orgs.
+//    Explicit --slugs MUST all exist (typo protection); parent-derived slugs
+//    are best-effort (a child club may simply have no imported data).
+const explicit = db.organizations.find({ slug: { $in: SLUGS } }, { slug: 1, name: 1 }).toArray();
+const explicitFound = new Set(explicit.map((o) => o.slug));
+const missingSlugs = SLUGS.filter((s) => !explicitFound.has(s));
 if (missingSlugs.length) {
-  print("\nABORT: slugs not found in organizations: " + missingSlugs.join(", "));
+  print("\nABORT: --slugs not found in organizations: " + missingSlugs.join(", "));
+  quit(1);
+}
+
+const parentOrgs = db.organizations.find({ slug: { $in: PARENT_SLUGS } }, { slug: 1, name: 1 }).toArray();
+const parentFound = new Set(parentOrgs.map((o) => o.slug));
+const skipped = PARENT_SLUGS.filter((s) => !parentFound.has(s));
+if (skipped.length) {
+  print("\nNote: parent-derived child clubs with no clubaid org (skipped): " + skipped.join(", "));
+}
+
+// Union explicit + parent-derived orgs, deduped by _id.
+const orgsById = new Map();
+explicit.concat(parentOrgs).forEach((o) => orgsById.set(String(o._id), o));
+const orgs = Array.from(orgsById.values());
+if (orgs.length === 0) {
+  print("\nABORT: no matching organizations to clean.");
   quit(1);
 }
 const ids = orgs.map((o) => o._id);
-print("\nResolved organizations:");
+print("\nResolved organizations (" + orgs.length + "):");
 orgs.forEach((o) => print("  - " + pad(o.slug, 28) + " " + o._id + "  " + (o.name || "")));
 
 // 2. Guard: every allow-list collection must exist (typo must not silently no-op).
