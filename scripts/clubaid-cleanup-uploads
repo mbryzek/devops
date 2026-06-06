@@ -45,7 +45,7 @@ SLUGS=""
 PARENT_IDS=""
 EXECUTE="false"
 
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # Append a (possibly comma-separated) value onto an accumulator, comma-joined.
 append_csv() { local acc="$1" val="$2"; [[ -z "$acc" ]] && printf '%s' "$val" || printf '%s,%s' "$acc" "$val"; }
