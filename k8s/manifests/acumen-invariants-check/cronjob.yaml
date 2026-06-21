@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: acumen-invariants-check
+  namespace: bryzek-production
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: checker
+              image: curlimages/curl:8.10.1
+              command:
+                - curl
+                - --fail
+                - --silent
+                - --show-error
+                - --max-time
+                - "30"
+                - --request
+                - POST
+                - https://api.trueacumen.com/_internal_/invariants/alert
