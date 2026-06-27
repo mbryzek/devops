@@ -84,7 +84,7 @@ puts "Self-healing: invoking build-and-push.sh for #{target_tag}..."
 puts ""
 
 Dir.chdir(DbImages::PLATFORM_POSTGRESQL_DIR) do
-  Util.run("#{build_script} #{target_tag}")
+  Util.run("#{build_script} #{Shellwords.shellescape(target_tag)}")
 end
 
 puts ""

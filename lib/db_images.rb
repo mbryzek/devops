@@ -87,7 +87,7 @@ module DbImages
     unless $?.success?
       Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
     end
-    JSON.parse(out).any? { |entry| entry["tag"] == tag }
+    (JSON.parse(out) || []).any? { |entry| entry["tag"] == tag }
   rescue JSON::ParserError => e
     Util.exit_with_error("Could not parse doctl registry output: #{e.message}")
   end

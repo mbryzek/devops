@@ -149,7 +149,7 @@ def ensure_image(desired_image, tag)
     )
   end
   Dir.chdir(DbImages::PLATFORM_POSTGRESQL_DIR) do
-    Util.run("#{build_script} #{tag}")
+    Util.run("#{build_script} #{Shellwords.shellescape(tag)}")
   end
   puts ""
   puts "Pulling freshly built image..."
