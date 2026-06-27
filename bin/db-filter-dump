@@ -98,6 +98,19 @@ PII = {
     'subject_name' => :name,
     'description'  => :message,
   },
+  'court_reserve.families' => {
+    'name' => :name, # family surname
+  },
+  'court_reserve.guest_member_numbers' => {
+    'raw_value' => :generic, # raw guest identifier (may be a name/phone)
+  },
+  'clubaid.ai_messages' => {
+    # AI Explorer renders sampled member rows into the message context, so these
+    # free-text fields can embed member names/emails — redact them wholesale.
+    'content'                => :message,
+    'rendered_system_prompt' => :message,
+    'rendered_context'       => :message,
+  },
 }.freeze
 
 # ─── Dump parsing ─────────────────────────────────────────────────────────────
@@ -194,7 +207,7 @@ def topo_order(listed, fk_refs)
     return if state[t] == :done
     return if state[t] == :open # cycle — break here
     state[t] = :open
-    fk_refs[t].each { |ref| visit.call(ref) if listed.include?(ref) && ref != t }
+    (fk_refs[t] || []).each { |ref| visit.call(ref) if listed.include?(ref) && ref != t }
     state[t] = :done
     order << t
   end
@@ -211,7 +224,7 @@ def parse_predicate(table, spec)
   when /\A(\w+)\s+in\s+:clubs\z/
     { kind: :club, col: Regexp.last_match(1) }
   when /\A(\w+)\s+in\s+(\S+)\.(\w+)\z/
-    { kind: :fk, col: Regexp.last_match(1), ref_table: "#{Regexp.last_match(2)}", ref_col: Regexp.last_match(3) }
+    { kind: :fk, col: Regexp.last_match(1), ref_table: Regexp.last_match(2), ref_col: Regexp.last_match(3) }
   else
     abort "Invalid predicate for #{table}: #{spec.inspect}"
   end
@@ -219,15 +232,22 @@ end
 
 # ─── psql helpers ─────────────────────────────────────────────────────────────
 
+def psql_argv(dbname, *extra)
+  ['psql', '--set=ON_ERROR_STOP=on', '-U', 'api', *extra, dbname]
+end
+
 def run_psql(dbname, what)
-  IO.popen(['psql', '--set=ON_ERROR_STOP=on', '-U', 'api', '-q', dbname], 'w') do |psql|
+  IO.popen(psql_argv(dbname, '-q'), 'w') do |psql|
     yield psql
+  rescue Errno::EPIPE
+    # psql exited early (ON_ERROR_STOP) — fall through to the exit-status check below,
+    # which raises with a clear message instead of the raw broken-pipe error.
   end
   raise "psql failed during #{what} (exit #{$?.exitstatus})" unless $?.success?
 end
 
 def query_values(dbname, table, col)
-  out = IO.popen(['psql', '-U', 'api', '-t', '-A', '-c', "SELECT \"#{col}\" FROM #{table}", dbname], &:read)
+  out = IO.popen(psql_argv(dbname, '-t', '-A', '-c', "SELECT \"#{col}\" FROM #{table}"), &:read)
   raise "psql query failed on #{table}.#{col} (exit #{$?.exitstatus})" unless $?.success?
   out.split("\n").to_set
 end
@@ -322,75 +342,79 @@ end
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-options = {}
-OptionParser.new do |o|
-  o.banner = 'Usage: db-filter-dump --db DBNAME [--input FILE] [--clubs id1,id2] [--list-clubs] [--clear-clubs]'
-  o.on('--db DBNAME',   'Database name (selects policy db-filter/<db>.yml and clubs config)') { |v| options[:db] = v }
-  o.on('--input FILE',  'Path to the SQL dump file to load')                                  { |v| options[:input] = v }
-  o.on('--clubs IDS',   'Comma-separated club IDs; saved for this database')                  { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
-  o.on('--clear-clubs', 'Clear the saved club list for this database')                        { options[:clear_clubs] = true }
-  o.on('--list-clubs',  'Print the saved club list for this database and exit')               { options[:list_clubs] = true }
-end.parse!
+def main
+  options = {}
+  OptionParser.new do |o|
+    o.banner = 'Usage: db-filter-dump --db DBNAME [--input FILE] [--clubs id1,id2] [--list-clubs] [--clear-clubs]'
+    o.on('--db DBNAME',   'Database name (selects policy db-filter/<db>.yml and clubs config)') { |v| options[:db] = v }
+    o.on('--input FILE',  'Path to the SQL dump file to load')                                  { |v| options[:input] = v }
+    o.on('--clubs IDS',   'Comma-separated club IDs; saved for this database')                  { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
+    o.on('--clear-clubs', 'Clear the saved club list for this database')                        { options[:clear_clubs] = true }
+    o.on('--list-clubs',  'Print the saved club list for this database and exit')               { options[:list_clubs] = true }
+  end.parse!
 
-if options[:db].nil? || options[:db].empty?
-  abort 'Error: --db DBNAME is required (e.g. --db platformdb).'
-end
-
-cfg_file = config_file(options[:db])
-cfg      = load_clubs_config(cfg_file)
-
-if options[:clear_clubs]
-  cfg.delete('clubs')
-  save_clubs_config(cfg_file, cfg)
-  warn "Cleared saved club list from #{cfg_file}."
-  exit
-end
-
-if options[:list_clubs]
-  clubs = cfg['clubs'] || []
-  if clubs.empty?
-    warn "No clubs saved for #{options[:db]}. Use --clubs id1,id2 to set them."
-  else
-    warn "Saved clubs for #{options[:db]} (#{clubs.size}):"
-    clubs.each { |c| warn "  #{c}" }
+  if options[:db].nil? || options[:db].empty?
+    abort 'Error: --db DBNAME is required (e.g. --db platformdb).'
   end
-  exit
+
+  cfg_file = config_file(options[:db])
+  cfg      = load_clubs_config(cfg_file)
+
+  if options[:clear_clubs]
+    cfg.delete('clubs')
+    save_clubs_config(cfg_file, cfg)
+    warn "Cleared saved club list from #{cfg_file}."
+    exit
+  end
+
+  if options[:list_clubs]
+    clubs = cfg['clubs'] || []
+    if clubs.empty?
+      warn "No clubs saved for #{options[:db]}. Use --clubs id1,id2 to set them."
+    else
+      warn "Saved clubs for #{options[:db]} (#{clubs.size}):"
+      clubs.each { |c| warn "  #{c}" }
+    end
+    exit
+  end
+
+  if options[:clubs]
+    cfg['clubs'] = options[:clubs]
+    save_clubs_config(cfg_file, cfg)
+    warn "Saved #{options[:clubs].size} club(s) to #{cfg_file}."
+    exit 0 unless options[:input] # save-only invocation is complete
+  end
+
+  requested_clubs = Set.new(cfg['clubs'] || [])
+  if requested_clubs.empty?
+    abort "No clubs configured for #{options[:db]}. Use --clubs id1,id2."
+  end
+
+  input_file = options[:input]
+  if input_file.nil? || !File.exist?(input_file)
+    abort 'Error: --input FILE is required and must exist.'
+  end
+
+  tables = load_policy(options[:db])
+
+  warn "Loading schema and indexing dump..."
+  blocks, fk_refs, club_parent = load_schema_and_index(input_file, options[:db])
+
+  expanded = expand_club_ids(requested_clubs, club_parent)
+  warn "Clubs: #{requested_clubs.size} requested -> #{expanded.size} after child expansion"
+
+  missing = tables.keys.reject { |t| blocks.key?(t) }
+  warn "WARNING: policy lists tables absent from the dump: #{missing.join(', ')}" unless missing.empty?
+
+  order = topo_order(tables.keys.select { |t| blocks.key?(t) }, fk_refs)
+
+  order.each do |table|
+    pred = parse_predicate(table, tables[table])
+    n = load_table(input_file, options[:db], table, blocks[table], pred, expanded)
+    warn format('  %-45s %8d rows', table, n)
+  end
+
+  warn "Done."
 end
 
-if options[:clubs]
-  cfg['clubs'] = options[:clubs]
-  save_clubs_config(cfg_file, cfg)
-  warn "Saved #{options[:clubs].size} club(s) to #{cfg_file}."
-  exit 0 unless options[:input] # save-only invocation is complete
-end
-
-requested_clubs = Set.new(cfg['clubs'] || [])
-if requested_clubs.empty?
-  abort "No clubs configured for #{options[:db]}. Use --clubs id1,id2."
-end
-
-input_file = options[:input]
-if input_file.nil? || !File.exist?(input_file)
-  abort 'Error: --input FILE is required and must exist.'
-end
-
-tables = load_policy(options[:db])
-
-warn "Loading schema and indexing dump..."
-blocks, fk_refs, club_parent = load_schema_and_index(input_file, options[:db])
-
-expanded = expand_club_ids(requested_clubs, club_parent)
-warn "Clubs: #{requested_clubs.size} requested -> #{expanded.size} after child expansion"
-
-missing = tables.keys.reject { |t| blocks.key?(t) }
-warn "WARNING: policy lists tables absent from the dump: #{missing.join(', ')}" unless missing.empty?
-
-order = topo_order(tables.keys.select { |t| blocks.key?(t) }, fk_refs)
-
-order.each do |table|
-  pred = parse_predicate(table, tables[table])
-  n = load_table(input_file, options[:db], table, blocks[table], pred, expanded)
-  warn format('  %-45s %8d rows', table, n)
-end
-
-warn "Done."
+main if __FILE__ == $PROGRAM_NAME

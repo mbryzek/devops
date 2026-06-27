@@ -13,6 +13,9 @@
 #   <col> in <schema.table.refcol>   keep rows whose <col> matches a value already
 #                                    loaded in <schema.table>.<refcol> (junction tables)
 #
+# Rows whose filter column is NULL are always kept (a NULL value belongs to no club
+# and cannot violate the foreign key that the predicate guards).
+#
 # Load order is derived automatically from the dump's foreign-key graph — list order
 # here does not matter.
 #
