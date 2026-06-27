@@ -41,9 +41,7 @@ tables:
   # storage.files for photos, no phones). Identity lookup tables are tiny.
   public.tenants:      all
   hoa.communities:     all
-  public.emails:
-    where: lower_email = mbryzek@gmail.com
-    blank: [verified_by_user_id]                  # avoids needing the 'anonymous' sentinel user
+  public.emails:       lower_email = mbryzek@gmail.com
   public.people:
     where: email_id in public.emails.id
     blank: [photo_id, mobile_phone_id]            # avoids storage.files and phones

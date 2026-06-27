@@ -285,9 +285,10 @@ def pii_indices(table, cols)
   end
 end
 
-# Carries everything the filter/resolve functions need across the load.
-# `loaded` is the set of tables already populated; `cache` memoizes resolved id-sets.
-Ctx = Struct.new(:input, :dbname, :blocks, :tables, :expanded, :loaded, :cache)
+# Carries everything the filter/resolve functions need across the load. `loaded` is the
+# set of tables already populated; `cache` memoizes resolved id-sets; `resolving` tracks
+# the in-progress resolution stack to detect predicate cycles.
+Ctx = Struct.new(:input, :dbname, :blocks, :tables, :expanded, :loaded, :cache, :resolving)
 
 # Iterate the data rows of one COPY block, seeking to its offset.
 def each_dump_row(input_path, offset)
@@ -304,13 +305,24 @@ end
 # The set of values of <table>.<col> over rows that satisfy <table>'s own predicate.
 # Queries the target DB if the table is already loaded; otherwise resolves from the dump
 # (so a parent table can be filtered to exactly the rows a not-yet-loaded child needs).
+#
+# Invariant: a column resolved here must not be `blank:`-ed or PII-obfuscated in its own
+# table — the dump path reads original values while the target path reads loaded values,
+# and the cache pins whichever ran first. Today only untouched id columns are resolved.
 def resolve_ref_set(table, col, ctx)
-  ctx.cache[[table, col]] ||=
+  key = [table, col]
+  return ctx.cache[key] if ctx.cache.key?(key)
+  abort "Predicate cycle resolving #{table}.#{col} — check the db-filter policy." if ctx.resolving.include?(key)
+
+  ctx.resolving << key
+  result =
     if ctx.loaded.include?(table)
       query_values(ctx.dbname, table, col)
     else
       dump_column_set(table, col, ctx)
     end
+  ctx.resolving.delete(key)
+  ctx.cache[key] = result
 end
 
 def dump_column_set(table, col, ctx)
@@ -467,7 +479,7 @@ def main
 
   order = topo_order(tables.keys.select { |t| blocks.key?(t) }, fk_refs)
 
-  ctx = Ctx.new(input_file, options[:db], blocks, tables, expanded, Set.new, {})
+  ctx = Ctx.new(input_file, options[:db], blocks, tables, expanded, Set.new, {}, Set.new)
   order.each do |table|
     entry = normalize_entry(tables[table])
     pred  = parse_predicate(table, entry[:where])

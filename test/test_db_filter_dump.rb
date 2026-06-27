@@ -83,6 +83,16 @@ class TestDbFilterDump < Minitest::Test
     assert_equal Set['a', 'b'], expand_club_ids(Set['a'], parent)
   end
 
+  # ── resolve_ref_set: cycle detection ──
+
+  def test_resolve_ref_set_aborts_on_predicate_cycle
+    # a.x -> b.y, b.z -> a.w : neither loaded, so both resolve from the (stubbed) dump
+    tables = { 'a' => 'x in b.y', 'b' => 'z in a.w' }
+    blocks = { 'a' => { cols: %w[x w], offset: 0 }, 'b' => { cols: %w[y z], offset: 0 } }
+    ctx = Ctx.new(nil, 'db', blocks, tables, Set.new, Set.new, {}, Set.new)
+    assert_raises(SystemExit) { resolve_ref_set('a', 'x', ctx) }
+  end
+
   # ── obfuscate: deterministic, null-safe, format-preserving ──
 
   def test_obfuscate_is_deterministic
