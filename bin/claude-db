@@ -1,0 +1,284 @@
+#!/usr/bin/env ruby
+# claude-db — per-Claude-session isolated Postgres database lifecycle manager
+#
+# Each Claude Code session gets its own database cloned from platformdb_template,
+# allowing parallel sessions to develop against the same schema without
+# interfering with each other.
+#
+# Usage:
+#   claude-db start    Boot the container if needed and create this session's DB.
+#                      Prints: CONF_DB_LOCAL_URL=jdbc:postgresql://localhost:5433/<db>
+#
+#   claude-db end      Drop this session's database.
+#
+#   claude-db status   Show container state and list all platformdb_sess_* databases.
+#
+#   claude-db gc       Drop session databases with no active backend (dead-session
+#                      orphans).  Always preserves the current session's database.
+#
+# Environment:
+#   CLAUDE_SESSION_ID  Session identifier set automatically by Claude Code.
+#                      Two concurrent sessions must have different values —
+#                      this is what gives each session a distinct database name.
+#                      Falls back to a stable per-user-per-machine string when
+#                      not set (manual use, single session only).
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+require 'shellwords'
+
+def show_usage
+  puts <<~USAGE
+
+    Usage: claude-db <command>
+
+    Commands:
+      start    Ensure the #{DbImages::CONTAINER} container is running and create a
+               per-session database cloned from #{DbImages::TEMPLATE_DB}.
+               Prints CONF_DB_LOCAL_URL for the caller to export.
+
+      end      Drop this session's database.
+
+      status   Show container state and list all session databases.
+
+      gc       Drop orphaned session databases (no active backend connections).
+               Always preserves the current session's database.
+
+    Environment:
+      CLAUDE_SESSION_ID   Session identifier (auto-set by Claude Code).
+                          Omit for manual single-session use.
+
+  USAGE
+  exit 1
+end
+
+# ── start ──────────────────────────────────────────────────────────────────
+
+def do_start
+  tag = DbImages.current_tag
+  puts ""
+  puts Util.underline("claude-db start  [schema tag: #{tag}]")
+  puts ""
+
+  desired_image = DbImages.image_ref(tag)
+
+  # 1. Ensure the container is running with the correct schema image.
+  if DbImages.container_running?
+    current_image = DbImages.container_image
+    if current_image == desired_image
+      puts "Container #{DbImages::CONTAINER} already running (#{tag}). No restart needed."
+    else
+      old_tag = current_image.split(':').last
+      puts "Container running with schema #{old_tag} — upgrading to #{tag}."
+      puts "(Existing session databases in the old container will be gone after restart.)"
+      Util.run("docker rm -f #{DbImages::CONTAINER}")
+      start_container(desired_image, tag)
+    end
+  else
+    # Remove stale (stopped) container record if one exists.
+    if system("docker inspect #{DbImages::CONTAINER} > /dev/null 2>&1")
+      Util.run("docker rm -f #{DbImages::CONTAINER}")
+    end
+    start_container(desired_image, tag)
+  end
+
+  # 2. Create this session's database (idempotent).
+  sid = DbImages.session_id
+  db  = DbImages.db_name(sid)
+  puts ""
+  puts "Session ID : #{sid}"
+  puts "Session DB : #{db}"
+
+  existing = DbImages.psql_query(
+    "SELECT 1 FROM pg_database WHERE datname = '#{db}'"
+  )
+
+  if existing == ["1"]
+    puts "Database #{db} already exists — reusing."
+  else
+    puts ""
+    puts "Creating #{db} from template #{DbImages::TEMPLATE_DB}..."
+    DbImages.psql_exec(
+      "CREATE DATABASE #{db} TEMPLATE #{DbImages::TEMPLATE_DB}"
+    )
+  end
+
+  # 3. Print the JDBC URL for the caller to export.
+  url = "jdbc:postgresql://#{DbImages::HOST}:#{DbImages::PORT}/#{db}"
+  puts ""
+  puts "CONF_DB_LOCAL_URL=#{url}"
+  puts ""
+end
+
+# Pull (or build+push) the image, then run the container on :5433.
+def start_container(desired_image, tag)
+  ensure_image(desired_image, tag)
+  Util.run(
+    "docker run -d -p #{DbImages::PORT}:5432 --name #{DbImages::CONTAINER} #{desired_image}"
+  )
+  print "Waiting for Postgres on :#{DbImages::PORT}..."
+  $stdout.flush
+  DbImages.wait_for_postgres
+  puts " ready."
+end
+
+# Ensure the image is available locally, pulling from the registry or
+# self-healing via build-and-push.sh if the image does not exist yet.
+def ensure_image(desired_image, tag)
+  if DbImages.image_available_locally?(desired_image)
+    puts "Image #{desired_image} found in local cache."
+    return
+  end
+
+  puts "Image not in local cache — pulling from registry..."
+  Util.run("doctl registry login --expiry-seconds 3600", :ignore_error => true)
+
+  if system("docker pull #{Shellwords.shellescape(desired_image)}")
+    return
+  end
+
+  # Pull failed — image not in registry.  Build and push it now.
+  puts ""
+  puts "Image not found in registry. Self-healing: building and pushing #{tag}..."
+  build_script = File.join(DbImages::PLATFORM_POSTGRESQL_DIR, "docker", "build-and-push.sh")
+  unless File.executable?(build_script)
+    Util.exit_with_error(
+      "Build script not found or not executable: #{build_script}\n" \
+      "Clone platform-postgresql to #{DbImages::PLATFORM_POSTGRESQL_DIR} first."
+    )
+  end
+  Dir.chdir(DbImages::PLATFORM_POSTGRESQL_DIR) do
+    Util.run("#{build_script} #{tag}")
+  end
+  puts ""
+  puts "Pulling freshly built image..."
+  Util.run("docker pull #{desired_image}")
+end
+
+# ── end ────────────────────────────────────────────────────────────────────
+
+def do_end
+  sid = DbImages.session_id
+  db  = DbImages.db_name(sid)
+  puts ""
+  puts Util.underline("claude-db end")
+  puts "Session ID : #{sid}"
+  puts "Session DB : #{db}"
+  puts ""
+
+  unless DbImages.container_running?
+    puts "Container not running — nothing to drop."
+    puts ""
+    return
+  end
+
+  existing = DbImages.psql_query(
+    "SELECT 1 FROM pg_database WHERE datname = '#{db}'"
+  )
+
+  if existing != ["1"]
+    puts "Database #{db} does not exist — already cleaned up."
+    puts ""
+    return
+  end
+
+  # Terminate active connections before dropping.
+  DbImages.psql_exec_quiet(
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
+  )
+  DbImages.psql_exec("DROP DATABASE #{db}")
+  puts "Dropped #{db}."
+  puts ""
+end
+
+# ── status ─────────────────────────────────────────────────────────────────
+
+def do_status
+  puts ""
+  puts Util.underline("claude-db status")
+  puts ""
+
+  if DbImages.container_running?
+    image = DbImages.container_image
+    puts "Container : #{DbImages::CONTAINER}  RUNNING  image=#{image}"
+  else
+    puts "Container : #{DbImages::CONTAINER}  not running"
+  end
+
+  puts ""
+
+  if DbImages.container_running?
+    dbs    = DbImages.list_session_dbs
+    active = DbImages.active_session_dbs
+    if dbs.empty?
+      puts "Session databases : none"
+    else
+      puts "Session databases :"
+      dbs.each do |db|
+        state = active.include?(db) ? "active" : "idle"
+        puts "  #{db}  [#{state}]"
+      end
+    end
+  end
+
+  current_db = DbImages.db_name(DbImages.session_id)
+  puts ""
+  puts "Current session DB : #{current_db}"
+  puts ""
+end
+
+# ── gc ─────────────────────────────────────────────────────────────────────
+
+def do_gc
+  puts ""
+  puts Util.underline("claude-db gc")
+  puts ""
+
+  unless DbImages.container_running?
+    puts "Container not running — nothing to GC."
+    puts ""
+    return
+  end
+
+  current_db = DbImages.db_name(DbImages.session_id)
+  dbs        = DbImages.list_session_dbs
+  active     = DbImages.active_session_dbs
+
+  # Orphans: session DBs that are neither the current session nor actively used.
+  orphans = dbs.reject { |db| db == current_db || active.include?(db) }
+
+  if orphans.empty?
+    puts "No orphaned session databases found."
+    puts ""
+    return
+  end
+
+  puts "Dropping #{orphans.length} orphaned database(s)..."
+  orphans.each do |db|
+    # Terminate lingering connections (safety net — should be none for orphans).
+    DbImages.psql_exec_quiet(
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
+    )
+    DbImages.psql_exec("DROP DATABASE #{db}")
+    puts "Dropped #{db}."
+  end
+  puts ""
+end
+
+# ── entry point ─────────────────────────────────────────────────────────────
+
+show_usage if ARGV.empty?
+
+subcommand = ARGV.shift
+
+case subcommand
+when "start"  then do_start
+when "end"    then do_end
+when "status" then do_status
+when "gc"     then do_gc
+when "-h", "--help", "help" then show_usage
+else
+  $stderr.puts "Unknown command: #{subcommand}"
+  show_usage
+end
