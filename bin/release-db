@@ -176,4 +176,34 @@ if deployed
   puts ""
   puts "Migration deployment complete!"
   puts ""
+
+  # Build and push a fresh platformdb Docker image for the just-released schema,
+  # then purge old registry images.  Best-effort only: the schema is already
+  # deployed at this point, so any failure in the image build or purge must NOT
+  # abort release-db or report a non-zero exit.  We rescue StandardError AND
+  # SystemExit because DbImages.purge_old calls Util.exit_with_error (which
+  # calls exit 1, raising SystemExit) on certain internal failures; plain
+  # `rescue => e` only catches StandardError and would let that SystemExit
+  # propagate, killing release-db after a successful migration.
+  if db_name == "platform-postgresql"
+    tag = nil
+    begin
+      tag = Dir.chdir(repo_dir) { `sem-info tag latest`.strip }
+      raise "sem-info tag latest returned empty string in #{repo_dir}" if tag.empty?
+      build_script = File.join(repo_dir, "docker", "build-and-push.sh")
+      puts "Building and pushing platformdb Docker image for schema tag #{tag}..."
+      unless system("#{Shellwords.shellescape(build_script)} #{Shellwords.shellescape(tag)}")
+        raise "build-and-push.sh exited non-zero for tag #{tag}"
+      end
+      puts "Purging old platformdb registry images..."
+      DbImages.purge_old
+    rescue StandardError, SystemExit => e
+      manual_cmd = tag ? "#{repo_dir}/docker/build-and-push.sh #{tag}" : "#{repo_dir}/docker/build-and-push.sh <tag>"
+      Util.warning(
+        "platformdb image build/purge failed (schema deploy succeeded): #{e.message}\n" \
+        "  To build manually: #{manual_cmd}\n" \
+        "  Or run:            bin/verify-db-images"
+      )
+    end
+  end
 end
