@@ -166,7 +166,13 @@ module DbImages
       return
     end
 
-    retained_tag = current_tag rescue nil
+    # Fail-safe: a purge run either knows the current latest tag (and retains
+    # it) or purges nothing. Never delete when the latest is unknown — let any
+    # error from current_tag propagate rather than swallowing it to nil.
+    retained_tag = current_tag
+    if retained_tag.nil? || retained_tag.strip.empty?
+      Util.exit_with_error("purge_old: cannot determine current latest tag — refusing to purge")
+    end
     cutoff = now - PURGE_AGE_DAYS * 24 * 3600
 
     entries.each do |entry|
