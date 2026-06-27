@@ -6,8 +6,8 @@
 # from production dumps.
 #
 # Usage:
-#   db-filter-dump --input platformdb.sql | psql platformdb
-#   db-filter-dump --clubs uuid1,uuid2 --input platformdb.sql | psql platformdb
+#   db-filter-dump --input platformdb.sql | psql -U api platformdb
+#   db-filter-dump --clubs uuid1,uuid2 --input platformdb.sql | psql -U api platformdb
 #   db-filter-dump --list-clubs
 #   db-filter-dump --clear-clubs
 
@@ -141,15 +141,23 @@ def pass1(input_path, requested_clubs)
         if parsed
           table, cols = parsed
           if table == 'clubaid.clubs'
-            in_copy = true
-            mode    = :clubs
             id_idx  = cols.index('id')
             par_idx = cols.index('parent_id')
+            if id_idx && par_idx
+              in_copy = true
+              mode    = :clubs
+            else
+              warn "WARNING: clubaid.clubs missing expected columns (id, parent_id) — child expansion skipped"
+            end
           elsif table == 'court_reserve.reservations'
-            in_copy = true
-            mode    = :reservations
             id_idx  = cols.index('id')
             cid_idx = cols.index('club_id')
+            if id_idx && cid_idx
+              in_copy = true
+              mode    = :reservations
+            else
+              warn "WARNING: court_reserve.reservations missing expected columns (id, club_id) — reservation tables will be unfiltered"
+            end
           end
         end
         next
@@ -193,7 +201,7 @@ end
 # ─── Pass 2: stream, filter, and obfuscate ───────────────────────────────────
 
 def pass2(input_path, expanded_clubs, valid_reservation_ids, obfuscate_pii)
-  warn "Pass 2: filtering and#{obfuscate_pii ? ' obfuscating' : ''} dump..."
+  warn "Pass 2: filtering#{obfuscate_pii ? ' and obfuscating' : ''} dump..."
 
   in_copy     = false
   filter_mode = nil   # :club_id | :reservation_id | :none
@@ -223,8 +231,15 @@ def pass2(input_path, expanded_clubs, valid_reservation_ids, obfuscate_pii)
             filter_mode = :none
             cid_idx     = nil
           elsif RESERVATION_FILTERED_TABLES.include?(table)
-            filter_mode = :reservation_id
-            cid_idx     = cols.index('reservation_id')
+            idx = cols.index('reservation_id')
+            if idx
+              filter_mode = :reservation_id
+              cid_idx     = idx
+            else
+              warn "WARNING: #{table} missing reservation_id column — rows will be unfiltered"
+              filter_mode = :none
+              cid_idx     = nil
+            end
           elsif (idx = cols.index('club_id'))
             filter_mode = :club_id
             cid_idx     = idx
@@ -346,7 +361,7 @@ end
 club_parent, reservation_clubs = pass1(input_file, requested_clubs)
 
 if club_parent.empty?
-  warn "WARNING: clubaid.clubs block not found in dump — club expansion will be empty"
+  warn "WARNING: clubaid.clubs block not found in dump — child expansion skipped, only requested club IDs included"
 end
 if reservation_clubs.empty?
   warn "WARNING: court_reserve.reservations block not found — reservation tables will be empty"

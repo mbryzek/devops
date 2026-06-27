@@ -8,14 +8,12 @@ FILTER_DUMP_BIN    = File.join(DIR, 'db-filter-dump')
 
 def filter_clubs_configured?
   return false unless File.exist?(FILTER_DUMP_CONFIG)
-  cfg = begin
-          require 'yaml'
-          YAML.safe_load(File.read(FILTER_DUMP_CONFIG)) || {}
-        rescue StandardError
-          {}
-        end
-  clubs = cfg['clubs'] || []
-  clubs.any?
+  require 'yaml'
+  cfg = YAML.safe_load(File.read(FILTER_DUMP_CONFIG)) || {}
+  (cfg['clubs'] || []).any?
+rescue StandardError => e
+  warn "WARNING: could not read #{FILTER_DUMP_CONFIG} (#{e.message}) — filter skipped, loading full dump"
+  false
 end
 
 def find_install_inscript(app)
@@ -77,15 +75,20 @@ else
     Util.run(l, :ignore_error => true)
   end
 
+  require 'shellwords'
+  file_esc = Shellwords.shellescape(file)
+  db_esc   = Shellwords.shellescape(dbname)
+
   if filter_clubs_configured?
     unless File.executable?(FILTER_DUMP_BIN)
       Util.exit_with_error("#{FILTER_DUMP_BIN} not found or not executable")
     end
     puts "Club filter active — loading filtered/obfuscated subset via db-filter-dump"
+    bin_esc = Shellwords.shellescape(FILTER_DUMP_BIN)
     # Use pipefail so a crash in db-filter-dump is not masked by psql's exit code.
-    Util.run("bash -o pipefail -c \"'#{FILTER_DUMP_BIN}' --input '#{file}' | psql -U api #{dbname}\"")
+    Util.run("bash -o pipefail -c \"#{bin_esc} --input #{file_esc} | psql --set ON_ERROR_STOP=on -U api #{db_esc}\"")
   else
-    Util.run("psql -U api -f '#{file}' #{dbname}")
+    Util.run("psql --set ON_ERROR_STOP=on -U api -f #{file_esc} #{db_esc}")
   end
 end
 
