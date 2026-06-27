@@ -1,0 +1,355 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Filters a PostgreSQL dump to only include rows for specific club IDs,
+# with optional PII obfuscation. Designed for creating smaller dev databases
+# from production dumps.
+#
+# Usage:
+#   db-filter-dump --input platformdb.sql | psql platformdb
+#   db-filter-dump --clubs uuid1,uuid2 --input platformdb.sql | psql platformdb
+#   db-filter-dump --list-clubs
+#   db-filter-dump --clear-clubs
+
+require 'digest'
+require 'optparse'
+require 'set'
+require 'yaml'
+
+CONFIG_FILE = File.expand_path('~/.db-filter-dump.yml')
+
+# ─── PII obfuscation ──────────────────────────────────────────────────────────
+
+def h8(val)
+  Digest::MD5.hexdigest(val.to_s)[0, 8]
+end
+
+def obfuscate(type, val)
+  return val if val == '\N'
+  case type
+  when :email    then "dev_#{h8(val)}@example.com"
+  when :lower_email then "dev_#{h8(val)}@example.com"
+  when :name     then "Dev#{h8(val).upcase[0, 6]}"
+  when :phone    then "+15550#{h8(val)[0, 7]}"
+  when :address  then "123 Dev Street"
+  when :city     then "Devtown"
+  when :state    then "CA"
+  when :zip      then "00000"
+  when :pin      then "0000"
+  when :message  then "[redacted]"
+  when :generic  then h8(val)
+  else val
+  end
+end
+
+# Columns to obfuscate per table: column_name => obfuscation_type
+PII = {
+  'public.people' => {
+    'name'     => :name,
+    'nickname' => :name,
+  },
+  'public.emails' => {
+    'email'       => :email,
+    'lower_email' => :lower_email,
+  },
+  'public.e164_phones' => {
+    'number' => :phone,
+  },
+  'public.phones' => {
+    'number' => :phone,
+  },
+  'sms.messages' => {
+    'phone_number' => :phone,
+    'from'         => :phone,
+    'message'      => :message,
+  },
+  'court_reserve.members' => {
+    'first_name' => :name, 'last_name' => :name, 'full_name' => :name,
+    'email'      => :email, 'phone' => :phone, 'username' => :email,
+    'address'    => :address, 'city' => :city, 'state' => :state,
+    'zip_code'   => :zip, 'pin_code' => :pin,
+    'family'     => :generic,
+    'how_did_you_hear_about_us' => :generic,
+    'referrals'  => :generic,
+  },
+  'court_reserve.event_registrations' => {
+    'member_first_name' => :name, 'member_last_name' => :name,
+    'member_full_name'  => :name, 'member_email'     => :email,
+    'member_phone'      => :phone,
+    'primary_first_name' => :name, 'primary_last_name' => :name,
+    'primary_email'      => :email, 'primary_address'  => :address,
+    'primary_city'       => :city,  'primary_state'    => :state,
+    'primary_zip_code'   => :zip,
+    'how_did_you_hear_about_us' => :generic,
+    'referrals'          => :generic,
+  },
+  'court_reserve.reservations' => {
+    'created_by' => :name,
+  },
+  'court_reserve.sales_transactions' => {
+    'member_name' => :name,
+  },
+  'court_reserve.transactions' => {
+    'member_name' => :name, 'member_display_name' => :name,
+  },
+  'court_reserve.audit_events' => {
+    'action_by'   => :name,
+    'subject_name' => :name,
+    'description'  => :message,
+  },
+}.freeze
+
+# Tables whose rows should be filtered by reservation_id (no direct club_id col)
+RESERVATION_FILTERED_TABLES = %w[
+  court_reserve.reservation_courts
+  court_reserve.reservation_players
+].freeze
+
+# ─── COPY header parsing ──────────────────────────────────────────────────────
+
+def parse_copy_header(line)
+  m = line.match(/\ACOPY (\S+) \(([^)]+)\) FROM stdin;\z/)
+  return nil unless m
+  table = m[1]
+  cols  = m[2].split(', ').map { |c| c.delete('"') }
+  [table, cols]
+end
+
+# ─── Pass 1: build club parent→children tree + collect reservation→club map ──
+
+def pass1(input_path, requested_clubs)
+  warn "Pass 1: scanning for club tree and reservation IDs..."
+  club_parent      = {}   # club_id → parent_id (nil if root)
+  reservation_clubs = {}  # reservation_id → club_id
+
+  in_copy   = false
+  mode      = nil   # :clubs | :reservations
+  id_idx    = nil
+  par_idx   = nil
+  cid_idx   = nil
+
+  File.open(input_path, 'r', encoding: 'utf-8') do |f|
+    f.each_line do |line|
+      line.chomp!
+
+      if line.start_with?('COPY ') && line.end_with?('FROM stdin;')
+        parsed = parse_copy_header(line)
+        in_copy = false
+        mode    = nil
+        if parsed
+          table, cols = parsed
+          if table == 'clubaid.clubs'
+            in_copy = true
+            mode    = :clubs
+            id_idx  = cols.index('id')
+            par_idx = cols.index('parent_id')
+          elsif table == 'court_reserve.reservations'
+            in_copy = true
+            mode    = :reservations
+            id_idx  = cols.index('id')
+            cid_idx = cols.index('club_id')
+          end
+        end
+        next
+      end
+
+      next unless in_copy
+
+      if line == '\\.'
+        in_copy = false
+        next
+      end
+
+      fields = line.split("\t")
+      case mode
+      when :clubs
+        club_parent[fields[id_idx]] = fields[par_idx] == '\N' ? nil : fields[par_idx]
+      when :reservations
+        reservation_clubs[fields[id_idx]] = fields[cid_idx]
+      end
+    end
+  end
+
+  [club_parent, reservation_clubs]
+end
+
+def expand_club_ids(requested, club_parent)
+  children = Hash.new { |h, k| h[k] = [] }
+  club_parent.each { |id, par| children[par] << id if par }
+
+  result = Set.new
+  queue  = requested.to_a.dup
+  until queue.empty?
+    id = queue.shift
+    next if result.include?(id)
+    result << id
+    queue.concat(children[id])
+  end
+  result
+end
+
+# ─── Pass 2: stream, filter, and obfuscate ───────────────────────────────────
+
+def pass2(input_path, expanded_clubs, valid_reservation_ids, obfuscate_pii)
+  warn "Pass 2: filtering and#{obfuscate_pii ? ' obfuscating' : ''} dump..."
+
+  in_copy     = false
+  filter_mode = nil   # :club_id | :clubs_self | :reservation_id | :none
+  cid_idx     = nil
+  pii_map     = {}    # col_index → obfuscation_type
+
+  File.open(input_path, 'r', encoding: 'utf-8') do |f|
+    f.each_line do |line|
+      line.chomp!
+
+      if line.start_with?('COPY ') && line.end_with?('FROM stdin;')
+        parsed = parse_copy_header(line)
+        if parsed
+          in_copy = true
+          table, cols = parsed
+
+          pii_map = if obfuscate_pii && PII.key?(table)
+                      PII[table]
+                        .transform_keys { |col| cols.index(col) }
+                        .reject { |k, _| k.nil? }
+                    else
+                      {}
+                    end
+
+          if table == 'clubaid.clubs'
+            # Include ALL clubs rows — tiny table, avoids FK issues for parent_id
+            filter_mode = :none
+            cid_idx     = nil
+          elsif RESERVATION_FILTERED_TABLES.include?(table)
+            filter_mode = :reservation_id
+            cid_idx     = cols.index('reservation_id')
+          elsif (idx = cols.index('club_id'))
+            filter_mode = :club_id
+            cid_idx     = idx
+          else
+            filter_mode = :none
+            cid_idx     = nil
+          end
+        else
+          in_copy = false
+        end
+        $stdout.puts line
+        next
+      end
+
+      unless in_copy
+        $stdout.puts line
+        next
+      end
+
+      if line == '\\.'
+        in_copy = false
+        $stdout.puts line
+        next
+      end
+
+      # Filter
+      if filter_mode != :none
+        fields = line.split("\t")
+        keep = case filter_mode
+               when :club_id       then expanded_clubs.include?(fields[cid_idx])
+               when :reservation_id then valid_reservation_ids.include?(fields[cid_idx])
+               end
+        next unless keep
+
+        # Obfuscate PII on filtered rows
+        unless pii_map.empty?
+          pii_map.each { |idx, type| fields[idx] = obfuscate(type, fields[idx]) }
+          $stdout.puts fields.join("\t")
+          next
+        end
+
+        $stdout.puts line
+      else
+        # No filtering; may still obfuscate
+        if pii_map.empty?
+          $stdout.puts line
+        else
+          fields = line.split("\t")
+          pii_map.each { |idx, type| fields[idx] = obfuscate(type, fields[idx]) }
+          $stdout.puts fields.join("\t")
+        end
+      end
+    end
+  end
+end
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+def load_config
+  return {} unless File.exist?(CONFIG_FILE)
+  YAML.safe_load(File.read(CONFIG_FILE)) || {}
+end
+
+def save_config(cfg)
+  File.write(CONFIG_FILE, YAML.dump(cfg))
+end
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+options = { obfuscate: true }
+OptionParser.new do |o|
+  o.banner = 'Usage: db-filter-dump --input FILE [--clubs id1,id2] [--no-obfuscate]'
+  o.on('--input FILE',    'Path to the SQL dump file (required)')           { |v| options[:input] = v }
+  o.on('--clubs IDS',     'Comma-separated club UUIDs; saved for next run') { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
+  o.on('--clear-clubs',   'Clear the saved club list')                      { options[:clear_clubs] = true }
+  o.on('--list-clubs',    'Print the saved club list and exit')             { options[:list_clubs] = true }
+  o.on('--no-obfuscate',  'Skip PII obfuscation')                           { options[:obfuscate] = false }
+end.parse!
+
+cfg = load_config
+
+if options[:clear_clubs]
+  cfg.delete('clubs')
+  save_config(cfg)
+  warn "Cleared saved club list from #{CONFIG_FILE}."
+  exit
+end
+
+if options[:list_clubs]
+  clubs = cfg['clubs'] || []
+  if clubs.empty?
+    warn "No clubs saved. Use --clubs uuid1,uuid2 to set them."
+  else
+    warn "Saved clubs (#{clubs.size}):"
+    clubs.each { |c| warn "  #{c}" }
+  end
+  exit
+end
+
+if options[:clubs]
+  cfg['clubs'] = options[:clubs]
+  save_config(cfg)
+  warn "Saved #{options[:clubs].size} club(s) to #{CONFIG_FILE}."
+end
+
+requested_clubs = Set.new(cfg['clubs'] || [])
+if requested_clubs.empty?
+  warn "No clubs specified. Use --clubs uuid1,uuid2 or --list-clubs to see saved clubs."
+  exit 1
+end
+
+input_file = options[:input] || ARGV.first
+if input_file.nil? || !File.exist?(input_file)
+  warn "Input file not found. Use --input FILE."
+  exit 1
+end
+
+# Pass 1
+club_parent, reservation_clubs = pass1(input_file, requested_clubs)
+expanded_clubs = expand_club_ids(requested_clubs, club_parent)
+warn "  Clubs: #{requested_clubs.size} requested → #{expanded_clubs.size} after child expansion"
+
+valid_reservation_ids = reservation_clubs
+  .select { |_, cid| expanded_clubs.include?(cid) }
+  .keys.to_set
+warn "  Reservations: #{valid_reservation_ids.size} valid"
+
+# Pass 2
+pass2(input_file, expanded_clubs, valid_reservation_ids, options[:obfuscate])
+warn "Done."

@@ -3,6 +3,21 @@
 DIR = File.dirname(__FILE__)
 load File.join(DIR, '../lib/common.rb')
 
+FILTER_DUMP_CONFIG = File.expand_path('~/.db-filter-dump.yml')
+FILTER_DUMP_BIN    = File.join(DIR, 'db-filter-dump')
+
+def filter_clubs_configured?
+  return false unless File.exist?(FILTER_DUMP_CONFIG)
+  cfg = begin
+          require 'yaml'
+          YAML.safe_load(File.read(FILTER_DUMP_CONFIG)) || {}
+        rescue StandardError
+          {}
+        end
+  clubs = cfg['clubs'] || []
+  clubs.any?
+end
+
 def find_install_inscript(app)
   candidate = File.join(`pwd`.strip, "install.sh")
   if File.exist?(candidate)
@@ -62,7 +77,12 @@ else
     Util.run(l, :ignore_error => true)
   end
 
-  Util.run("psql -U api -f #{file} #{dbname}")
+  if filter_clubs_configured?
+    puts "Club filter active — loading filtered/obfuscated subset via db-filter-dump"
+    Util.run("#{FILTER_DUMP_BIN} --input #{file} | psql -U api #{dbname}")
+  else
+    Util.run("psql -U api -f #{file} #{dbname}")
+  end
 end
 
 tmpfile = "/tmp/db-reinstall.#{Process.pid}.tmp"
