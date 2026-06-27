@@ -6,17 +6,22 @@
 # from production dumps.
 #
 # Usage:
-#   db-filter-dump --input platformdb.sql | psql -U api platformdb
-#   db-filter-dump --clubs uuid1,uuid2 --input platformdb.sql | psql -U api platformdb
-#   db-filter-dump --list-clubs
-#   db-filter-dump --clear-clubs
+#   db-filter-dump --db platformdb --clubs bounce        # save clubs for platformdb
+#   db-filter-dump --db platformdb --input dump.sql | psql -U api platformdb
+#   db-filter-dump --db platformdb --list-clubs
+#   db-filter-dump --db platformdb --clear-clubs
 
 require 'digest'
+require 'fileutils'
 require 'optparse'
 require 'set'
 require 'yaml'
 
-CONFIG_FILE = File.expand_path('~/.db-filter-dump.yml')
+CONFIG_DIR = File.expand_path('~/.platform')
+
+def config_file(dbname)
+  File.join(CONFIG_DIR, "db-filter-dump.#{dbname}.yml")
+end
 
 # ─── PII obfuscation ──────────────────────────────────────────────────────────
 
@@ -298,42 +303,50 @@ end
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-def load_config
-  return {} unless File.exist?(CONFIG_FILE)
-  YAML.safe_load(File.read(CONFIG_FILE)) || {}
+def load_config(cfg_file)
+  return {} unless File.exist?(cfg_file)
+  YAML.safe_load(File.read(cfg_file)) || {}
 end
 
-def save_config(cfg)
-  File.write(CONFIG_FILE, YAML.dump(cfg))
+def save_config(cfg_file, cfg)
+  FileUtils.mkdir_p(CONFIG_DIR)
+  File.write(cfg_file, YAML.dump(cfg))
 end
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 options = { obfuscate: true }
 OptionParser.new do |o|
-  o.banner = 'Usage: db-filter-dump --input FILE [--clubs id1,id2] [--no-obfuscate]'
-  o.on('--input FILE',    'Path to the SQL dump file (required)')           { |v| options[:input] = v }
-  o.on('--clubs IDS',     'Comma-separated club UUIDs; saved for next run') { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
-  o.on('--clear-clubs',   'Clear the saved club list')                      { options[:clear_clubs] = true }
-  o.on('--list-clubs',    'Print the saved club list and exit')             { options[:list_clubs] = true }
-  o.on('--no-obfuscate',  'Skip PII obfuscation')                           { options[:obfuscate] = false }
+  o.banner = 'Usage: db-filter-dump --db DBNAME --input FILE [--clubs id1,id2] [--no-obfuscate]'
+  o.on('--db DBNAME',     'Database name (e.g. platformdb); selects which config file to use') { |v| options[:db] = v }
+  o.on('--input FILE',    'Path to the SQL dump file')                                          { |v| options[:input] = v }
+  o.on('--clubs IDS',     'Comma-separated club IDs; saved for next run')                      { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
+  o.on('--clear-clubs',   'Clear the saved club list for this database')                        { options[:clear_clubs] = true }
+  o.on('--list-clubs',    'Print the saved club list for this database and exit')               { options[:list_clubs] = true }
+  o.on('--no-obfuscate',  'Skip PII obfuscation')                                              { options[:obfuscate] = false }
 end.parse!
 
-cfg = load_config
+if options[:db].nil? || options[:db].empty?
+  warn "Error: --db DBNAME is required (e.g. --db platformdb)."
+  exit 1
+end
+
+cfg_file = config_file(options[:db])
+cfg      = load_config(cfg_file)
 
 if options[:clear_clubs]
   cfg.delete('clubs')
-  save_config(cfg)
-  warn "Cleared saved club list from #{CONFIG_FILE}."
+  save_config(cfg_file, cfg)
+  warn "Cleared saved club list from #{cfg_file}."
   exit
 end
 
 if options[:list_clubs]
   clubs = cfg['clubs'] || []
   if clubs.empty?
-    warn "No clubs saved. Use --clubs uuid1,uuid2 to set them."
+    warn "No clubs saved for #{options[:db]}. Use --clubs id1,id2 to set them."
   else
-    warn "Saved clubs (#{clubs.size}):"
+    warn "Saved clubs for #{options[:db]} (#{clubs.size}):"
     clubs.each { |c| warn "  #{c}" }
   end
   exit
@@ -341,13 +354,13 @@ end
 
 if options[:clubs]
   cfg['clubs'] = options[:clubs]
-  save_config(cfg)
-  warn "Saved #{options[:clubs].size} club(s) to #{CONFIG_FILE}."
+  save_config(cfg_file, cfg)
+  warn "Saved #{options[:clubs].size} club(s) to #{cfg_file}."
 end
 
 requested_clubs = Set.new(cfg['clubs'] || [])
 if requested_clubs.empty?
-  warn "No clubs specified. Use --clubs uuid1,uuid2 or --list-clubs to see saved clubs."
+  warn "No clubs specified for #{options[:db]}. Use --clubs id1,id2 or --list-clubs to see saved clubs."
   exit 1
 end
 
