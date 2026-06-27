@@ -78,10 +78,14 @@ else
   end
 
   if filter_clubs_configured?
+    unless File.executable?(FILTER_DUMP_BIN)
+      Util.exit_with_error("#{FILTER_DUMP_BIN} not found or not executable")
+    end
     puts "Club filter active — loading filtered/obfuscated subset via db-filter-dump"
-    Util.run("#{FILTER_DUMP_BIN} --input #{file} | psql -U api #{dbname}")
+    # Use pipefail so a crash in db-filter-dump is not masked by psql's exit code.
+    Util.run("bash -o pipefail -c \"'#{FILTER_DUMP_BIN}' --input '#{file}' | psql -U api #{dbname}\"")
   else
-    Util.run("psql -U api -f #{file} #{dbname}")
+    Util.run("psql -U api -f '#{file}' #{dbname}")
   end
 end
 

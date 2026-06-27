@@ -27,10 +27,12 @@ end
 def obfuscate(type, val)
   return val if val == '\N'
   case type
-  when :email    then "dev_#{h8(val)}@example.com"
-  when :lower_email then "dev_#{h8(val)}@example.com"
+  # Hash on downcase so email and lower_email always agree: lower(obfuscated_email) == obfuscated_lower_email
+  when :email, :lower_email then "dev_#{h8(val.downcase)}@example.com"
   when :name     then "Dev#{h8(val).upcase[0, 6]}"
-  when :phone    then "+15550#{h8(val)[0, 7]}"
+  # Produce a valid US E.164 number (+1 555-0xxx-xxx, reserved fiction range).
+  # Use integer modulo to stay all-decimal; rjust pads short values.
+  when :phone    then "+15550#{(h8(val).to_i(16) % 1_000_000).to_s.rjust(6, '0')}"
   when :address  then "123 Dev Street"
   when :city     then "Devtown"
   when :state    then "CA"
@@ -194,7 +196,7 @@ def pass2(input_path, expanded_clubs, valid_reservation_ids, obfuscate_pii)
   warn "Pass 2: filtering and#{obfuscate_pii ? ' obfuscating' : ''} dump..."
 
   in_copy     = false
-  filter_mode = nil   # :club_id | :clubs_self | :reservation_id | :none
+  filter_mode = nil   # :club_id | :reservation_id | :none
   cid_idx     = nil
   pii_map     = {}    # col_index → obfuscation_type
 
@@ -342,6 +344,14 @@ end
 
 # Pass 1
 club_parent, reservation_clubs = pass1(input_file, requested_clubs)
+
+if club_parent.empty?
+  warn "WARNING: clubaid.clubs block not found in dump — club expansion will be empty"
+end
+if reservation_clubs.empty?
+  warn "WARNING: court_reserve.reservations block not found — reservation tables will be empty"
+end
+
 expanded_clubs = expand_club_ids(requested_clubs, club_parent)
 warn "  Clubs: #{requested_clubs.size} requested → #{expanded_clubs.size} after child expansion"
 
