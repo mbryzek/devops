@@ -76,6 +76,22 @@ module DbImages
     "#{SESS_PREFIX}#{sanitized}"
   end
 
+  # True if the given schema tag has a pushed image in the DO registry.
+  #
+  # Requires doctl to be authenticated.  Exits with an error on unexpected
+  # doctl failures (e.g. network error) so callers are never silently misled
+  # into thinking a tag is absent when it might just be unreachable.
+  def DbImages.registry_tag_exists?(tag)
+    require 'json'
+    out = `doctl registry repository list-tags #{IMAGE_NAME} --output json 2>&1`
+    unless $?.success?
+      Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
+    end
+    JSON.parse(out).any? { |entry| entry["tag"] == tag }
+  rescue JSON::ParserError => e
+    Util.exit_with_error("Could not parse doctl registry output: #{e.message}")
+  end
+
   # True if the image exists in the local Docker image cache.
   def DbImages.image_available_locally?(image)
     system("docker image inspect #{Shellwords.shellescape(image)} > /dev/null 2>&1")
