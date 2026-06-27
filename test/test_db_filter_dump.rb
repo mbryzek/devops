@@ -21,8 +21,30 @@ class TestDbFilterDump < Minitest::Test
     assert_equal 'id', pred[:ref_col]
   end
 
+  def test_parse_predicate_eq
+    assert_equal({ kind: :eq, col: 'lower_email', value: 'mbryzek@gmail.com' },
+                 parse_predicate('t', 'lower_email = mbryzek@gmail.com'))
+  end
+
   def test_parse_predicate_rejects_unknown_form
-    assert_raises(SystemExit) { parse_predicate('t', 'club_id = 5') }
+    assert_raises(SystemExit) { parse_predicate('t', 'club_id like 5') }
+  end
+
+  # ── normalize_entry: plain string vs { where:, blank: } map ──
+
+  def test_normalize_entry_string
+    assert_equal({ where: 'all', blank: [] }, normalize_entry('all'))
+  end
+
+  def test_normalize_entry_map
+    entry = normalize_entry('where' => 'email_id in public.emails.id', 'blank' => ['photo_id', 'mobile_phone_id'])
+    assert_equal 'email_id in public.emails.id', entry[:where]
+    assert_equal %w[photo_id mobile_phone_id], entry[:blank]
+  end
+
+  def test_normalize_entry_map_defaults_where_to_all
+    assert_equal({ where: 'all', blank: ['verified_by_user_id'] },
+                 normalize_entry('blank' => ['verified_by_user_id']))
   end
 
   # ── topo_order: referenced tables come before the tables that reference them ──

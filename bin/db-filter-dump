@@ -217,6 +217,17 @@ end
 
 # ─── Predicates ───────────────────────────────────────────────────────────────
 
+# A policy entry is either a predicate string or a hash { where:, blank: }. Normalize to
+# { where: <predicate string>, blank: [columns to set NULL] }. (The key is `blank`, not
+# `null`, because a bare `null:` in YAML parses to the nil key rather than the string.)
+def normalize_entry(spec)
+  if spec.is_a?(Hash)
+    { where: (spec['where'] || 'all').to_s, blank: Array(spec['blank']).map(&:to_s) }
+  else
+    { where: spec.to_s, blank: [] }
+  end
+end
+
 def parse_predicate(table, spec)
   case spec.strip
   when 'all'
@@ -225,6 +236,8 @@ def parse_predicate(table, spec)
     { kind: :club, col: Regexp.last_match(1) }
   when /\A(\w+)\s+in\s+(\S+)\.(\w+)\z/
     { kind: :fk, col: Regexp.last_match(1), ref_table: Regexp.last_match(2), ref_col: Regexp.last_match(3) }
+  when /\A(\w+)\s*=\s*(.+)\z/
+    { kind: :eq, col: Regexp.last_match(1), value: Regexp.last_match(2).strip }
   else
     abort "Invalid predicate for #{table}: #{spec.inspect}"
   end
@@ -272,23 +285,32 @@ def pii_indices(table, cols)
   end
 end
 
-# Stream one COPY block from the dump (seeking to its offset), filter + obfuscate, and
-# COPY the surviving rows into the target DB.
-def load_table(input_path, dbname, table, block, pred, expanded)
+# Build a row-filter for a predicate: returns [column_index, keep?(value) lambda].
+# A nil column_index means "keep every row".
+def row_filter(table, cols, pred, dbname, expanded)
+  case pred[:kind]
+  when :all
+    [nil, nil]
+  when :club
+    set = expanded
+    [column_index!(table, cols, pred[:col]), ->(v) { set.include?(v) }]
+  when :fk
+    set = query_values(dbname, pred[:ref_table], pred[:ref_col])
+    [column_index!(table, cols, pred[:col]), ->(v) { set.include?(v) }]
+  when :eq
+    val = pred[:value]
+    [column_index!(table, cols, pred[:col]), ->(v) { v == val }]
+  end
+end
+
+# Stream one COPY block from the dump (seeking to its offset), filter, blank `blank_cols`,
+# obfuscate PII, and COPY the surviving rows into the target DB.
+def load_table(input_path, dbname, table, block, pred, expanded, blank_cols)
   cols = block[:cols]
   pii  = pii_indices(table, cols)
-
-  case pred[:kind]
-  when :club
-    filter_idx = column_index!(table, cols, pred[:col])
-    keepset    = expanded
-  when :fk
-    filter_idx = column_index!(table, cols, pred[:col])
-    keepset    = query_values(dbname, pred[:ref_table], pred[:ref_col])
-  else
-    filter_idx = nil
-    keepset    = nil
-  end
+  blank_idx = blank_cols.map { |c| column_index!(table, cols, c) }
+  filter_idx, keep = row_filter(table, cols, pred, dbname, expanded)
+  rewrite = !pii.empty? || !blank_idx.empty?
 
   kept = 0
   run_psql(dbname, "load #{table}") do |psql|
@@ -300,12 +322,12 @@ def load_table(input_path, dbname, table, block, pred, expanded)
         break if line == COPY_END
 
         if filter_idx
-          val = line.split("\t", -1)[filter_idx]
-          next unless val == '\N' || keepset.include?(val)
+          next unless keep.call(line.split("\t", -1)[filter_idx])
         end
 
-        unless pii.empty?
+        if rewrite
           fields = line.split("\t", -1)
+          blank_idx.each { |i| fields[i] = '\N' }
           pii.each { |i, t| fields[i] = obfuscate(t, fields[i]) }
           line = fields.join("\t")
         end
@@ -409,8 +431,9 @@ def main
   order = topo_order(tables.keys.select { |t| blocks.key?(t) }, fk_refs)
 
   order.each do |table|
-    pred = parse_predicate(table, tables[table])
-    n = load_table(input_file, options[:db], table, blocks[table], pred, expanded)
+    entry = normalize_entry(tables[table])
+    pred  = parse_predicate(table, entry[:where])
+    n = load_table(input_file, options[:db], table, blocks[table], pred, expanded, entry[:blank])
     warn format('  %-45s %8d rows', table, n)
   end
 
