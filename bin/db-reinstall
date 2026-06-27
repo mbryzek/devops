@@ -88,10 +88,10 @@ else
     unless File.executable?(FILTER_DUMP_BIN)
       Util.exit_with_error("#{FILTER_DUMP_BIN} not found or not executable")
     end
-    puts "Club filter active — loading filtered/obfuscated subset via db-filter-dump"
+    puts "Club filter active — loading schema + filtered/obfuscated subset via db-filter-dump"
+    # db-filter-dump loads the schema and the allow-listed tables directly into the DB.
     bin_esc = Shellwords.shellescape(FILTER_DUMP_BIN)
-    # Use pipefail so a crash in db-filter-dump is not masked by psql's exit code.
-    Util.run("bash -o pipefail -c \"#{bin_esc} --db #{db_esc} --input #{file_esc} | psql --set ON_ERROR_STOP=on -U api #{db_esc}\"")
+    Util.run("#{bin_esc} --db #{db_esc} --input #{file_esc}")
   else
     Util.run("psql --set ON_ERROR_STOP=on -U api -f #{file_esc} #{db_esc}")
   end

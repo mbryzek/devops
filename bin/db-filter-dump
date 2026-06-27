@@ -1,13 +1,20 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Filters a PostgreSQL dump to only include rows for specific club IDs,
-# with optional PII obfuscation. Designed for creating smaller dev databases
-# from production dumps.
+# Loads a filtered, PII-obfuscated subset of a PostgreSQL dump into a target DB.
+#
+# Approach (see db-filter/<db>.yml for the allow-list policy):
+#   1. Load the schema in full from the dump — every table, empty.
+#   2. Load ONLY the allow-listed tables, each filtered by its predicate, in
+#      foreign-key dependency order, with FK constraints ENFORCED.
+#
+# Because FKs stay enforced, the allow-list must be FK-closed: a violation during
+# load names exactly the table to add to the policy. Tables not listed stay empty,
+# which is safe — nothing loaded references them.
 #
 # Usage:
-#   db-filter-dump --db platformdb --clubs bounce        # save clubs for platformdb
-#   db-filter-dump --db platformdb --input dump.sql | psql -U api platformdb
+#   db-filter-dump --db platformdb --clubs bounce          # save clubs for platformdb
+#   db-filter-dump --db platformdb --input dump.sql        # load filtered subset
 #   db-filter-dump --db platformdb --list-clubs
 #   db-filter-dump --db platformdb --clear-clubs
 
@@ -17,10 +24,16 @@ require 'optparse'
 require 'set'
 require 'yaml'
 
-CONFIG_DIR = File.expand_path('~/.platform')
+CONFIG_DIR = File.expand_path('~/.platform')                 # per-developer club selection
+POLICY_DIR = File.expand_path('../db-filter', __dir__)       # versioned allow-list policy
+COPY_END   = "\\."                                           # PostgreSQL COPY terminator line
 
 def config_file(dbname)
   File.join(CONFIG_DIR, "db-filter-dump.#{dbname}.yml")
+end
+
+def policy_file(dbname)
+  File.join(POLICY_DIR, "#{dbname}.yml")
 end
 
 # ─── PII obfuscation ──────────────────────────────────────────────────────────
@@ -30,13 +43,12 @@ def h8(val)
 end
 
 def obfuscate(type, val)
-  return val if val == '\N'
+  return val if val.nil? || val == '\N'
   case type
   # Hash on downcase so email and lower_email always agree: lower(obfuscated_email) == obfuscated_lower_email
   when :email, :lower_email then "dev_#{h8(val.downcase)}@example.com"
   when :name     then "Dev#{h8(val).upcase[0, 6]}"
-  # Produce a valid US E.164 number (+1 555-0xxx-xxx, reserved fiction range).
-  # Use integer modulo to stay all-decimal; rjust pads short values.
+  # Produce a valid all-digit US phone number; integer modulo keeps it numeric.
   when :phone    then "+15550#{(h8(val).to_i(16) % 1_000_000).to_s.rjust(6, '0')}"
   when :address  then "123 Dev Street"
   when :city     then "Devtown"
@@ -49,27 +61,9 @@ def obfuscate(type, val)
   end
 end
 
-# Columns to obfuscate per table: column_name => obfuscation_type
+# Columns to obfuscate per table: column_name => obfuscation_type. Only applied to
+# tables that are actually loaded, so unlisted tables here are simply inert.
 PII = {
-  'public.people' => {
-    'name'     => :name,
-    'nickname' => :name,
-  },
-  'public.emails' => {
-    'email'       => :email,
-    'lower_email' => :lower_email,
-  },
-  'public.e164_phones' => {
-    'number' => :phone,
-  },
-  'public.phones' => {
-    'number' => :phone,
-  },
-  'sms.messages' => {
-    'phone_number' => :phone,
-    'from'         => :phone,
-    'message'      => :message,
-  },
   'court_reserve.members' => {
     'first_name' => :name, 'last_name' => :name, 'full_name' => :name,
     'email'      => :email, 'phone' => :phone, 'username' => :email,
@@ -100,92 +94,93 @@ PII = {
     'member_name' => :name, 'member_display_name' => :name,
   },
   'court_reserve.audit_events' => {
-    'action_by'   => :name,
+    'action_by'    => :name,
     'subject_name' => :name,
     'description'  => :message,
   },
+  'court_reserve.families' => {
+    'name' => :name, # family surname
+  },
+  'court_reserve.guest_member_numbers' => {
+    'raw_value' => :generic, # raw guest identifier (may be a name/phone)
+  },
+  'clubaid.ai_messages' => {
+    # AI Explorer renders sampled member rows into the message context, so these
+    # free-text fields can embed member names/emails — redact them wholesale.
+    'content'                => :message,
+    'rendered_system_prompt' => :message,
+    'rendered_context'       => :message,
+  },
 }.freeze
 
-# Tables whose rows should be filtered by reservation_id (no direct club_id col)
-RESERVATION_FILTERED_TABLES = %w[
-  court_reserve.reservation_courts
-  court_reserve.reservation_players
-].freeze
-
-# ─── COPY header parsing ──────────────────────────────────────────────────────
+# ─── Dump parsing ─────────────────────────────────────────────────────────────
 
 def parse_copy_header(line)
   m = line.match(/\ACOPY (\S+) \(([^)]+)\) FROM stdin;\z/)
   return nil unless m
-  table = m[1]
-  cols  = m[2].split(', ').map { |c| c.delete('"') }
-  [table, cols]
+  [m[1], m[2].split(', ').map { |c| c.delete('"') }]
 end
 
-# ─── Pass 1: build club parent→children tree + collect reservation→club map ──
+# Single pass over the dump: load the schema (everything except COPY data) into the
+# target DB, and collect (a) each COPY block's byte offset + columns, (b) the FK graph
+# (referencing table => referenced tables) for load ordering, (c) the club parent tree.
+def load_schema_and_index(input_path, dbname)
+  blocks      = {}                               # table => { cols:, offset: }
+  fk_refs     = Hash.new { |h, k| h[k] = [] }    # table => [referenced table, ...]
+  club_parent = {}                               # club id => parent id (nil if root)
 
-def pass1(input_path, requested_clubs)
-  warn "Pass 1: scanning for club tree and reservation IDs..."
-  club_parent      = {}   # club_id → parent_id (nil if root)
-  reservation_clubs = {}  # reservation_id → club_id
-
+  cur_alter = nil
   in_copy   = false
-  mode      = nil   # :clubs | :reservations
-  id_idx    = nil
-  par_idx   = nil
-  cid_idx   = nil
+  clubs_mode = false
+  clubs_id_idx = nil
+  clubs_par_idx = nil
+  pos = 0
 
-  File.open(input_path, 'r', encoding: 'utf-8') do |f|
-    f.each_line do |line|
-      line.chomp!
+  run_psql(dbname, 'schema load') do |psql|
+    File.open(input_path, 'r', encoding: 'binary') do |f|
+      while (raw = f.gets)
+        pos += raw.bytesize
+        line = raw.chomp
 
-      if line.start_with?('COPY ') && line.end_with?('FROM stdin;')
-        parsed = parse_copy_header(line)
-        in_copy = false
-        mode    = nil
-        if parsed
-          table, cols = parsed
-          if table == 'clubaid.clubs'
-            id_idx  = cols.index('id')
-            par_idx = cols.index('parent_id')
-            if id_idx && par_idx
-              in_copy = true
-              mode    = :clubs
-            else
-              warn "WARNING: clubaid.clubs missing expected columns (id, parent_id) — child expansion skipped"
-            end
-          elsif table == 'court_reserve.reservations'
-            id_idx  = cols.index('id')
-            cid_idx = cols.index('club_id')
-            if id_idx && cid_idx
-              in_copy = true
-              mode    = :reservations
-            else
-              warn "WARNING: court_reserve.reservations missing expected columns (id, club_id) — reservation tables will be unfiltered"
+        if !in_copy && line.start_with?('COPY ') && line.end_with?('FROM stdin;')
+          parsed = parse_copy_header(line)
+          if parsed
+            table, cols = parsed
+            blocks[table] = { cols: cols, offset: pos } # pos == start of first data row
+            in_copy = true
+            clubs_mode = (table == 'clubaid.clubs')
+            if clubs_mode
+              clubs_id_idx  = cols.index('id')
+              clubs_par_idx = cols.index('parent_id')
             end
           end
+          next # COPY blocks are dropped from the schema load
         end
-        next
-      end
 
-      next unless in_copy
+        if in_copy
+          if line == COPY_END
+            in_copy = false
+            clubs_mode = false
+          elsif clubs_mode && clubs_id_idx && clubs_par_idx
+            fields = line.split("\t")
+            club_parent[fields[clubs_id_idx]] = fields[clubs_par_idx] == '\N' ? nil : fields[clubs_par_idx]
+          end
+          next
+        end
 
-      if line == '\\.'
-        in_copy = false
-        next
-      end
-
-      fields = line.split("\t")
-      case mode
-      when :clubs
-        club_parent[fields[id_idx]] = fields[par_idx] == '\N' ? nil : fields[par_idx]
-      when :reservations
-        reservation_clubs[fields[id_idx]] = fields[cid_idx]
+        # Non-COPY line: part of the schema. Emit to psql and harvest FK edges.
+        psql.write(raw)
+        if (m = line.match(/\AALTER TABLE (?:ONLY )?(\S+)/))
+          cur_alter = m[1]
+        end
+        if cur_alter && (m = line.match(/ADD CONSTRAINT \S+ FOREIGN KEY \([^)]+\) REFERENCES (\S+?)\(/))
+          fk_refs[cur_alter] << m[1]
+        end
       end
     end
   end
 
-  [club_parent, reservation_clubs]
+  [blocks, fk_refs, club_parent]
 end
 
 def expand_club_ids(requested, club_parent)
@@ -203,191 +198,297 @@ def expand_club_ids(requested, club_parent)
   result
 end
 
-# ─── Pass 2: stream, filter, and obfuscate ───────────────────────────────────
+# Topological order (referenced tables first) over the listed tables, using the FK graph.
+# Self-references and FKs to unlisted tables are ignored; cycles are broken best-effort.
+def topo_order(listed, fk_refs)
+  order = []
+  state = {}
+  visit = lambda do |t|
+    return if state[t] == :done
+    return if state[t] == :open # cycle — break here
+    state[t] = :open
+    (fk_refs[t] || []).each { |ref| visit.call(ref) if listed.include?(ref) && ref != t }
+    state[t] = :done
+    order << t
+  end
+  listed.each { |t| visit.call(t) }
+  order
+end
 
-def pass2(input_path, expanded_clubs, valid_reservation_ids, obfuscate_pii)
-  warn "Pass 2: filtering#{obfuscate_pii ? ' and obfuscating' : ''} dump..."
+# ─── Predicates ───────────────────────────────────────────────────────────────
 
-  in_copy     = false
-  filter_mode = nil   # :club_id | :reservation_id | :none
-  cid_idx     = nil
-  pii_map     = {}    # col_index → obfuscation_type
+# A policy entry is either a predicate string or a hash { where:, blank: }. Normalize to
+# { where: <predicate string>, blank: [columns to set NULL] }. (The key is `blank`, not
+# `null`, because a bare `null:` in YAML parses to the nil key rather than the string.)
+def normalize_entry(spec)
+  if spec.is_a?(Hash)
+    { where: (spec['where'] || 'all').to_s, blank: Array(spec['blank']).map(&:to_s) }
+  else
+    { where: spec.to_s, blank: [] }
+  end
+end
 
-  File.open(input_path, 'r', encoding: 'utf-8') do |f|
-    f.each_line do |line|
-      line.chomp!
+def parse_predicate(table, spec)
+  case spec.strip
+  when 'all'
+    { kind: :all }
+  when /\A(\w+)\s+in\s+:clubs\z/
+    { kind: :club, col: Regexp.last_match(1) }
+  when /\A(\w+)\s+in\s+(\S+)\.(\w+)\z/
+    { kind: :fk, col: Regexp.last_match(1), ref_table: Regexp.last_match(2), ref_col: Regexp.last_match(3) }
+  when /\A(\w+)\s*=\s*(.+)\z/
+    { kind: :eq, col: Regexp.last_match(1), value: Regexp.last_match(2).strip }
+  else
+    abort "Invalid predicate for #{table}: #{spec.inspect}"
+  end
+end
 
-      if line.start_with?('COPY ') && line.end_with?('FROM stdin;')
-        parsed = parse_copy_header(line)
-        if parsed
-          in_copy = true
-          table, cols = parsed
+# ─── psql helpers ─────────────────────────────────────────────────────────────
 
-          pii_map = if obfuscate_pii && PII.key?(table)
-                      PII[table]
-                        .transform_keys { |col| cols.index(col) }
-                        .reject { |k, _| k.nil? }
-                    else
-                      {}
-                    end
+def psql_argv(dbname, *extra)
+  ['psql', '--set=ON_ERROR_STOP=on', '-U', 'api', *extra, dbname]
+end
 
-          if table == 'clubaid.clubs'
-            # Include ALL clubs rows — tiny table, avoids FK issues for parent_id
-            filter_mode = :none
-            cid_idx     = nil
-          elsif RESERVATION_FILTERED_TABLES.include?(table)
-            idx = cols.index('reservation_id')
-            if idx
-              filter_mode = :reservation_id
-              cid_idx     = idx
-            else
-              warn "WARNING: #{table} missing reservation_id column — rows will be unfiltered"
-              filter_mode = :none
-              cid_idx     = nil
-            end
-          elsif (idx = cols.index('club_id'))
-            filter_mode = :club_id
-            cid_idx     = idx
-          else
-            filter_mode = :none
-            cid_idx     = nil
-          end
-        else
-          in_copy = false
-        end
-        $stdout.puts line
-        next
-      end
+def run_psql(dbname, what)
+  IO.popen(psql_argv(dbname, '-q'), 'w') do |psql|
+    yield psql
+  rescue Errno::EPIPE
+    # psql exited early (ON_ERROR_STOP) — fall through to the exit-status check below,
+    # which raises with a clear message instead of the raw broken-pipe error.
+  end
+  raise "psql failed during #{what} (exit #{$?.exitstatus})" unless $?.success?
+end
 
-      unless in_copy
-        $stdout.puts line
-        next
-      end
+def query_values(dbname, table, col)
+  out = IO.popen(psql_argv(dbname, '-t', '-A', '-c', "SELECT \"#{col}\" FROM #{table}"), &:read)
+  raise "psql query failed on #{table}.#{col} (exit #{$?.exitstatus})" unless $?.success?
+  out.split("\n").to_set
+end
 
-      if line == '\\.'
-        in_copy = false
-        $stdout.puts line
-        next
-      end
+# Column index for a filter column; fail loudly rather than silently loading every row
+# (a nil index would make the `if filter_idx` guard skip filtering entirely).
+def column_index!(table, cols, col)
+  cols.index(col) or abort "Column #{col.inspect} not found in #{table} — check db-filter policy. Columns: #{cols.join(', ')}"
+end
 
-      # Filter
-      if filter_mode != :none
-        fields = line.split("\t")
-        keep = case filter_mode
-               when :club_id       then expanded_clubs.include?(fields[cid_idx])
-               when :reservation_id then valid_reservation_ids.include?(fields[cid_idx])
-               end
-        next unless keep
-
-        # Obfuscate PII on filtered rows
-        unless pii_map.empty?
-          pii_map.each { |idx, type| fields[idx] = obfuscate(type, fields[idx]) }
-          $stdout.puts fields.join("\t")
-          next
-        end
-
-        $stdout.puts line
-      else
-        # No filtering; may still obfuscate
-        if pii_map.empty?
-          $stdout.puts line
-        else
-          fields = line.split("\t")
-          pii_map.each { |idx, type| fields[idx] = obfuscate(type, fields[idx]) }
-          $stdout.puts fields.join("\t")
-        end
-      end
+# Map this table's PII columns to their indices, warning loudly about any column the
+# dump doesn't have (so plaintext is never silently shipped).
+def pii_indices(table, cols)
+  return {} unless PII.key?(table)
+  PII[table].each_with_object({}) do |(col, type), acc|
+    idx = cols.index(col)
+    if idx.nil?
+      warn "WARNING: PII column #{col.inspect} not found in #{table} — NOT obfuscated"
+    else
+      acc[idx] = type
     end
   end
 end
 
+# Carries everything the filter/resolve functions need across the load. `loaded` is the
+# set of tables already populated; `cache` memoizes resolved id-sets; `resolving` tracks
+# the in-progress resolution stack to detect predicate cycles.
+Ctx = Struct.new(:input, :dbname, :blocks, :tables, :expanded, :loaded, :cache, :resolving)
+
+# Iterate the data rows of one COPY block, seeking to its offset.
+def each_dump_row(input_path, offset)
+  File.open(input_path, 'r', encoding: 'binary') do |f|
+    f.seek(offset)
+    while (raw = f.gets)
+      line = raw.chomp
+      break if line == COPY_END
+      yield line
+    end
+  end
+end
+
+# The set of values of <table>.<col> over rows that satisfy <table>'s own predicate.
+# Queries the target DB if the table is already loaded; otherwise resolves from the dump
+# (so a parent table can be filtered to exactly the rows a not-yet-loaded child needs).
+#
+# Invariant: a column resolved here must not be `blank:`-ed or PII-obfuscated in its own
+# table — the dump path reads original values while the target path reads loaded values,
+# and the cache pins whichever ran first. Today only untouched id columns are resolved.
+def resolve_ref_set(table, col, ctx)
+  key = [table, col]
+  return ctx.cache[key] if ctx.cache.key?(key)
+  abort "Predicate cycle resolving #{table}.#{col} — check the db-filter policy." if ctx.resolving.include?(key)
+
+  ctx.resolving << key
+  result =
+    if ctx.loaded.include?(table)
+      query_values(ctx.dbname, table, col)
+    else
+      dump_column_set(table, col, ctx)
+    end
+  ctx.resolving.delete(key)
+  ctx.cache[key] = result
+end
+
+def dump_column_set(table, col, ctx)
+  block = ctx.blocks[table] or abort "Cannot resolve #{table}.#{col}: #{table} absent from dump."
+  cols = block[:cols]
+  pred = parse_predicate(table, normalize_entry(ctx.tables[table])[:where])
+  col_idx = column_index!(table, cols, col)
+  filter_idx, keep = row_filter(table, cols, pred, ctx)
+  set = Set.new
+  each_dump_row(ctx.input, block[:offset]) do |line|
+    fields = line.split("\t", -1)
+    next if filter_idx && !keep.call(fields[filter_idx])
+    v = fields[col_idx]
+    set << v unless v == '\N'
+  end
+  set
+end
+
+# Build a row-filter for a predicate: returns [column_index, keep?(value) lambda].
+# A nil column_index means "keep every row".
+def row_filter(table, cols, pred, ctx)
+  case pred[:kind]
+  when :all
+    [nil, nil]
+  when :club
+    set = ctx.expanded
+    [column_index!(table, cols, pred[:col]), ->(v) { set.include?(v) }]
+  when :fk
+    set = resolve_ref_set(pred[:ref_table], pred[:ref_col], ctx)
+    [column_index!(table, cols, pred[:col]), ->(v) { set.include?(v) }]
+  when :eq
+    val = pred[:value]
+    [column_index!(table, cols, pred[:col]), ->(v) { v == val }]
+  end
+end
+
+# Stream one COPY block from the dump (seeking to its offset), filter, blank `blank_cols`,
+# obfuscate PII, and COPY the surviving rows into the target DB.
+def load_table(table, pred, blank_cols, ctx)
+  block = ctx.blocks[table]
+  cols  = block[:cols]
+  pii   = pii_indices(table, cols)
+  blank_idx = blank_cols.map { |c| column_index!(table, cols, c) }
+  filter_idx, keep = row_filter(table, cols, pred, ctx)
+  rewrite = !pii.empty? || !blank_idx.empty?
+
+  kept = 0
+  run_psql(ctx.dbname, "load #{table}") do |psql|
+    psql.puts "COPY #{table} (#{cols.map { |c| "\"#{c}\"" }.join(', ')}) FROM stdin;"
+    each_dump_row(ctx.input, block[:offset]) do |line|
+      next if filter_idx && !keep.call(line.split("\t", -1)[filter_idx])
+
+      if rewrite
+        fields = line.split("\t", -1)
+        blank_idx.each { |i| fields[i] = '\N' }
+        pii.each { |i, t| fields[i] = obfuscate(t, fields[i]) }
+        line = fields.join("\t")
+      end
+
+      psql.puts line
+      kept += 1
+    end
+    psql.puts COPY_END
+  end
+  kept
+end
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-def load_config(cfg_file)
+def load_clubs_config(cfg_file)
   return {} unless File.exist?(cfg_file)
   YAML.safe_load(File.read(cfg_file)) || {}
 end
 
-def save_config(cfg_file, cfg)
+def save_clubs_config(cfg_file, cfg)
   FileUtils.mkdir_p(CONFIG_DIR)
   File.write(cfg_file, YAML.dump(cfg))
 end
 
+def load_policy(dbname)
+  pf = policy_file(dbname)
+  abort "No allow-list policy for #{dbname} (expected #{pf})." unless File.exist?(pf)
+  policy = YAML.safe_load(File.read(pf)) || {}
+  tables = policy['tables'] || {}
+  abort "Policy #{pf} has no tables." if tables.empty?
+  tables
+end
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-options = { obfuscate: true }
-OptionParser.new do |o|
-  o.banner = 'Usage: db-filter-dump --db DBNAME --input FILE [--clubs id1,id2] [--no-obfuscate]'
-  o.on('--db DBNAME',     'Database name (e.g. platformdb); selects which config file to use') { |v| options[:db] = v }
-  o.on('--input FILE',    'Path to the SQL dump file')                                          { |v| options[:input] = v }
-  o.on('--clubs IDS',     'Comma-separated club IDs; saved for next run')                      { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
-  o.on('--clear-clubs',   'Clear the saved club list for this database')                        { options[:clear_clubs] = true }
-  o.on('--list-clubs',    'Print the saved club list for this database and exit')               { options[:list_clubs] = true }
-  o.on('--no-obfuscate',  'Skip PII obfuscation')                                              { options[:obfuscate] = false }
-end.parse!
+def main
+  options = {}
+  OptionParser.new do |o|
+    o.banner = 'Usage: db-filter-dump --db DBNAME [--input FILE] [--clubs id1,id2] [--list-clubs] [--clear-clubs]'
+    o.on('--db DBNAME',   'Database name (selects policy db-filter/<db>.yml and clubs config)') { |v| options[:db] = v }
+    o.on('--input FILE',  'Path to the SQL dump file to load')                                  { |v| options[:input] = v }
+    o.on('--clubs IDS',   'Comma-separated club IDs; saved for this database')                  { |v| options[:clubs] = v.split(',').map(&:strip).reject(&:empty?) }
+    o.on('--clear-clubs', 'Clear the saved club list for this database')                        { options[:clear_clubs] = true }
+    o.on('--list-clubs',  'Print the saved club list for this database and exit')               { options[:list_clubs] = true }
+  end.parse!
 
-if options[:db].nil? || options[:db].empty?
-  warn "Error: --db DBNAME is required (e.g. --db platformdb)."
-  exit 1
-end
-
-cfg_file = config_file(options[:db])
-cfg      = load_config(cfg_file)
-
-if options[:clear_clubs]
-  cfg.delete('clubs')
-  save_config(cfg_file, cfg)
-  warn "Cleared saved club list from #{cfg_file}."
-  exit
-end
-
-if options[:list_clubs]
-  clubs = cfg['clubs'] || []
-  if clubs.empty?
-    warn "No clubs saved for #{options[:db]}. Use --clubs id1,id2 to set them."
-  else
-    warn "Saved clubs for #{options[:db]} (#{clubs.size}):"
-    clubs.each { |c| warn "  #{c}" }
+  if options[:db].nil? || options[:db].empty?
+    abort 'Error: --db DBNAME is required (e.g. --db platformdb).'
   end
-  exit
+
+  cfg_file = config_file(options[:db])
+  cfg      = load_clubs_config(cfg_file)
+
+  if options[:clear_clubs]
+    cfg.delete('clubs')
+    save_clubs_config(cfg_file, cfg)
+    warn "Cleared saved club list from #{cfg_file}."
+    exit
+  end
+
+  if options[:list_clubs]
+    clubs = cfg['clubs'] || []
+    if clubs.empty?
+      warn "No clubs saved for #{options[:db]}. Use --clubs id1,id2 to set them."
+    else
+      warn "Saved clubs for #{options[:db]} (#{clubs.size}):"
+      clubs.each { |c| warn "  #{c}" }
+    end
+    exit
+  end
+
+  if options[:clubs]
+    cfg['clubs'] = options[:clubs]
+    save_clubs_config(cfg_file, cfg)
+    warn "Saved #{options[:clubs].size} club(s) to #{cfg_file}."
+    exit 0 unless options[:input] # save-only invocation is complete
+  end
+
+  requested_clubs = Set.new(cfg['clubs'] || [])
+  if requested_clubs.empty?
+    abort "No clubs configured for #{options[:db]}. Use --clubs id1,id2."
+  end
+
+  input_file = options[:input]
+  if input_file.nil? || !File.exist?(input_file)
+    abort 'Error: --input FILE is required and must exist.'
+  end
+
+  tables = load_policy(options[:db])
+
+  warn "Loading schema and indexing dump..."
+  blocks, fk_refs, club_parent = load_schema_and_index(input_file, options[:db])
+
+  expanded = expand_club_ids(requested_clubs, club_parent)
+  warn "Clubs: #{requested_clubs.size} requested -> #{expanded.size} after child expansion"
+
+  missing = tables.keys.reject { |t| blocks.key?(t) }
+  warn "WARNING: policy lists tables absent from the dump: #{missing.join(', ')}" unless missing.empty?
+
+  order = topo_order(tables.keys.select { |t| blocks.key?(t) }, fk_refs)
+
+  ctx = Ctx.new(input_file, options[:db], blocks, tables, expanded, Set.new, {}, Set.new)
+  order.each do |table|
+    entry = normalize_entry(tables[table])
+    pred  = parse_predicate(table, entry[:where])
+    n = load_table(table, pred, entry[:blank], ctx)
+    ctx.loaded << table
+    warn format('  %-45s %8d rows', table, n)
+  end
+
+  warn "Done."
 end
 
-if options[:clubs]
-  cfg['clubs'] = options[:clubs]
-  save_config(cfg_file, cfg)
-  warn "Saved #{options[:clubs].size} club(s) to #{cfg_file}."
-end
-
-requested_clubs = Set.new(cfg['clubs'] || [])
-if requested_clubs.empty?
-  warn "No clubs specified for #{options[:db]}. Use --clubs id1,id2 or --list-clubs to see saved clubs."
-  exit 1
-end
-
-input_file = options[:input] || ARGV.first
-if input_file.nil? || !File.exist?(input_file)
-  warn "Input file not found. Use --input FILE."
-  exit 1
-end
-
-# Pass 1
-club_parent, reservation_clubs = pass1(input_file, requested_clubs)
-
-if club_parent.empty?
-  warn "WARNING: clubaid.clubs block not found in dump — child expansion skipped, only requested club IDs included"
-end
-if reservation_clubs.empty?
-  warn "WARNING: court_reserve.reservations block not found — reservation tables will be empty"
-end
-
-expanded_clubs = expand_club_ids(requested_clubs, club_parent)
-warn "  Clubs: #{requested_clubs.size} requested → #{expanded_clubs.size} after child expansion"
-
-valid_reservation_ids = reservation_clubs
-  .select { |_, cid| expanded_clubs.include?(cid) }
-  .keys.to_set
-warn "  Reservations: #{valid_reservation_ids.size} valid"
-
-# Pass 2
-pass2(input_file, expanded_clubs, valid_reservation_ids, options[:obfuscate])
-warn "Done."
+main if __FILE__ == $PROGRAM_NAME

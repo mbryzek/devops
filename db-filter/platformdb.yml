@@ -1,0 +1,87 @@
+# Allow-list policy for building a filtered platformdb dev database.
+#
+# The schema is loaded in full (every table, empty). Then ONLY the tables listed
+# below are populated, each filtered by its predicate. Foreign keys stay ENFORCED
+# during load, so this list must be FK-closed: every non-null FK target of a listed
+# table must also be listed (or be `all`). If a load fails with an FK violation, the
+# error names the table you need to add here.
+#
+# Predicate forms:
+#   all                              copy every row
+#   <col> in :clubs                  keep rows whose <col> is in the selected club set
+#                                    (the club set expands to include child clubs)
+#   <col> in <schema.table.refcol>   keep rows whose <col> matches a value already
+#                                    loaded in <schema.table>.<refcol> (junction tables)
+#   <col> = <value>                  keep rows whose <col> exactly equals <value>
+#
+# A predicate keeps only rows that match; rows whose filter column is NULL are dropped
+# (dropping a row is always FK-safe — nothing else loaded references it).
+#
+# An entry may instead be a map with `where:` (a predicate, default `all`) and `blank:`
+# (a list of nullable columns to set NULL on load). Blanking optional FK columns prunes the
+# dependency closure — e.g. blanking people.photo_id avoids having to load storage.files.
+#
+# Load order is derived automatically from the dump's foreign-key graph — list order
+# here does not matter.
+#
+# Scope: this starter policy covers the clubaid analytics domain (court_reserve facts,
+# playbook revenue/insights, and the clubaid.clubs dimension) plus the identity records
+# needed to log in as mbryzek@gmail.com. Tables that reach into other schemas
+# (storage.files, worker.*) are intentionally omitted; add them — together with their
+# cross-schema dependencies — when a dev workflow needs them.
+
+tables:
+  # ── dimensions (full copy) ──────────────────────────────────────────────
+  clubaid.clubs:                  all
+  playbook.transaction_types:     all
+
+  # ── identity / org structure ─────────────────────────────────────────────
+  # All tenants and HOA communities; the mbryzek@gmail.com login (its people, users, and
+  # passwords). Optional FK columns are blanked to keep the closure small (no
+  # storage.files for photos, no phones). Identity lookup tables are tiny.
+  public.tenants:      all
+  hoa.communities:     all
+  public.emails:       lower_email = mbryzek@gmail.com
+  public.people:
+    where: email_id in public.emails.id
+    blank: [photo_id, mobile_phone_id]            # avoids storage.files and phones
+  public.users:        person_id in public.people.id
+  # Only the password ciphers belonging to the users we load. ciphers is a parent of
+  # users (loaded first), so this resolves the cipher ids from the dump's users rows.
+  public.ciphers:      id in public.users.password_cipher_id
+
+  # ── clubaid ─────────────────────────────────────────────────────────────
+  clubaid.ai_chats:               club_id in :clubs
+  clubaid.export_watermarks:      club_id in :clubs
+  clubaid.ai_messages:            chat_id in clubaid.ai_chats.id
+
+  # ── court_reserve ───────────────────────────────────────────────────────
+  court_reserve.clubs:                       club_id in :clubs
+  court_reserve.club_crawler_states:         club_id in :clubs
+  court_reserve.courts:                      club_id in :clubs
+  court_reserve.events:                      club_id in :clubs
+  court_reserve.event_occurrences:           club_id in :clubs
+  court_reserve.event_registrations:         club_id in :clubs
+  court_reserve.event_summaries:             club_id in :clubs
+  court_reserve.families:                    club_id in :clubs
+  court_reserve.guest_member_numbers:        club_id in :clubs
+  court_reserve.member_membership_intervals: club_id in :clubs
+  court_reserve.members:                     club_id in :clubs
+  court_reserve.report_urls:                 club_id in :clubs
+  court_reserve.reservations:                club_id in :clubs
+  court_reserve.sales_categories:            club_id in :clubs
+  court_reserve.sales_summaries:             club_id in :clubs
+  court_reserve.sales_transactions:          club_id in :clubs
+  court_reserve.transactions:                club_id in :clubs
+  court_reserve.audit_events:                club_id in :clubs
+  court_reserve.reservation_courts:          reservation_id in court_reserve.reservations.id
+  court_reserve.reservation_players:         reservation_id in court_reserve.reservations.id
+
+  # ── playbook ────────────────────────────────────────────────────────────
+  playbook.membership_categories:        club_id in :clubs
+  playbook.revenue_categories:           club_id in :clubs
+  playbook.revenue_entries:              club_id in :clubs
+  playbook.watermarks:                   club_id in :clubs
+  playbook.weekly_insights:              club_id in :clubs
+  playbook.weekly_insight_chunks:        weekly_insight_id in playbook.weekly_insights.id
+  playbook.weekly_insight_verifications: weekly_insight_id in playbook.weekly_insights.id
