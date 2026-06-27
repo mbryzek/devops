@@ -143,6 +143,72 @@ module DbImages
     system(cmd)
   end
 
+  # Purge registry images older than 10 days, while always retaining:
+  #   (a) the current latest tag (from current_tag)
+  #   (b) the baseline anchor BASELINE_TAG
+  #
+  # Inject `now:` for testable age logic.  Pass `dry_run: true` to print
+  # what would be purged without deleting anything.
+  BASELINE_TAG    = "0.3.44"
+  PURGE_AGE_DAYS  = 10
+
+  def DbImages.purge_old(now: Time.now, dry_run: false)
+    require 'json'
+    require 'time'
+    out = `doctl registry repository list-tags #{IMAGE_NAME} --output json 2>&1`
+    unless $?.success?
+      Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
+    end
+
+    entries = JSON.parse(out) || []
+    if entries.empty?
+      puts "purge_old: no tags found in registry — nothing to do"
+      return
+    end
+
+    retained_tag = current_tag rescue nil
+    cutoff = now - PURGE_AGE_DAYS * 24 * 3600
+
+    entries.each do |entry|
+      tag        = entry["tag"]
+      updated_at = Time.parse(entry["updated_at"])
+
+      # Skip untagged manifests — they have no named tag and cannot be
+      # addressed by doctl registry repository delete-tag.
+      if tag.nil? || tag.strip.empty?
+        puts "SKIP    (untagged manifest #{entry["manifest_digest"]})"
+        next
+      end
+
+      if tag == retained_tag
+        puts "RETAIN  #{tag}  (current latest tag)"
+        next
+      end
+
+      if tag == BASELINE_TAG
+        puts "RETAIN  #{tag}  (baseline anchor)"
+        next
+      end
+
+      if updated_at > cutoff
+        age_days = ((now - updated_at) / 86400).round(1)
+        puts "RETAIN  #{tag}  (#{age_days}d old — within #{PURGE_AGE_DAYS}-day window)"
+        next
+      end
+
+      age_days = ((now - updated_at) / 86400).round(1)
+      if dry_run
+        puts "PURGE   #{tag}  (#{age_days}d old) [dry-run — not deleted]"
+      else
+        puts "PURGE   #{tag}  (#{age_days}d old)"
+        Util.run(
+          "doctl registry repository delete-tag #{IMAGE_NAME} " \
+          "#{Shellwords.shellescape(tag)} --force"
+        )
+      end
+    end
+  end
+
   # List all platformdb_sess_* database names.
   def DbImages.list_session_dbs
     psql_query(
