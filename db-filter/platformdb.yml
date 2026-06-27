@@ -36,12 +36,11 @@ tables:
   playbook.transaction_types:     all
 
   # ── identity / org structure ─────────────────────────────────────────────
-  # All tenants and HOA communities; the mbryzek@gmail.com login (its people, users,
-  # passwords, and club memberships). Optional FK columns are nulled to keep the closure
-  # small (no storage.files for photos, no phones). Identity lookup tables are tiny.
+  # All tenants and HOA communities; the mbryzek@gmail.com login (its people, users, and
+  # passwords). Optional FK columns are blanked to keep the closure small (no
+  # storage.files for photos, no phones). Identity lookup tables are tiny.
   public.tenants:      all
   hoa.communities:     all
-  public.ciphers:      all                        # password material (encrypted); my user's must be present
   public.emails:
     where: lower_email = mbryzek@gmail.com
     blank: [verified_by_user_id]                  # avoids needing the 'anonymous' sentinel user
@@ -49,7 +48,9 @@ tables:
     where: email_id in public.emails.id
     blank: [photo_id, mobile_phone_id]            # avoids storage.files and phones
   public.users:        person_id in public.people.id
-  clubaid.user_clubs:  user_id in public.users.id
+  # Only the password ciphers belonging to the users we load. ciphers is a parent of
+  # users (loaded first), so this resolves the cipher ids from the dump's users rows.
+  public.ciphers:      id in public.users.password_cipher_id
 
   # ── clubaid ─────────────────────────────────────────────────────────────
   clubaid.ai_chats:               club_id in :clubs

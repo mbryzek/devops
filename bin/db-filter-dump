@@ -285,17 +285,61 @@ def pii_indices(table, cols)
   end
 end
 
+# Carries everything the filter/resolve functions need across the load.
+# `loaded` is the set of tables already populated; `cache` memoizes resolved id-sets.
+Ctx = Struct.new(:input, :dbname, :blocks, :tables, :expanded, :loaded, :cache)
+
+# Iterate the data rows of one COPY block, seeking to its offset.
+def each_dump_row(input_path, offset)
+  File.open(input_path, 'r', encoding: 'binary') do |f|
+    f.seek(offset)
+    while (raw = f.gets)
+      line = raw.chomp
+      break if line == COPY_END
+      yield line
+    end
+  end
+end
+
+# The set of values of <table>.<col> over rows that satisfy <table>'s own predicate.
+# Queries the target DB if the table is already loaded; otherwise resolves from the dump
+# (so a parent table can be filtered to exactly the rows a not-yet-loaded child needs).
+def resolve_ref_set(table, col, ctx)
+  ctx.cache[[table, col]] ||=
+    if ctx.loaded.include?(table)
+      query_values(ctx.dbname, table, col)
+    else
+      dump_column_set(table, col, ctx)
+    end
+end
+
+def dump_column_set(table, col, ctx)
+  block = ctx.blocks[table] or abort "Cannot resolve #{table}.#{col}: #{table} absent from dump."
+  cols = block[:cols]
+  pred = parse_predicate(table, normalize_entry(ctx.tables[table])[:where])
+  col_idx = column_index!(table, cols, col)
+  filter_idx, keep = row_filter(table, cols, pred, ctx)
+  set = Set.new
+  each_dump_row(ctx.input, block[:offset]) do |line|
+    fields = line.split("\t", -1)
+    next if filter_idx && !keep.call(fields[filter_idx])
+    v = fields[col_idx]
+    set << v unless v == '\N'
+  end
+  set
+end
+
 # Build a row-filter for a predicate: returns [column_index, keep?(value) lambda].
 # A nil column_index means "keep every row".
-def row_filter(table, cols, pred, dbname, expanded)
+def row_filter(table, cols, pred, ctx)
   case pred[:kind]
   when :all
     [nil, nil]
   when :club
-    set = expanded
+    set = ctx.expanded
     [column_index!(table, cols, pred[:col]), ->(v) { set.include?(v) }]
   when :fk
-    set = query_values(dbname, pred[:ref_table], pred[:ref_col])
+    set = resolve_ref_set(pred[:ref_table], pred[:ref_col], ctx)
     [column_index!(table, cols, pred[:col]), ->(v) { set.include?(v) }]
   when :eq
     val = pred[:value]
@@ -305,36 +349,29 @@ end
 
 # Stream one COPY block from the dump (seeking to its offset), filter, blank `blank_cols`,
 # obfuscate PII, and COPY the surviving rows into the target DB.
-def load_table(input_path, dbname, table, block, pred, expanded, blank_cols)
-  cols = block[:cols]
-  pii  = pii_indices(table, cols)
+def load_table(table, pred, blank_cols, ctx)
+  block = ctx.blocks[table]
+  cols  = block[:cols]
+  pii   = pii_indices(table, cols)
   blank_idx = blank_cols.map { |c| column_index!(table, cols, c) }
-  filter_idx, keep = row_filter(table, cols, pred, dbname, expanded)
+  filter_idx, keep = row_filter(table, cols, pred, ctx)
   rewrite = !pii.empty? || !blank_idx.empty?
 
   kept = 0
-  run_psql(dbname, "load #{table}") do |psql|
+  run_psql(ctx.dbname, "load #{table}") do |psql|
     psql.puts "COPY #{table} (#{cols.map { |c| "\"#{c}\"" }.join(', ')}) FROM stdin;"
-    File.open(input_path, 'r', encoding: 'binary') do |f|
-      f.seek(block[:offset])
-      while (raw = f.gets)
-        line = raw.chomp
-        break if line == COPY_END
+    each_dump_row(ctx.input, block[:offset]) do |line|
+      next if filter_idx && !keep.call(line.split("\t", -1)[filter_idx])
 
-        if filter_idx
-          next unless keep.call(line.split("\t", -1)[filter_idx])
-        end
-
-        if rewrite
-          fields = line.split("\t", -1)
-          blank_idx.each { |i| fields[i] = '\N' }
-          pii.each { |i, t| fields[i] = obfuscate(t, fields[i]) }
-          line = fields.join("\t")
-        end
-
-        psql.puts line
-        kept += 1
+      if rewrite
+        fields = line.split("\t", -1)
+        blank_idx.each { |i| fields[i] = '\N' }
+        pii.each { |i, t| fields[i] = obfuscate(t, fields[i]) }
+        line = fields.join("\t")
       end
+
+      psql.puts line
+      kept += 1
     end
     psql.puts COPY_END
   end
@@ -430,10 +467,12 @@ def main
 
   order = topo_order(tables.keys.select { |t| blocks.key?(t) }, fk_refs)
 
+  ctx = Ctx.new(input_file, options[:db], blocks, tables, expanded, Set.new, {})
   order.each do |table|
     entry = normalize_entry(tables[table])
     pred  = parse_predicate(table, entry[:where])
-    n = load_table(input_file, options[:db], table, blocks[table], pred, expanded, entry[:blank])
+    n = load_table(table, pred, entry[:blank], ctx)
+    ctx.loaded << table
     warn format('  %-45s %8d rows', table, n)
   end
 
