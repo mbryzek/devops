@@ -124,7 +124,7 @@ def load_schema_and_index(input_path, dbname)
   pos = 0
 
   run_psql(dbname, 'schema load') do |psql|
-    File.open(input_path, 'r', encoding: 'utf-8') do |f|
+    File.open(input_path, 'r', encoding: 'binary') do |f|
       while (raw = f.gets)
         pos += raw.bytesize
         line = raw.chomp
@@ -227,27 +227,53 @@ def run_psql(dbname, what)
 end
 
 def query_values(dbname, table, col)
-  out = IO.popen(['psql', '-U', 'api', '-t', '-A', '-c', "SELECT #{col} FROM #{table}", dbname], &:read)
+  out = IO.popen(['psql', '-U', 'api', '-t', '-A', '-c', "SELECT \"#{col}\" FROM #{table}", dbname], &:read)
   raise "psql query failed on #{table}.#{col} (exit #{$?.exitstatus})" unless $?.success?
   out.split("\n").to_set
+end
+
+# Column index for a filter column; fail loudly rather than silently loading every row
+# (a nil index would make the `if filter_idx` guard skip filtering entirely).
+def column_index!(table, cols, col)
+  cols.index(col) or abort "Column #{col.inspect} not found in #{table} — check db-filter policy. Columns: #{cols.join(', ')}"
+end
+
+# Map this table's PII columns to their indices, warning loudly about any column the
+# dump doesn't have (so plaintext is never silently shipped).
+def pii_indices(table, cols)
+  return {} unless PII.key?(table)
+  PII[table].each_with_object({}) do |(col, type), acc|
+    idx = cols.index(col)
+    if idx.nil?
+      warn "WARNING: PII column #{col.inspect} not found in #{table} — NOT obfuscated"
+    else
+      acc[idx] = type
+    end
+  end
 end
 
 # Stream one COPY block from the dump (seeking to its offset), filter + obfuscate, and
 # COPY the surviving rows into the target DB.
 def load_table(input_path, dbname, table, block, pred, expanded)
   cols = block[:cols]
-  pii  = PII.key?(table) ? PII[table].transform_keys { |c| cols.index(c) }.reject { |k, _| k.nil? } : {}
+  pii  = pii_indices(table, cols)
 
   case pred[:kind]
-  when :club then filter_idx = cols.index(pred[:col]); keepset = expanded
-  when :fk   then filter_idx = cols.index(pred[:col]); keepset = query_values(dbname, pred[:ref_table], pred[:ref_col])
-  else            filter_idx = nil;                    keepset = nil
+  when :club
+    filter_idx = column_index!(table, cols, pred[:col])
+    keepset    = expanded
+  when :fk
+    filter_idx = column_index!(table, cols, pred[:col])
+    keepset    = query_values(dbname, pred[:ref_table], pred[:ref_col])
+  else
+    filter_idx = nil
+    keepset    = nil
   end
 
   kept = 0
   run_psql(dbname, "load #{table}") do |psql|
     psql.puts "COPY #{table} (#{cols.map { |c| "\"#{c}\"" }.join(', ')}) FROM stdin;"
-    File.open(input_path, 'r', encoding: 'utf-8') do |f|
+    File.open(input_path, 'r', encoding: 'binary') do |f|
       f.seek(block[:offset])
       while (raw = f.gets)
         line = raw.chomp
@@ -335,6 +361,7 @@ if options[:clubs]
   cfg['clubs'] = options[:clubs]
   save_clubs_config(cfg_file, cfg)
   warn "Saved #{options[:clubs].size} club(s) to #{cfg_file}."
+  exit 0 unless options[:input] # save-only invocation is complete
 end
 
 requested_clubs = Set.new(cfg['clubs'] || [])
