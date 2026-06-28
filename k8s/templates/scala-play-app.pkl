@@ -58,8 +58,9 @@ local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-jav
 // -G1PeriodicGCInvokesConcurrent forces a Full GC rather than a concurrent
 // cycle. Verified locally on OpenJDK (1.5GB stranded, 4GB heap): the Full-GC
 // variant reclaims completely in ONE STW pause at the first interval (~sub-second
-// at that size; expect a few seconds at the ~9750MB prod heap, scaling with the
-// reclaimed set), whereas the concurrent variant drains in stages across many
+// at that size; expect roughly a second or two at the multi-GB prod job heap,
+// scaling with the reclaimed set), whereas the concurrent variant drains in
+// stages across many
 // cycles (15-25 min at a 5-min interval) because old-region evacuation still
 // waits on mixed GCs that never come while idle. That trade-off is why Full GC
 // wins HERE specifically: the job tier is a background batch processor with no
@@ -82,13 +83,13 @@ local jobIdleGcFlags = "-XX:G1PeriodicGCInterval=300000 -XX:-G1PeriodicGCInvokes
 // with another app's pod); at webReplicas>=2 we swap in place (see strategy
 // block below).
 local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
-// 13000Mi sits comfortably under the ~14300Mi allocatable on s-4vcpu-16gb-amd
-// (leaves ~1300Mi for kube-system DaemonSets) and yields a ~9750MB JVM heap
-// at -XX:MaxRAMPercentage=75.0 — up from 8256MB at 11000Mi. Sized for the
-// clubaid generate/upload pipeline where peak inflight CSV byte arrays land in
-// G1 humongous regions; the earlier 8GB heap entered a GC death spiral around
-// the same 8 GB of inflight bytea, causing 5-15 min restart loops on 2026-05-18.
-local memoryJobServer = read?("env:JOB_MEMORY") ?? "13000Mi"
+// Generic job-tier default for an app that does not pin its own footprint. Each
+// app sizes jobMemory in k8s/apps/<app>.pkl to its own batch working set
+// (platform-job and acumen-job both pin explicitly), so this default only
+// applies to a new app until it is profiled. 5600Mi yields a ~4200MB heap at
+// -XX:MaxRAMPercentage=75.0, a proven-schedulable footprint on the current job
+// node pools with room for kube-system DaemonSets.
+local memoryJobServer = read?("env:JOB_MEMORY") ?? "5600Mi"
 local memoryLimit = memoryDefault
 local memoryLimitJobServer = memoryJobServer
 
@@ -108,7 +109,7 @@ local jobRamPercent = 75
 // format overhead). emptyDir (medium unset) is backed by node ephemeral DISK,
 // not pod RAM, so this does not compete with the JVM heap; job/web DO nodes
 // have ample SSD. Derived from the same {memory, ramPercent} as the heap, so it
-// always tracks: e.g. job 13000Mi*75% = 9750MB heap -> 11700Mi dump volume.
+// always tracks: e.g. job 6000Mi*75% = 4500MB heap -> 5400Mi dump volume.
 // All memory values in this template are expressed in Mi (see memoryDefault /
 // memoryJobServer). Fail loudly on any other unit rather than silently
 // miscomputing the heap-dump volume size.

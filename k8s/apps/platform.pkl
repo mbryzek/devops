@@ -12,4 +12,16 @@ module platform
 appName = "platform"
 appPort = 9300
 webMemory = "4400Mi"
+// platform-job runs the clubaid CSV generate / ingest / export pipeline. Every
+// report streams to an on-disk temp file in fixed-size row chunks, so peak
+// inflight bytes stay bounded instead of materializing whole CSVs (and their
+// G1-humongous byte arrays) on heap. Combined with a @Singleton DI graph — one
+// processor + DAO tree shared across all task discriminators rather than a copy
+// per actor — the steady job working set is ~1.3GB, and the per-minute
+// JvmMemoryMetrics heapUsedMb has held well under that ceiling in production.
+// 6000Mi yields a 4500MB heap at MaxRAMPercentage=75 (~3.4x the observed peak,
+// with slack for batch bursts) and schedules comfortably on the
+// s-4vcpu-16gb-amd job node. The heap governor and -XX:+ExitOnOutOfMemoryError
+// remain the guardrails if a future unbounded path is introduced.
+jobMemory = "6000Mi"
 javaAgent = "/opt/newrelic/newrelic.jar"
