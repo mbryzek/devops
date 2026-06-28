@@ -61,8 +61,9 @@ local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-jav
 // at that size; expect roughly a second or two at the multi-GB prod job heap,
 // scaling with the reclaimed set), whereas the concurrent variant drains in
 // stages across many cycles (15-25 min at a 5-min interval) because old-region
-// evacuation still waits on mixed GCs that never come while idle. That trade-off is why Full GC
-// wins HERE specifically: the job tier is a background batch processor with no
+// evacuation still waits on mixed GCs that never come while idle. That
+// trade-off is why Full GC wins HERE specifically: the job tier is a background
+// batch processor with no
 // request-latency SLA and the pause only ever lands while idle, so even a
 // multi-second Full GC is free. It is deliberately NOT on the web tier, whose
 // pauses are user-facing (and which is healthy at 30-43% heap anyway). It never
@@ -84,8 +85,8 @@ local jobIdleGcFlags = "-XX:G1PeriodicGCInterval=300000 -XX:-G1PeriodicGCInvokes
 local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
 // Generic job-tier default for an app that does not pin its own footprint. Each
 // app sizes jobMemory in k8s/apps/<app>.pkl to its own batch working set
-// (platform-job and acumen-job both pin explicitly), so this default only
-// applies to a new app until it is profiled. 5600Mi yields a ~4200MB heap at
+// (platform-job and acumen-job both pin explicitly), so this default applies
+// only to an app that pins nothing. 5600Mi yields a ~4200MB heap at
 // -XX:MaxRAMPercentage=75.0, a proven-schedulable footprint on the current job
 // node pools with room for kube-system DaemonSets.
 local memoryJobServer = read?("env:JOB_MEMORY") ?? "5600Mi"
@@ -114,7 +115,7 @@ local jobRamPercent = 75
 // miscomputing the heap-dump volume size.
 local function parseMi(memory: String): Int =
   if (memory.endsWith("Mi")) memory.dropLast(2).toInt()
-  else throw("Memory must be expressed in Mi (e.g. \"13000Mi\"), got: \(memory)")
+  else throw("Memory must be expressed in Mi (e.g. \"6000Mi\"), got: \(memory)")
 local function heapMb(memory: String, ramPercent: Int): Int = parseMi(memory) * ramPercent ~/ 100
 local function heapDumpSizeLimit(memory: String, ramPercent: Int): String = "\(heapMb(memory, ramPercent) * 12 ~/ 10)Mi"
 
