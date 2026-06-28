@@ -38,10 +38,15 @@ class TestK8sMemory < Minitest::Test
   def test_platform_job_is_right_sized
     job_memory = app_job_memory('platform')
     assert_equal '6000Mi', job_memory, 'platform.pkl jobMemory drifted'
-    r = render_job(app: 'platform', port: 9300, extra_env: { 'JOB_MEMORY' => job_memory, 'WEB_MEMORY' => '4400Mi' })
+    # Mirror k8s-deploy, which also forwards the app's javaAgent so the rendered
+    # JAVA_OPTS is the real production New Relic path, not the no-agent variant.
+    r = render_job(app: 'platform', port: 9300,
+                   extra_env: { 'JOB_MEMORY' => job_memory, 'WEB_MEMORY' => '4400Mi',
+                                'JAVA_AGENT' => '/opt/newrelic/newrelic.jar' })
     assert_equal '6000Mi', r[:container].dig('resources', 'requests', 'memory')
     assert_equal '6000Mi', r[:container].dig('resources', 'limits', 'memory')
     assert_equal '5400Mi', r[:heap_dump].dig('emptyDir', 'sizeLimit')
+    assert_includes r[:java_opts], '-javaagent:/opt/newrelic/newrelic.jar'
     assert_includes r[:java_opts], '-XX:MaxRAMPercentage=75.0'
   end
 

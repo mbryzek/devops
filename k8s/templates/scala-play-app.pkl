@@ -60,9 +60,8 @@ local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-jav
 // variant reclaims completely in ONE STW pause at the first interval (~sub-second
 // at that size; expect roughly a second or two at the multi-GB prod job heap,
 // scaling with the reclaimed set), whereas the concurrent variant drains in
-// stages across many
-// cycles (15-25 min at a 5-min interval) because old-region evacuation still
-// waits on mixed GCs that never come while idle. That trade-off is why Full GC
+// stages across many cycles (15-25 min at a 5-min interval) because old-region
+// evacuation still waits on mixed GCs that never come while idle. That trade-off is why Full GC
 // wins HERE specifically: the job tier is a background batch processor with no
 // request-latency SLA and the pause only ever lands while idle, so even a
 // multi-second Full GC is free. It is deliberately NOT on the web tier, whose
