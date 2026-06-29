@@ -60,9 +60,9 @@ def load_db_config(args)
 
     # Get database password from environment variables
     env_vars = EnvironmentVariables.load(app_name, args.env)
-    db_url = env_vars['CONF_DB_DEFAULT_URL']
+    db_url = env_vars['CONF_DB_PROD_URL']
     if db_url.nil?
-        Util.exit_with_error("CONF_DB_DEFAULT_URL not found in environment variables for #{app_name}")
+        Util.exit_with_error("CONF_DB_PROD_URL not found in environment variables for #{app_name}")
     end
 
     # Extract password from URL (format: ?user=x&password=y&)
@@ -79,7 +79,7 @@ def load_db_config(args)
     end
 
     if password.nil?
-        Util.exit_with_error("Could not extract password from CONF_DB_DEFAULT_URL")
+        Util.exit_with_error("Could not extract password from CONF_DB_PROD_URL")
     end
 
     {
