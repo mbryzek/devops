@@ -7,7 +7,7 @@
 #
 # Usage:
 #   claude-db start    Boot the container if needed and create this session's DB.
-#                      Prints: CONF_DB_LOCAL_URL=jdbc:postgresql://localhost:5433/<db>
+#                      Prints: CONF_DB_DEV_URL=jdbc:postgresql://localhost:5433/<db>
 #
 #   claude-db end      Drop this session's database.
 #
@@ -36,7 +36,7 @@ def show_usage
     Commands:
       start    Ensure the #{DbImages::CONTAINER} container is running and create a
                per-session database cloned from #{DbImages::TEMPLATE_DB}.
-               Prints CONF_DB_LOCAL_URL for the caller to export.
+               Prints CONF_DB_DEV_URL for the caller to export.
 
       end      Drop this session's database.
 
@@ -107,7 +107,7 @@ def do_start
   # 3. Print the JDBC URL for the caller to export.
   url = "jdbc:postgresql://#{DbImages::HOST}:#{DbImages::PORT}/#{db}"
   puts ""
-  puts "CONF_DB_LOCAL_URL=#{url}"
+  puts "CONF_DB_DEV_URL=#{url}"
   puts ""
 end
 
