@@ -79,7 +79,7 @@ fi
 PARENT_SLUGS=""
 if [[ -n "$PARENT_IDS" ]]; then
   command -v psql >/dev/null 2>&1 || { echo "ERROR: psql not found (needed for --parent-ids)" >&2; exit 1; }
-  # Pin the local platformdb explicitly; never inherit CONF_DB_DEFAULT_URL (could be prod).
+  # Pin the local platformdb explicitly; never inherit CONF_DB_PROD_URL (could be prod).
   # SQL is fed via stdin (not -c) because psql only interpolates :'parents' from
   # stdin / -f, never from -c command strings.
   PSQL=(psql -U api -d platformdb -X -q -t -A -v ON_ERROR_STOP=1 -v parents="$PARENT_IDS")
