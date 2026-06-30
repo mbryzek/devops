@@ -106,8 +106,8 @@ def do_start
 
   # The session DB must be owned by api so that migrations applied via
   # `sem-apply` AS api can issue database-level DDL (CREATE SCHEMA, etc.).
-  # Run unconditionally so databases created before this clause are healed too;
-  # quiet because it is a no-op on DBs just created with OWNER api.
+  # Idempotent: succeeds harmlessly when already owned by api, so it runs on
+  # every start (both the create and reuse paths). Quiet to suppress the echo.
   DbImages.psql_exec_quiet("ALTER DATABASE #{db} OWNER TO api")
 
   # 3. Print the JDBC URL for the caller to export.
