@@ -19,6 +19,7 @@ USAGE = <<~TEXT
   Usage: api [--profile PROFILE] [--app APP ...] [--group GROUP] [<operation> ...]
          api [--profile PROFILE] init [--language typescript] [--language scala]
          api [--profile PROFILE] validate <file>
+         api [--profile PROFILE] lint [<file>] [--fix]
          api [--profile PROFILE] result [--dry-run]
 
   Commands:
@@ -26,6 +27,10 @@ USAGE = <<~TEXT
                       Use --language to also create a local .api/config.pkl with default
                       code generators. Can be repeated for multiple languages.
     validate <file>   Validate an api.json spec file via server-side validation
+    lint [<file>]     Report imports that are declared but never referenced. With no
+                      <file>, lints every spec referenced in .api/config.pkl. Exits
+                      non-zero if any spec has unused imports (use it as a CI gate).
+                      Pass --fix to rewrite each spec with the unused imports removed.
     result            Generate a repo-wide ApiResult.scala from the union of all
                       specs whose blocks bind the play_controller generator in
                       .api/config.pkl. Use --dry-run to print the request body
@@ -51,6 +56,9 @@ USAGE = <<~TEXT
     api init --language scala                        # + create .api/config.pkl for Scala
     api init --language typescript --language scala   # + create .api/config.pkl for both
     api validate spec/myapp.json                     # validate a spec file
+    api lint                                         # lint every spec in .api/config.pkl
+    api lint spec/myapp.json                          # lint a single spec
+    api lint --fix                                   # remove unused imports from every spec
     api                                              # auto-detect operations
     api --profile localhost                           # auto-detect with profile
     api upload                                       # upload only
@@ -455,6 +463,126 @@ def run_validate(profile, file_path)
   end
 end
 
+# --- Lint Command ---
+
+def parse_lint_args(remaining)
+  fix = false
+  file_path = nil
+  args = remaining.dup
+  while arg = args.shift
+    case arg
+    when "--fix"
+      fix = true
+    else
+      if arg.start_with?("--")
+        Util.exit_with_error("Unknown argument: #{arg}\nUsage: api lint [<file>] [--fix]")
+      elsif file_path
+        Util.exit_with_error("api lint accepts at most one <file> (omit it to lint every spec)")
+      else
+        file_path = arg
+      end
+    end
+  end
+  { file_path: file_path, fix: fix }
+end
+
+# Lints every spec referenced in .api/config.pkl (or just <file>) by submitting a
+# `lint` batch per organization and reading back batch.lint_results. Exits non-zero
+# if any spec has unused imports or fails to parse; --fix rewrites the local files.
+def run_lint(profile, file_path, fix:)
+  config_path = File.join(Dir.pwd, ".api", "config.pkl")
+  Util.exit_with_error("No .api/config.pkl found in #{Dir.pwd}") unless File.exist?(config_path)
+  if file_path
+    Util.exit_with_error("File not found: #{file_path}") unless File.exist?(file_path)
+  end
+  config = ApiConfig.new(config_path)
+
+  client = ApibuilderClient.new(profile)
+  batch_client = ApiBatchClient.new(client)
+
+  had_unused = false
+  had_error = false
+  linted = 0
+
+  config.orgs.each do |org|
+    apps = config.blocks_for_org(org).flat_map(&:applications).select { |a| File.exist?(a.file_path) }
+    apps = apps.select { |a| File.expand_path(a.file_path) == File.expand_path(file_path) } if file_path
+    apps = apps.uniq(&:file_path)
+    next if apps.empty?
+
+    path_by_app = apps.map { |a| [a.key, a.file_path] }.to_h
+    applications = apps.map do |a|
+      { "organization_key" => org, "application_key" => a.key, "original" => JSON.parse(IO.read(a.file_path)) }
+    end
+
+    batch = batch_client.create_batch(org, { "operations" => ["lint"], "applications" => applications })
+    result = batch_client.poll_until_complete(org, batch["id"])
+    linted += apps.size
+
+    case result["status"]
+    when "done"
+      (result["lint_results"] || []).each do |r|
+        path = path_by_app[r["application_key"]] || r["application_key"]
+        unused = r["unused_imports"] || []
+        if unused.empty?
+          puts "==> #{lint_rel(path)}: clean"
+        else
+          had_unused = true
+          puts "==> #{lint_rel(path)}: #{unused.size} unused import#{'s' unless unused.size == 1}"
+          unused.each { |u| puts "      #{u["namespace"]} (#{u["application"]})" }
+          if fix
+            lint_remove_unused_imports(path, unused)
+            puts "      fixed: removed #{unused.size}"
+          end
+        end
+      end
+    when "error"
+      had_error = true
+      (result["errors"] || []).each do |e|
+        label = e["application_key"] || org
+        $stderr.puts "==> #{label}: #{e["message"]}"
+      end
+    else
+      Util.exit_with_error("Unexpected batch status '#{result["status"]}' for org #{org}")
+    end
+  end
+
+  Util.exit_with_error("No spec files found to lint") if linted.zero?
+
+  if fix
+    exit(had_error ? 1 : 0)
+  else
+    exit(had_error || had_unused ? 1 : 0)
+  end
+end
+
+def lint_rel(path)
+  prefix = "#{Dir.pwd}/"
+  path.start_with?(prefix) ? path[prefix.length..] : path
+end
+
+# Removes the given unused imports (matched by the app segment of each import URI)
+# from a spec file in place. Drops the "imports" key entirely if it becomes empty.
+def lint_remove_unused_imports(path, unused)
+  spec = JSON.parse(IO.read(path))
+  return unless spec["imports"].is_a?(Array)
+
+  unused_apps = unused.map { |u| u["application"] }
+  kept = spec["imports"].reject do |imp|
+    uri = imp["uri"]
+    next false unless uri.is_a?(String)
+    md = uri.match(%r{/([^/]+)/([^/]+)/([^/]+)/service\.json\z})
+    md && unused_apps.include?(md[2])
+  end
+
+  if kept.empty?
+    spec.delete("imports")
+  else
+    spec["imports"] = kept
+  end
+  File.write(path, JSON.pretty_generate(spec) + "\n")
+end
+
 # --- Batch Operations ---
 
 def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
@@ -672,6 +800,9 @@ if __FILE__ == $PROGRAM_NAME
     run_init(profile, languages)
   when "validate"
     run_validate(profile, remaining[1])
+  when "lint"
+    parsed = parse_lint_args(remaining[1..])
+    run_lint(profile, parsed[:file_path], fix: parsed[:fix])
   when "result"
     parsed = parse_result_args(remaining[1..])
     run_result(profile, parsed[:dry_run])
