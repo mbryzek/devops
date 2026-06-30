@@ -100,9 +100,14 @@ def do_start
     puts ""
     puts "Creating #{db} from template #{DbImages::TEMPLATE_DB}..."
     DbImages.psql_exec(
-      "CREATE DATABASE #{db} TEMPLATE #{DbImages::TEMPLATE_DB}"
+      "CREATE DATABASE #{db} TEMPLATE #{DbImages::TEMPLATE_DB} OWNER api"
     )
   end
+
+  # The session DB must be owned by api so that migrations applied via
+  # `sem-apply` AS api can issue database-level DDL (CREATE SCHEMA, etc.).
+  # Run unconditionally so databases created before this clause are healed too.
+  DbImages.psql_exec("ALTER DATABASE #{db} OWNER TO api")
 
   # 3. Print the JDBC URL for the caller to export.
   url = "jdbc:postgresql://#{DbImages::HOST}:#{DbImages::PORT}/#{db}"
