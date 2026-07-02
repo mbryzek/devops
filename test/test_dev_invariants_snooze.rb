@@ -48,7 +48,7 @@ class TestDevInvariantsSnooze < Minitest::Test
 
   def test_report_single_problem_is_one_line
     out, status = capture_stderr_and_exit do
-      report_arg_problems("snooze", ["--app is required"], SNOOZE_USAGE)
+      report_arg_problems("snooze", ["--app is required"], usage_for("invariants snooze"))
     end
     assert_equal 1, status
     assert_match(/snooze: --app is required/, out)
@@ -57,7 +57,7 @@ class TestDevInvariantsSnooze < Minitest::Test
 
   def test_report_multiple_problems_are_bulleted
     out, status = capture_stderr_and_exit do
-      report_arg_problems("snooze", ["--app is required", "--days is required"], SNOOZE_USAGE)
+      report_arg_problems("snooze", ["--app is required", "--days is required"], usage_for("invariants snooze"))
     end
     assert_equal 1, status
     assert_match(/snooze: 2 problems:/, out)
@@ -66,7 +66,7 @@ class TestDevInvariantsSnooze < Minitest::Test
   end
 
   def test_report_empty_problems_is_noop
-    out, status = capture_stderr_and_exit { report_arg_problems("snooze", [], SNOOZE_USAGE) }
+    out, status = capture_stderr_and_exit { report_arg_problems("snooze", [], usage_for("invariants snooze")) }
     assert_nil status
     assert_empty out
   end

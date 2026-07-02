@@ -11,16 +11,39 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 $LOAD_PATH.unshift(File.expand_path('~/code/claude/lib'))
 require 'work/registry'
 
-# Single source of truth for the snooze/unsnooze invocation lines: reused both in
-# the USAGE block below and in the inline `Usage:` shown on an argument error.
-SNOOZE_INVOCATION = 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]'
-UNSNOOZE_INVOCATION = 'invariants unsnooze <name> --app APP [--localhost]'
+# Single source of truth for each command's invocation line, keyed by the command
+# path. The same string is interpolated into the USAGE block below and shown
+# inline (via usage_for) on an argument error, so help text and error hints can't
+# drift. Add a command here and reference it in both places.
+INVOCATIONS = {
+  "login"               => 'login [--email EMAIL] [--app APP] [--localhost]',
+  "logout"              => 'logout [--localhost]',
+  "invariants check"    => 'invariants check [--app APP] [--localhost] [--examples N | --all-examples]',
+  "invariants snoozes"  => 'invariants snoozes [--app APP] [--localhost]',
+  "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
+  "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
+  "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
+  "version"             => 'version [--app APP] [--localhost]',
+  "pending list"        => 'pending [list] [--app APP]',
+  "pending release"     => 'pending release [--app APP] [--concurrency N]',
+  "config check"        => 'config check [--app APP]',
+  "config rollout"      => 'config rollout [--app APP]',
+  "docker prune"        => 'docker prune [--days N] [--dry-run] [--yes]',
+  "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
+  "scripts run"         => 'scripts run <name> [args...]',
+}.freeze
+
+# The full `dev ...` form passed as `example:` to usage_exit on an arg error.
+# fetch (not []) so a typo'd command key fails loudly instead of showing "dev ".
+def usage_for(command)
+  "dev #{INVOCATIONS.fetch(command)}"
+end
 
 USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
   Commands:
-    login [--email EMAIL] [--app APP] [--localhost]
+    #{INVOCATIONS["login"]}
         Log in to platform and acumen. Prompts for email + password
         separately per app (credentials differ between stacks). If
         --email is passed it is reused for both; password is always
@@ -28,35 +51,35 @@ USAGE = <<~USAGE
         Pass `--app acumen` or `--app platform` to target just one.
         Sessions are stored under ~/.platform/.
 
-    logout [--localhost]
+    #{INVOCATIONS["logout"]}
         Clear the cached devops sessions (platform + acumen).
 
-    invariants check [--app APP] [--localhost] [--examples N | --all-examples]
+    #{INVOCATIONS["invariants check"]}
         Check invariants across endpoints. Shows up to N examples per failure
         (default 10), or all with --all-examples.
 
-    invariants snoozes [--app APP] [--localhost]
+    #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
 
-    #{SNOOZE_INVOCATION}
+    #{INVOCATIONS["invariants snooze"]}
         Snooze an invariant for N days. --app is required.
 
-    #{UNSNOOZE_INVOCATION}
+    #{INVOCATIONS["invariants unsnooze"]}
         Remove an invariant snooze. --app is required.
 
-    tasks requeue [--app APP] [--localhost]
+    #{INVOCATIONS["tasks requeue"]}
         Requeue failed async tasks.
 
-    version [--app APP] [--localhost]
+    #{INVOCATIONS["version"]}
     versions [--localhost]
         Show deployed app version(s) and release timestamp.
 
-    pending [list] [--app APP]
+    #{INVOCATIONS["pending list"]}
         List apps and *-postgresql repos whose origin/main is ahead of the
         latest tag (need deploy). `list` is the default when no subcommand
         is given. --app APP matches an app or DB name exactly (e.g.
         `platform` vs `platform-postgresql`).
-    pending release [--app APP] [--concurrency N]
+    #{INVOCATIONS["pending release"]}
         Release every item `pending list` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
@@ -66,16 +89,16 @@ USAGE = <<~USAGE
         is skipped to avoid deploying an app against an unmigrated schema.
         Skips repos not on `main` or with a dirty tree.
 
-    config check [--app APP]
+    #{INVOCATIONS["config check"]}
         Diff live ConfigMap in cluster against env/apps/<app>/env/production.env.
-    config rollout [--app APP]
+    #{INVOCATIONS["config rollout"]}
         Apply k8s-secrets and rollout restart workloads (picks up ConfigMap changes).
 
-    docker prune [--days N] [--dry-run] [--yes]
+    #{INVOCATIONS["docker prune"]}
         Remove Docker images, build cache, and dangling volumes older than N days
         (default 7). Useful when local disk fills from pushed-but-unused builds.
 
-    browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]
+    #{INVOCATIONS["browserslist update"]}
         Shallow-clone every ~/code/* repo with a package.json into
         ~/code/browserslist.<YYYYMMDD>/<name>, run `npx update-browserslist-db@latest`,
         and push changes to main. Use --app NAME to limit to one repo (matched by
@@ -87,7 +110,7 @@ USAGE = <<~USAGE
         List utility scripts in devops/scripts/ with their allowed targets and
         a one-line description. `list` is the default when no subcommand given.
 
-    scripts run <name> [args...]
+    #{INVOCATIONS["scripts run"]}
         Run a utility script (or wrapper) — the NAME comes first. For `.sql`
         scripts the args are env flags: local platformdb by default, or `--prod` /
         `--env development` to run via `db exec` (production prompts for
@@ -169,6 +192,25 @@ def unknown(kind, value, candidates)
   msg = "Unknown #{kind}: #{value}"
   msg += " (did you mean '#{hint}'?)" if hint
   usage_exit(msg)
+end
+
+# `dev <command>` with no subcommand: name the valid subcommands inline instead
+# of a bare "requires a subcommand", so the user doesn't have to open `dev help`
+# just to discover what's available.
+def require_subcommand(command)
+  subs = SUBCOMMANDS[command] || []
+  hint = subs.length == 1 ? subs.first : "one of: #{subs.join(', ')}"
+  usage_exit("#{command} requires a subcommand (#{hint})")
+end
+
+# Commands that take only common flags (--app/--localhost) accept no positional
+# args or other flags; anything left over is a typo. Reject it with the command's
+# usage inline instead of silently ignoring it (parse_common_flags returns these
+# leftover tokens, which such commands would otherwise discard).
+def reject_unknown_args(command, leftover)
+  return if leftover.empty?
+  label = leftover.length == 1 ? "argument" : "arguments"
+  usage_exit("#{command}: unknown #{label}: #{leftover.join(', ')}", example: usage_for(command))
 end
 
 def parse_common_flags(args)
@@ -260,24 +302,24 @@ def cmd_login(args)
     case a
     when "--email"
       email = args[i + 1]
-      usage_exit("--email requires a value") if email.nil?
+      usage_exit("--email requires a value", example: usage_for("login")) if email.nil?
       i += 2
     when "--app"
       app_filter = args[i + 1]
-      usage_exit("--app requires a value") if app_filter.nil?
+      usage_exit("--app requires a value", example: usage_for("login")) if app_filter.nil?
       i += 2
     when "--localhost"
       use_localhost = true
       i += 1
     else
-      usage_exit("Unknown argument: #{a}")
+      usage_exit("Unknown argument: #{a}", example: usage_for("login"))
     end
   end
 
   apps = if app_filter
            valid = ApiClient::ENDPOINTS.map { |e| e[:app] }
            unless valid.include?(app_filter)
-             usage_exit("--app must be one of: #{valid.join(', ')}")
+             usage_exit("--app must be one of: #{valid.join(', ')}", example: usage_for("login"))
            end
            [app_filter]
          else
@@ -332,7 +374,7 @@ def cmd_logout(args)
   args.each do |a|
     case a
     when "--localhost" then use_localhost = true
-    else usage_exit("Unknown argument: #{a}")
+    else usage_exit("Unknown argument: #{a}", example: usage_for("logout"))
     end
   end
 
@@ -396,13 +438,13 @@ def cmd_invariants_check(args)
   while i < rest.length
     case rest[i]
     when "--examples"
-      example_limit = Integer(rest[i + 1] || usage_exit("--examples requires a value"))
+      example_limit = Integer(rest[i + 1] || usage_exit("--examples requires a value", example: usage_for("invariants check")))
       i += 2
     when "--all-examples"
       example_limit = nil
       i += 1
     else
-      usage_exit("Unknown flag: #{rest[i]}")
+      usage_exit("Unknown flag: #{rest[i]}", example: usage_for("invariants check"))
     end
   end
   endpoints = resolve_endpoints(app_filter, use_localhost)
@@ -467,7 +509,8 @@ def cmd_invariants_check(args)
 end
 
 def cmd_invariants_snoozes(args)
-  _, app_filter, use_localhost = parse_common_flags(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("invariants snoozes", rest)
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
   puts ""
@@ -489,8 +532,6 @@ def cmd_invariants_snoozes(args)
   end
 end
 
-SNOOZE_USAGE = "dev #{SNOOZE_INVOCATION}"
-UNSNOOZE_USAGE = "dev #{UNSNOOZE_INVOCATION}"
 APP_REQUIRED = "--app is required (mutations must target a single app)"
 
 # The invariant name is a positional argument, but a natural first guess is
@@ -538,11 +579,11 @@ def cmd_invariants_snooze(args)
     case a
     when "--days"
       days = rest[i + 1]
-      usage_exit("--days requires a value", example: SNOOZE_USAGE) if days.nil?
+      usage_exit("--days requires a value", example: usage_for("invariants snooze")) if days.nil?
       i += 2
     when "--reason"
       reason = rest[i + 1]
-      usage_exit("--reason requires a value", example: SNOOZE_USAGE) if reason.nil?
+      usage_exit("--reason requires a value", example: usage_for("invariants snooze")) if reason.nil?
       i += 2
     else
       leftover << a
@@ -556,7 +597,7 @@ def cmd_invariants_snooze(args)
   problems << "--reason is required" if reason.nil? || reason.empty?
   days_i = days && (Integer(days) rescue nil)
   problems << "--days must be an integer >= 1" if days && (days_i.nil? || days_i < 1)
-  report_arg_problems("snooze", problems, SNOOZE_USAGE)
+  report_arg_problems("snooze", problems, usage_for("invariants snooze"))
 
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
@@ -573,7 +614,7 @@ def cmd_invariants_unsnooze(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   name, problems = collect_invariant_name(rest)
   problems << APP_REQUIRED if app_filter.nil? || app_filter.empty?
-  report_arg_problems("unsnooze", problems, UNSNOOZE_USAGE)
+  report_arg_problems("unsnooze", problems, usage_for("invariants unsnooze"))
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
   handle_errors do
@@ -587,7 +628,8 @@ end
 # ---------- tasks ----------
 
 def cmd_tasks_requeue(args)
-  _, app_filter, use_localhost = parse_common_flags(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("tasks requeue", rest)
   endpoints = resolve_endpoints(app_filter, use_localhost)
 
   puts ""
@@ -622,15 +664,15 @@ def cmd_docker_prune(args)
   while (arg = args.shift)
     case arg
     when "--days"
-      raw = args.shift or usage_exit("--days requires a value")
-      days = Integer(raw) rescue usage_exit("--days must be an integer")
+      raw = args.shift or usage_exit("--days requires a value", example: usage_for("docker prune"))
+      days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("docker prune"))
     when "--dry-run" then dry_run = true
     when "--yes", "-y" then assume_yes = true
     when "-h", "--help" then puts USAGE; exit 0
-    else usage_exit("Unknown flag: #{arg}")
+    else usage_exit("Unknown flag: #{arg}", example: usage_for("docker prune"))
     end
   end
-  usage_exit("--days must be > 0") if days <= 0
+  usage_exit("--days must be > 0", example: usage_for("docker prune")) if days <= 0
 
   hours = days * 24
   filter = "until=#{hours}h"
@@ -725,7 +767,8 @@ def fetch_app_version(registry, app)
 end
 
 def cmd_versions(args)
-  _, app_filter, _ = parse_common_flags(args)
+  rest, app_filter, _ = parse_common_flags(args)
+  reject_unknown_args("version", rest)
 
   registry = Work::Registry.load
   apps = registry.deployable.sort_by(&:name)
@@ -805,7 +848,8 @@ def resolve_pending_items(name_filter)
 end
 
 def cmd_pending_list(args)
-  _, name_filter, _ = parse_common_flags(args)
+  rest, name_filter, _ = parse_common_flags(args)
+  reject_unknown_args("pending list", rest)
   rows = resolve_pending_items(name_filter)
 
   pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
@@ -836,15 +880,15 @@ def parse_pending_release_args(args)
     case a
     when "--app"
       app_filter = args[i + 1]
-      usage_exit("--app requires a value") if app_filter.nil?
+      usage_exit("--app requires a value", example: usage_for("pending release")) if app_filter.nil?
       i += 2
     when "--concurrency"
       raw = args[i + 1]
-      usage_exit("--concurrency requires a positive integer") if raw.nil? || raw.to_i <= 0
+      usage_exit("--concurrency requires a positive integer", example: usage_for("pending release")) if raw.nil? || raw.to_i <= 0
       concurrency = raw.to_i
       i += 2
     else
-      usage_exit("Unknown argument: #{a}")
+      usage_exit("Unknown argument: #{a}", example: usage_for("pending release"))
     end
   end
   [app_filter, concurrency]
@@ -1043,7 +1087,8 @@ end
 
 def cmd_config_check(args)
   require 'open3'
-  _, app_filter, _ = parse_common_flags(args)
+  rest, app_filter, _ = parse_common_flags(args)
+  reject_unknown_args("config check", rest)
   apps = k8s_apps(app_filter)
 
   any_drift = false
@@ -1074,7 +1119,8 @@ end
 
 def cmd_config_rollout(args)
   require 'open3'
-  _, app_filter, _ = parse_common_flags(args)
+  rest, app_filter, _ = parse_common_flags(args)
+  reject_unknown_args("config rollout", rest)
   apps = k8s_apps(app_filter)
   bin_dir = File.dirname(__FILE__)
 
@@ -1137,14 +1183,14 @@ def cmd_browserslist_update(args)
     when "--keep-tmp-dir"  then keep_tmp = true; i += 1
     when "--app"
       app_filter = args[i + 1]
-      usage_exit("--app requires a value") if app_filter.nil?
+      usage_exit("--app requires a value", example: usage_for("browserslist update")) if app_filter.nil?
       i += 2
     else
       rest << a
       i += 1
     end
   end
-  usage_exit("browserslist update takes no positional arguments") unless rest.empty?
+  usage_exit("browserslist update takes no positional arguments", example: usage_for("browserslist update")) unless rest.empty?
 
   code_root = File.expand_path("~/code")
   source_repos = Dir.children(code_root)
@@ -1342,7 +1388,7 @@ def resolve_script(name)
   if matches.empty?
     unknown("script", name, scripts.map { |f| script_base(f) }.uniq)
   elsif matches.length > 1
-    usage_exit("Ambiguous script '#{name}' matches: #{matches.join(', ')}")
+    usage_exit("Ambiguous script '#{name}' matches: #{matches.join(', ')}", example: usage_for("scripts run"))
   end
   File.join(SCRIPTS_DIR, matches.first)
 end
@@ -1418,7 +1464,7 @@ end
 def cmd_scripts_run(args)
   name = args.shift
   if name.nil? || name.start_with?("-")
-    usage_exit("scripts run requires a script name first (see 'dev scripts list')")
+    usage_exit("scripts run requires a script name first (see 'dev scripts list')", example: usage_for("scripts run"))
   end
   path = resolve_script(name)
 
@@ -1441,7 +1487,7 @@ def run_sql_script(path, name, args)
   while i < args.length
     case args[i]
     when "--env"
-      usage_exit("--env requires a value (local, development, or production)") if i + 1 >= args.length
+      usage_exit("--env requires a value (local, development, or production)", example: usage_for("scripts run")) if i + 1 >= args.length
       env = args[i + 1]; i += 1
     when "--prod", "--production" then env = "production"
     when "--dev", "--development" then env = "development"
@@ -1486,7 +1532,7 @@ when "invariants"
   when "snoozes"   then cmd_invariants_snoozes(argv)
   when "snooze"    then cmd_invariants_snooze(argv)
   when "unsnooze"  then cmd_invariants_unsnooze(argv)
-  when nil         then usage_exit("invariants requires a subcommand")
+  when nil         then require_subcommand("invariants")
   else                  unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
   end
 when "version", "versions"
@@ -1508,28 +1554,28 @@ when "config"
   case sub
   when "check"   then cmd_config_check(argv)
   when "rollout" then cmd_config_rollout(argv)
-  when nil       then usage_exit("config requires a subcommand")
+  when nil       then require_subcommand("config")
   else                unknown("config subcommand", sub, SUBCOMMANDS["config"])
   end
 when "tasks"
   sub = argv.shift
   case sub
   when "requeue" then cmd_tasks_requeue(argv)
-  when nil       then usage_exit("tasks requires a subcommand")
+  when nil       then require_subcommand("tasks")
   else                unknown("tasks subcommand", sub, SUBCOMMANDS["tasks"])
   end
 when "browserslist"
   sub = argv.shift
   case sub
   when "update" then cmd_browserslist_update(argv)
-  when nil      then usage_exit("browserslist requires a subcommand")
+  when nil      then require_subcommand("browserslist")
   else               unknown("browserslist subcommand", sub, SUBCOMMANDS["browserslist"])
   end
 when "docker"
   sub = argv.shift
   case sub
   when "prune" then cmd_docker_prune(argv)
-  when nil     then usage_exit("docker requires a subcommand")
+  when nil     then require_subcommand("docker")
   else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
   end
 when "scripts"
