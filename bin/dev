@@ -11,6 +11,11 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 $LOAD_PATH.unshift(File.expand_path('~/code/claude/lib'))
 require 'work/registry'
 
+# Single source of truth for the snooze/unsnooze invocation lines: reused both in
+# the USAGE block below and in the inline `Usage:` shown on an argument error.
+SNOOZE_INVOCATION = 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]'
+UNSNOOZE_INVOCATION = 'invariants unsnooze <name> --app APP [--localhost]'
+
 USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
@@ -33,10 +38,10 @@ USAGE = <<~USAGE
     invariants snoozes [--app APP] [--localhost]
         List active invariant snoozes.
 
-    invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]
+    #{SNOOZE_INVOCATION}
         Snooze an invariant for N days. --app is required.
 
-    invariants unsnooze <name> --app APP [--localhost]
+    #{UNSNOOZE_INVOCATION}
         Remove an invariant snooze. --app is required.
 
     tasks requeue [--app APP] [--localhost]
@@ -484,21 +489,22 @@ def cmd_invariants_snoozes(args)
   end
 end
 
-SNOOZE_USAGE = 'dev invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]'
-UNSNOOZE_USAGE = 'dev invariants unsnooze <name> --app APP [--localhost]'
+SNOOZE_USAGE = "dev #{SNOOZE_INVOCATION}"
+UNSNOOZE_USAGE = "dev #{UNSNOOZE_INVOCATION}"
+APP_REQUIRED = "--app is required (mutations must target a single app)"
 
 # The invariant name is a positional argument, but a natural first guess is
-# `--name X`; that lands both tokens in `leftover` and used to surface the
-# misleading "requires an invariant name". Split leftover tokens into the single
-# positional name vs stray `--flags` and describe exactly what went wrong,
-# returning [name, problems] so the caller can add its own required-arg checks.
+# `--name X`, which lands both tokens in `leftover`. Split leftover tokens into
+# the single positional name vs stray `--flags` and describe exactly what went
+# wrong, returning [name, problems] so the caller can add its own required-arg
+# checks.
 def collect_invariant_name(leftover)
-  unknown = leftover.select { |a| a.start_with?("--") }
+  unknown_flags = leftover.select { |a| a.start_with?("--") }
   positional = leftover.reject { |a| a.start_with?("--") }
   problems = []
-  unless unknown.empty?
-    label = unknown.length == 1 ? "flag" : "flags"
-    problems << "unknown #{label} #{unknown.join(', ')} (the invariant name is a positional argument, not --name)"
+  unless unknown_flags.empty?
+    label = unknown_flags.length == 1 ? "flag" : "flags"
+    problems << "unknown #{label} #{unknown_flags.join(', ')} (the invariant name is a positional argument — pass it without a flag)"
   end
   if positional.empty?
     problems << "missing invariant name (positional argument)"
@@ -545,7 +551,7 @@ def cmd_invariants_snooze(args)
   end
 
   name, problems = collect_invariant_name(leftover)
-  problems << "--app is required" if app_filter.nil? || app_filter.empty?
+  problems << APP_REQUIRED if app_filter.nil? || app_filter.empty?
   problems << "--days is required" if days.nil?
   problems << "--reason is required" if reason.nil? || reason.empty?
   days_i = days && (Integer(days) rescue nil)
@@ -566,7 +572,7 @@ end
 def cmd_invariants_unsnooze(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   name, problems = collect_invariant_name(rest)
-  problems << "--app is required" if app_filter.nil? || app_filter.empty?
+  problems << APP_REQUIRED if app_filter.nil? || app_filter.empty?
   report_arg_problems("unsnooze", problems, UNSNOOZE_USAGE)
   endpoints = resolve_endpoints(app_filter, use_localhost)
 

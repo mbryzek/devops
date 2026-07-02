@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
-require 'stringio'
+require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 
 # Covers the argument-validation DX for `dev invariants snooze` / `unsnooze`:
@@ -8,20 +8,7 @@ load File.expand_path('../bin/dev', __dir__)
 # name is a positional (a `--name X` guess is named as an unknown flag), and the
 # command's usage line is shown inline so you don't have to hunt through help.
 class TestDevInvariantsSnooze < Minitest::Test
-  def capture_stderr_and_exit
-    buf = StringIO.new
-    old = $stderr
-    $stderr = buf
-    status = nil
-    begin
-      yield
-    rescue SystemExit => e
-      status = e.status
-    end
-    [buf.string, status]
-  ensure
-    $stderr = old
-  end
+  include DevTestSupport
 
   # ---- collect_invariant_name ----
 
@@ -35,7 +22,15 @@ class TestDevInvariantsSnooze < Minitest::Test
     _name, problems = collect_invariant_name(["--name", "my_invariant"])
     assert_equal 1, problems.length
     assert_match(/unknown flag --name/, problems.first)
-    assert_match(/positional argument, not --name/, problems.first)
+    assert_match(/positional argument — pass it without a flag/, problems.first)
+  end
+
+  def test_unknown_flag_message_names_the_actual_flag_not_name
+    # The hint must reference whatever flag the user actually typed, never a
+    # hardcoded --name they never used.
+    _name, problems = collect_invariant_name(["--foo", "bar"])
+    assert_match(/unknown flag --foo/, problems.first)
+    refute_match(/--name/, problems.first)
   end
 
   def test_missing_name_is_reported
@@ -95,7 +90,16 @@ class TestDevInvariantsSnooze < Minitest::Test
     out, status = capture_stderr_and_exit { cmd_invariants_snooze(args) }
     assert_equal 1, status
     assert_match(/snooze: unknown flag --name/, out)
-    assert_match(/positional argument, not --name/, out)
+    assert_match(/positional argument — pass it without a flag/, out)
+  end
+
+  def test_snooze_missing_only_app_reports_it_with_rationale
+    # --app moved from a dedicated Util.exit_with_error into the batched report;
+    # pin that it still surfaces as the single problem, with the safety rationale.
+    args = ["my_invariant", "--days", "10", "--reason", "test"]
+    out, status = capture_stderr_and_exit { cmd_invariants_snooze(args) }
+    assert_equal 1, status
+    assert_match(/snooze: --app is required \(mutations must target a single app\)/, out)
   end
 
   def test_snooze_non_integer_days_is_reported

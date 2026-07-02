@@ -1,12 +1,14 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
-require 'stringio'
+require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 
 # Covers the command-suggestion + trimmed-error behavior added to `dev`:
 # levenshtein distance, the suggest() prefix/edit-distance heuristic, and the
 # usage_exit()/unknown() output (short error on mistake, full usage on help).
 class TestDevSuggest < Minitest::Test
+  include DevTestSupport
+
   # ---- levenshtein ----
 
   def test_levenshtein_identical_is_zero
@@ -66,21 +68,6 @@ class TestDevSuggest < Minitest::Test
   end
 
   # ---- unknown / usage_exit output ----
-
-  def capture_stderr_and_exit
-    buf = StringIO.new
-    old = $stderr
-    $stderr = buf
-    status = nil
-    begin
-      yield
-    rescue SystemExit => e
-      status = e.status
-    end
-    [buf.string, status]
-  ensure
-    $stderr = old
-  end
 
   def test_unknown_with_suggestion_is_short
     out, status = capture_stderr_and_exit { unknown("command", "task", COMMANDS) }
