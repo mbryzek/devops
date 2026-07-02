@@ -60,15 +60,52 @@ class TestDevArgUsage < Minitest::Test
     end
   end
 
-  # ---- USAGE stays in sync with the invocation constants ----
+  # ---- reject_unknown_args (common-flags-only commands) ----
+
+  def test_reject_unknown_args_errors_with_inline_usage
+    out, status = capture_stderr_and_exit { reject_unknown_args("tasks requeue", ["--typo"]) }
+    assert_equal 1, status
+    assert_match(/tasks requeue: unknown argument: --typo/, out)
+    assert_match(%r{  Usage: dev tasks requeue}, out)
+  end
+
+  def test_reject_unknown_args_pluralizes_and_is_noop_when_empty
+    out, _ = capture_stderr_and_exit { reject_unknown_args("config check", %w[a b]) }
+    assert_match(/unknown arguments: a, b/, out)
+
+    quiet, status = capture_stderr_and_exit { reject_unknown_args("config check", []) }
+    assert_nil status
+    assert_empty quiet
+  end
+
+  def test_common_flag_only_commands_reject_stray_flags
+    # These take only --app/--localhost; a stray token used to be silently
+    # dropped. Each must now error, exit 1, and show its own usage line.
+    {
+      "invariants snoozes" => -> { cmd_invariants_snoozes(["--typo"]) },
+      "tasks requeue"      => -> { cmd_tasks_requeue(["--typo"]) },
+      "version"            => -> { cmd_versions(["--typo"]) },
+      "pending list"       => -> { cmd_pending_list(["--typo"]) },
+      "config check"       => -> { cmd_config_check(["--typo"]) },
+      "config rollout"     => -> { cmd_config_rollout(["--typo"]) },
+    }.each do |command, callable|
+      out, status = capture_stderr_and_exit { callable.call }
+      assert_equal 1, status, "#{command}: expected exit 1 on stray flag"
+      assert_includes out, "unknown", "#{command}: expected an unknown-arg error"
+      assert_includes out, "  Usage: #{usage_for(command)}", "#{command}: wrong/absent usage line"
+    end
+  end
+
+  # ---- USAGE / usage_for stay in sync with the INVOCATIONS map ----
 
   def test_usage_block_contains_each_invocation_line
-    [
-      LOGIN_INVOCATION, INVARIANTS_CHECK_INVOCATION, SNOOZE_INVOCATION,
-      UNSNOOZE_INVOCATION, PENDING_RELEASE_INVOCATION, DOCKER_PRUNE_INVOCATION,
-      BROWSERSLIST_INVOCATION, SCRIPTS_RUN_INVOCATION
-    ].each do |line|
+    INVOCATIONS.each_value do |line|
       assert_includes USAGE, line, "USAGE missing invocation line: #{line}"
     end
+  end
+
+  def test_usage_for_prefixes_dev_and_fails_loud_on_unknown_command
+    assert_equal "dev tasks requeue [--app APP] [--localhost]", usage_for("tasks requeue")
+    assert_raises(KeyError) { usage_for("nope not a command") }
   end
 end
