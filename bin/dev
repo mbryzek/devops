@@ -508,6 +508,24 @@ def cmd_invariants_check(args)
   end
 end
 
+# Render the `created_by` audit union (from bryzek/audit), keyed off its discriminator:
+#   - "person":    resolved profile — show name and/or email, falling back to the person id.
+#   - "reference": unresolved user — only the opaque user id is available.
+# Any other discriminator is a newer variant this client predates; show it verbatim.
+def format_created_by(created_by)
+  case created_by['discriminator']
+  when 'person'
+    person = created_by['person'] || {}
+    email  = (person['email'] || {})['address']
+    parts  = [person['name'], email && "<#{email}>"].compact
+    parts.empty? ? person['id'] : parts.join(' ')
+  when 'reference'
+    (created_by['user'] || {})['id']
+  else
+    created_by['discriminator'] || 'unknown'
+  end
+end
+
 def cmd_invariants_snoozes(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   reject_unknown_args("invariants snoozes", rest)
@@ -522,10 +540,11 @@ def cmd_invariants_snoozes(args)
       snoozes = ApiClient.request(endpoint, :get, "/dev/invariant/snoozes") || []
       puts "#{endpoint[:name]}: #{snoozes.length} active"
       snoozes.each do |s|
+        created_by = s['created_by'] || {}
         puts "  - #{s['invariant_name']}"
         puts "    Until:   #{s['snoozed_until']}"
         puts "    Reason:  #{s['reason']}"
-        puts "    By:      #{s['created_by_user_id']} at #{s['created_at']}"
+        puts "    By:      #{format_created_by(created_by)} at #{created_by['created_at']}"
       end
       puts ""
     end
