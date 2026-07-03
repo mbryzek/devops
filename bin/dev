@@ -516,14 +516,19 @@ def format_created_by(created_by)
   case created_by['discriminator']
   when 'person'
     person = created_by['person'] || {}
-    email  = (person['email'] || {})['address']
-    parts  = [person['name'], email && "<#{email}>"].compact
-    parts.empty? ? person['id'] : parts.join(' ')
+    name   = blank_to_nil(person['name'])
+    email  = blank_to_nil(person.dig('email', 'address'))
+    parts  = [name, email && "<#{email}>"].compact
+    parts.empty? ? (person['id'] || 'unknown') : parts.join(' ')
   when 'reference'
-    (created_by['user'] || {})['id']
+    (created_by['user'] || {})['id'] || 'unknown'
   else
     created_by['discriminator'] || 'unknown'
   end
+end
+
+def blank_to_nil(value)
+  value.to_s.strip.empty? ? nil : value
 end
 
 def cmd_invariants_snoozes(args)
