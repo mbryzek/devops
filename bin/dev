@@ -18,7 +18,7 @@ require 'work/registry'
 INVOCATIONS = {
   "login"               => 'login [--email EMAIL] [--app APP] [--localhost]',
   "logout"              => 'logout [--localhost]',
-  "invariants check"    => 'invariants check [--app APP] [--localhost] [--examples N | --all-examples]',
+  "invariants check"    => 'invariants [check] [--app APP] [--localhost] [--examples N | --all-examples]',
   "invariants snoozes"  => 'invariants snoozes [--app APP] [--localhost]',
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
@@ -55,8 +55,9 @@ USAGE = <<~USAGE
         Clear the cached devops sessions (platform + acumen).
 
     #{INVOCATIONS["invariants check"]}
-        Check invariants across endpoints. Shows up to N examples per failure
-        (default 10), or all with --all-examples.
+        Check invariants across endpoints. `check` is the default when no
+        subcommand is given. Shows up to N examples per failure (default 10),
+        or all with --all-examples.
 
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
@@ -201,6 +202,18 @@ def require_subcommand(command)
   subs = SUBCOMMANDS[command] || []
   hint = subs.length == 1 ? subs.first : "one of: #{subs.join(', ')}"
   usage_exit("#{command} requires a subcommand (#{hint})")
+end
+
+# Pick the subcommand for `dev <command> [subcommand] ...`. The first token names
+# it, unless it's absent or a flag — those belong to the default subcommand's own
+# args, so `dev pending --app X` and bare `dev invariants` both run the default.
+# Shifts the token off `argv` only when it named a subcommand, leaving flags and
+# positionals for the handler. Returns the chosen (or default) subcommand name;
+# an unrecognized name is returned as-is so the caller can report it.
+def resolve_subcommand(argv, default:)
+  first = argv.first
+  return default if first.nil? || first.start_with?("-")
+  argv.shift
 end
 
 # Commands that take only common flags (--app/--localhost) accept no positional
@@ -1526,32 +1539,22 @@ when "login"
 when "logout"
   cmd_logout(argv)
 when "invariants"
-  sub = argv.first
-  if sub.nil? || sub.start_with?("-")
-    cmd_invariants_check(argv)
-  else
-    argv.shift
-    case sub
-    when "check"    then cmd_invariants_check(argv)
-    when "snoozes"  then cmd_invariants_snoozes(argv)
-    when "snooze"   then cmd_invariants_snooze(argv)
-    when "unsnooze" then cmd_invariants_unsnooze(argv)
-    else                 unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
-    end
+  sub = resolve_subcommand(argv, default: "check")
+  case sub
+  when "check"    then cmd_invariants_check(argv)
+  when "snoozes"  then cmd_invariants_snoozes(argv)
+  when "snooze"   then cmd_invariants_snooze(argv)
+  when "unsnooze" then cmd_invariants_unsnooze(argv)
+  else                 unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
   end
 when "version", "versions"
   cmd_versions(argv)
 when "pending"
-  sub = argv.first
-  if sub.nil? || sub.start_with?("-")
-    cmd_pending_check(argv)
-  else
-    argv.shift
-    case sub
-    when "check"   then cmd_pending_check(argv)
-    when "release" then cmd_pending_release(argv)
-    else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
-    end
+  sub = resolve_subcommand(argv, default: "check")
+  case sub
+  when "check"   then cmd_pending_check(argv)
+  when "release" then cmd_pending_release(argv)
+  else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
   end
 when "config"
   sub = argv.shift

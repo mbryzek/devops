@@ -34,6 +34,33 @@ class TestDevArgUsage < Minitest::Test
     end
   end
 
+  # ---- resolve_subcommand (default-on-nil/flag dispatch heuristic) ----
+
+  def test_resolve_subcommand_defaults_when_absent
+    argv = []
+    assert_equal "check", resolve_subcommand(argv, default: "check")
+    assert_empty argv
+  end
+
+  def test_resolve_subcommand_defaults_when_leading_flag
+    # A leading flag belongs to the default subcommand's args, not a subcommand.
+    argv = ["--app", "acumen"]
+    assert_equal "check", resolve_subcommand(argv, default: "check")
+    assert_equal ["--app", "acumen"], argv, "flag must be left for the handler"
+  end
+
+  def test_resolve_subcommand_shifts_named_subcommand
+    argv = ["release", "--concurrency", "2"]
+    assert_equal "release", resolve_subcommand(argv, default: "check")
+    assert_equal ["--concurrency", "2"], argv, "named subcommand must be consumed"
+  end
+
+  def test_resolve_subcommand_returns_unknown_token_asis
+    argv = ["bogus"]
+    assert_equal "bogus", resolve_subcommand(argv, default: "check")
+    assert_empty argv
+  end
+
   # ---- inline usage examples on arg errors ----
 
   # Each case invokes a command's real arg-parsing failure path and asserts the
@@ -42,7 +69,7 @@ class TestDevArgUsage < Minitest::Test
   def error_cases
     {
       "login unknown arg"         => [-> { cmd_login(["--nope"]) },                    "dev login [--email EMAIL]"],
-      "invariants check bad flag" => [-> { cmd_invariants_check(["--bogus"]) },        "dev invariants check"],
+      "invariants check bad flag" => [-> { cmd_invariants_check(["--bogus"]) },        "dev invariants [check]"],
       "docker prune bad days"     => [-> { cmd_docker_prune(["--days", "abc"]) },      "dev docker prune"],
       "pending release bad conc"  => [-> { cmd_pending_release(["--concurrency", "0"]) }, "dev pending release"],
       "browserslist stray arg"    => [-> { cmd_browserslist_update(["foo"]) },         "dev browserslist update"],
