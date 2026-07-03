@@ -519,9 +519,9 @@ def format_created_by(created_by)
     name   = blank_to_nil(person['name'])
     email  = blank_to_nil(person.dig('email', 'address'))
     parts  = [name, email && "<#{email}>"].compact
-    parts.empty? ? (person['id'] || 'unknown') : parts.join(' ')
+    parts.empty? ? (blank_to_nil(person['id']) || 'unknown') : parts.join(' ')
   when 'reference'
-    (created_by['user'] || {})['id'] || 'unknown'
+    blank_to_nil((created_by['user'] || {})['id']) || 'unknown'
   else
     created_by['discriminator'] || 'unknown'
   end
