@@ -1586,18 +1586,11 @@ when "docker"
   else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
   end
 when "scripts"
-  # Peek (don't shift) so a bare `dev scripts` or a stray flag falls through to
-  # the default `list`, matching the `pending` dispatch pattern.
-  sub = argv.first
-  if sub.nil? || sub.start_with?("-")
-    cmd_scripts_list(argv)
-  else
-    argv.shift
-    case sub
-    when "list" then cmd_scripts_list(argv)
-    when "run"  then cmd_scripts_run(argv)
-    else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
-    end
+  sub = resolve_subcommand(argv, default: "list")
+  case sub
+  when "list" then cmd_scripts_list(argv)
+  when "run"  then cmd_scripts_run(argv)
+  else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
   end
 else
   unknown("command", command, COMMANDS)
