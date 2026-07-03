@@ -13,9 +13,9 @@ class TestDevArgUsage < Minitest::Test
   # ---- require_subcommand ----
 
   def test_multi_subcommand_lists_all_options
-    out, status = capture_stderr_and_exit { require_subcommand("invariants") }
+    out, status = capture_stderr_and_exit { require_subcommand("config") }
     assert_equal 1, status
-    assert_match(/invariants requires a subcommand \(one of: check, snoozes, snooze, unsnooze\)/, out)
+    assert_match(/config requires a subcommand \(one of: check, rollout\)/, out)
   end
 
   def test_single_subcommand_names_it_without_one_of
@@ -28,7 +28,7 @@ class TestDevArgUsage < Minitest::Test
   def test_every_dispatched_command_has_subcommands
     # Every command wired to require_subcommand must have a non-empty SUBCOMMANDS
     # entry, or the hint would read "()".
-    %w[invariants config tasks browserslist docker].each do |cmd|
+    %w[config tasks browserslist docker].each do |cmd|
       refute_nil SUBCOMMANDS[cmd], "SUBCOMMANDS missing #{cmd}"
       refute_empty SUBCOMMANDS[cmd]
     end
@@ -85,7 +85,7 @@ class TestDevArgUsage < Minitest::Test
       "invariants snoozes" => -> { cmd_invariants_snoozes(["--typo"]) },
       "tasks requeue"      => -> { cmd_tasks_requeue(["--typo"]) },
       "version"            => -> { cmd_versions(["--typo"]) },
-      "pending list"       => -> { cmd_pending_list(["--typo"]) },
+      "pending check"      => -> { cmd_pending_check(["--typo"]) },
       "config check"       => -> { cmd_config_check(["--typo"]) },
       "config rollout"     => -> { cmd_config_rollout(["--typo"]) },
     }.each do |command, callable|

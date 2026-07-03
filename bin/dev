@@ -24,7 +24,7 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "version"             => 'version [--app APP] [--localhost]',
-  "pending list"        => 'pending [list] [--app APP]',
+  "pending check"       => 'pending [check] [--app APP]',
   "pending release"     => 'pending release [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
@@ -74,13 +74,13 @@ USAGE = <<~USAGE
     versions [--localhost]
         Show deployed app version(s) and release timestamp.
 
-    #{INVOCATIONS["pending list"]}
+    #{INVOCATIONS["pending check"]}
         List apps and *-postgresql repos whose origin/main is ahead of the
-        latest tag (need deploy). `list` is the default when no subcommand
+        latest tag (need deploy). `check` is the default when no subcommand
         is given. --app APP matches an app or DB name exactly (e.g.
         `platform` vs `platform-postgresql`).
     #{INVOCATIONS["pending release"]}
-        Release every item `pending list` would report. Two phases:
+        Release every item `pending check` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
           2. Apps release in parallel (concurrency defaults to 4) via
@@ -147,7 +147,7 @@ COMMANDS = %w[login logout invariants tasks version versions pending config dock
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
-  "pending"      => %w[list release],
+  "pending"      => %w[check release],
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "browserslist" => %w[update],
@@ -847,9 +847,9 @@ def resolve_pending_items(name_filter)
   items.map { |name, dir| Thread.new { [name, pending_for(name, dir)] } }.map(&:value)
 end
 
-def cmd_pending_list(args)
+def cmd_pending_check(args)
   rest, name_filter, _ = parse_common_flags(args)
-  reject_unknown_args("pending list", rest)
+  reject_unknown_args("pending check", rest)
   rows = resolve_pending_items(name_filter)
 
   pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
@@ -1526,25 +1526,29 @@ when "login"
 when "logout"
   cmd_logout(argv)
 when "invariants"
-  sub = argv.shift
-  case sub
-  when "check"     then cmd_invariants_check(argv)
-  when "snoozes"   then cmd_invariants_snoozes(argv)
-  when "snooze"    then cmd_invariants_snooze(argv)
-  when "unsnooze"  then cmd_invariants_unsnooze(argv)
-  when nil         then require_subcommand("invariants")
-  else                  unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
+  sub = argv.first
+  if sub.nil? || sub.start_with?("-")
+    cmd_invariants_check(argv)
+  else
+    argv.shift
+    case sub
+    when "check"    then cmd_invariants_check(argv)
+    when "snoozes"  then cmd_invariants_snoozes(argv)
+    when "snooze"   then cmd_invariants_snooze(argv)
+    when "unsnooze" then cmd_invariants_unsnooze(argv)
+    else                 unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
+    end
   end
 when "version", "versions"
   cmd_versions(argv)
 when "pending"
   sub = argv.first
   if sub.nil? || sub.start_with?("-")
-    cmd_pending_list(argv)
+    cmd_pending_check(argv)
   else
     argv.shift
     case sub
-    when "list"    then cmd_pending_list(argv)
+    when "check"   then cmd_pending_check(argv)
     when "release" then cmd_pending_release(argv)
     else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
     end

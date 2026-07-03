@@ -3,7 +3,7 @@ require 'minitest/autorun'
 load File.expand_path('../bin/dev', __dir__)
 load File.expand_path('../lib/tag.rb', __dir__)
 
-# Covers the `dev pending {list,release}` subcommand split and the
+# Covers the `dev pending {check,release}` subcommand split and the
 # RELEASE_AUTO_TAG escape hatch that lets `pending release` run releases
 # without interactive prompts.
 class TestDevPending < Minitest::Test
