@@ -127,3 +127,55 @@ class TestDevInvariantsSnooze < Minitest::Test
     assert_match(%r{Usage: dev invariants unsnooze <name> --app APP}, out)
   end
 end
+
+# Rendering the `created_by` audit union returned by GET /dev/invariant/snoozes.
+# Keyed off the discriminator: "person" shows name and/or email (fallback to id),
+# "reference" shows the opaque user id, any other variant is shown verbatim.
+class TestFormatCreatedBy < Minitest::Test
+  def person(fields)
+    { 'discriminator' => 'person', 'person' => fields }
+  end
+
+  def test_person_with_name_and_email
+    cb = person('id' => 'per-1', 'name' => 'Jane Doe', 'email' => { 'address' => 'jane@example.com' })
+    assert_equal 'Jane Doe <jane@example.com>', format_created_by(cb)
+  end
+
+  def test_person_with_email_only
+    cb = person('id' => 'per-2', 'email' => { 'address' => 'bob@example.com' })
+    assert_equal '<bob@example.com>', format_created_by(cb)
+  end
+
+  def test_person_with_name_only
+    cb = person('id' => 'per-3', 'name' => 'No Email')
+    assert_equal 'No Email', format_created_by(cb)
+  end
+
+  def test_person_with_neither_falls_back_to_person_id
+    cb = person('id' => 'per-4')
+    assert_equal 'per-4', format_created_by(cb)
+  end
+
+  def test_person_blank_name_and_email_are_ignored
+    cb = person('id' => 'per-5', 'name' => '  ', 'email' => { 'address' => '' })
+    assert_equal 'per-5', format_created_by(cb)
+  end
+
+  def test_person_fully_empty_falls_back_to_unknown
+    cb = person({})
+    assert_equal 'unknown', format_created_by(cb)
+  end
+
+  def test_reference_shows_user_id
+    cb = { 'discriminator' => 'reference', 'user' => { 'id' => 'usr-109fd8' } }
+    assert_equal 'usr-109fd8', format_created_by(cb)
+  end
+
+  def test_unknown_discriminator_is_shown_verbatim
+    assert_equal 'future_thing', format_created_by('discriminator' => 'future_thing')
+  end
+
+  def test_missing_discriminator_falls_back_to_unknown
+    assert_equal 'unknown', format_created_by({})
+  end
+end
