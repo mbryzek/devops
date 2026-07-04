@@ -13,9 +13,9 @@ class TestDevArgUsage < Minitest::Test
   # ---- require_subcommand ----
 
   def test_multi_subcommand_lists_all_options
-    out, status = capture_stderr_and_exit { require_subcommand("invariants") }
+    out, status = capture_stderr_and_exit { require_subcommand("config") }
     assert_equal 1, status
-    assert_match(/invariants requires a subcommand \(one of: check, snoozes, snooze, unsnooze\)/, out)
+    assert_match(/config requires a subcommand \(one of: check, rollout\)/, out)
   end
 
   def test_single_subcommand_names_it_without_one_of
@@ -28,10 +28,37 @@ class TestDevArgUsage < Minitest::Test
   def test_every_dispatched_command_has_subcommands
     # Every command wired to require_subcommand must have a non-empty SUBCOMMANDS
     # entry, or the hint would read "()".
-    %w[invariants config tasks browserslist docker].each do |cmd|
+    %w[config tasks browserslist docker].each do |cmd|
       refute_nil SUBCOMMANDS[cmd], "SUBCOMMANDS missing #{cmd}"
       refute_empty SUBCOMMANDS[cmd]
     end
+  end
+
+  # ---- resolve_subcommand (default-on-nil/flag dispatch heuristic) ----
+
+  def test_resolve_subcommand_defaults_when_absent
+    argv = []
+    assert_equal "check", resolve_subcommand(argv, default: "check")
+    assert_empty argv
+  end
+
+  def test_resolve_subcommand_defaults_when_leading_flag
+    # A leading flag belongs to the default subcommand's args, not a subcommand.
+    argv = ["--app", "acumen"]
+    assert_equal "check", resolve_subcommand(argv, default: "check")
+    assert_equal ["--app", "acumen"], argv, "flag must be left for the handler"
+  end
+
+  def test_resolve_subcommand_shifts_named_subcommand
+    argv = ["release", "--concurrency", "2"]
+    assert_equal "release", resolve_subcommand(argv, default: "check")
+    assert_equal ["--concurrency", "2"], argv, "named subcommand must be consumed"
+  end
+
+  def test_resolve_subcommand_returns_unknown_token_asis
+    argv = ["bogus"]
+    assert_equal "bogus", resolve_subcommand(argv, default: "check")
+    assert_empty argv
   end
 
   # ---- inline usage examples on arg errors ----
@@ -42,7 +69,7 @@ class TestDevArgUsage < Minitest::Test
   def error_cases
     {
       "login unknown arg"         => [-> { cmd_login(["--nope"]) },                    "dev login [--email EMAIL]"],
-      "invariants check bad flag" => [-> { cmd_invariants_check(["--bogus"]) },        "dev invariants check"],
+      "invariants check bad flag" => [-> { cmd_invariants_check(["--bogus"]) },        "dev invariants [check]"],
       "docker prune bad days"     => [-> { cmd_docker_prune(["--days", "abc"]) },      "dev docker prune"],
       "pending release bad conc"  => [-> { cmd_pending_release(["--concurrency", "0"]) }, "dev pending release"],
       "browserslist stray arg"    => [-> { cmd_browserslist_update(["foo"]) },         "dev browserslist update"],
@@ -85,7 +112,7 @@ class TestDevArgUsage < Minitest::Test
       "invariants snoozes" => -> { cmd_invariants_snoozes(["--typo"]) },
       "tasks requeue"      => -> { cmd_tasks_requeue(["--typo"]) },
       "version"            => -> { cmd_versions(["--typo"]) },
-      "pending list"       => -> { cmd_pending_list(["--typo"]) },
+      "pending check"      => -> { cmd_pending_check(["--typo"]) },
       "config check"       => -> { cmd_config_check(["--typo"]) },
       "config rollout"     => -> { cmd_config_rollout(["--typo"]) },
     }.each do |command, callable|

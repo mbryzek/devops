@@ -18,13 +18,13 @@ require 'work/registry'
 INVOCATIONS = {
   "login"               => 'login [--email EMAIL] [--app APP] [--localhost]',
   "logout"              => 'logout [--localhost]',
-  "invariants check"    => 'invariants check [--app APP] [--localhost] [--examples N | --all-examples]',
+  "invariants check"    => 'invariants [check] [--app APP] [--localhost] [--examples N | --all-examples]',
   "invariants snoozes"  => 'invariants snoozes [--app APP] [--localhost]',
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "version"             => 'version [--app APP] [--localhost]',
-  "pending list"        => 'pending [list] [--app APP]',
+  "pending check"       => 'pending [check] [--app APP]',
   "pending release"     => 'pending release [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
@@ -55,8 +55,9 @@ USAGE = <<~USAGE
         Clear the cached devops sessions (platform + acumen).
 
     #{INVOCATIONS["invariants check"]}
-        Check invariants across endpoints. Shows up to N examples per failure
-        (default 10), or all with --all-examples.
+        Check invariants across endpoints. `check` is the default when no
+        subcommand is given. Shows up to N examples per failure (default 10),
+        or all with --all-examples.
 
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
@@ -74,13 +75,13 @@ USAGE = <<~USAGE
     versions [--localhost]
         Show deployed app version(s) and release timestamp.
 
-    #{INVOCATIONS["pending list"]}
+    #{INVOCATIONS["pending check"]}
         List apps and *-postgresql repos whose origin/main is ahead of the
-        latest tag (need deploy). `list` is the default when no subcommand
+        latest tag (need deploy). `check` is the default when no subcommand
         is given. --app APP matches an app or DB name exactly (e.g.
         `platform` vs `platform-postgresql`).
     #{INVOCATIONS["pending release"]}
-        Release every item `pending list` would report. Two phases:
+        Release every item `pending check` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
           2. Apps release in parallel (concurrency defaults to 4) via
@@ -147,7 +148,7 @@ COMMANDS = %w[login logout invariants tasks version versions pending config dock
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
-  "pending"      => %w[list release],
+  "pending"      => %w[check release],
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "browserslist" => %w[update],
@@ -201,6 +202,18 @@ def require_subcommand(command)
   subs = SUBCOMMANDS[command] || []
   hint = subs.length == 1 ? subs.first : "one of: #{subs.join(', ')}"
   usage_exit("#{command} requires a subcommand (#{hint})")
+end
+
+# Pick the subcommand for `dev <command> [subcommand] ...`. The first token names
+# it, unless it's absent or a flag — those belong to the default subcommand's own
+# args, so `dev pending --app X` and bare `dev invariants` both run the default.
+# Shifts the token off `argv` only when it named a subcommand, leaving flags and
+# positionals for the handler. Returns the chosen (or default) subcommand name;
+# an unrecognized name is returned as-is so the caller can report it.
+def resolve_subcommand(argv, default:)
+  first = argv.first
+  return default if first.nil? || first.start_with?("-")
+  argv.shift
 end
 
 # Commands that take only common flags (--app/--localhost) accept no positional
@@ -871,9 +884,9 @@ def resolve_pending_items(name_filter)
   items.map { |name, dir| Thread.new { [name, pending_for(name, dir)] } }.map(&:value)
 end
 
-def cmd_pending_list(args)
+def cmd_pending_check(args)
   rest, name_filter, _ = parse_common_flags(args)
-  reject_unknown_args("pending list", rest)
+  reject_unknown_args("pending check", rest)
   rows = resolve_pending_items(name_filter)
 
   pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
@@ -1550,28 +1563,22 @@ when "login"
 when "logout"
   cmd_logout(argv)
 when "invariants"
-  sub = argv.shift
+  sub = resolve_subcommand(argv, default: "check")
   case sub
-  when "check"     then cmd_invariants_check(argv)
-  when "snoozes"   then cmd_invariants_snoozes(argv)
-  when "snooze"    then cmd_invariants_snooze(argv)
-  when "unsnooze"  then cmd_invariants_unsnooze(argv)
-  when nil         then require_subcommand("invariants")
-  else                  unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
+  when "check"    then cmd_invariants_check(argv)
+  when "snoozes"  then cmd_invariants_snoozes(argv)
+  when "snooze"   then cmd_invariants_snooze(argv)
+  when "unsnooze" then cmd_invariants_unsnooze(argv)
+  else                 unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
   end
 when "version", "versions"
   cmd_versions(argv)
 when "pending"
-  sub = argv.first
-  if sub.nil? || sub.start_with?("-")
-    cmd_pending_list(argv)
-  else
-    argv.shift
-    case sub
-    when "list"    then cmd_pending_list(argv)
-    when "release" then cmd_pending_release(argv)
-    else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
-    end
+  sub = resolve_subcommand(argv, default: "check")
+  case sub
+  when "check"   then cmd_pending_check(argv)
+  when "release" then cmd_pending_release(argv)
+  else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
   end
 when "config"
   sub = argv.shift
@@ -1603,18 +1610,11 @@ when "docker"
   else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
   end
 when "scripts"
-  # Peek (don't shift) so a bare `dev scripts` or a stray flag falls through to
-  # the default `list`, matching the `pending` dispatch pattern.
-  sub = argv.first
-  if sub.nil? || sub.start_with?("-")
-    cmd_scripts_list(argv)
-  else
-    argv.shift
-    case sub
-    when "list" then cmd_scripts_list(argv)
-    when "run"  then cmd_scripts_run(argv)
-    else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
-    end
+  sub = resolve_subcommand(argv, default: "list")
+  case sub
+  when "list" then cmd_scripts_list(argv)
+  when "run"  then cmd_scripts_run(argv)
+  else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
   end
 else
   unknown("command", command, COMMANDS)
