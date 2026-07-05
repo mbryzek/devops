@@ -63,7 +63,7 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_script_base_strips_extension
-    assert_equal "delete-test-uploads", script_base("delete-test-uploads.sql")
+    assert_equal "delete-test-clubs", script_base("delete-test-clubs.sql")
     assert_equal "tool", script_base("tool.sh")
     assert_equal "noext", script_base("noext")
   end
@@ -73,7 +73,7 @@ class TestDevScripts < Minitest::Test
   # These names must match the files committed in scripts/ — update if renamed.
   def test_available_scripts_include_seeded_and_exclude_readme
     names = scripts_available
-    assert_includes names, "delete-test-uploads.sql"
+    assert_includes names, "delete-test-clubs.sql"
     assert_includes names, "truncate-court-reserve-data.sql"
     # Wrappers (executables) are discovered the same as first-class scripts.
     assert_includes names, "clubaid-credentials"
@@ -89,8 +89,8 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_resolve_by_base_name
-    assert_equal File.join(SCRIPTS_DIR, "delete-test-uploads.sql"),
-                 resolve_script("delete-test-uploads")
+    assert_equal File.join(SCRIPTS_DIR, "delete-test-clubs.sql"),
+                 resolve_script("delete-test-clubs")
   end
 
   # ---- run: env-target enforcement (no execution reached) ----
@@ -115,9 +115,9 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_run_refuses_undeclared_prod_target
-    # delete-test-uploads declares targets=local; --prod must be refused before
+    # delete-test-clubs declares targets=local; --prod must be refused before
     # any execution.
-    out, status = capture { cmd_scripts_run(["delete-test-uploads", "--prod"]) }
+    out, status = capture { cmd_scripts_run(["delete-test-clubs", "--prod"]) }
     assert_equal 1, status
     assert_match(/does not support env 'production'/, out)
     assert_match(/Allowed: local/, out)
@@ -138,7 +138,7 @@ class TestDevScripts < Minitest::Test
 
   def test_run_rejects_leading_flag_as_name
     # The name must come first; a leading flag is not a script name.
-    out, status = capture { cmd_scripts_run(["--prod", "delete-test-uploads"]) }
+    out, status = capture { cmd_scripts_run(["--prod", "delete-test-clubs"]) }
     assert_equal 1, status
     assert_match(/requires a script name/, out)
   end
@@ -150,14 +150,14 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_run_rejects_args_for_sql_script
-    out, status = capture { cmd_scripts_run(["delete-test-uploads", "foo"]) }
+    out, status = capture { cmd_scripts_run(["delete-test-clubs", "foo"]) }
     assert_equal 1, status
     assert_match(/is a SQL script; unexpected argument 'foo'/, out)
   end
 
   def test_run_unknown_script_suggests
-    out, status = capture { cmd_scripts_run(["delete-test-upload"]) }
+    out, status = capture { cmd_scripts_run(["delete-test-club"]) }
     assert_equal 1, status
-    assert_match(/Unknown script: delete-test-upload \(did you mean 'delete-test-uploads'\?\)/, out)
+    assert_match(/Unknown script: delete-test-club \(did you mean 'delete-test-clubs'\?\)/, out)
   end
 end
