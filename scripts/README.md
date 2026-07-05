@@ -10,7 +10,7 @@ dev scripts run <name> [args...]    # the name comes FIRST, then any arguments
 Two kinds of scripts live here:
 
 - **First-class scripts** — `.sql` files (and standalone executables) that *are*
-  the utility. Example: `delete-test-uploads.sql`.
+  the utility. Example: `delete-test-clubs.sql`.
 - **Wrappers** — thin executables that invoke a script living in another repo
   (it's coupled to that repo's helpers/config, so it stays there). Example:
   `clubaid-data-diff` wraps `platform/scripts/clubaid-data-diff.scala`. This lets
