@@ -17,6 +17,12 @@ class TestDevAidirs < Minitest::Test
   FUTURE = Time.now + 3600
   NO_PR  = ->(_slug, _branch) { nil }
 
+  # pr_state stub: return the {state:, number:} shape gh_pr_state produces.
+  def self.pr(state, number = 1) = ->(_slug, _branch) { { state: state, number: number } }
+  MERGED = pr(:merged)
+  CLOSED = pr(:closed)
+  OPEN   = pr(:open, 7)
+
   def git(dir, *args)
     out, status = Open3.capture2("git", "-C", dir, *args)
     raise "git #{args.join(' ')} failed: #{out}" unless status.success?
@@ -64,7 +70,7 @@ class TestDevAidirs < Minitest::Test
   def test_local_only_commits_with_merged_pr_is_deletable
     Dir.mktmpdir do |dir|
       make_repo(dir, "platform")
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: ->(_s, _b) { :merged })
+      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: MERGED)
       assert_equal :delete, action
     end
   end
@@ -72,7 +78,7 @@ class TestDevAidirs < Minitest::Test
   def test_local_only_commits_with_closed_pr_is_deletable
     Dir.mktmpdir do |dir|
       make_repo(dir, "platform")
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: ->(_s, _b) { :closed })
+      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: CLOSED)
       assert_equal :delete, action
     end
   end
@@ -80,9 +86,9 @@ class TestDevAidirs < Minitest::Test
   def test_local_only_commits_with_open_pr_is_kept
     Dir.mktmpdir do |dir|
       make_repo(dir, "platform")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: ->(_s, _b) { :open })
+      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: OPEN)
       assert_equal :keep, action
-      assert_match(/local-only commits.*open/, reason)
+      assert_match(/local-only commits.*platform#7 OPEN/, reason)
     end
   end
 
@@ -91,7 +97,7 @@ class TestDevAidirs < Minitest::Test
       make_repo(dir, "platform")
       action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
       assert_equal :keep, action
-      assert_match(/PR: none/, reason)
+      assert_match(/no PR/, reason)
     end
   end
 
@@ -101,7 +107,7 @@ class TestDevAidirs < Minitest::Test
     Dir.mktmpdir do |dir|
       repo = make_repo(dir, "platform")
       File.write(File.join(repo, "f.txt"), "dirty")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: ->(_s, _b) { :merged })
+      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: MERGED)
       assert_equal :keep, action
       assert_match(/uncommitted changes/, reason)
     end
@@ -220,6 +226,26 @@ class TestDevAidirs < Minitest::Test
     assert_nil gh_pr_state("mbryzek/platform", "some-branch")
   ensure
     ENV["PATH"] = old
+  end
+
+  # ---- PR tie surfaced in output ----
+
+  def test_merged_pr_number_and_state_surface_in_notes
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform") # local-only commit
+      action, _reason, notes = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: TestDevAidirs.pr(:merged, 1204))
+      assert_equal :delete, action
+      assert_equal ["platform#1204 MERGED"], notes
+    end
+  end
+
+  def test_cleanly_pushed_dir_has_no_pr_notes
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "acumen-ui", remote: true) # no local-only commits => no gh call
+      action, _reason, notes = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
+      assert_equal :delete, action
+      assert_empty notes
+    end
   end
 
   # ---- helpers ----
