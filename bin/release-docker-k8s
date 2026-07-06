@@ -4,9 +4,11 @@
 # (e.g. workers). Steps:
 #   1. Bump + push a git tag in the app's source repo (Tag.ask).
 #   2. Run <source_dir>/<build_script> <tag> to build + push the image.
-#   3. kubectl apply every *.yaml in <manifests_dir> with __IMAGE_TAG__
+#   3. Sync ConfigMap + Secrets via k8s-secrets (same as release-scala) so
+#      the new pods load current env values.
+#   4. kubectl apply every *.yaml in <manifests_dir> with __IMAGE_TAG__
 #      substituted to the new tag.
-#   4. kubectl rollout status <rollout_target> in <namespace>.
+#   5. kubectl rollout status <rollout_target> in <namespace>.
 #
 # Config comes from the app's pkl: app.docker_k8s in env/apps/<app>/config.pkl.
 #
@@ -56,7 +58,15 @@ Dir.chdir(source_dir) do
   Util.run("#{build_script} #{version}")
 end
 
-# Step 2: apply manifests with __IMAGE_TAG__ substituted. sed is a no-op on
+# Step 2: sync ConfigMap + Secrets so the pods the rollout below starts load
+# current env values. Same step as release-scala — a release that skips it
+# deploys against stale config/secrets (a var added to the env repo but never
+# synced fails the deploy or, worse, boots pods with old values).
+puts ""
+puts Util.underline("Syncing ConfigMap + Secrets")
+Util.sync_k8s_secrets(app, namespace: dk.namespace)
+
+# Step 3: apply manifests with __IMAGE_TAG__ substituted. sed is a no-op on
 # files that don't contain the placeholder, so this works for pvc/service/etc.
 puts ""
 puts Util.underline("Applying k8s manifests from #{dk.manifests_dir}")
@@ -80,7 +90,7 @@ ensure
   FileUtils.rm_rf(tmp_dir)
 end
 
-# Step 3: wait for rollout.
+# Step 4: wait for rollout.
 puts ""
 puts Util.underline("Waiting for rollout: #{dk.rollout_target} in #{dk.namespace}")
 Util.run("kubectl rollout status #{dk.rollout_target} -n #{dk.namespace} --timeout=180s")

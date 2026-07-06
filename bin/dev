@@ -1159,12 +1159,11 @@ def cmd_config_rollout(args)
   rest, app_filter, _ = parse_common_flags(args)
   reject_unknown_args("config rollout", rest)
   apps = k8s_apps(app_filter)
-  bin_dir = File.dirname(__FILE__)
 
   apps.each do |app|
     puts ""
     puts Util.underline("#{app}: apply k8s-secrets")
-    Util.run("#{File.join(bin_dir, 'k8s-secrets')} --app #{app}")
+    Util.sync_k8s_secrets(app)
 
     puts ""
     puts Util.underline("#{app}: rollout restart")

@@ -30,9 +30,12 @@ class SvelteKit {}
 /// (e.g. workers). Released via `release-docker-k8s` which:
 ///   1. tags via `Tag.ask`
 ///   2. runs <source_dir>/<build_script> to build + push the image
-///   3. applies every manifest under <manifests_dir>, sed-substituting
+///   3. syncs ConfigMap + Secrets via `k8s-secrets --app <app> --namespace
+///      <namespace>` (the app must have env files in the env repo) so new
+///      pods load current values
+///   4. applies every manifest under <manifests_dir>, sed-substituting
 ///      `__IMAGE_TAG__` with the new tag
-///   4. waits on `kubectl rollout status <rollout_target>` in <namespace>
+///   5. waits on `kubectl rollout status <rollout_target>` in <namespace>
 class DockerK8sConfig {
     /// Path (relative to source dir) to the build-and-push script. The script
     /// must accept the tag as its first positional argument.

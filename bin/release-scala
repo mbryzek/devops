@@ -32,8 +32,7 @@ puts ""
 # Sync ConfigMap + Secrets so the new pods load current env values.
 # release-scala used to skip this, which left stale config in the cluster.
 puts "Syncing ConfigMap + Secrets..."
-secrets_cmd = File.join(__dir__, "k8s-secrets") + " --app #{app}"
-Util.run(secrets_cmd)
+Util.sync_k8s_secrets(app)
 
 puts ""
 

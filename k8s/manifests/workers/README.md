@@ -6,10 +6,12 @@ only non-Scala app in the cluster — templating one app isn't a win.
 ## Deploy
 
 ```bash
-# Standard release: tag, build+push image, apply manifests, wait for rollout.
+# Standard release: tag, build+push image, sync Secret/ConfigMap from the
+# env repo, apply manifests, wait for rollout.
 devops/bin/release --app workers
 
-# If env vars changed, also sync the Secret/ConfigMap (release does NOT touch them):
+# To push env-var changes WITHOUT a release (running pods only pick them up
+# on their next restart/rollout):
 devops/bin/k8s-secrets --app workers
 ```
 
