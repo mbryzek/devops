@@ -277,22 +277,36 @@ end
 
 class TestFixPrompt < Minitest::Test
   def test_prompt_includes_core_directives
-    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "codegen-sync",
+    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "codegen-sync-x",
                                  verify_cmd: "npm run check", regen_only: false,
                                  build_error: "TS2322: type mismatch")
     assert_includes p, "rallyd"
-    assert_includes p, "codegen-sync"
+    assert_includes p, "codegen-sync-x"
     assert_includes p, "npm run check"
-    assert_includes p, "never edit generated files"
+    assert_includes p.downcase, "never edit generated files"
     assert_includes p, "TS2322: type mismatch"
-    assert_includes p, "draft PR"
-    assert_includes p, "Do NOT merge to main"
+    assert_includes p, "gh pr create"
+    assert_includes p.downcase, "do not merge to main"
   end
 
-  def test_regen_only_skips_completion_workflow
-    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "codegen-sync",
+  # The slim prompt must forbid the old heavy completion workflow (code-review
+  # rounds + rebase) — running it per repo is what made sessions take ~20 min
+  # and hang. It should carry the guardrails, not the affirmative instructions.
+  def test_prompt_forbids_review_and_rebase
+    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "b",
+                                 verify_cmd: "npm run check", regen_only: false)
+    assert_includes p.downcase, "do not run code reviews"
+    assert_includes p.downcase, "do not rebase"
+    refute_includes p.downcase, "code-reviewer agent"
+    refute_includes p.downcase, "code-review:code-review"
+  end
+
+  def test_regen_only_skips_build
+    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "b",
                                  verify_cmd: "npm run check", regen_only: true)
-    refute_includes p, "code review"
+    refute_includes p, "npm run check"   # no build step
+    refute_includes p.downcase, "code-reviewer agent"
+    assert_includes p.downcase, "draft"  # regen-only opens a draft PR
   end
 end
 
