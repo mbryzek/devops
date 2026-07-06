@@ -32,6 +32,7 @@ INVOCATIONS = {
   "aidirs prune"        => 'aidirs prune [--days N] [--dry-run] [--yes] [--trash]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
+  "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -118,6 +119,15 @@ USAGE = <<~USAGE
         --keep-tmp-dir is passed; it is always kept if any repo fails so output
         can be inspected. Quiet by default; use --verbose to stream full output.
 
+    #{INVOCATIONS["codegen sync"]}
+        Regenerate every codegen-consuming repo against the latest generator and
+        registry, opening a review-ready PR per repo that changes. Backends
+        (platform, acumen) upload their specs and regenerate first, serially;
+        consumers regenerate in parallel. `sync` is the default subcommand.
+        --dry-run reports diffs without spawning Claude or opening PRs;
+        --regen-only opens draft PRs but skips the review-completion workflow;
+        --full-tests runs the full Scala suite instead of Test/compile.
+
     scripts [list]
         List utility scripts in devops/scripts/ with their allowed targets and
         a one-line description. `list` is the default when no subcommand given.
@@ -155,7 +165,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts].freeze
+COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts codegen].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
@@ -165,6 +175,7 @@ SUBCOMMANDS = {
   "aidirs"       => %w[prune],
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
+  "codegen"      => %w[sync],
 }.freeze
 
 def levenshtein(a, b)
@@ -941,6 +952,32 @@ def parse_pending_release_args(args)
     end
   end
   [app_filter, concurrency]
+end
+
+def parse_codegen_sync_args(argv)
+  opts = { app: nil, concurrency: 4, dry_run: false, regen_only: false, full_tests: false }
+  args = argv.dup
+  until args.empty?
+    case (a = args.shift)
+    when "--app"
+      opts[:app] = args.shift or usage_exit("--app requires a value", example: usage_for("codegen sync"))
+    when "--concurrency"
+      n = args.shift.to_i
+      usage_exit("--concurrency must be a positive integer", example: usage_for("codegen sync")) if n < 1
+      opts[:concurrency] = n
+    when "--dry-run"    then opts[:dry_run] = true
+    when "--regen-only" then opts[:regen_only] = true
+    when "--full-tests" then opts[:full_tests] = true
+    else usage_exit("unknown option #{a}", example: usage_for("codegen sync"))
+    end
+  end
+  opts
+end
+
+# Stub: real orchestration lands in Task 6.
+def cmd_codegen_sync(argv)
+  opts = parse_codegen_sync_args(argv)
+  raise NotImplementedError, "cmd_codegen_sync wired in Task 6 (#{opts.inspect})"
 end
 
 def release_one(name)
@@ -1812,6 +1849,12 @@ when "aidirs"
   when "prune" then cmd_aidirs_prune(argv)
   when nil     then require_subcommand("aidirs")
   else              unknown("aidirs subcommand", sub, SUBCOMMANDS["aidirs"])
+  end
+when "codegen"
+  sub = resolve_subcommand(argv, default: "sync")
+  case sub
+  when "sync" then cmd_codegen_sync(argv)
+  else             unknown("codegen subcommand", sub, SUBCOMMANDS["codegen"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")
