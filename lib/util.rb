@@ -1,6 +1,16 @@
 require 'pathname'
 
 module Util
+    # Sync <app>-config + <app>-secrets from the git-crypt env repo to the
+    # cluster via bin/k8s-secrets (which requires env/apps/<app>/env files).
+    # Aborts the caller on failure (Util.run semantics) — never release
+    # against stale config/secrets. nil namespace uses k8s-secrets' default.
+    def Util.sync_k8s_secrets(app, namespace: nil)
+      cmd = File.join(File.dirname(__FILE__), "../bin/k8s-secrets") + " --app #{app}"
+      cmd += " --namespace #{namespace}" if namespace
+      Util.run(cmd)
+    end
+
     def Util.run(cmd, params={})
       quiet = (params.has_key?(:quiet) && params[:quiet]) ? true  : false
       ignore_error = (params.has_key?(:ignore_error) && params[:ignore_error]) ? true : false

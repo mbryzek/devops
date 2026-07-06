@@ -1164,7 +1164,7 @@ def cmd_config_rollout(args)
   apps.each do |app|
     puts ""
     puts Util.underline("#{app}: apply k8s-secrets")
-    Util.run("#{File.join(bin_dir, 'k8s-secrets')} --app #{app}")
+    Util.sync_k8s_secrets(app)
 
     puts ""
     puts Util.underline("#{app}: rollout restart")

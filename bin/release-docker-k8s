@@ -64,8 +64,7 @@ end
 # synced fails the deploy or, worse, boots pods with old values).
 puts ""
 puts Util.underline("Syncing ConfigMap + Secrets")
-secrets_cmd = File.join(__dir__, "k8s-secrets") + " --app #{app} --namespace #{dk.namespace}"
-Util.run(secrets_cmd)
+Util.sync_k8s_secrets(app, namespace: dk.namespace)
 
 # Step 3: apply manifests with __IMAGE_TAG__ substituted. sed is a no-op on
 # files that don't contain the placeholder, so this works for pvc/service/etc.
