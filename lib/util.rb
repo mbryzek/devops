@@ -1,4 +1,6 @@
 require 'pathname'
+require 'json'
+require 'tempfile'
 
 module Util
     # Sync <app>-config + <app>-secrets from the git-crypt env repo to the
@@ -9,6 +11,43 @@ module Util
       cmd = File.join(File.dirname(__FILE__), "../bin/k8s-secrets") + " --app #{app}"
       cmd += " --namespace #{namespace}" if namespace
       Util.run(cmd)
+    end
+
+    # Sync a Secret/ConfigMap from a manifest file so the live object ends up
+    # with EXACTLY the given desired_keys — no more, no less — without ever
+    # deleting the object (no outage window).
+    #
+    # `kubectl apply` alone is not enough: its client-side 3-way merge only
+    # removes a key if it saw that key drop out of the object's
+    # `last-applied-configuration` annotation history. A key that entered the
+    # object any other way (a `kubectl edit`/`patch`, or the object having
+    # existed before this script ever applied it) is invisible to that diff
+    # and survives every future sync forever, even after being deleted from
+    # the source env file. (Incident: workers-secrets carried a stray
+    # HEADLESS=true added via `kubectl edit` that `k8s-secrets` re-synced
+    # through untouched for weeks — 2026-07-06.)
+    #
+    # So: apply first (adds/updates desired keys, zero downtime), then
+    # explicitly diff the live object's keys against desired_keys and
+    # null-patch away anything extra. Nulling a key in a JSON merge patch
+    # deletes it; a targeted patch never removes/recreates the object itself.
+    def Util.sync_k8s_resource(kind, name, file, desired_keys, namespace:)
+      Util.run("kubectl apply -f #{file}")
+
+      existing_json = `kubectl get #{kind} #{name} -n #{namespace} -o json 2>/dev/null`
+      return if existing_json.strip.empty?
+
+      existing_keys = (JSON.parse(existing_json)["data"] || {}).keys
+      stale_keys = existing_keys - desired_keys
+      return if stale_keys.empty?
+
+      Util.warning("Removing stale key(s) from #{kind}/#{name} not present in source: #{stale_keys.join(', ')}")
+      patch = { "data" => stale_keys.each_with_object({}) { |k, h| h[k] = nil } }
+      Tempfile.create(["k8s-prune-#{name}-", ".json"]) do |f|
+        f.write(JSON.generate(patch))
+        f.flush
+        Util.run("kubectl patch #{kind} #{name} -n #{namespace} --type=merge --patch-file=#{f.path}")
+      end
     end
 
     def Util.run(cmd, params={})
