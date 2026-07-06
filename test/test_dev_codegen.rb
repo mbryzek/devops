@@ -172,3 +172,24 @@ class TestSyncPaths < Minitest::Test
     end
   end
 end
+
+class TestFixPrompt < Minitest::Test
+  def test_prompt_includes_core_directives
+    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "codegen-sync",
+                                 verify_cmd: "npm run check", regen_only: false,
+                                 build_error: "TS2322: type mismatch")
+    assert_includes p, "rallyd"
+    assert_includes p, "codegen-sync"
+    assert_includes p, "npm run check"
+    assert_includes p, "never edit generated files"
+    assert_includes p, "TS2322: type mismatch"
+    assert_includes p, "draft PR"
+    assert_includes p, "Do NOT merge to main"
+  end
+
+  def test_regen_only_skips_completion_workflow
+    p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "codegen-sync",
+                                 verify_cmd: "npm run check", regen_only: true)
+    refute_includes p, "code review"
+  end
+end
