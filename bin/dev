@@ -28,8 +28,8 @@ INVOCATIONS = {
   "pending release"     => 'pending release [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
-  "docker prune"        => 'docker prune [--days N] [--dry-run] [--yes]',
-  "aidirs prune"        => 'aidirs prune [--days N] [--dry-run] [--yes] [--trash]',
+  "docker prune"        => 'docker prune [--days N] [--apply]',
+  "aidirs prune"        => 'aidirs prune [--days N] [--apply] [--trash]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
 }.freeze
@@ -99,16 +99,17 @@ USAGE = <<~USAGE
     #{INVOCATIONS["docker prune"]}
         Remove Docker images, build cache, and dangling volumes older than N days
         (default 7). Useful when local disk fills from pushed-but-unused builds.
+        Dry-run by default (lists what would be removed); pass --apply to remove.
 
     #{INVOCATIONS["aidirs prune"]}
         Remove finished feature dirs under ~/code/ai that are fully safe to delete
         — every git repo inside is clean and either fully pushed or its branch's PR
         is merged/closed (checked via `gh`). Keeps anything with uncommitted changes,
         with local-only commits and no merged/closed PR, or modified within N days
-        (default 7, a possibly-live session). Interactive by default: prints the
-        keep/delete split and prompts before acting. --dry-run shows the split only;
-        --yes skips the prompt; --trash moves dirs to ~/code/ai-trash/<timestamp>
-        (reversible) instead of deleting them.
+        (default 7, a possibly-live session). Dry-run by default: prints the
+        keep/delete split and removes nothing. Pass --apply to actually remove;
+        --trash moves dirs to ~/code/ai-trash/<timestamp> (reversible) instead of
+        deleting them.
 
     #{INVOCATIONS["browserslist update"]}
         Shallow-clone every ~/code/* repo with a package.json into
@@ -708,15 +709,13 @@ end
 
 def cmd_docker_prune(args)
   days = 7
-  dry_run = false
-  assume_yes = false
+  apply = false
   while (arg = args.shift)
     case arg
     when "--days"
       raw = args.shift or usage_exit("--days requires a value", example: usage_for("docker prune"))
       days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("docker prune"))
-    when "--dry-run" then dry_run = true
-    when "--yes", "-y" then assume_yes = true
+    when "--apply" then apply = true
     when "-h", "--help" then puts USAGE; exit 0
     else usage_exit("Unknown flag: #{arg}", example: usage_for("docker prune"))
     end
@@ -730,12 +729,8 @@ def cmd_docker_prune(args)
   puts ""
   puts "Pre-prune state:"
   abort("docker not available or daemon not running") unless system("docker", "system", "df")
-
-  unless dry_run || assume_yes
-    print "\nProceed? [y/N] "
-    answer = STDIN.gets&.strip&.downcase
-    exit 0 unless answer == "y" || answer == "yes"
-  end
+  puts ""
+  puts "(dry-run — pass --apply to remove)" unless apply
 
   steps = [
     ["containers",  ["docker", "container", "prune", "-f", "--filter", filter]],
@@ -745,9 +740,9 @@ def cmd_docker_prune(args)
   ]
   steps.each do |label, cmd|
     puts ""
-    suffix = dry_run ? "  (dry-run, skipping)" : ""
+    suffix = apply ? "" : "  (dry-run, skipping)"
     puts "==> #{label}: #{cmd.join(' ')}#{suffix}"
-    next if dry_run
+    next unless apply
     abort("FAILED at step: #{label}") unless system(*cmd)
   end
 
@@ -1249,7 +1244,8 @@ def git_slug(path)
 end
 
 # PR state for a branch as a symbol (:merged / :closed / :open) or nil when there
-# is no PR or `gh` is unavailable. nil is treated as "not safe" by the caller.
+# is no PR or `gh` is unavailable/erroring. nil is treated as "not safe" by the
+# caller, so a missing `gh` binary degrades to keeping the dir, not crashing.
 def gh_pr_state(slug, branch)
   return nil unless slug && branch
   out, status = Open3.capture2(
@@ -1262,6 +1258,13 @@ def gh_pr_state(slug, branch)
   when "CLOSED" then :closed
   when "OPEN"   then :open
   end
+rescue Errno::ENOENT
+  nil
+end
+
+def git_has_stash?(path)
+  out, status = Open3.capture2("git", "-C", path, "stash", "list")
+  status.success? && !out.strip.empty?
 end
 
 # Real (non-symlink) git repos inside a feature dir: the dir itself when it is a
@@ -1274,6 +1277,18 @@ end
 
 def dir_effectively_empty?(dir)
   Dir.children(dir).all? { |c| File.symlink?(File.join(dir, c)) }
+end
+
+# Top-level entries that are neither a symlink nor one of the detected repos —
+# loose files or non-repo dirs that no git check below would ever cover. Skipped
+# when the feature dir is itself a clone (repos includes dir): then every
+# top-level file is git-tracked and git_clean? already accounts for it.
+def ai_dir_has_loose_content?(dir, repos)
+  return false if repos.include?(dir)
+  repo_names = repos.map { |r| File.basename(r) }
+  Dir.children(dir).any? do |c|
+    !File.symlink?(File.join(dir, c)) && !repo_names.include?(c)
+  end
 end
 
 # Newest activity across the dir and its repos' git metadata — catches a session
@@ -1300,8 +1315,16 @@ def classify_ai_dir(dir, cutoff_time:, pr_state:)
     return [:keep, "no git repo (unexpected content)"]
   end
 
+  return [:keep, "unexpected non-repo content"] if ai_dir_has_loose_content?(dir, repos)
+
   repos.each do |r|
-    return [:keep, "uncommitted changes in #{File.basename(r)}"] unless git_clean?(r)
+    name = File.basename(r)
+    # Detached HEAD: commits made while detached hang off no branch ref, so
+    # git_has_local_only_commits? (which walks --branches) can't see them. Keep
+    # rather than risk deleting unreachable work.
+    return [:keep, "detached HEAD in #{name}"] if git_current_branch(r).nil?
+    return [:keep, "uncommitted changes in #{name}"] unless git_clean?(r)
+    return [:keep, "stashed changes in #{name}"] if git_has_stash?(r)
   end
 
   repos.each do |r|
@@ -1316,16 +1339,14 @@ end
 
 def cmd_aidirs_prune(args)
   days = 7
-  dry_run = false
-  assume_yes = false
+  apply = false
   trash = false
   while (arg = args.shift)
     case arg
     when "--days"
       raw = args.shift or usage_exit("--days requires a value", example: usage_for("aidirs prune"))
       days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("aidirs prune"))
-    when "--dry-run" then dry_run = true
-    when "--yes", "-y" then assume_yes = true
+    when "--apply" then apply = true
     when "--trash" then trash = true
     when "-h", "--help" then puts USAGE; exit 0
     else usage_exit("Unknown flag: #{arg}", example: usage_for("aidirs prune"))
@@ -1353,7 +1374,7 @@ def cmd_aidirs_prune(args)
   end
 
   puts "Scanned #{dirs.length} dir(s) under #{AI_ROOT}."
-  puts "Keeping anything modified within #{days} day(s), with uncommitted changes, or with unmerged local-only commits."
+  puts "Keeping anything modified within #{days} day(s) or holding unsaved work (uncommitted, stashed, detached, unexpected files, or local-only commits without a merged/closed PR)."
   puts ""
   puts "Keeping #{keep.length}:"
   keep.each { |d, r| puts "  #{File.basename(d)}  (#{r})" }
@@ -1367,19 +1388,10 @@ def cmd_aidirs_prune(args)
     puts "Nothing to remove."
     return
   end
-  if dry_run
+  unless apply
     puts ""
-    puts "(dry-run — nothing removed)"
+    puts "(dry-run — pass --apply to #{trash ? 'move these to trash' : 'delete these'})"
     return
-  end
-
-  unless assume_yes
-    print "\n#{verb} #{delete.length} dir(s)? [y/N] "
-    answer = STDIN.gets&.strip&.downcase
-    unless answer == "y" || answer == "yes"
-      puts "Aborted."
-      return
-    end
   end
 
   trash_root = nil
@@ -1387,20 +1399,38 @@ def cmd_aidirs_prune(args)
     trash_root = File.join("#{AI_ROOT}-trash", Time.now.strftime("%Y%m%d-%H%M%S"))
     FileUtils.mkdir_p(trash_root)
   end
+
+  removed = 0
+  skipped = []
   delete.each do |dir, _|
+    # Re-check immediately before removing: parallel sessions routinely touch
+    # ~/code/ai/* between the scan and here, so a dir can become dirty/active in
+    # the window. Skip anything no longer classified :delete.
+    action, reason = classify_ai_dir(dir, cutoff_time: cutoff, pr_state: pr_state)
+    unless action == :delete
+      skipped << [File.basename(dir), reason]
+      next
+    end
     if trash
       FileUtils.mv(dir, File.join(trash_root, File.basename(dir)))
     else
       FileUtils.rm_rf(dir)
     end
+    removed += 1
   end
+  FileUtils.rmdir(trash_root) if trash_root && removed.zero? && Dir.exist?(trash_root)
 
   puts ""
+  unless skipped.empty?
+    puts "Skipped #{skipped.length} dir(s) that changed since the scan:"
+    skipped.each { |name, r| puts "  #{name}  (#{r})" }
+    puts ""
+  end
   if trash
-    puts "Moved #{delete.length} dir(s) to #{trash_root}"
-    puts "Restore: mv #{trash_root}/<name> #{AI_ROOT}/   —   empty: rm -rf #{trash_root}"
+    puts "Moved #{removed} dir(s) to #{trash_root}"
+    puts "Restore: mv #{trash_root}/<name> #{AI_ROOT}/   —   empty: rm -rf #{trash_root}" if removed.positive?
   else
-    puts "Deleted #{delete.length} dir(s)."
+    puts "Deleted #{removed} dir(s)."
   end
 end
 

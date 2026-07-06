@@ -37,12 +37,12 @@ class TestDevAidirs < Minitest::Test
     repo
   end
 
-  # Give a repo an origin whose main already contains HEAD, so nothing is local-only.
-  def push_to_bare_remote(parent, repo)
-    bare = File.join(parent, "#{File.basename(repo)}.git")
-    git(repo, "clone", "--bare", "-q", repo, bare) rescue system("git", "clone", "--bare", "-q", repo, bare)
+  # Give a repo an origin whose main already contains HEAD, so nothing is
+  # local-only. No real remote needed — a remote-tracking ref at HEAD is enough to
+  # make `git log --not --remotes` empty (and avoids polluting the feature dir with
+  # a bare mirror, which the loose-content guard would rightly flag).
+  def push_to_bare_remote(_parent, repo)
     git(repo, "remote", "add", "origin", "git@github.com:mbryzek/#{File.basename(repo)}.git")
-    # point a tracking ref at HEAD without a real network remote
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
   end
 
@@ -160,6 +160,66 @@ class TestDevAidirs < Minitest::Test
       action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
       assert_equal :delete, action
     end
+  end
+
+  # ---- safety guards: unsaved work that isn't a plain dirty tree ----
+
+  def test_detached_head_is_kept
+    Dir.mktmpdir do |dir|
+      repo = make_repo(dir, "platform")
+      # a commit made while detached hangs off no branch ref
+      git(repo, "checkout", "-q", "--detach")
+      File.write(File.join(repo, "f.txt"), "more")
+      git(repo, "commit", "-qam", "detached work")
+      # gh must never even be consulted — the detached guard fires first
+      pr = ->(_s, _b) { flunk "detached repo must be kept before any PR check" }
+      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: pr)
+      assert_equal :keep, action
+      assert_match(/detached HEAD/, reason)
+    end
+  end
+
+  def test_stashed_changes_are_kept
+    Dir.mktmpdir do |dir|
+      repo = make_repo(dir, "platform", remote: true) # clean + pushed otherwise
+      File.write(File.join(repo, "f.txt"), "wip")
+      git(repo, "stash", "push", "-q")
+      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/stashed changes/, reason)
+    end
+  end
+
+  def test_loose_nonrepo_content_beside_a_repo_is_kept
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "acumen-ui", remote: true) # clean + pushed
+      FileUtils.mkdir_p(File.join(dir, "notes"))
+      File.write(File.join(dir, "notes", "findings.md"), "irreplaceable")
+      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/non-repo content/, reason)
+    end
+  end
+
+  def test_top_level_clone_with_tracked_files_is_not_flagged_as_loose
+    Dir.mktmpdir do |parent|
+      # repo cloned AT the feature-dir top level: its own files are git-tracked,
+      # so git_clean? covers them and they must not read as "loose content".
+      dir = make_repo(parent, "feature", remote: true)
+      refute ai_dir_has_loose_content?(dir, ai_dir_repos(dir))
+      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_gh_pr_state_missing_binary_degrades_to_nil
+    # Simulate `gh` absent by emptying PATH; the lookup must return nil (keep),
+    # not raise Errno::ENOENT mid-scan.
+    old = ENV["PATH"]
+    ENV["PATH"] = ""
+    assert_nil gh_pr_state("mbryzek/platform", "some-branch")
+  ensure
+    ENV["PATH"] = old
   end
 
   # ---- helpers ----
