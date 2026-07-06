@@ -212,3 +212,48 @@ class TestFixPrompt < Minitest::Test
     refute_includes p, "code review"
   end
 end
+
+class TestCodegenSummary < Minitest::Test
+  def test_rows_sorted_with_full_urls
+    results = {
+      "rallyd"    => { status: :pr_opened, pr_url: "https://github.com/mbryzek/rallyd/pull/5" },
+      "acumen"    => { status: :in_sync },
+      "hackathon" => { status: :needs_attention, error: "compile failed" },
+    }
+    rows = codegen_status_rows(results)
+    assert_equal %w[acumen hackathon rallyd], rows.map(&:first)
+    assert_includes rows.flatten, "https://github.com/mbryzek/rallyd/pull/5"
+    refute(rows.flatten.any? { |c| c.to_s.match?(/\A\w[\w-]*#\d+\z/) }) # no repo#NN shorthand — full URLs only
+  end
+
+  def test_rows_use_dash_when_no_pr_url
+    rows = codegen_status_rows({ "acumen" => { status: :in_sync } })
+    assert_equal [["acumen", "in_sync", "-"]], rows
+  end
+
+  def test_write_codegen_status_json_writes_valid_json_with_four_keys
+    results = {
+      "rallyd"    => { status: :pr_opened, pr_url: "https://github.com/mbryzek/rallyd/pull/5" },
+      "acumen"    => { status: :in_sync },
+      "hackathon" => { status: :needs_attention, error: "compile failed" },
+    }
+    Dir.mktmpdir do |dir|
+      write_codegen_status_json(dir, results)
+      path = File.join(dir, "codegen-sync-status.json")
+      assert File.exist?(path)
+      data = JSON.parse(File.read(path))
+      assert_equal 3, data.length
+      data.each { |row| assert_equal %w[error pr_url repo status].sort, row.keys.sort }
+
+      rallyd = data.find { |row| row["repo"] == "rallyd" }
+      assert_equal "pr_opened", rallyd["status"]
+      assert_equal "https://github.com/mbryzek/rallyd/pull/5", rallyd["pr_url"]
+      assert_nil rallyd["error"]
+
+      hackathon = data.find { |row| row["repo"] == "hackathon" }
+      assert_equal "needs_attention", hackathon["status"]
+      assert_equal "compile failed", hackathon["error"]
+      assert_nil hackathon["pr_url"]
+    end
+  end
+end

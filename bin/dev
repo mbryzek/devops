@@ -1183,6 +1183,17 @@ def spawn_claude(clone, prompt)
   { status: :pr_opened, pr_url: pr_url }
 end
 
+
+# Pure, testable seam: one sorted [name, status_string, pr_url_or_dash] row per
+# repo, shared by both the human-readable printer below and the
+# machine-readable JSON writer so they can never drift out of agreement.
+def codegen_status_rows(results)
+  results.keys.sort.map do |name|
+    r = results[name]
+    [name, r[:status].to_s, r[:pr_url] || "-"]
+  end
+end
+
 def print_codegen_summary(results)
   puts ""
   puts Util.underline("codegen sync summary")
@@ -1190,13 +1201,25 @@ def print_codegen_summary(results)
     puts "  (no apps processed)"
     return
   end
-  results.sort.each do |name, r|
-    line = +"  #{name} [#{r[:status]}]"
-    line << " #{r[:pr_url]}" if r[:pr_url]
+  codegen_status_rows(results).each do |name, status, pr_url|
+    r = results[name]
+    line = +"  #{name} [#{status}]"
+    line << " #{pr_url}" unless pr_url == "-"
     line << " (#{r[:note]})" if r[:note]
     line << " - #{r[:error]}" if r[:error]
     puts line
   end
+end
+
+# Writes codegen-sync-status.json into workdir: an array of
+# {repo, status, pr_url, error} objects (pr_url/error may be nil) for
+# openclaw's morning briefing to consume.
+def write_codegen_status_json(workdir, results)
+  data = results.keys.sort.map do |name|
+    r = results[name]
+    { repo: name, status: r[:status].to_s, pr_url: r[:pr_url], error: r[:error] }
+  end
+  File.write(File.join(workdir, "codegen-sync-status.json"), JSON.pretty_generate(data))
 end
 
 def cmd_codegen_sync(argv)
@@ -1284,6 +1307,7 @@ def cmd_codegen_sync(argv)
   end
 
   print_codegen_summary(results)
+  write_codegen_status_json(workdir, results)
 end
 
 def release_one(name)
