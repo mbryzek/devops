@@ -187,22 +187,43 @@ if deployed
   # propagate, killing release-db after a successful migration.
   if db_name == "platform-postgresql"
     tag = nil
+    build_log = nil
+    build_failed = false
     begin
       tag = Dir.chdir(repo_dir) { `sem-info tag latest`.strip }
       raise "sem-info tag latest returned empty string in #{repo_dir}" if tag.empty?
       build_script = File.join(repo_dir, "docker", "build-and-push.sh")
+      # The image build replays the full schema through psql and runs a
+      # multi-arch docker buildx — thousands of lines of dev-only output that
+      # otherwise bury the production migration result above.  Capture stdout
+      # AND stderr to a log file so the release console stays readable; the log
+      # is surfaced (tail + path) only when the build itself fails.
+      build_log = "/tmp/platformdb-image-build-#{tag}.log"
       puts "Building and pushing platformdb Docker image for schema tag #{tag}..."
-      unless system("#{Shellwords.shellescape(build_script)} #{Shellwords.shellescape(tag)}")
-        raise "build-and-push.sh exited non-zero for tag #{tag}"
+      puts "  (dev-only build output -> #{build_log}; shown here only on failure)"
+      cmd = "#{Shellwords.shellescape(build_script)} #{Shellwords.shellescape(tag)} " \
+            "> #{Shellwords.shellescape(build_log)} 2>&1"
+      unless system(cmd)
+        build_failed = true
+        raise "build-and-push.sh exited non-zero for tag #{tag} (see #{build_log})"
       end
       puts "Purging old platformdb registry images..."
       DbImages.purge_old
     rescue StandardError, SystemExit => e
       manual_cmd = tag ? "#{repo_dir}/docker/build-and-push.sh #{tag}" : "#{repo_dir}/docker/build-and-push.sh <tag>"
+      # Only dump the build log when the *build* is what failed. A purge failure
+      # means the build succeeded, so its log is irrelevant (and would look like
+      # a clean success); e.message still carries the real cause below.
+      details = ["  To build manually: #{manual_cmd}", "  Or run:            bin/verify-db-images"]
+      if build_failed && build_log && File.exist?(build_log)
+        puts ""
+        puts "---- last 40 lines of #{build_log} ----"
+        puts File.readlines(build_log).last(40).join
+        puts "---- end of build log ----"
+        details.unshift("  Full build log:    #{build_log}")
+      end
       Util.warning(
-        "platformdb image build/purge failed (schema deploy succeeded): #{e.message}\n" \
-        "  To build manually: #{manual_cmd}\n" \
-        "  Or run:            bin/verify-db-images"
+        (["platformdb image build/purge failed (schema deploy succeeded): #{e.message}"] + details).join("\n")
       )
     end
   end
