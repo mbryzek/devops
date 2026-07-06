@@ -29,6 +29,7 @@ INVOCATIONS = {
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
   "docker prune"        => 'docker prune [--days N] [--dry-run] [--yes]',
+  "aidirs prune"        => 'aidirs prune [--days N] [--dry-run] [--yes] [--trash]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
 }.freeze
@@ -99,6 +100,16 @@ USAGE = <<~USAGE
         Remove Docker images, build cache, and dangling volumes older than N days
         (default 7). Useful when local disk fills from pushed-but-unused builds.
 
+    #{INVOCATIONS["aidirs prune"]}
+        Remove finished feature dirs under ~/code/ai that are fully safe to delete
+        — every git repo inside is clean and either fully pushed or its branch's PR
+        is merged/closed (checked via `gh`). Keeps anything with uncommitted changes,
+        with local-only commits and no merged/closed PR, or modified within N days
+        (default 7, a possibly-live session). Interactive by default: prints the
+        keep/delete split and prompts before acting. --dry-run shows the split only;
+        --yes skips the prompt; --trash moves dirs to ~/code/ai-trash/<timestamp>
+        (reversible) instead of deleting them.
+
     #{INVOCATIONS["browserslist update"]}
         Shallow-clone every ~/code/* repo with a package.json into
         ~/code/browserslist.<YYYYMMDD>/<name>, run `npx update-browserslist-db@latest`,
@@ -144,13 +155,14 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks version versions pending config docker browserslist scripts].freeze
+COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
   "pending"      => %w[check release],
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
+  "aidirs"       => %w[prune],
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
 }.freeze
@@ -1206,6 +1218,192 @@ def git_origin_url(path)
   status.success? ? out.strip : nil
 end
 
+# ---------- aidirs prune ----------
+#
+# Feature dirs under ~/code/ai are throwaway clones (one branch per dir, same
+# name across every repo inside). A dir is safe to delete only when nothing would
+# be lost — every repo is clean AND either fully pushed or its branch is merged/
+# closed on GitHub. These repos SQUASH-merge, so a merged branch's local commits
+# never match the squashed commit on main and look "unpushed"; we resolve that by
+# asking `gh` for the PR state rather than trusting the git ref alone.
+
+AI_ROOT = File.expand_path("~/code/ai")
+
+def git_repo?(path)
+  File.exist?(File.join(path, ".git"))
+end
+
+# True if HEAD has commits that live on no remote-tracking branch. On a merged,
+# squash-landed branch this is true even though the work is on main — callers
+# gate on the PR state before treating it as unsafe.
+def git_has_local_only_commits?(path)
+  out, status = Open3.capture2("git", "-C", path, "log", "--branches", "--not", "--remotes", "--oneline", "-1")
+  status.success? && !out.strip.empty?
+end
+
+# owner/repo parsed from the origin url (git@github.com:o/r.git or https://…/o/r).
+def git_slug(path)
+  url = git_origin_url(path) or return nil
+  m = url.match(%r{github\.com[:/](.+?)(?:\.git)?/?\z}) or return nil
+  m[1]
+end
+
+# PR state for a branch as a symbol (:merged / :closed / :open) or nil when there
+# is no PR or `gh` is unavailable. nil is treated as "not safe" by the caller.
+def gh_pr_state(slug, branch)
+  return nil unless slug && branch
+  out, status = Open3.capture2(
+    "gh", "pr", "list", "--repo", slug, "--head", branch,
+    "--state", "all", "--json", "state", "--jq", ".[0].state"
+  )
+  return nil unless status.success?
+  case out.strip
+  when "MERGED" then :merged
+  when "CLOSED" then :closed
+  when "OPEN"   then :open
+  end
+end
+
+# Real (non-symlink) git repos inside a feature dir: the dir itself when it is a
+# clone, plus each immediate subdir. Symlinks (e.g. devops@ -> shared checkout)
+# are skipped — deleting the feature dir only removes the link, not the target.
+def ai_dir_repos(dir)
+  candidates = [dir] + Dir.children(dir).map { |c| File.join(dir, c) }
+  candidates.select { |p| !File.symlink?(p) && File.directory?(p) && git_repo?(p) }
+end
+
+def dir_effectively_empty?(dir)
+  Dir.children(dir).all? { |c| File.symlink?(File.join(dir, c)) }
+end
+
+# Newest activity across the dir and its repos' git metadata — catches a session
+# committing deep inside a repo without touching the top-level dir mtime.
+def ai_dir_last_activity(dir, repos)
+  times = [File.mtime(dir)]
+  repos.each do |r|
+    %w[.git/index .git/HEAD .git/ORIG_HEAD].each do |f|
+      p = File.join(r, f)
+      times << File.mtime(p) if File.exist?(p)
+    end
+  end
+  times.max
+end
+
+# Returns [:delete, nil] or [:keep, reason]. pr_state is injected for testing;
+# it defaults to the gh-backed lookup in cmd_aidirs_prune.
+def classify_ai_dir(dir, cutoff_time:, pr_state:)
+  repos = ai_dir_repos(dir)
+  return [:keep, "modified within cutoff"] if ai_dir_last_activity(dir, repos) >= cutoff_time
+
+  if repos.empty?
+    return [:delete, nil] if dir_effectively_empty?(dir)
+    return [:keep, "no git repo (unexpected content)"]
+  end
+
+  repos.each do |r|
+    return [:keep, "uncommitted changes in #{File.basename(r)}"] unless git_clean?(r)
+  end
+
+  repos.each do |r|
+    next unless git_has_local_only_commits?(r)
+    state = pr_state.call(git_slug(r), git_current_branch(r))
+    next if %i[merged closed].include?(state)
+    return [:keep, "local-only commits in #{File.basename(r)} (PR: #{state || 'none'})"]
+  end
+
+  [:delete, nil]
+end
+
+def cmd_aidirs_prune(args)
+  days = 7
+  dry_run = false
+  assume_yes = false
+  trash = false
+  while (arg = args.shift)
+    case arg
+    when "--days"
+      raw = args.shift or usage_exit("--days requires a value", example: usage_for("aidirs prune"))
+      days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("aidirs prune"))
+    when "--dry-run" then dry_run = true
+    when "--yes", "-y" then assume_yes = true
+    when "--trash" then trash = true
+    when "-h", "--help" then puts USAGE; exit 0
+    else usage_exit("Unknown flag: #{arg}", example: usage_for("aidirs prune"))
+    end
+  end
+  usage_exit("--days must be >= 0", example: usage_for("aidirs prune")) if days < 0
+
+  unless Dir.exist?(AI_ROOT)
+    puts "Nothing to prune: #{AI_ROOT} does not exist."
+    return
+  end
+
+  cutoff = Time.now - days * 24 * 60 * 60
+  dirs = Dir.children(AI_ROOT)
+            .map { |c| File.join(AI_ROOT, c) }
+            .select { |p| !File.symlink?(p) && File.directory?(p) }
+            .sort
+  pr_state = method(:gh_pr_state)
+
+  delete = []
+  keep = []
+  dirs.each do |dir|
+    action, reason = classify_ai_dir(dir, cutoff_time: cutoff, pr_state: pr_state)
+    (action == :delete ? delete : keep) << [dir, reason]
+  end
+
+  puts "Scanned #{dirs.length} dir(s) under #{AI_ROOT}."
+  puts "Keeping anything modified within #{days} day(s), with uncommitted changes, or with unmerged local-only commits."
+  puts ""
+  puts "Keeping #{keep.length}:"
+  keep.each { |d, r| puts "  #{File.basename(d)}  (#{r})" }
+  verb = trash ? "Trash" : "Delete"
+  puts ""
+  puts "#{verb} #{delete.length}:"
+  delete.each { |d, _| puts "  #{File.basename(d)}" }
+
+  if delete.empty?
+    puts ""
+    puts "Nothing to remove."
+    return
+  end
+  if dry_run
+    puts ""
+    puts "(dry-run — nothing removed)"
+    return
+  end
+
+  unless assume_yes
+    print "\n#{verb} #{delete.length} dir(s)? [y/N] "
+    answer = STDIN.gets&.strip&.downcase
+    unless answer == "y" || answer == "yes"
+      puts "Aborted."
+      return
+    end
+  end
+
+  trash_root = nil
+  if trash
+    trash_root = File.join("#{AI_ROOT}-trash", Time.now.strftime("%Y%m%d-%H%M%S"))
+    FileUtils.mkdir_p(trash_root)
+  end
+  delete.each do |dir, _|
+    if trash
+      FileUtils.mv(dir, File.join(trash_root, File.basename(dir)))
+    else
+      FileUtils.rm_rf(dir)
+    end
+  end
+
+  puts ""
+  if trash
+    puts "Moved #{delete.length} dir(s) to #{trash_root}"
+    puts "Restore: mv #{trash_root}/<name> #{AI_ROOT}/   —   empty: rm -rf #{trash_root}"
+  else
+    puts "Deleted #{delete.length} dir(s)."
+  end
+end
+
 def cmd_browserslist_update(args)
   verbose = false
   keep_tmp = false
@@ -1607,6 +1805,13 @@ when "docker"
   when "prune" then cmd_docker_prune(argv)
   when nil     then require_subcommand("docker")
   else              unknown("docker subcommand", sub, SUBCOMMANDS["docker"])
+  end
+when "aidirs"
+  sub = argv.shift
+  case sub
+  when "prune" then cmd_aidirs_prune(argv)
+  when nil     then require_subcommand("aidirs")
+  else              unknown("aidirs subcommand", sub, SUBCOMMANDS["aidirs"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")
