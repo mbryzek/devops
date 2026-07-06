@@ -1627,21 +1627,20 @@ def git_slug(path)
   m[1]
 end
 
-# PR state for a branch as a symbol (:merged / :closed / :open) or nil when there
-# is no PR or `gh` is unavailable/erroring. nil is treated as "not safe" by the
+# A branch's PR as {state: :merged|:closed|:open, number: N}, or nil when there is
+# no PR or `gh` is unavailable/erroring. nil is treated as "not safe" by the
 # caller, so a missing `gh` binary degrades to keeping the dir, not crashing.
 def gh_pr_state(slug, branch)
   return nil unless slug && branch
   out, status = Open3.capture2(
     "gh", "pr", "list", "--repo", slug, "--head", branch,
-    "--state", "all", "--json", "state", "--jq", ".[0].state"
+    "--state", "all", "--json", "state,number",
+    "--jq", ".[0] | select(.) | \"\\(.state) \\(.number)\""
   )
   return nil unless status.success?
-  case out.strip
-  when "MERGED" then :merged
-  when "CLOSED" then :closed
-  when "OPEN"   then :open
-  end
+  state_s, num = out.strip.split(" ", 2)
+  sym = { "MERGED" => :merged, "CLOSED" => :closed, "OPEN" => :open }[state_s]
+  sym && { state: sym, number: num.to_i }
 rescue Errno::ENOENT
   nil
 end
@@ -1688,37 +1687,44 @@ def ai_dir_last_activity(dir, repos)
   times.max
 end
 
-# Returns [:delete, nil] or [:keep, reason]. pr_state is injected for testing;
-# it defaults to the gh-backed lookup in cmd_aidirs_prune.
+# Returns [action, reason, pr_notes] where action is :delete or :keep, reason is a
+# short keep explanation (nil when deleting), and pr_notes is an array of
+# "repo#N STATE" strings for any PR consulted while classifying — surfaced in the
+# output so the dir<->PR tie is visible (e.g. deleted because platform#1204 merged).
+# pr_state is injected for testing; it defaults to the gh-backed lookup.
 def classify_ai_dir(dir, cutoff_time:, pr_state:)
   repos = ai_dir_repos(dir)
-  return [:keep, "modified within cutoff"] if ai_dir_last_activity(dir, repos) >= cutoff_time
+  return [:keep, "modified within cutoff", []] if ai_dir_last_activity(dir, repos) >= cutoff_time
 
   if repos.empty?
-    return [:delete, nil] if dir_effectively_empty?(dir)
-    return [:keep, "no git repo (unexpected content)"]
+    return [:delete, nil, []] if dir_effectively_empty?(dir)
+    return [:keep, "no git repo (unexpected content)", []]
   end
 
-  return [:keep, "unexpected non-repo content"] if ai_dir_has_loose_content?(dir, repos)
+  return [:keep, "unexpected non-repo content", []] if ai_dir_has_loose_content?(dir, repos)
 
   repos.each do |r|
     name = File.basename(r)
     # Detached HEAD: commits made while detached hang off no branch ref, so
     # git_has_local_only_commits? (which walks --branches) can't see them. Keep
     # rather than risk deleting unreachable work.
-    return [:keep, "detached HEAD in #{name}"] if git_current_branch(r).nil?
-    return [:keep, "uncommitted changes in #{name}"] unless git_clean?(r)
-    return [:keep, "stashed changes in #{name}"] if git_has_stash?(r)
+    return [:keep, "detached HEAD in #{name}", []] if git_current_branch(r).nil?
+    return [:keep, "uncommitted changes in #{name}", []] unless git_clean?(r)
+    return [:keep, "stashed changes in #{name}", []] if git_has_stash?(r)
   end
 
+  pr_notes = []
   repos.each do |r|
     next unless git_has_local_only_commits?(r)
-    state = pr_state.call(git_slug(r), git_current_branch(r))
-    next if %i[merged closed].include?(state)
-    return [:keep, "local-only commits in #{File.basename(r)} (PR: #{state || 'none'})"]
+    name = File.basename(r)
+    pr = pr_state.call(git_slug(r), git_current_branch(r))
+    label = pr ? "#{name}##{pr[:number]} #{pr[:state].to_s.upcase}" : "#{name} (no PR)"
+    pr_notes << label
+    next if pr && %i[merged closed].include?(pr[:state])
+    return [:keep, "local-only commits: #{label}", pr_notes]
   end
 
-  [:delete, nil]
+  [:delete, nil, pr_notes]
 end
 
 def cmd_aidirs_prune(args)
@@ -1753,19 +1759,22 @@ def cmd_aidirs_prune(args)
   delete = []
   keep = []
   dirs.each do |dir|
-    action, reason = classify_ai_dir(dir, cutoff_time: cutoff, pr_state: pr_state)
-    (action == :delete ? delete : keep) << [dir, reason]
+    action, reason, notes = classify_ai_dir(dir, cutoff_time: cutoff, pr_state: pr_state)
+    (action == :delete ? delete : keep) << [dir, reason, notes]
   end
 
   puts "Scanned #{dirs.length} dir(s) under #{AI_ROOT}."
   puts "Keeping anything modified within #{days} day(s) or holding unsaved work (uncommitted, stashed, detached, unexpected files, or local-only commits without a merged/closed PR)."
   puts ""
   puts "Keeping #{keep.length}:"
-  keep.each { |d, r| puts "  #{File.basename(d)}  (#{r})" }
+  keep.each { |d, r, _| puts "  #{File.basename(d)}  (#{r})" }
   verb = trash ? "Trash" : "Delete"
   puts ""
   puts "#{verb} #{delete.length}:"
-  delete.each { |d, _| puts "  #{File.basename(d)}" }
+  delete.each do |d, _, notes|
+    suffix = notes && !notes.empty? ? "  (#{notes.join(', ')})" : ""
+    puts "  #{File.basename(d)}#{suffix}"
+  end
 
   if delete.empty?
     puts ""
