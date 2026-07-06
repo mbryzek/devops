@@ -1021,9 +1021,9 @@ end
 # needs nothing else (its own `.api/config.pkl` fully determines its stack and
 # generators). A single-backend `--app` needs every consumer candidate cloned
 # too, so `Codegen::Graph` can compute which consumers actually depend on it
-# (a consumer's dependency on a backend is only knowable from the consumer's
-# own parsed `consumed_names`, which requires cloning the consumer). No `--app`
-# (full sweep) needs everything.
+# (a consumer's dependency on a backend is only knowable by intersecting the
+# consumer's parsed `app_names` with the backend's, which requires cloning the
+# consumer). No `--app` (full sweep) needs everything.
 def codegen_clone_set(target, eligible)
   return eligible if target.nil?
   return [target] if target.stack != :scala
