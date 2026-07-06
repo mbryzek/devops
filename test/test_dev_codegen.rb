@@ -155,10 +155,24 @@ class TestSyncPaths < Minitest::Test
     assert_equal :changed, Codegen::Sync.classify_diff(" M src/generated/x.ts\n")
   end
 
-  def test_remote_branch_exists
-    refute Codegen::Sync.remote_branch_exists?("")
-    refute Codegen::Sync.remote_branch_exists?("   \n")
-    assert Codegen::Sync.remote_branch_exists?("abc123\trefs/heads/codegen-sync\n")
+  def test_open_codegen_pr_url_finds_matching_head
+    json = [
+      { "url" => "https://github.com/mbryzek/acumen/pull/9", "headRefName" => "some-other-branch" },
+      { "url" => "https://github.com/mbryzek/acumen/pull/108", "headRefName" => "codegen-sync-20260706-142530" },
+    ].to_json
+    assert_equal "https://github.com/mbryzek/acumen/pull/108",
+                 Codegen::Sync.open_codegen_pr_url(json, "codegen-sync")
+  end
+
+  def test_open_codegen_pr_url_nil_when_none_match
+    json = [{ "url" => "u", "headRefName" => "feature-x" }].to_json
+    assert_nil Codegen::Sync.open_codegen_pr_url(json, "codegen-sync")
+    assert_nil Codegen::Sync.open_codegen_pr_url("[]", "codegen-sync")
+  end
+
+  def test_open_codegen_pr_url_nil_on_garbage
+    assert_nil Codegen::Sync.open_codegen_pr_url("not json", "codegen-sync")
+    assert_nil Codegen::Sync.open_codegen_pr_url("", "codegen-sync")
   end
 
   TIMESTAMP_DIFF = <<~DIFF

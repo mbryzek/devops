@@ -1,5 +1,6 @@
 require 'set'
 require 'find'
+require 'json'
 
 module Codegen
   module Sync
@@ -41,9 +42,18 @@ module Codegen
       end
     end
 
-    # True when `git ls-remote --heads` output indicates the branch exists.
-    def remote_branch_exists?(ls_remote_output)
-      !ls_remote_output.to_s.strip.empty?
+    # URL of the first OPEN PR whose head branch is a codegen-sync branch, given
+    # the JSON from `gh pr list --json url,headRefName`, or nil. The gate against
+    # duplicate sweeps is an open PR, not a leftover branch.
+    def open_codegen_pr_url(gh_json, branch_prefix)
+      data = begin
+        JSON.parse(gh_json.to_s)
+      rescue JSON::ParserError
+        nil
+      end
+      return nil unless data.is_a?(Array)
+      pr = data.find { |p| p.is_a?(Hash) && p["headRefName"].to_s.start_with?(branch_prefix) }
+      pr && pr["url"]
     end
 
     # Files to delete before rerunning `api`: everything carrying the

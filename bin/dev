@@ -977,7 +977,10 @@ def parse_codegen_sync_args(argv)
 end
 
 CODEGEN_DEVOPS_REPO = "mbryzek/devops".freeze
-CODEGEN_BRANCH = "codegen-sync".freeze
+# Every sweep uses a fresh, unique branch (`<prefix>-<run_id>`) so a leftover
+# branch from a prior run never blocks or gets clobbered. The gate against
+# duplicate work is an OPEN PR (see open_codegen_pr), not branch existence.
+CODEGEN_BRANCH_PREFIX = "codegen-sync".freeze
 CODEGEN_STACKS = %i[scala elm sveltekit].freeze
 CODEGEN_CLAUDE_TIMEOUT_SECS = 20 * 60
 
@@ -1113,21 +1116,29 @@ def revert_comment_only_changes(clone)
   reverted
 end
 
+# URL of an already-open PR from a prior codegen sweep for this repo (its head
+# branch starts with the codegen-sync prefix), or nil. `gh` infers the repo
+# from the clone's origin.
+def open_codegen_pr(clone)
+  _, out = run_step(["gh", "pr", "list", "--state", "open", "--limit", "200", "--json", "url,headRefName"], clone, false, +"")
+  Codegen::Sync.open_codegen_pr_url(out, CODEGEN_BRANCH_PREFIX)
+end
+
 # Deterministic, mechanical pass for one repo: branch, wipe generated files,
 # rerun `api`, classify the diff. Only reaches for Claude if there's an actual
 # diff and the caller isn't in --dry-run.
-def run_repo(name, workdir, stack, opts, &announce)
+def run_repo(name, workdir, stack, opts, branch, &announce)
   clone = File.join(workdir, name)
   note = ->(msg) { announce&.call(msg) }
 
-  # A depth-1 clone only sees the default branch tip — a leftover remote
-  # codegen-sync branch from a prior (possibly aborted) run is invisible to
-  # `git branch`/`git status` here. Without this check, Claude's force-push
-  # (per fix_prompt) would silently clobber whatever's already on that remote
-  # branch. --dry-run never pushes, so it's exempt.
+  # Gate on an OPEN PR, not on branch existence: this run uses a fresh unique
+  # branch, so a leftover branch can't collide or be clobbered. But if a prior
+  # sweep's PR for this repo is still open, don't stack a second one — skip and
+  # let the human land/close it first. --dry-run never pushes, so it's exempt.
   unless opts[:dry_run]
-    _, ls_remote_out = run_step(["git", "ls-remote", "--heads", "origin", CODEGEN_BRANCH], clone, false, +"")
-    return { status: :needs_attention, error: "origin already has a #{CODEGEN_BRANCH} branch — resolve manually before re-running" } if Codegen::Sync.remote_branch_exists?(ls_remote_out)
+    if (pr = open_codegen_pr(clone))
+      return { status: :needs_attention, error: "an open codegen-sync PR already exists (#{pr}) — merge or close it before re-running" }
+    end
   end
 
   # Fetch origin/main fresh and branch off FETCH_HEAD rather than trusting the
@@ -1136,7 +1147,7 @@ def run_repo(name, workdir, stack, opts, &announce)
   fetch_ok, fetch_out = run_step(["git", "fetch", "--depth=1", "origin", "main"], clone, false, +"")
   return { status: :error, error: "fetch origin main failed: #{fetch_out}" } unless fetch_ok
 
-  branch_ok, branch_out = run_step(["git", "checkout", "-B", CODEGEN_BRANCH, "FETCH_HEAD"], clone, false, +"")
+  branch_ok, branch_out = run_step(["git", "checkout", "-B", branch, "FETCH_HEAD"], clone, false, +"")
   return { status: :error, error: "branch checkout failed: #{branch_out}" } unless branch_ok
 
   # Load the config purely to validate it parses — a repo whose .api/config.pkl
@@ -1171,7 +1182,7 @@ def run_repo(name, workdir, stack, opts, &announce)
   return { status: :changed, note: "diff only (dry-run)" } if opts[:dry_run]
 
   verify = Codegen::Sync.verify_cmd_for(stack, full_tests: opts[:full_tests])
-  prompt = Codegen::Sync.fix_prompt(repo: name, branch: CODEGEN_BRANCH,
+  prompt = Codegen::Sync.fix_prompt(repo: name, branch: branch,
                                     verify_cmd: verify, regen_only: opts[:regen_only])
   spawn_claude(clone, prompt)
 rescue => e
@@ -1277,8 +1288,11 @@ end
 def cmd_codegen_sync(argv)
   opts = parse_codegen_sync_args(argv)
   registry = Work::Registry.load
-  date = ENV["CODEGEN_SYNC_DATE"] || Time.now.strftime("%Y%m%d")
-  workdir = File.expand_path("~/code/codegen-sync.#{date}")
+  # One id per sweep, to the second, drives both the workdir and the branch
+  # name so reruns never collide with a prior run's clones or remote branch.
+  run_id = ENV["CODEGEN_SYNC_DATE"] || Time.now.strftime("%Y%m%d-%H%M%S")
+  branch = "#{CODEGEN_BRANCH_PREFIX}-#{run_id}"
+  workdir = File.expand_path("~/code/codegen-sync.#{run_id}")
   FileUtils.mkdir_p(workdir)
   ensure_codegen_devops(workdir)
 
@@ -1330,7 +1344,7 @@ def cmd_codegen_sync(argv)
     puts Util.underline("Backends (serial)")
     backend_names.each do |name|
       puts "  #{name}:"
-      r = run_repo(name, workdir, :scala, opts) { |msg| puts "    #{msg}" }
+      r = run_repo(name, workdir, :scala, opts, branch) { |msg| puts "    #{msg}" }
       results[name] = r
       report_repo_line(name, r[:status], r[:error] || r[:note], false)
     end
@@ -1351,7 +1365,7 @@ def cmd_codegen_sync(argv)
     results.merge!(run_concurrent(consumer_names, opts[:concurrency]) do |name|
       bad = graph.depends_on(name).select { |d| failed_backends.include?(d) }
       if bad.empty?
-        run_repo(name, workdir, consumer_stacks.fetch(name), opts)
+        run_repo(name, workdir, consumer_stacks.fetch(name), opts, branch)
       else
         { status: :skipped, error: "skipped: dependency backend(s) failed: #{bad.join(', ')}" }
       end
