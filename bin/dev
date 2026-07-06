@@ -1092,8 +1092,8 @@ def run_repo(name, workdir, stack, opts)
   # (per fix_prompt) would silently clobber whatever's already on that remote
   # branch. --dry-run never pushes, so it's exempt.
   unless opts[:dry_run]
-    existing, _ = run_step(["git", "ls-remote", "--heads", "origin", CODEGEN_BRANCH], clone, false, +"")
-    return { status: :needs_attention, error: "origin already has a #{CODEGEN_BRANCH} branch — resolve manually before re-running" } unless existing.to_s.strip.empty?
+    _, ls_remote_out = run_step(["git", "ls-remote", "--heads", "origin", CODEGEN_BRANCH], clone, false, +"")
+    return { status: :needs_attention, error: "origin already has a #{CODEGEN_BRANCH} branch — resolve manually before re-running" } if Codegen::Sync.remote_branch_exists?(ls_remote_out)
   end
 
   # Fetch origin/main fresh and branch off FETCH_HEAD rather than trusting the
@@ -1146,7 +1146,12 @@ end
 # :needs_attention. Instead we open the pipes ourselves, capture the pid before
 # the blocking read, and on timeout kill the process directly.
 def spawn_claude(clone, prompt)
-  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", prompt, chdir: clone)
+  # pgroup: true makes the spawned `claude` process its own process group
+  # leader (its pid == its pgid), so killing -pid on timeout signals the whole
+  # group — including grandchildren like `gh pr create`/`git push` that could
+  # otherwise outlive the direct child and still push/open a PR after we've
+  # already recorded :needs_attention.
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", prompt, chdir: clone, pgroup: true)
   stdin.close
   pid = wait_thr.pid
 
@@ -1155,11 +1160,11 @@ def spawn_claude(clone, prompt)
       Timeout.timeout(CODEGEN_CLAUDE_TIMEOUT_SECS) { out_err.read }
     rescue Timeout::Error
       begin
-        Process.kill("TERM", pid)
+        Process.kill("TERM", -pid)
       rescue Errno::ESRCH
       end
       begin
-        Process.kill("KILL", pid)
+        Process.kill("KILL", -pid)
       rescue Errno::ESRCH
       end
       return { status: :needs_attention, error: "claude --print timed out after #{CODEGEN_CLAUDE_TIMEOUT_SECS}s (clone left at #{clone}); process killed" }

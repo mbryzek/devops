@@ -141,6 +141,12 @@ class TestSyncPaths < Minitest::Test
     assert_equal :changed, Codegen::Sync.classify_diff(" M src/generated/x.ts\n")
   end
 
+  def test_remote_branch_exists
+    refute Codegen::Sync.remote_branch_exists?("")
+    refute Codegen::Sync.remote_branch_exists?("   \n")
+    assert Codegen::Sync.remote_branch_exists?("abc123\trefs/heads/codegen-sync\n")
+  end
+
   def test_generated_paths_union_of_dirs_and_marker
     Dir.mktmpdir do |dir|
       FileUtils.mkdir_p(File.join(dir, "src/generated"))

@@ -12,6 +12,11 @@ module Codegen
       porcelain.to_s.strip.empty? ? :in_sync : :changed
     end
 
+    # True when `git ls-remote --heads` output indicates the branch exists.
+    def remote_branch_exists?(ls_remote_output)
+      !ls_remote_output.to_s.strip.empty?
+    end
+
     def generated_paths(repo_dir, api_config)
       root = File.expand_path(repo_dir)
       paths = Set.new
