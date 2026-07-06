@@ -1,0 +1,5 @@
+{"org":"bryzek","applications":[
+  {"names":["platform","platform-storage","rallyd-api"],"generators":[{"key":"play_controller","target":"api/app/generated"},{"key":"bryzek_play_client","target":"generated/app"}]},
+  {"names":["platform-internal"],"generators":[{"key":"bryzek_play_client","target":"generated/app"}]},
+  {"group":"dao","generators":[{"key":"psql_scala","target":"generated/app"},{"key":"psql_ddl","target":"dao/psql"}]}
+]}
