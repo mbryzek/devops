@@ -1,8 +1,12 @@
 require 'set'
-require 'open3'
-require 'json'
+require 'api_config'
 
 module Codegen
+  # Derives the codegen-sync view of a repo's .api/config.pkl — which apibuilder
+  # apps it produces vs consumes, and every generator output dir — by wrapping
+  # the existing top-level ApiConfig parser (which already handles the real
+  # `pkl eval -f json` shape: org-keyed blocks, generators as {key => target},
+  # applications as {key => file_path}, plus spec_glob and group).
   class ApiConfig
     CLIENT_KEYS = %w[typescript elm].freeze
 
@@ -16,20 +20,18 @@ module Codegen
 
     def self.load(repo_dir)
       path = File.join(repo_dir, ".api", "config.pkl")
-      stdout, status = Open3.capture2("pkl", "eval", "-f", "json", path)
-      raise "pkl eval failed for #{path}" unless status.success?
-      parse(JSON.parse(stdout))
+      from_blocks(::ApiConfig.new(path).blocks)
     end
 
-    def self.parse(data)
+    def self.from_blocks(blocks)
       produced = Set.new
       consumed = Set.new
       dirs = Set.new
-      Array(data["applications"]).each do |group|
-        gens = Array(group["generators"])
-        dirs.merge(gens.map { |g| g["target"] }.compact)
-        names = Array(group["names"])
-        client = !gens.empty? && gens.all? { |g| CLIENT_KEYS.include?(g["key"]) }
+      blocks.each do |block|
+        gens = block.generators
+        dirs.merge(gens.map(&:target).compact)
+        names = block.applications.map(&:key)
+        client = !gens.empty? && gens.all? { |g| CLIENT_KEYS.include?(g.key) }
         (client ? consumed : produced).merge(names)
       end
       new(produced_names: produced, consumed_names: consumed, target_dirs: dirs.to_a)

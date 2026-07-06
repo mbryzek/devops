@@ -1,4 +1,0 @@
-{"org":"bryzek","applications":[
-  {"names":["platform","platform-storage","rallyd-api"],"generators":[{"key":"typescript","target":"./src/generated"}]},
-  {"names":["platform"],"generators":[{"key":"typescript","target":"./playwright/generated"}]}
-]}
