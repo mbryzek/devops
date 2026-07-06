@@ -4,6 +4,7 @@ require 'fileutils'
 require 'io/console'
 require 'json'
 require 'open3'
+require 'set'
 require 'timeout'
 require 'uri'
 
@@ -997,11 +998,11 @@ end
 # clone, i.e. at `<workdir>/devops` — NOT the real `~/code/devops` (verified via
 # `pkl eval`: the amends is a plain relative-path resolution against the config
 # file's own location, so a workdir nested under `~/code` does not reach the
-# real `~/code/devops`). Cloned fresh from GitHub main each run so the sweep
-# doesn't depend on whatever branch happens to be checked out at `~/code/devops`.
+# real `~/code/devops`). Cloned fresh from GitHub main every run — including a
+# same-date rerun that reuses `workdir` — so the sweep never drives codegen off
+# a stale sibling left over from a prior run; `clone_repo` wipes any existing
+# dir before cloning.
 def ensure_codegen_devops(workdir)
-  path = File.join(workdir, "devops")
-  return path if File.directory?(path)
   captured = +""
   clone_path = clone_repo(github_origin(CODEGEN_DEVOPS_REPO), "devops", workdir, false, captured)
   Util.exit_with_error("codegen sync: failed to clone devops into #{workdir}:\n#{captured}") unless clone_path
@@ -1061,15 +1062,17 @@ def run_concurrent(names, concurrency)
   workers = Array.new([concurrency, names.length].min) do
     Thread.new do
       while (name = (queue.pop(true) rescue nil))
+        mutex.synchronize { puts "  #{name} [starting]" }
         result =
           begin
-            puts "  #{name} [starting]"
             yield name
           rescue => e
             { status: :error, error: "worker crashed: #{e.class}: #{e.message}" }
           end
-        mutex.synchronize { results[name] = result }
-        puts "  #{name} [#{result[:status]}]"
+        mutex.synchronize do
+          results[name] = result
+          puts "  #{name} [#{result[:status]}]"
+        end
       end
     end
   end
@@ -1083,7 +1086,23 @@ end
 def run_repo(name, workdir, stack, opts)
   clone = File.join(workdir, name)
 
-  branch_ok, branch_out = run_step(["git", "-C", clone, "checkout", "-b", CODEGEN_BRANCH], clone, false, +"")
+  # A depth-1 clone only sees the default branch tip — a leftover remote
+  # codegen-sync branch from a prior (possibly aborted) run is invisible to
+  # `git branch`/`git status` here. Without this check, Claude's force-push
+  # (per fix_prompt) would silently clobber whatever's already on that remote
+  # branch. --dry-run never pushes, so it's exempt.
+  unless opts[:dry_run]
+    existing, _ = run_step(["git", "ls-remote", "--heads", "origin", CODEGEN_BRANCH], clone, false, +"")
+    return { status: :needs_attention, error: "origin already has a #{CODEGEN_BRANCH} branch — resolve manually before re-running" } unless existing.to_s.strip.empty?
+  end
+
+  # Fetch origin/main fresh and branch off FETCH_HEAD rather than trusting the
+  # shallow clone's default-branch tip: a clone made earlier in a long sweep
+  # (or reused across a rerun) can otherwise serve a stale main.
+  fetch_ok, fetch_out = run_step(["git", "fetch", "--depth=1", "origin", "main"], clone, false, +"")
+  return { status: :error, error: "fetch origin main failed: #{fetch_out}" } unless fetch_ok
+
+  branch_ok, branch_out = run_step(["git", "checkout", "-B", CODEGEN_BRANCH, "FETCH_HEAD"], clone, false, +"")
   return { status: :error, error: "branch checkout failed: #{branch_out}" } unless branch_ok
 
   cfg = safe_load_api_config(clone)
@@ -1091,8 +1110,13 @@ def run_repo(name, workdir, stack, opts)
 
   Codegen::Sync.generated_paths(clone, cfg).each { |p| File.delete(p) if File.exist?(p) }
 
+  # For a backend, bare `api` uploads specs to the shared registry AND
+  # regenerates — --dry-run must never mutate the shared registry, so it runs
+  # codegen only. For a consumer `api` is already codegen-only, so this is a
+  # no-op change for that case.
+  api_cmd = opts[:dry_run] ? ["api", "codegen"] : ["api"]
   log = +""
-  api_ok, _ = run_step(["api"], clone, false, log)
+  api_ok, _ = run_step(api_cmd, clone, false, log)
   return { status: :error, error: "api failed: #{log.strip}" } unless api_ok
 
   porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
@@ -1112,22 +1136,43 @@ end
 # `Codegen::Sync.fix_prompt`). Bounded by a timeout so one stuck repo can't hang
 # the whole sweep. On timeout/failure the clone + branch are left in place
 # (never deleted) so a human can pick up where Claude left off.
+#
+# Deliberately NOT `Open3.capture2e`/block-form `popen2e`: both wait on the
+# child internally (capture2e blocks until exit; popen2e's block form runs a
+# `wait_thr.join` in its `ensure`, which fires *before* our `rescue
+# Timeout::Error` regains control) — a `Timeout.timeout` wrapped around either
+# would unwind our Ruby frame while the orphaned `claude` process keeps running
+# in the background, free to push/open a PR after we've already recorded
+# :needs_attention. Instead we open the pipes ourselves, capture the pid before
+# the blocking read, and on timeout kill the process directly.
 def spawn_claude(clone, prompt)
-  out = +""
-  status = nil
-  begin
-    Timeout.timeout(CODEGEN_CLAUDE_TIMEOUT_SECS) do
-      out, status = Open3.capture2e("claude", "--print", prompt, chdir: clone)
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", prompt, chdir: clone)
+  stdin.close
+  pid = wait_thr.pid
+
+  output =
+    begin
+      Timeout.timeout(CODEGEN_CLAUDE_TIMEOUT_SECS) { out_err.read }
+    rescue Timeout::Error
+      begin
+        Process.kill("TERM", pid)
+      rescue Errno::ESRCH
+      end
+      begin
+        Process.kill("KILL", pid)
+      rescue Errno::ESRCH
+      end
+      return { status: :needs_attention, error: "claude --print timed out after #{CODEGEN_CLAUDE_TIMEOUT_SECS}s (clone left at #{clone}); process killed" }
+    ensure
+      out_err.close unless out_err.closed?
     end
-  rescue Timeout::Error
-    return { status: :needs_attention, error: "claude --print timed out after #{CODEGEN_CLAUDE_TIMEOUT_SECS}s (clone left at #{clone})" }
+
+  status = wait_thr.value
+  unless status.success?
+    return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{output}" }
   end
 
-  unless status&.success?
-    return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{out}" }
-  end
-
-  pr_url = out[%r{https://github\.com/\S+/pull/\d+}]
+  pr_url = output[%r{https://github\.com/\S+/pull/\d+}]
   return { status: :needs_attention, error: "claude finished but no PR URL found in output (clone left at #{clone})" } unless pr_url
 
   { status: :pr_opened, pr_url: pr_url }
@@ -1168,9 +1213,26 @@ def cmd_codegen_sync(argv)
   configs = {}
   to_clone.each do |app|
     clone_path = clone_repo(github_origin(app.repo), app.name, workdir, false, +"")
-    next unless clone_path && File.exist?(File.join(clone_path, ".api", "config.pkl"))
-    cfg = safe_load_api_config(clone_path)
-    configs[app.name] = cfg if cfg
+    if clone_path && File.exist?(File.join(clone_path, ".api", "config.pkl"))
+      cfg = safe_load_api_config(clone_path)
+      configs[app.name] = cfg if cfg
+    end
+    next if configs.key?(app.name)
+
+    # A backend (scala) that silently drops out of `configs` vanishes from
+    # `graph.backends` too (Graph.build filters on configs.key?) — the sweep
+    # would print an empty summary with no error while consumers regenerate
+    # against a registry missing that backend's specs. Fatal. A consumer
+    # failing the same way is expected/handled: Graph.build already excludes
+    # it from `graph.consumers`, so just warn and move on.
+    if app.stack == :scala
+      Util.exit_with_error(
+        "codegen sync: backend '#{app.name}' has no usable .api/config.pkl " \
+        "(clone failed, missing file, or parse error) — aborting sweep"
+      )
+    else
+      warn "codegen sync: skipping '#{app.name}' — no usable .api/config.pkl (clone failed, missing file, or parse error)"
+    end
   end
 
   graph = Codegen::Graph.build(apps: to_clone, configs: configs)
@@ -1201,7 +1263,18 @@ def cmd_codegen_sync(argv)
   unless consumer_names.empty?
     puts Util.underline("Consumers (concurrency=#{opts[:concurrency]})")
     consumer_stacks = registry.apps.each_with_object({}) { |a, h| h[a.name] = a.stack }
-    results.merge!(run_concurrent(consumer_names, opts[:concurrency]) { |name| run_repo(name, workdir, consumer_stacks.fetch(name), opts) })
+    # A consumer that regenerates against a registry missing a failed backend's
+    # freshly-uploaded specs would be regenerating against stale/incomplete
+    # data — skip it rather than run codegen on a bad premise.
+    failed_backends = backend_names.select { |b| results[b] && results[b][:status] == :error }.to_set
+    results.merge!(run_concurrent(consumer_names, opts[:concurrency]) do |name|
+      bad = graph.depends_on(name).select { |d| failed_backends.include?(d) }
+      if bad.empty?
+        run_repo(name, workdir, consumer_stacks.fetch(name), opts)
+      else
+        { status: :skipped, error: "skipped: dependency backend(s) failed: #{bad.join(', ')}" }
+      end
+    end)
     puts ""
   end
 
