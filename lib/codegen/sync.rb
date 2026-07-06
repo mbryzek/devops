@@ -1,4 +1,5 @@
 require 'set'
+require 'find'
 
 module Codegen
   module Sync
@@ -12,18 +13,21 @@ module Codegen
     end
 
     def generated_paths(repo_dir, api_config)
+      root = File.expand_path(repo_dir)
       paths = Set.new
       api_config.target_dirs.each do |rel|
-        base = File.expand_path(rel.sub(%r{\A\./}, ""), repo_dir)
+        base = File.expand_path(rel.sub(%r{\A\./}, ""), root)
         next unless File.directory?(base)
         Dir.glob(File.join(base, "**", "*"), File::FNM_DOTMATCH)
            .select { |p| File.file?(p) }
            .each { |p| paths << p }
       end
-      Dir.glob(File.join(repo_dir, "**", "*"), File::FNM_DOTMATCH).each do |p|
-        next if p.include?("#{File::SEPARATOR}.git#{File::SEPARATOR}")
-        next unless File.file?(p)
-        paths << p if marker?(p)
+      Find.find(root) do |p|
+        if File.basename(p) == ".git" && File.directory?(p)
+          Find.prune
+        elsif File.file?(p) && marker?(p)
+          paths << p
+        end
       end
       paths.to_a
     end
