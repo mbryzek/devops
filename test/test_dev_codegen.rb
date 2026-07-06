@@ -69,6 +69,18 @@ class TestCodegenApiConfig < Minitest::Test
     assert_includes cfg.target_dirs, "./src/generated"
   end
 
+  # Regression: Elm frontends generate with `elm_v2` (NOT bare `elm`). A stale
+  # CLIENT_KEYS misclassified them as producers, emptying consumed_names and
+  # dropping their backend dependency edges (acumen-ui → acumen, etc.).
+  def test_elm_v2_block_is_consumed
+    cfg = Codegen::ApiConfig.from_blocks([
+      block([gen("elm_v2", "./src/generated")], [app("acumen-api"), app("acumen-view")]),
+    ])
+    assert_includes cfg.consumed_names, "acumen-api"
+    assert_includes cfg.consumed_names, "acumen-view"
+    assert_empty cfg.produced_names
+  end
+
   def test_dao_group_block_with_no_apps
     cfg = Codegen::ApiConfig.from_blocks([
       block([gen("psql_scala", "generated/app"), gen("psql_ddl", "dao/psql")], [], group: "dao"),

@@ -8,7 +8,13 @@ module Codegen
   # `pkl eval -f json` shape: org-keyed blocks, generators as {key => target},
   # applications as {key => file_path}, plus spec_glob and group).
   class ApiConfig
-    CLIENT_KEYS = %w[typescript elm].freeze
+    # apibuilder client-codegen generator keys — a block that ONLY emits these
+    # means this repo consumes those apps rather than owning them. Must list
+    # every client generator in use across the fleet: `typescript` (svelte/TS
+    # frontends) and `elm_v2` (Elm frontends — note the `_v2`, NOT bare `elm`).
+    # Miss one and that frontend is misclassified as a producer, losing its
+    # dependency edges to the backend (breaks `--app <backend>` + failure gating).
+    CLIENT_KEYS = %w[typescript elm_v2].freeze
 
     attr_reader :produced_names, :consumed_names, :target_dirs
 
@@ -20,7 +26,10 @@ module Codegen
 
     def self.load(repo_dir)
       path = File.join(repo_dir, ".api", "config.pkl")
-      from_blocks(::ApiConfig.new(path).blocks)
+      # base_dir must be the cloned repo, not Dir.pwd: `dev codegen sync` runs
+      # from wherever it was invoked, so a spec_glob (e.g. the dao group's
+      # "dao/spec/*.json") would otherwise resolve against the wrong tree.
+      from_blocks(::ApiConfig.new(path, base_dir: repo_dir).blocks)
     end
 
     def self.from_blocks(blocks)
