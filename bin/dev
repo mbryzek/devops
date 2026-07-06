@@ -1097,6 +1097,22 @@ def run_concurrent(names, concurrency)
   results
 end
 
+# `git checkout` every modified file whose diff touches only comments, so the
+# apibuilder generator's per-file `Service version:` timestamp churn stays out
+# of the diff. Only modified (M) files are considered — deleted orphans and new
+# files are never comment-only. Returns the count reverted.
+def revert_comment_only_changes(clone)
+  _, names = run_step(["git", "diff", "--name-only", "--diff-filter=M"], clone, false, +"")
+  reverted = 0
+  names.to_s.split("\n").map(&:strip).reject(&:empty?).each do |f|
+    _, diff = run_step(["git", "diff", "--", f], clone, false, +"")
+    next unless Codegen::Sync.comment_only_diff?(diff)
+    run_step(["git", "checkout", "--", f], clone, false, +"")
+    reverted += 1
+  end
+  reverted
+end
+
 # Deterministic, mechanical pass for one repo: branch, wipe generated files,
 # rerun `api`, classify the diff. Only reaches for Claude if there's an actual
 # diff and the caller isn't in --dry-run.
@@ -1146,6 +1162,9 @@ def run_repo(name, workdir, stack, opts, &announce)
   log = +""
   api_ok, _ = run_step(api_cmd, clone, false, log)
   return { status: :error, error: "api failed: #{log.strip}" } unless api_ok
+
+  reverted = revert_comment_only_changes(clone)
+  note.call("reverted #{reverted} comment-only (timestamp) file(s)") if reverted.positive?
 
   porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
   return { status: :in_sync } if Codegen::Sync.classify_diff(porcelain) == :in_sync
