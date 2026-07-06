@@ -1197,12 +1197,60 @@ def run_repo(name, workdir, stack, opts, branch, &announce)
   return { status: :in_sync } if Codegen::Sync.classify_diff(porcelain) == :in_sync
   return { status: :changed, note: "diff only (dry-run)" } if opts[:dry_run]
 
-  verify = Codegen::Sync.verify_cmd_for(stack, full_tests: opts[:full_tests])
-  prompt = Codegen::Sync.fix_prompt(repo: name, branch: branch,
-                                    verify_cmd: verify, regen_only: opts[:regen_only])
-  spawn_claude(clone, prompt)
+  # regen-only: commit the regen as-is and open a DRAFT PR — no build, no Claude.
+  return commit_and_open_pr(clone, branch, draft: true) if opts[:regen_only]
+
+  # Build-gate: if the regenerated repo builds, the change is clean — commit and
+  # open the PR directly, NO Claude. Only a genuine build failure (a real API
+  # contract change that broke consuming code) hands off to Claude to fix.
+  verify_cmd = Codegen::Sync.verify_cmd_for(stack, full_tests: opts[:full_tests])
+  note.call("verifying (#{verify_cmd})…")
+  verify_ok, verify_log = run_verify(clone, stack, verify_cmd)
+  if verify_ok
+    note.call("build clean — committing + opening PR (no Claude)")
+    commit_and_open_pr(clone, branch, draft: false)
+  else
+    note.call("build failed — handing to Claude to fix")
+    prompt = Codegen::Sync.fix_prompt(repo: name, branch: branch,
+                                      verify_cmd: verify_cmd, regen_only: false,
+                                      build_error: verify_log)
+    spawn_claude(clone, prompt)
+  end
 rescue => e
   { status: :error, error: "run_repo crashed: #{e.class}: #{e.message}" }
+end
+
+# Build/typecheck the regenerated repo so a clean regen can skip Claude. Installs
+# node deps first when there's a package.json (a fresh clone has no
+# node_modules; this also warms it for a Claude handoff on failure). Returns
+# [ok, combined_log].
+def run_verify(clone, stack, verify_cmd)
+  log = +""
+  if File.exist?(File.join(clone, "package.json"))
+    ok, _ = run_step(["npm", "install", "--no-audit", "--no-fund"], clone, false, log)
+    return [false, log] unless ok
+  end
+  ok, _ = run_step(verify_cmd.split, clone, false, log)
+  [ok, log]
+end
+
+CODEGEN_COMMIT_MSG = "Sync regenerated apibuilder/DAO code".freeze
+
+# Deterministic clean-regen path (no Claude): stage everything, commit, push the
+# branch, and open a PR. Returns {status: :pr_opened, pr_url:} or an error /
+# needs_attention hash. Never merges. draft: true opens a draft PR (regen-only).
+def commit_and_open_pr(clone, branch, draft:)
+  run_step(["git", "add", "-A"], clone, false, +"")
+  commit_ok, commit_out = run_step(["git", "commit", "-m", CODEGEN_COMMIT_MSG], clone, false, +"")
+  return { status: :error, error: "commit failed: #{commit_out}" } unless commit_ok
+  push_ok, push_out = run_step(["git", "push", "-u", "origin", branch], clone, false, +"")
+  return { status: :error, error: "push failed: #{push_out}" } unless push_ok
+  create = ["gh", "pr", "create", "--fill"]
+  create << "--draft" if draft
+  _, create_out = run_step(create, clone, false, +"")
+  url = create_out[%r{https://github\.com/\S+/pull/\d+}]
+  return { status: :needs_attention, error: "PR create produced no URL (clone left at #{clone})" } unless url
+  { status: :pr_opened, pr_url: url }
 end
 
 # Thin integration glue: run a fresh Claude session in `clone` to make the
