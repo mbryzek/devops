@@ -38,6 +38,15 @@ module Codegen
       false
     end
 
+    def verify_cmd_for(stack, full_tests:)
+      case stack
+      when :scala     then full_tests ? "sbt test" : "sbt Test/compile"
+      when :sveltekit then "npm run check"
+      when :elm       then "./review.sh"
+      else raise "no verify command for stack #{stack.inspect}"
+      end
+    end
+
     def fix_prompt(repo:, branch:, verify_cmd:, regen_only:, build_error: nil)
       lines = []
       lines << "You are in a fresh clone of #{repo} on branch #{branch}."

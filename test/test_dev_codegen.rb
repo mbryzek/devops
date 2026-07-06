@@ -173,6 +173,19 @@ class TestSyncPaths < Minitest::Test
   end
 end
 
+class TestVerifyCmd < Minitest::Test
+  def test_scala_default_is_compile
+    assert_equal "sbt Test/compile", Codegen::Sync.verify_cmd_for(:scala, full_tests: false)
+  end
+  def test_scala_full_tests
+    assert_equal "sbt test", Codegen::Sync.verify_cmd_for(:scala, full_tests: true)
+  end
+  def test_sveltekit_and_elm
+    assert_equal "npm run check", Codegen::Sync.verify_cmd_for(:sveltekit, full_tests: false)
+    assert_equal "./review.sh",   Codegen::Sync.verify_cmd_for(:elm, full_tests: false)
+  end
+end
+
 class TestFixPrompt < Minitest::Test
   def test_prompt_includes_core_directives
     p = Codegen::Sync.fix_prompt(repo: "rallyd", branch: "codegen-sync",
