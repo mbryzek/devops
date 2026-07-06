@@ -1123,10 +1123,12 @@ def run_repo(name, workdir, stack, opts, &announce)
   branch_ok, branch_out = run_step(["git", "checkout", "-B", CODEGEN_BRANCH, "FETCH_HEAD"], clone, false, +"")
   return { status: :error, error: "branch checkout failed: #{branch_out}" } unless branch_ok
 
-  cfg = safe_load_api_config(clone)
-  return { status: :error, error: "no usable .api/config.pkl" } unless cfg
+  # Load the config purely to validate it parses — a repo whose .api/config.pkl
+  # is broken should error rather than silently regenerate nothing. The wipe
+  # itself is marker-driven and needs no config.
+  return { status: :error, error: "no usable .api/config.pkl" } unless safe_load_api_config(clone)
 
-  wiped = Codegen::Sync.generated_paths(clone, cfg).each { |p| File.delete(p) if File.exist?(p) }
+  wiped = Codegen::Sync.generated_paths(clone).each { |p| File.delete(p) if File.exist?(p) }
   note.call("wiped #{wiped.length} generated file(s)")
 
   # For a backend, bare `api` uploads specs to the shared registry AND
@@ -1177,7 +1179,12 @@ def spawn_claude(clone, prompt)
   # group — including grandchildren like `gh pr create`/`git push` that could
   # otherwise outlive the direct child and still push/open a PR after we've
   # already recorded :needs_attention.
-  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", prompt, chdir: clone, pgroup: true)
+  # --dangerously-skip-permissions: a headless `claude --print` session has no
+  # human to answer permission prompts, so without it every Bash/Edit/gh call is
+  # blocked and the session does nothing (no commit, no push, no PR). It runs in
+  # a throwaway clone and only ever pushes the codegen-sync branch, so the blast
+  # radius is bounded.
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions", prompt, chdir: clone, pgroup: true)
   stdin.close
   pid = wait_thr.pid
 
