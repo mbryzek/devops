@@ -4,12 +4,19 @@ require 'fileutils'
 require 'io/console'
 require 'json'
 require 'open3'
+require 'set'
+require 'timeout'
 require 'uri'
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
 $LOAD_PATH.unshift(File.expand_path('~/code/claude/lib'))
 require 'work/registry'
+
+$LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
+require 'codegen/api_config'
+require 'codegen/graph'
+require 'codegen/sync'
 
 # Single source of truth for each command's invocation line, keyed by the command
 # path. The same string is interpolated into the USAGE block below and shown
@@ -32,6 +39,7 @@ INVOCATIONS = {
   "aidirs prune"        => 'aidirs prune [--days N] [--apply] [--trash]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
+  "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -119,6 +127,15 @@ USAGE = <<~USAGE
         --keep-tmp-dir is passed; it is always kept if any repo fails so output
         can be inspected. Quiet by default; use --verbose to stream full output.
 
+    #{INVOCATIONS["codegen sync"]}
+        Regenerate every codegen-consuming repo against the latest generator and
+        registry, opening a review-ready PR per repo that changes. Backends
+        (platform, acumen) upload their specs and regenerate first, serially;
+        consumers regenerate in parallel. `sync` is the default subcommand.
+        --dry-run reports diffs without spawning Claude or opening PRs;
+        --regen-only opens draft PRs but skips the review-completion workflow;
+        --full-tests runs the full Scala suite instead of Test/compile.
+
     scripts [list]
         List utility scripts in devops/scripts/ with their allowed targets and
         a one-line description. `list` is the default when no subcommand given.
@@ -156,7 +173,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts].freeze
+COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts codegen].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
@@ -166,6 +183,7 @@ SUBCOMMANDS = {
   "aidirs"       => %w[prune],
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
+  "codegen"      => %w[sync],
 }.freeze
 
 def levenshtein(a, b)
@@ -938,6 +956,372 @@ def parse_pending_release_args(args)
   [app_filter, concurrency]
 end
 
+def parse_codegen_sync_args(argv)
+  opts = { app: nil, concurrency: 4, dry_run: false, regen_only: false, full_tests: false }
+  args = argv.dup
+  until args.empty?
+    case (a = args.shift)
+    when "--app"
+      opts[:app] = args.shift or usage_exit("--app requires a value", example: usage_for("codegen sync"))
+    when "--concurrency"
+      n = args.shift.to_i
+      usage_exit("--concurrency must be a positive integer", example: usage_for("codegen sync")) if n < 1
+      opts[:concurrency] = n
+    when "--dry-run"    then opts[:dry_run] = true
+    when "--regen-only" then opts[:regen_only] = true
+    when "--full-tests" then opts[:full_tests] = true
+    else usage_exit("unknown option #{a}", example: usage_for("codegen sync"))
+    end
+  end
+  opts
+end
+
+CODEGEN_DEVOPS_REPO = "mbryzek/devops".freeze
+CODEGEN_BRANCH = "codegen-sync".freeze
+CODEGEN_STACKS = %i[scala elm sveltekit].freeze
+CODEGEN_CLAUDE_TIMEOUT_SECS = 20 * 60
+
+def github_origin(repo_slug)
+  "git@github.com:#{repo_slug}.git"
+end
+
+# Every repo's `.api/config.pkl` does `amends "../../devops/..."`, resolved
+# relative to the file's own path two directories up. That's the shape of a
+# normal checkout (`~/code/<repo>/.api/config.pkl`, with `devops` a sibling of
+# `<repo>` under `~/code`). A scratch clone at `<workdir>/<repo>/.api/config.pkl`
+# needs the same shape one level in: `devops` cloned as a sibling of every repo
+# clone, i.e. at `<workdir>/devops` — NOT the real `~/code/devops` (verified via
+# `pkl eval`: the amends is a plain relative-path resolution against the config
+# file's own location, so a workdir nested under `~/code` does not reach the
+# real `~/code/devops`). Cloned fresh from GitHub main every run — including a
+# same-date rerun that reuses `workdir` — so the sweep never drives codegen off
+# a stale sibling left over from a prior run; `clone_repo` wipes any existing
+# dir before cloning.
+def ensure_codegen_devops(workdir)
+  captured = +""
+  clone_path = clone_repo(github_origin(CODEGEN_DEVOPS_REPO), "devops", workdir, false, captured)
+  Util.exit_with_error("codegen sync: failed to clone devops into #{workdir}:\n#{captured}") unless clone_path
+  clone_path
+end
+
+# `Codegen::ApiConfig.load` runs `pkl eval` under the hood (via the top-level
+# `ApiConfig` class), which calls `Util.exit_with_error` (hard `exit 1`) on any
+# parse failure. That's fine for a single-repo CLI invocation but would abort
+# the entire multi-repo sweep here — one repo's bad pkl state shouldn't take
+# down every other repo's run. Rescue both the raised SystemExit and any
+# StandardError and treat it as "no config for this repo" instead.
+def safe_load_api_config(clone_path)
+  Codegen::ApiConfig.load(clone_path)
+rescue SystemExit, StandardError => e
+  warn "codegen sync: failed to parse #{clone_path}/.api/config.pkl: #{e.message}"
+  nil
+end
+
+# Which registry apps to clone + parse for this run. A single-consumer `--app`
+# needs nothing else (its own `.api/config.pkl` fully determines its stack and
+# generators). A single-backend `--app` needs every consumer candidate cloned
+# too, so `Codegen::Graph` can compute which consumers actually depend on it
+# (a consumer's dependency on a backend is only knowable from the consumer's
+# own parsed `consumed_names`, which requires cloning the consumer). No `--app`
+# (full sweep) needs everything.
+def codegen_clone_set(target, eligible)
+  return eligible if target.nil?
+  return [target] if target.stack != :scala
+  [target] + eligible.reject { |a| a.stack == :scala }
+end
+
+# Resolves `--app` against the eligible (non-ignored, scala/elm/sveltekit)
+# registry apps. nil means "no filter" (full sweep). Exits with a clear error
+# if the name matches neither a backend nor a consumer.
+def resolve_codegen_target(app_filter, eligible)
+  return nil if app_filter.nil?
+  target = eligible.find { |a| a.name == app_filter }
+  return target if target
+  Util.exit_with_error(
+    "codegen sync: '#{app_filter}' is not an eligible app. " \
+    "Eligible: #{eligible.map(&:name).sort.join(', ')}"
+  )
+end
+
+# Given the resolved target (nil = full sweep, or an eligible registry App with
+# #name/#stack) and the built graph, returns the ordered run plan:
+#   { backends: [sorted names], consumers: [sorted names], run_names: [...] }
+# Full sweep runs all backends then all consumers. A scala (backend) target runs
+# that backend plus only the consumers that depend on it. A consumer target runs
+# just that consumer (empty if it isn't in the graph).
+def codegen_run_plan(target, graph)
+  run_names =
+    if target.nil?
+      graph.backends + graph.consumers
+    elsif target.stack == :scala
+      [target.name] + graph.consumers.select { |c| graph.depends_on(c).include?(target.name) }
+    else
+      [target.name] & (graph.backends + graph.consumers)
+    end
+  {
+    backends: (run_names & graph.backends).sort,
+    consumers: (run_names & graph.consumers).sort,
+    run_names: run_names,
+  }
+end
+
+# Generic concurrency-capped worker pool, modeled directly on `release_concurrent`
+# (Queue + fixed-size Thread pool, `pop(true) rescue nil` to drain without
+# blocking) but generic over the per-name block instead of hardcoding
+# `release_one`, since codegen's per-repo work (`run_repo`) has a different
+# signature. Returns { name => block-result }.
+def run_concurrent(names, concurrency)
+  results = {}
+  return results if names.empty?
+  mutex = Mutex.new
+  queue = Queue.new
+  names.each { |n| queue << n }
+  workers = Array.new([concurrency, names.length].min) do
+    Thread.new do
+      while (name = (queue.pop(true) rescue nil))
+        mutex.synchronize { puts "  #{name} [starting]" }
+        result =
+          begin
+            yield name
+          rescue => e
+            { status: :error, error: "worker crashed: #{e.class}: #{e.message}" }
+          end
+        mutex.synchronize do
+          results[name] = result
+          puts "  #{name} [#{result[:status]}]"
+        end
+      end
+    end
+  end
+  workers.each(&:join)
+  results
+end
+
+# Deterministic, mechanical pass for one repo: branch, wipe generated files,
+# rerun `api`, classify the diff. Only reaches for Claude if there's an actual
+# diff and the caller isn't in --dry-run.
+def run_repo(name, workdir, stack, opts)
+  clone = File.join(workdir, name)
+
+  # A depth-1 clone only sees the default branch tip — a leftover remote
+  # codegen-sync branch from a prior (possibly aborted) run is invisible to
+  # `git branch`/`git status` here. Without this check, Claude's force-push
+  # (per fix_prompt) would silently clobber whatever's already on that remote
+  # branch. --dry-run never pushes, so it's exempt.
+  unless opts[:dry_run]
+    _, ls_remote_out = run_step(["git", "ls-remote", "--heads", "origin", CODEGEN_BRANCH], clone, false, +"")
+    return { status: :needs_attention, error: "origin already has a #{CODEGEN_BRANCH} branch — resolve manually before re-running" } if Codegen::Sync.remote_branch_exists?(ls_remote_out)
+  end
+
+  # Fetch origin/main fresh and branch off FETCH_HEAD rather than trusting the
+  # shallow clone's default-branch tip: a clone made earlier in a long sweep
+  # (or reused across a rerun) can otherwise serve a stale main.
+  fetch_ok, fetch_out = run_step(["git", "fetch", "--depth=1", "origin", "main"], clone, false, +"")
+  return { status: :error, error: "fetch origin main failed: #{fetch_out}" } unless fetch_ok
+
+  branch_ok, branch_out = run_step(["git", "checkout", "-B", CODEGEN_BRANCH, "FETCH_HEAD"], clone, false, +"")
+  return { status: :error, error: "branch checkout failed: #{branch_out}" } unless branch_ok
+
+  cfg = safe_load_api_config(clone)
+  return { status: :error, error: "no usable .api/config.pkl" } unless cfg
+
+  Codegen::Sync.generated_paths(clone, cfg).each { |p| File.delete(p) if File.exist?(p) }
+
+  # For a backend, bare `api` uploads specs to the shared registry AND
+  # regenerates — --dry-run must never mutate the shared registry, so it runs
+  # codegen only. For a consumer `api` is already codegen-only, so this is a
+  # no-op change for that case.
+  api_cmd = opts[:dry_run] ? ["api", "codegen"] : ["api"]
+  log = +""
+  api_ok, _ = run_step(api_cmd, clone, false, log)
+  return { status: :error, error: "api failed: #{log.strip}" } unless api_ok
+
+  porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
+  return { status: :in_sync } if Codegen::Sync.classify_diff(porcelain) == :in_sync
+  return { status: :changed, note: "diff only (dry-run)" } if opts[:dry_run]
+
+  verify = Codegen::Sync.verify_cmd_for(stack, full_tests: opts[:full_tests])
+  prompt = Codegen::Sync.fix_prompt(repo: name, branch: CODEGEN_BRANCH,
+                                    verify_cmd: verify, regen_only: opts[:regen_only])
+  spawn_claude(clone, prompt)
+rescue => e
+  { status: :error, error: "run_repo crashed: #{e.class}: #{e.message}" }
+end
+
+# Thin integration glue: run a fresh Claude session in `clone` to make the
+# regenerated repo build, commit, and open a draft PR (per the prompt built by
+# `Codegen::Sync.fix_prompt`). Bounded by a timeout so one stuck repo can't hang
+# the whole sweep. On timeout/failure the clone + branch are left in place
+# (never deleted) so a human can pick up where Claude left off.
+#
+# Deliberately NOT `Open3.capture2e`/block-form `popen2e`: both wait on the
+# child internally (capture2e blocks until exit; popen2e's block form runs a
+# `wait_thr.join` in its `ensure`, which fires *before* our `rescue
+# Timeout::Error` regains control) — a `Timeout.timeout` wrapped around either
+# would unwind our Ruby frame while the orphaned `claude` process keeps running
+# in the background, free to push/open a PR after we've already recorded
+# :needs_attention. Instead we open the pipes ourselves, capture the pid before
+# the blocking read, and on timeout kill the process directly.
+def spawn_claude(clone, prompt)
+  # pgroup: true makes the spawned `claude` process its own process group
+  # leader (its pid == its pgid), so killing -pid on timeout signals the whole
+  # group — including grandchildren like `gh pr create`/`git push` that could
+  # otherwise outlive the direct child and still push/open a PR after we've
+  # already recorded :needs_attention.
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", prompt, chdir: clone, pgroup: true)
+  stdin.close
+  pid = wait_thr.pid
+
+  output =
+    begin
+      Timeout.timeout(CODEGEN_CLAUDE_TIMEOUT_SECS) { out_err.read }
+    rescue Timeout::Error
+      begin
+        Process.kill("TERM", -pid)
+      rescue Errno::ESRCH
+      end
+      begin
+        Process.kill("KILL", -pid)
+      rescue Errno::ESRCH
+      end
+      return { status: :needs_attention, error: "claude --print timed out after #{CODEGEN_CLAUDE_TIMEOUT_SECS}s (clone left at #{clone}); process killed" }
+    ensure
+      out_err.close unless out_err.closed?
+    end
+
+  status = wait_thr.value
+  unless status.success?
+    return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{output}" }
+  end
+
+  pr_url = output[%r{https://github\.com/\S+/pull/\d+}]
+  return { status: :needs_attention, error: "claude finished but no PR URL found in output (clone left at #{clone})" } unless pr_url
+
+  { status: :pr_opened, pr_url: pr_url }
+end
+
+
+# Pure, testable seam: one sorted [name, status_string, pr_url_or_dash] row per
+# repo, shared by both the human-readable printer below and the
+# machine-readable JSON writer so they can never drift out of agreement.
+def codegen_status_rows(results)
+  results.keys.sort.map do |name|
+    r = results[name]
+    [name, r[:status].to_s, r[:pr_url] || "-"]
+  end
+end
+
+def print_codegen_summary(results)
+  puts ""
+  puts Util.underline("codegen sync summary")
+  if results.empty?
+    puts "  (no apps processed)"
+    return
+  end
+  codegen_status_rows(results).each do |name, status, pr_url|
+    r = results[name]
+    line = +"  #{name} [#{status}]"
+    line << " #{pr_url}" unless pr_url == "-"
+    line << " (#{r[:note]})" if r[:note]
+    line << " - #{r[:error]}" if r[:error]
+    puts line
+  end
+end
+
+# Writes codegen-sync-status.json into workdir: an array of
+# {repo, status, pr_url, error} objects (pr_url/error may be nil) for
+# openclaw's morning briefing to consume.
+def write_codegen_status_json(workdir, results)
+  data = results.keys.sort.map do |name|
+    r = results[name]
+    { repo: name, status: r[:status].to_s, pr_url: r[:pr_url], error: r[:error] }
+  end
+  File.write(File.join(workdir, "codegen-sync-status.json"), JSON.pretty_generate(data))
+end
+
+def cmd_codegen_sync(argv)
+  opts = parse_codegen_sync_args(argv)
+  registry = Work::Registry.load
+  date = ENV["CODEGEN_SYNC_DATE"] || Time.now.strftime("%Y%m%d")
+  workdir = File.expand_path("~/code/codegen-sync.#{date}")
+  FileUtils.mkdir_p(workdir)
+  ensure_codegen_devops(workdir)
+
+  eligible = registry.apps.reject(&:ignored).select { |a| CODEGEN_STACKS.include?(a.stack) }
+  target = resolve_codegen_target(opts[:app], eligible)
+  to_clone = codegen_clone_set(target, eligible)
+
+  puts "Working in #{workdir}"
+  puts "Cloning #{to_clone.length} repo(s): #{to_clone.map(&:name).sort.join(', ')}"
+  puts ""
+
+  configs = {}
+  to_clone.each do |app|
+    clone_path = clone_repo(github_origin(app.repo), app.name, workdir, false, +"")
+    if clone_path && File.exist?(File.join(clone_path, ".api", "config.pkl"))
+      cfg = safe_load_api_config(clone_path)
+      configs[app.name] = cfg if cfg
+    end
+    next if configs.key?(app.name)
+
+    # A backend (scala) that silently drops out of `configs` vanishes from
+    # `graph.backends` too (Graph.build filters on configs.key?) — the sweep
+    # would print an empty summary with no error while consumers regenerate
+    # against a registry missing that backend's specs. Fatal. A consumer
+    # failing the same way is expected/handled: Graph.build already excludes
+    # it from `graph.consumers`, so just warn and move on.
+    if app.stack == :scala
+      Util.exit_with_error(
+        "codegen sync: backend '#{app.name}' has no usable .api/config.pkl " \
+        "(clone failed, missing file, or parse error) — aborting sweep"
+      )
+    else
+      warn "codegen sync: skipping '#{app.name}' — no usable .api/config.pkl (clone failed, missing file, or parse error)"
+    end
+  end
+
+  graph = Codegen::Graph.build(apps: to_clone, configs: configs)
+
+  plan = codegen_run_plan(target, graph)
+  if target && plan[:run_names].empty?
+    Util.exit_with_error("codegen sync: '#{target.name}' has no usable .api/config.pkl — nothing to run")
+  end
+  backend_names = plan[:backends]
+  consumer_names = plan[:consumers]
+  results = {}
+
+  unless backend_names.empty?
+    puts Util.underline("Backends (serial)")
+    backend_names.each { |name| results[name] = run_repo(name, workdir, :scala, opts) }
+    puts ""
+  end
+
+  unless consumer_names.empty?
+    puts Util.underline("Consumers (concurrency=#{opts[:concurrency]})")
+    consumer_stacks = registry.apps.each_with_object({}) { |a, h| h[a.name] = a.stack }
+    # A consumer that regenerates against a registry missing a failed backend's
+    # freshly-uploaded specs would be regenerating against stale/incomplete
+    # data — skip it rather than run codegen on a bad premise.
+    # Gate on :error only. A backend ending :needs_attention either already
+    # uploaded its specs (api runs before spawn_claude) or never touched the
+    # registry (pre-existing-branch guard fired before api) — consumers are
+    # safe either way, so do NOT skip them for :needs_attention.
+    failed_backends = backend_names.select { |b| results[b] && results[b][:status] == :error }.to_set
+    results.merge!(run_concurrent(consumer_names, opts[:concurrency]) do |name|
+      bad = graph.depends_on(name).select { |d| failed_backends.include?(d) }
+      if bad.empty?
+        run_repo(name, workdir, consumer_stacks.fetch(name), opts)
+      else
+        { status: :skipped, error: "skipped: dependency backend(s) failed: #{bad.join(', ')}" }
+      end
+    end)
+    puts ""
+  end
+
+  print_codegen_summary(results)
+  write_codegen_status_json(workdir, results)
+end
+
 def release_one(name)
   dir = File.expand_path("~/code/#{name}")
   return { ok: false, log: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
@@ -1434,6 +1818,17 @@ def cmd_aidirs_prune(args)
   end
 end
 
+# Shared shallow-clone-into-workdir idiom used by both `browserslist update`
+# and `codegen sync`: wipe any stale directory left from a prior run, then
+# `git clone --depth=1 --quiet`. Returns the clone path on success, nil on
+# failure (caller decides how to report/log it).
+def clone_repo(origin, name, workdir, verbose, captured)
+  clone_path = File.join(workdir, name)
+  FileUtils.rm_rf(clone_path) if File.directory?(clone_path)
+  ok, _ = run_step(["git", "clone", "--depth=1", "--quiet", origin, clone_path], workdir, verbose, captured)
+  ok ? clone_path : nil
+end
+
 def cmd_browserslist_update(args)
   verbose = false
   keep_tmp = false
@@ -1500,15 +1895,9 @@ def cmd_browserslist_update(args)
       next
     end
 
-    clone_path = File.join(workdir, name)
     captured = +""
-
-    if File.directory?(clone_path)
-      FileUtils.rm_rf(clone_path)
-    end
-
-    ok, _ = run_step(["git", "clone", "--depth=1", "--quiet", origin, clone_path], workdir, verbose, captured)
-    unless ok
+    clone_path = clone_repo(origin, name, workdir, verbose, captured)
+    unless clone_path
       failures << "#{name} (clone failed)"
       logs[name] = captured unless verbose
       report_repo_line(name, "FAIL", "git clone", verbose)
@@ -1842,6 +2231,12 @@ when "aidirs"
   when "prune" then cmd_aidirs_prune(argv)
   when nil     then require_subcommand("aidirs")
   else              unknown("aidirs subcommand", sub, SUBCOMMANDS["aidirs"])
+  end
+when "codegen"
+  sub = resolve_subcommand(argv, default: "sync")
+  case sub
+  when "sync" then cmd_codegen_sync(argv)
+  else             unknown("codegen subcommand", sub, SUBCOMMANDS["codegen"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")
