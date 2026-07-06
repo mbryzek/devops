@@ -47,53 +47,36 @@ class TestCodegenApiConfig < Minitest::Test
     ApiConfig::Block.new(org: "bryzek", group: group, generators: gens, attributes: {}, applications: apps)
   end
 
-  def test_backend_block_is_produced
+  def test_app_names_and_target_dirs_collected_across_blocks
     cfg = Codegen::ApiConfig.from_blocks([
       block([gen("play_controller", "api/app/generated"), gen("bryzek_play_client", "generated/app")],
             [app("platform"), app("rallyd-api")]),
+      block([gen("typescript", "./src/generated")], [app("acumen-api")]),
     ])
-    assert_includes cfg.produced_names, "platform"
-    assert_includes cfg.produced_names, "rallyd-api"
-    assert_empty cfg.consumed_names
+    assert_equal Set["platform", "rallyd-api", "acumen-api"], cfg.app_names
     assert_includes cfg.target_dirs, "api/app/generated"
     assert_includes cfg.target_dirs, "generated/app"
-  end
-
-  def test_typescript_block_is_consumed
-    cfg = Codegen::ApiConfig.from_blocks([
-      block([gen("typescript", "./src/generated")], [app("platform"), app("rallyd-api")]),
-    ])
-    assert_includes cfg.consumed_names, "platform"
-    assert_includes cfg.consumed_names, "rallyd-api"
-    assert_empty cfg.produced_names
     assert_includes cfg.target_dirs, "./src/generated"
   end
 
-  # Regression: Elm frontends generate with `elm_v2` (NOT bare `elm`). A stale
-  # CLIENT_KEYS misclassified them as producers, emptying consumed_names and
-  # dropping their backend dependency edges (acumen-ui → acumen, etc.).
-  def test_elm_v2_block_is_consumed
-    cfg = Codegen::ApiConfig.from_blocks([
-      block([gen("elm_v2", "./src/generated")], [app("acumen-api"), app("acumen-view")]),
-    ])
-    assert_includes cfg.consumed_names, "acumen-api"
-    assert_includes cfg.consumed_names, "acumen-view"
-    assert_empty cfg.produced_names
+  # Classification is generator-agnostic: whether a block uses typescript,
+  # elm_v2, play_controller, or a not-yet-invented key, its apps land in
+  # app_names all the same. Role (backend vs consumer) is decided by stack in
+  # Codegen::Graph — the source of truth for generator keys lives in platform's
+  # GeneratorsService, so nothing here needs to know or track them.
+  def test_app_names_are_generator_key_agnostic
+    %w[typescript elm_v2 play_controller elm_v99_future].each do |key|
+      cfg = Codegen::ApiConfig.from_blocks([block([gen(key, "d")], [app("a")])])
+      assert_equal Set["a"], cfg.app_names, "app_names must not depend on generator key #{key}"
+    end
   end
 
-  def test_dao_group_block_with_no_apps
+  def test_dao_group_block_contributes_dirs_but_no_apps
     cfg = Codegen::ApiConfig.from_blocks([
       block([gen("psql_scala", "generated/app"), gen("psql_ddl", "dao/psql")], [], group: "dao"),
     ])
-    assert_empty cfg.produced_names
-    assert_empty cfg.consumed_names
+    assert_empty cfg.app_names
     assert_includes cfg.target_dirs, "dao/psql"
-  end
-
-  def test_empty_generators_block_is_produced_not_consumed
-    cfg = Codegen::ApiConfig.from_blocks([block([], [app("x")])])
-    assert_includes cfg.produced_names, "x"
-    assert_empty cfg.consumed_names
   end
 
   def test_load_against_real_config_shape
@@ -101,7 +84,7 @@ class TestCodegenApiConfig < Minitest::Test
     # .api/config.pkl — a shape regression cannot pass this.
     cfg = Codegen::ApiConfig.load(File.expand_path('..', __dir__))
     refute_empty cfg.target_dirs
-    refute_empty cfg.produced_names
+    refute_empty cfg.app_names
   end
 end
 
@@ -118,11 +101,11 @@ class TestGraph < Minitest::Test
       App.new(name: "no-api",   stack: :sveltekit, ignored: false),
     ]
     configs = {
-      "platform"  => Codegen::ApiConfig.new(produced_names: Set["platform","rallyd-api"], consumed_names: Set[], target_dirs: []),
-      "acumen"    => Codegen::ApiConfig.new(produced_names: Set["acumen"], consumed_names: Set[], target_dirs: []),
-      "rallyd"    => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["platform","rallyd-api"], target_dirs: []),
-      "acumen-ui" => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["acumen"], target_dirs: []),
-      "ignored-x" => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["platform"], target_dirs: []),
+      "platform"  => Codegen::ApiConfig.new(app_names: Set["platform", "rallyd-api"], target_dirs: []),
+      "acumen"    => Codegen::ApiConfig.new(app_names: Set["acumen"], target_dirs: []),
+      "rallyd"    => Codegen::ApiConfig.new(app_names: Set["platform", "rallyd-api"], target_dirs: []),
+      "acumen-ui" => Codegen::ApiConfig.new(app_names: Set["acumen"], target_dirs: []),
+      "ignored-x" => Codegen::ApiConfig.new(app_names: Set["platform"], target_dirs: []),
     }
     Codegen::Graph.build(apps: apps, configs: configs)
   end
@@ -140,9 +123,33 @@ class TestGraph < Minitest::Test
     refute_includes c, "platform"
   end
 
+  # acumen-ui is an :elm consumer — this is the edge the elm/elm_v2 generator-key
+  # bug used to drop. Now that roles come from stack + app-name overlap, it holds
+  # regardless of which generator key acumen-ui uses.
   def test_depends_on_maps_consumer_to_backend
     assert_equal ["platform"], build.depends_on("rallyd")
     assert_equal ["acumen"],   build.depends_on("acumen-ui")
+  end
+
+  # Robustness: a consumer whose config uses a brand-new/unknown generator key
+  # still gets its backend edge, because Graph classifies by stack + app-name
+  # overlap, never by generator key (the failure class of the old allowlist).
+  def test_edge_survives_unknown_generator_key
+    fe_block = ApiConfig::Block.new(
+      org: "bryzek", group: nil,
+      generators: [ApiConfig::Generator.new(key: "elm_v99_future", target: "d", attributes: {})],
+      attributes: {}, applications: [ApiConfig::Application.new(key: "platform", file_path: nil)],
+    )
+    apps = [
+      App.new(name: "platform", stack: :scala, ignored: false),
+      App.new(name: "newfe",    stack: :elm,   ignored: false),
+    ]
+    configs = {
+      "platform" => Codegen::ApiConfig.new(app_names: Set["platform"], target_dirs: []),
+      "newfe"    => Codegen::ApiConfig.from_blocks([fe_block]),
+    }
+    g = Codegen::Graph.build(apps: apps, configs: configs)
+    assert_equal ["platform"], g.depends_on("newfe")
   end
 end
 
@@ -167,7 +174,7 @@ class TestSyncPaths < Minitest::Test
       File.write(File.join(dir, "src/hand/marked.ts"), "line1\n// Generated by API Builder - do not edit\n")
       File.write(File.join(dir, "src/hand/plain.ts"), "just my code\n")
 
-      cfg = Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["x"], target_dirs: ["./src/generated"])
+      cfg = Codegen::ApiConfig.new(app_names: Set["x"], target_dirs: ["./src/generated"])
       paths = Codegen::Sync.generated_paths(dir, cfg)
 
       assert_includes paths, File.join(dir, "src/generated/a.ts")      # via target dir
@@ -180,7 +187,7 @@ class TestSyncPaths < Minitest::Test
     Dir.mktmpdir do |dir|
       FileUtils.mkdir_p(File.join(dir, "src/generated"))
       File.write(File.join(dir, "src/generated/a.ts"), "// Generated by API Builder\n") # matches BOTH branches
-      cfg = Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["x"], target_dirs: ["./src/generated"])
+      cfg = Codegen::ApiConfig.new(app_names: Set["x"], target_dirs: ["./src/generated"])
       Dir.chdir(File.dirname(dir)) do
         paths = Codegen::Sync.generated_paths(File.basename(dir), cfg)
         assert paths.all? { |p| Pathname.new(p).absolute? }, "expected all absolute: #{paths.inspect}"
@@ -286,10 +293,10 @@ class TestCodegenRunPlan < Minitest::Test
       App.new(name: "no-api",    stack: :sveltekit,  ignored: false),
     ]
     configs = {
-      "platform"  => Codegen::ApiConfig.new(produced_names: Set["platform", "rallyd-api"], consumed_names: Set[], target_dirs: []),
-      "acumen"    => Codegen::ApiConfig.new(produced_names: Set["acumen"], consumed_names: Set[], target_dirs: []),
-      "rallyd"    => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["platform", "rallyd-api"], target_dirs: []),
-      "acumen-ui" => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["acumen"], target_dirs: []),
+      "platform"  => Codegen::ApiConfig.new(app_names: Set["platform", "rallyd-api"], target_dirs: []),
+      "acumen"    => Codegen::ApiConfig.new(app_names: Set["acumen"], target_dirs: []),
+      "rallyd"    => Codegen::ApiConfig.new(app_names: Set["platform", "rallyd-api"], target_dirs: []),
+      "acumen-ui" => Codegen::ApiConfig.new(app_names: Set["acumen"], target_dirs: []),
     }
     Codegen::Graph.build(apps: apps, configs: configs)
   end

@@ -1021,9 +1021,9 @@ end
 # needs nothing else (its own `.api/config.pkl` fully determines its stack and
 # generators). A single-backend `--app` needs every consumer candidate cloned
 # too, so `Codegen::Graph` can compute which consumers actually depend on it
-# (a consumer's dependency on a backend is only knowable from the consumer's
-# own parsed `consumed_names`, which requires cloning the consumer). No `--app`
-# (full sweep) needs everything.
+# (a consumer's dependency on a backend is only knowable by intersecting the
+# consumer's parsed `app_names` with the backend's, which requires cloning the
+# consumer). No `--app` (full sweep) needs everything.
 def codegen_clone_set(target, eligible)
   return eligible if target.nil?
   return [target] if target.stack != :scala
@@ -1100,8 +1100,9 @@ end
 # Deterministic, mechanical pass for one repo: branch, wipe generated files,
 # rerun `api`, classify the diff. Only reaches for Claude if there's an actual
 # diff and the caller isn't in --dry-run.
-def run_repo(name, workdir, stack, opts)
+def run_repo(name, workdir, stack, opts, &announce)
   clone = File.join(workdir, name)
+  note = ->(msg) { announce&.call(msg) }
 
   # A depth-1 clone only sees the default branch tip — a leftover remote
   # codegen-sync branch from a prior (possibly aborted) run is invisible to
@@ -1125,13 +1126,21 @@ def run_repo(name, workdir, stack, opts)
   cfg = safe_load_api_config(clone)
   return { status: :error, error: "no usable .api/config.pkl" } unless cfg
 
-  Codegen::Sync.generated_paths(clone, cfg).each { |p| File.delete(p) if File.exist?(p) }
+  wiped = Codegen::Sync.generated_paths(clone, cfg).each { |p| File.delete(p) if File.exist?(p) }
+  note.call("wiped #{wiped.length} generated file(s)")
 
   # For a backend, bare `api` uploads specs to the shared registry AND
   # regenerates — --dry-run must never mutate the shared registry, so it runs
   # codegen only. For a consumer `api` is already codegen-only, so this is a
   # no-op change for that case.
   api_cmd = opts[:dry_run] ? ["api", "codegen"] : ["api"]
+  note.call(
+    if stack == :scala && !opts[:dry_run]
+      "running api (uploading specs to the registry + regenerating — can take a few minutes)…"
+    else
+      "running api (regenerating client)…"
+    end
+  )
   log = +""
   api_ok, _ = run_step(api_cmd, clone, false, log)
   return { status: :error, error: "api failed: #{log.strip}" } unless api_ok
@@ -1256,7 +1265,8 @@ def cmd_codegen_sync(argv)
   puts ""
 
   configs = {}
-  to_clone.each do |app|
+  to_clone.each_with_index do |app, i|
+    puts "  [#{i + 1}/#{to_clone.length}] cloning #{app.name}…"
     clone_path = clone_repo(github_origin(app.repo), app.name, workdir, false, +"")
     if clone_path && File.exist?(File.join(clone_path, ".api", "config.pkl"))
       cfg = safe_load_api_config(clone_path)
@@ -1292,7 +1302,12 @@ def cmd_codegen_sync(argv)
 
   unless backend_names.empty?
     puts Util.underline("Backends (serial)")
-    backend_names.each { |name| results[name] = run_repo(name, workdir, :scala, opts) }
+    backend_names.each do |name|
+      puts "  #{name}:"
+      r = run_repo(name, workdir, :scala, opts) { |msg| puts "    #{msg}" }
+      results[name] = r
+      report_repo_line(name, r[:status], r[:error] || r[:note], false)
+    end
     puts ""
   end
 
