@@ -257,3 +257,61 @@ class TestCodegenSummary < Minitest::Test
     end
   end
 end
+
+class TestCodegenRunPlan < Minitest::Test
+  App = Struct.new(:name, :stack, :ignored, keyword_init: true)
+  Target = Struct.new(:name, :stack, keyword_init: true)
+
+  # Two backends (platform, acumen), two consumers each tied to a DIFFERENT
+  # backend (rallyd -> platform, acumen-ui -> acumen), plus one consumer
+  # candidate ("no-api") with no parsed config so it never enters the graph.
+  def build
+    apps = [
+      App.new(name: "platform",  stack: :scala,     ignored: false),
+      App.new(name: "acumen",    stack: :scala,      ignored: false),
+      App.new(name: "rallyd",    stack: :sveltekit,  ignored: false),
+      App.new(name: "acumen-ui", stack: :elm,        ignored: false),
+      App.new(name: "no-api",    stack: :sveltekit,  ignored: false),
+    ]
+    configs = {
+      "platform"  => Codegen::ApiConfig.new(produced_names: Set["platform", "rallyd-api"], consumed_names: Set[], target_dirs: []),
+      "acumen"    => Codegen::ApiConfig.new(produced_names: Set["acumen"], consumed_names: Set[], target_dirs: []),
+      "rallyd"    => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["platform", "rallyd-api"], target_dirs: []),
+      "acumen-ui" => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["acumen"], target_dirs: []),
+    }
+    Codegen::Graph.build(apps: apps, configs: configs)
+  end
+
+  def test_full_sweep_runs_every_backend_and_consumer
+    plan = codegen_run_plan(nil, build)
+    assert_equal %w[acumen platform], plan[:backends]
+    assert_equal %w[acumen-ui rallyd], plan[:consumers]
+    assert_equal %w[acumen acumen-ui platform rallyd].sort, plan[:run_names].sort
+  end
+
+  def test_consumer_target_runs_only_itself
+    target = Target.new(name: "rallyd", stack: :sveltekit)
+    plan = codegen_run_plan(target, build)
+    assert_empty plan[:backends]
+    assert_equal ["rallyd"], plan[:consumers]
+    refute_empty plan[:run_names]
+  end
+
+  def test_backend_target_runs_itself_plus_only_dependent_consumers
+    target = Target.new(name: "platform", stack: :scala)
+    plan = codegen_run_plan(target, build)
+    assert_equal ["platform"], plan[:backends]
+    # rallyd depends on platform -> included. acumen-ui depends on acumen
+    # (a DIFFERENT backend) -> must be excluded, proving the dependency filter works.
+    assert_equal ["rallyd"], plan[:consumers]
+    refute_includes plan[:consumers], "acumen-ui"
+  end
+
+  def test_consumer_target_not_in_graph_yields_empty_plan
+    target = Target.new(name: "no-api", stack: :sveltekit)
+    plan = codegen_run_plan(target, build)
+    assert_empty plan[:backends]
+    assert_empty plan[:consumers]
+    assert_empty plan[:run_names]
+  end
+end

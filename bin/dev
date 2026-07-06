@@ -1048,6 +1048,28 @@ def resolve_codegen_target(app_filter, eligible)
   )
 end
 
+# Given the resolved target (nil = full sweep, or an eligible registry App with
+# #name/#stack) and the built graph, returns the ordered run plan:
+#   { backends: [sorted names], consumers: [sorted names], run_names: [...] }
+# Full sweep runs all backends then all consumers. A scala (backend) target runs
+# that backend plus only the consumers that depend on it. A consumer target runs
+# just that consumer (empty if it isn't in the graph).
+def codegen_run_plan(target, graph)
+  run_names =
+    if target.nil?
+      graph.backends + graph.consumers
+    elsif target.stack == :scala
+      [target.name] + graph.consumers.select { |c| graph.depends_on(c).include?(target.name) }
+    else
+      [target.name] & (graph.backends + graph.consumers)
+    end
+  {
+    backends: (run_names & graph.backends).sort,
+    consumers: (run_names & graph.consumers).sort,
+    run_names: run_names,
+  }
+end
+
 # Generic concurrency-capped worker pool, modeled directly on `release_concurrent`
 # (Queue + fixed-size Thread pool, `pop(true) rescue nil` to drain without
 # blocking) but generic over the per-name block instead of hardcoding
@@ -1265,21 +1287,12 @@ def cmd_codegen_sync(argv)
 
   graph = Codegen::Graph.build(apps: to_clone, configs: configs)
 
-  run_names =
-    if target.nil?
-      graph.backends + graph.consumers
-    elsif target.stack == :scala
-      [target.name] + graph.consumers.select { |c| graph.depends_on(c).include?(target.name) }
-    else
-      [target.name] & (graph.backends + graph.consumers)
-    end
-
-  if target && run_names.empty?
+  plan = codegen_run_plan(target, graph)
+  if target && plan[:run_names].empty?
     Util.exit_with_error("codegen sync: '#{target.name}' has no usable .api/config.pkl — nothing to run")
   end
-
-  backend_names = (run_names & graph.backends).sort
-  consumer_names = (run_names & graph.consumers).sort
+  backend_names = plan[:backends]
+  consumer_names = plan[:consumers]
   results = {}
 
   unless backend_names.empty?
@@ -1294,6 +1307,10 @@ def cmd_codegen_sync(argv)
     # A consumer that regenerates against a registry missing a failed backend's
     # freshly-uploaded specs would be regenerating against stale/incomplete
     # data — skip it rather than run codegen on a bad premise.
+    # Gate on :error only. A backend ending :needs_attention either already
+    # uploaded its specs (api runs before spawn_claude) or never touched the
+    # registry (pre-existing-branch guard fired before api) — consumers are
+    # safe either way, so do NOT skip them for :needs_attention.
     failed_backends = backend_names.select { |b| results[b] && results[b][:status] == :error }.to_set
     results.merge!(run_concurrent(consumer_names, opts[:concurrency]) do |name|
       bad = graph.depends_on(name).select { |d| failed_backends.include?(d) }
