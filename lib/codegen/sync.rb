@@ -17,29 +17,38 @@ module Codegen
       porcelain.to_s.strip.empty? ? :in_sync : :changed
     end
 
-    # True when a single file's unified diff changes ONLY comment (or blank)
-    # lines. The apibuilder generator stamps a fresh `Service version:`
-    # timestamp into every generated file's header comment, so a no-op regen
-    # rewrites all of them; reverting comment-only changes keeps that churn out
-    # of the diff/PR. Returns false for an empty diff (nothing to revert).
-    def comment_only_diff?(diff_text)
-      # Parse hunk-aware: only +/- lines AFTER an `@@` header are content.
-      # (A removed Elm `--` comment renders as `--- …`, which would otherwise
-      # collide with the `---`/`+++` file-header lines that precede any hunk.)
+    # True when a file's unified diff has NO real content change — only comment
+    # and/or whitespace/newline noise. Two sources of noise on a no-op regen:
+    #   1. the apibuilder `Service version:` timestamp in the header comment;
+    #   2. the generator omits the trailing newline that committed files have,
+    #      so the last line shows as `-X` / `+X` for an identical X (with a
+    #      `\ No newline at end of file` marker).
+    # Compares the non-comment, non-blank removed vs added lines after stripping
+    # trailing whitespace; equal multisets ⇒ nothing real changed, so revert.
+    # Returns false for an empty diff.
+    def noise_only_diff?(diff_text)
+      # Hunk-aware: only +/- lines AFTER an `@@` header are content (a removed
+      # Elm `--` comment renders as `--- …`, which must not be confused with the
+      # `---`/`+++` file-header lines that precede any hunk).
+      removed = []
+      added = []
       in_hunk = false
-      changed = []
       diff_text.to_s.each_line do |l|
         if l.start_with?("@@")
           in_hunk = true
-        elsif in_hunk && (l.start_with?("+") || l.start_with?("-"))
-          changed << l
+        elsif in_hunk && l.start_with?("+") && !l.start_with?("+++")
+          added << l[1..].to_s
+        elsif in_hunk && l.start_with?("-") && !l.start_with?("---")
+          removed << l[1..].to_s
         end
       end
-      return false if changed.empty?
-      changed.all? do |l|
-        content = l[1..].to_s.lstrip
-        content.empty? || COMMENT_PREFIXES.any? { |p| content.start_with?(p) }
+      return false if removed.empty? && added.empty?
+      meaningful = lambda do |lines|
+        lines.map(&:rstrip)
+             .reject { |c| c.empty? || COMMENT_PREFIXES.any? { |p| c.lstrip.start_with?(p) } }
+             .sort
       end
+      meaningful.call(removed) == meaningful.call(added)
     end
 
     # URL of the first OPEN PR whose head branch is a codegen-sync branch, given
