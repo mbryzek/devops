@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
 require 'codegen/api_config'
+require 'codegen/graph'
 load File.expand_path('../bin/dev', __dir__)
 
 class TestDevCodegen < Minitest::Test
@@ -85,5 +86,46 @@ class TestCodegenApiConfig < Minitest::Test
     cfg = Codegen::ApiConfig.load(File.expand_path('..', __dir__))
     refute_empty cfg.target_dirs
     refute_empty cfg.produced_names
+  end
+end
+
+class TestGraph < Minitest::Test
+  App = Struct.new(:name, :stack, :ignored, keyword_init: true)
+
+  def build
+    apps = [
+      App.new(name: "platform", stack: :scala, ignored: false),
+      App.new(name: "acumen",   stack: :scala, ignored: false),
+      App.new(name: "rallyd",   stack: :sveltekit, ignored: false),
+      App.new(name: "acumen-ui",stack: :elm, ignored: false),
+      App.new(name: "ignored-x",stack: :sveltekit, ignored: true),
+      App.new(name: "no-api",   stack: :sveltekit, ignored: false),
+    ]
+    configs = {
+      "platform"  => Codegen::ApiConfig.new(produced_names: Set["platform","rallyd-api"], consumed_names: Set[], target_dirs: []),
+      "acumen"    => Codegen::ApiConfig.new(produced_names: Set["acumen"], consumed_names: Set[], target_dirs: []),
+      "rallyd"    => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["platform","rallyd-api"], target_dirs: []),
+      "acumen-ui" => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["acumen"], target_dirs: []),
+      "ignored-x" => Codegen::ApiConfig.new(produced_names: Set[], consumed_names: Set["platform"], target_dirs: []),
+    }
+    Codegen::Graph.build(apps: apps, configs: configs)
+  end
+
+  def test_backends_are_scala_repos_with_config
+    assert_equal %w[acumen platform], build.backends.sort
+  end
+
+  def test_consumers_exclude_ignored_and_configless
+    c = build.consumers
+    assert_includes c, "rallyd"
+    assert_includes c, "acumen-ui"
+    refute_includes c, "ignored-x"
+    refute_includes c, "no-api"
+    refute_includes c, "platform"
+  end
+
+  def test_depends_on_maps_consumer_to_backend
+    assert_equal ["platform"], build.depends_on("rallyd")
+    assert_equal ["acumen"],   build.depends_on("acumen-ui")
   end
 end
