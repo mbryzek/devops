@@ -2,25 +2,23 @@ require 'set'
 require 'api_config'
 
 module Codegen
-  # Derives the codegen-sync view of a repo's .api/config.pkl — which apibuilder
-  # apps it produces vs consumes, and every generator output dir — by wrapping
-  # the existing top-level ApiConfig parser (which already handles the real
-  # `pkl eval -f json` shape: org-keyed blocks, generators as {key => target},
-  # applications as {key => file_path}, plus spec_glob and group).
+  # Derives the codegen-sync view of a repo's .api/config.pkl — every apibuilder
+  # app it references and every generator output dir — by wrapping the existing
+  # top-level ApiConfig parser (which handles the real `pkl eval -f json` shape:
+  # org-keyed blocks, generators as {key => target}, applications as
+  # {key => file_path}, plus spec_glob and group).
+  #
+  # It deliberately does NOT classify generators as client vs server. A repo's
+  # role (a backend that uploads specs vs a frontend that only regenerates a
+  # client) is decided by its STACK in Codegen::Graph. That keeps the whole
+  # feature independent of generator-key names — whose source of truth lives in
+  # platform's GeneratorsService — so a new/renamed generator can never silently
+  # break classification (the failure mode that hid the `elm` vs `elm_v2` bug).
   class ApiConfig
-    # apibuilder client-codegen generator keys — a block that ONLY emits these
-    # means this repo consumes those apps rather than owning them. Must list
-    # every client generator in use across the fleet: `typescript` (svelte/TS
-    # frontends) and `elm_v2` (Elm frontends — note the `_v2`, NOT bare `elm`).
-    # Miss one and that frontend is misclassified as a producer, losing its
-    # dependency edges to the backend (breaks `--app <backend>` + failure gating).
-    CLIENT_KEYS = %w[typescript elm_v2].freeze
+    attr_reader :app_names, :target_dirs
 
-    attr_reader :produced_names, :consumed_names, :target_dirs
-
-    def initialize(produced_names:, consumed_names:, target_dirs:)
-      @produced_names = produced_names
-      @consumed_names = consumed_names
+    def initialize(app_names:, target_dirs:)
+      @app_names = app_names
       @target_dirs = target_dirs
     end
 
@@ -33,17 +31,13 @@ module Codegen
     end
 
     def self.from_blocks(blocks)
-      produced = Set.new
-      consumed = Set.new
+      names = Set.new
       dirs = Set.new
       blocks.each do |block|
-        gens = block.generators
-        dirs.merge(gens.map(&:target).compact)
-        names = block.applications.map(&:key)
-        client = !gens.empty? && gens.all? { |g| CLIENT_KEYS.include?(g.key) }
-        (client ? consumed : produced).merge(names)
+        names.merge(block.applications.map(&:key))
+        dirs.merge(block.generators.map(&:target).compact)
       end
-      new(produced_names: produced, consumed_names: consumed, target_dirs: dirs.to_a)
+      new(app_names: names, target_dirs: dirs.to_a)
     end
   end
 end
