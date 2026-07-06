@@ -983,6 +983,9 @@ CODEGEN_DEVOPS_REPO = "mbryzek/devops".freeze
 CODEGEN_BRANCH_PREFIX = "codegen-sync".freeze
 CODEGEN_STACKS = %i[scala elm sveltekit].freeze
 CODEGEN_CLAUDE_TIMEOUT_SECS = 20 * 60
+# The per-repo sessions do mechanical work (fix compile errors, commit, open a
+# PR), so a cheap/fast model is the right default.
+CODEGEN_CLAUDE_MODEL = "haiku".freeze
 
 def github_origin(repo_slug)
   "git@github.com:#{repo_slug}.git"
@@ -1100,16 +1103,28 @@ def run_concurrent(names, concurrency)
   results
 end
 
-# `git checkout` every modified file whose diff touches only comments, so the
-# apibuilder generator's per-file `Service version:` timestamp churn stays out
-# of the diff. Only modified (M) files are considered — deleted orphans and new
-# files are never comment-only. Returns the count reverted.
-def revert_comment_only_changes(clone)
+# Every dir in the clone that has its own `.api/config.pkl` — `api` must run in
+# each. Some repos have a second one under ./playwright (its own test-client
+# config); the root `api` run does not regenerate those, so without this the
+# wipe would leave playwright/generated files deleted. Root (shortest) first.
+def codegen_api_dirs(clone)
+  Dir.glob(File.join(clone, "**", ".api", "config.pkl"), File::FNM_DOTMATCH)
+     .reject { |p| p.include?("#{File::SEPARATOR}node_modules#{File::SEPARATOR}") }
+     .map { |p| File.dirname(File.dirname(p)) }
+     .uniq
+     .sort_by(&:length)
+end
+
+# `git checkout` every modified file whose diff is only noise — the apibuilder
+# `Service version:` timestamp comment and/or the trailing-newline the generator
+# omits — so a no-op regen stays out of the diff. Only modified (M) files are
+# considered; deleted orphans and new files are never noise. Returns the count.
+def revert_noise_only_changes(clone)
   _, names = run_step(["git", "diff", "--name-only", "--diff-filter=M"], clone, false, +"")
   reverted = 0
   names.to_s.split("\n").map(&:strip).reject(&:empty?).each do |f|
     _, diff = run_step(["git", "diff", "--", f], clone, false, +"")
-    next unless Codegen::Sync.comment_only_diff?(diff)
+    next unless Codegen::Sync.noise_only_diff?(diff)
     run_step(["git", "checkout", "--", f], clone, false, +"")
     reverted += 1
   end
@@ -1161,21 +1176,22 @@ def run_repo(name, workdir, stack, opts, branch, &announce)
   # For a backend, bare `api` uploads specs to the shared registry AND
   # regenerates — --dry-run must never mutate the shared registry, so it runs
   # codegen only. For a consumer `api` is already codegen-only, so this is a
-  # no-op change for that case.
+  # no-op change for that case. Run it in every dir with a .api/config.pkl
+  # (root, plus e.g. ./playwright) so all generated files are recreated — the
+  # wipe deleted them all.
   api_cmd = opts[:dry_run] ? ["api", "codegen"] : ["api"]
-  note.call(
-    if stack == :scala && !opts[:dry_run]
-      "running api (uploading specs to the registry + regenerating — can take a few minutes)…"
-    else
-      "running api (regenerating client)…"
-    end
-  )
-  log = +""
-  api_ok, _ = run_step(api_cmd, clone, false, log)
-  return { status: :error, error: "api failed: #{log.strip}" } unless api_ok
+  api_dirs = codegen_api_dirs(clone)
+  base = stack == :scala && !opts[:dry_run] ? "uploading specs + regenerating (backend — can take a few minutes)" : "regenerating client"
+  note.call("running api in #{api_dirs.length} config dir(s): #{base}…")
+  api_dirs.each do |dir|
+    log = +""
+    ok, _ = run_step(api_cmd, dir, false, log)
+    rel = dir == clone ? "." : dir.sub("#{clone}#{File::SEPARATOR}", "")
+    return { status: :error, error: "api failed in #{rel}: #{log.strip}" } unless ok
+  end
 
-  reverted = revert_comment_only_changes(clone)
-  note.call("reverted #{reverted} comment-only (timestamp) file(s)") if reverted.positive?
+  reverted = revert_noise_only_changes(clone)
+  note.call("reverted #{reverted} no-op (timestamp/whitespace) file(s)") if reverted.positive?
 
   porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
   return { status: :in_sync } if Codegen::Sync.classify_diff(porcelain) == :in_sync
@@ -1214,7 +1230,7 @@ def spawn_claude(clone, prompt)
   # blocked and the session does nothing (no commit, no push, no PR). It runs in
   # a throwaway clone and only ever pushes the codegen-sync branch, so the blast
   # radius is bounded.
-  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions", prompt, chdir: clone, pgroup: true)
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions", "--model", CODEGEN_CLAUDE_MODEL, prompt, chdir: clone, pgroup: true)
   stdin.close
   pid = wait_thr.pid
 
