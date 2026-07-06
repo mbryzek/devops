@@ -53,6 +53,20 @@ class TestApiConfig < Minitest::Test
     assert_equal ["dummy"], block.applications.map(&:key)
   end
 
+  # Regression: `dev codegen sync` parses each cloned repo's config from a cwd
+  # that is NOT the repo (it runs from wherever `dev` was invoked). A spec_glob
+  # must resolve relative to the passed base_dir (the repo), not Dir.pwd — the
+  # bug that made the real sweep abort on the acumen/platform `dao` block.
+  def test_spec_glob_resolves_relative_to_base_dir_not_cwd
+    other = File.expand_path("..", __dir__) # repo root, NOT the fixture dir
+    Dir.chdir(other) do
+      config = ApiConfig.new(FIXTURE, base_dir: File.dirname(FIXTURE))
+      dao = config.blocks.find { |b| b.group == "dao" }
+      refute_nil dao
+      assert_equal ["dummy"], dao.applications.map(&:key)
+    end
+  end
+
   def test_find_target
     assert_equal "generated/app/apibuilder", @config.find_target("apibuilder-spec", "bryzek_play_model")
     assert_equal "rallyd/conf", @config.find_target("rallyd-api", "bryzek_play_routes")

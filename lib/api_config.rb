@@ -1,5 +1,6 @@
 require 'json'
 require 'open3'
+require 'pathname'
 
 class ApiConfig
 
@@ -9,8 +10,16 @@ class ApiConfig
 
   attr_reader :blocks
 
-  def initialize(path = nil)
+  # base_dir is the directory that spec_glob patterns resolve against. It
+  # defaults to Dir.pwd so callers running from a repo root (the `api` command)
+  # are unaffected. Callers that parse a config for a repo other than the
+  # current working directory (e.g. `dev codegen sync`, which parses cloned
+  # repos from an unrelated cwd) MUST pass the repo dir explicitly — otherwise a
+  # spec_glob like "dao/spec/*.json" resolves against the wrong tree. Passing it
+  # (rather than Dir.chdir) keeps parsing thread-safe for parallel callers.
+  def initialize(path = nil, base_dir: nil)
     path ||= File.join(Dir.pwd, ".api", "config.pkl")
+    @base_dir = base_dir || Dir.pwd
     if !File.exist?(path)
       Util.exit_with_error("No .api/config.pkl found at #{path}")
     end
@@ -115,13 +124,17 @@ class ApiConfig
   end
 
   def parse_spec_glob(glob)
-    files = Dir.glob(glob).sort
+    base = Pathname.new(@base_dir)
+    files = Dir.glob(File.join(@base_dir, glob)).sort
     if files.empty?
-      Util.exit_with_error("spec_glob '#{glob}' matched no files")
+      Util.exit_with_error("spec_glob '#{glob}' matched no files (relative to #{@base_dir})")
     end
     files.map do |path|
       key = File.basename(path, ".json")
-      Application.new(key: key, file_path: path)
+      # Keep file_path relative to base_dir so values are identical to the
+      # historical cwd-relative behavior when base_dir == the repo root.
+      file_path = Pathname.new(path).relative_path_from(base).to_s
+      Application.new(key: key, file_path: file_path)
     end
   end
 
