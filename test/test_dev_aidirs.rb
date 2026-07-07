@@ -7,9 +7,11 @@ load File.expand_path('../bin/dev', __dir__)
 # Covers `dev ai prune`'s classification: which ~/code/ai feature dirs are safe to
 # delete. The rule is "keep unless proven disposable" — a dir is deleted only when
 # every real git repo inside is clean AND either fully pushed or its branch's PR is
-# merged/closed. Recent activity, uncommitted changes, and local-only commits with
-# no merged/closed PR all protect a dir. gh is stubbed via the injected pr_state so
-# no network is touched; git state is exercised against real temp repos.
+# merged/closed. A merged/closed PR OVERRIDES recency (landed work is deleted even
+# if touched today); recency only shields dirs with no merged PR and nothing local
+# at risk. Uncommitted changes and local-only commits with no merged/closed PR
+# always protect a dir. gh is stubbed via the injected pr_state so no network is
+# touched; git state is exercised against real temp repos.
 class TestDevAidirs < Minitest::Test
   # cutoff far in the future => every temp dir counts as "modified within cutoff",
   # so pass PAST to reach the git checks and FUTURE to assert the recency guard.
@@ -114,15 +116,38 @@ class TestDevAidirs < Minitest::Test
   end
 
   # ---- recency guard ----
+  #
+  # A merged/closed PR is proof the work landed, so it deletes the dir even when
+  # it was touched today. Recency only shields dirs we can't prove are finished:
+  # nothing local at risk and no merged PR to point at.
 
-  def test_recent_activity_is_kept_before_any_git_check
+  def test_recent_dir_with_merged_pr_is_deleted
     Dir.mktmpdir do |dir|
-      make_repo(dir, "platform") # local-only + would otherwise need a PR
-      # PAST cutoff => freshly made dir is newer => recent => kept, PR never checked
-      pr = ->(_s, _b) { flunk "should not reach PR check for a recent dir" }
+      make_repo(dir, "platform") # local-only commit, but its PR merged
+      # PAST cutoff => dir is "recent"; the merged PR must still win.
+      action, = classify_ai_dir(dir, cutoff_time: PAST, pr_state: MERGED)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_recent_clean_pushed_dir_is_kept_by_recency
+    Dir.mktmpdir do |dir|
+      # Fully pushed, nothing local at risk, no merged PR — a fresh clone still on
+      # main. Nothing proves it's finished, so recency keeps it and gh is never hit.
+      make_repo(dir, "platform", remote: true)
+      pr = ->(_s, _b) { flunk "no local-only commits => PR must not be consulted" }
       action, reason = classify_ai_dir(dir, cutoff_time: PAST, pr_state: pr)
       assert_equal :keep, action
       assert_equal "modified within cutoff", reason
+    end
+  end
+
+  def test_recent_dir_with_open_pr_is_kept_as_unsaved
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform") # local-only commit, PR still open
+      action, reason = classify_ai_dir(dir, cutoff_time: PAST, pr_state: OPEN)
+      assert_equal :keep, action
+      assert_match(/local-only commits.*platform#7 OPEN/, reason)
     end
   end
 
