@@ -1724,6 +1724,11 @@ end
 # closed on GitHub. These repos SQUASH-merge, so a merged branch's local commits
 # never match the squashed commit on main and look "unpushed"; we resolve that by
 # asking `gh` for the PR state rather than trusting the git ref alone.
+#
+# A merged/closed PR means the work has landed, so it deletes the dir regardless
+# of how recently it was touched — the whole point of prune is to reclaim these.
+# Recency only shields dirs we can't prove are finished (no merged PR, nothing
+# local at risk — e.g. a fresh clone still on main).
 
 AI_ROOT = File.expand_path("~/code/ai")
 
@@ -1811,11 +1816,20 @@ end
 # "repo#N STATE" strings for any PR consulted while classifying — surfaced in the
 # output so the dir<->PR tie is visible (e.g. deleted because platform#1204 merged).
 # pr_state is injected for testing; it defaults to the gh-backed lookup.
+#
+# A merged/closed PR is the strongest "done" signal we have, so it OVERRIDES
+# recency: a dir whose work has landed is deleted even if a session touched it
+# today. Recency only protects dirs we CANNOT positively confirm are finished —
+# no local-only commits and no merged PR to point at (e.g. a fresh clone still on
+# main, or a branch pushed but not yet reviewed). Uncommitted/stashed/detached/
+# loose work still wins over everything, merged or not.
 def classify_ai_dir(dir, cutoff_time:, pr_state:)
   repos = ai_dir_repos(dir)
-  return [:keep, "modified within cutoff", []] if ai_dir_last_activity(dir, repos) >= cutoff_time
+  recent = ai_dir_last_activity(dir, repos) >= cutoff_time
 
   if repos.empty?
+    # No repo to reason about — recency is the only safety signal we have.
+    return [:keep, "modified within cutoff", []] if recent
     return [:delete, nil, []] if dir_effectively_empty?(dir)
     return [:keep, "no git repo (unexpected content)", []]
   end
@@ -1833,16 +1847,42 @@ def classify_ai_dir(dir, cutoff_time:, pr_state:)
   end
 
   pr_notes = []
+  merged_confirmed = false
   repos.each do |r|
-    next unless git_has_local_only_commits?(r)
     name = File.basename(r)
-    pr = pr_state.call(git_slug(r), git_current_branch(r))
-    label = pr ? "#{name}##{pr[:number]} #{pr[:state].to_s.upcase}" : "#{name} (no PR)"
-    pr_notes << label
-    next if pr && %i[merged closed].include?(pr[:state])
-    return [:keep, "local-only commits: #{label}", pr_notes]
+    branch = git_current_branch(r)
+    has_local = git_has_local_only_commits?(r)
+    # A repo sitting on main/master with everything pushed has no branch work to
+    # reason about — nothing to lose, and no PR to look up. Skip it entirely.
+    next if %w[main master].include?(branch) && !has_local
+
+    # Consult the PR even when nothing is local-only: a squash-merged branch stays
+    # on its (lingering) origin/<branch> ref, so it reads as "fully pushed" — the
+    # only way to know it LANDED (vs. an open/未opened PR) is to ask gh.
+    pr = pr_state.call(git_slug(r), branch)
+    landed = pr && %i[merged closed].include?(pr[:state])
+    pr_notes << "#{name}##{pr[:number]} #{pr[:state].to_s.upcase}" if pr
+
+    if landed
+      merged_confirmed = true
+      next
+    end
+    # Local commits that never landed = unsaved work. Never delete.
+    if has_local
+      label = pr ? pr_notes.last : "#{name} (no PR)"
+      pr_notes << label unless pr
+      return [:keep, "local-only commits: #{label}", pr_notes]
+    end
+    # Otherwise: pushed to a feature branch with an open/unopened PR — safe on the
+    # remote but plausibly still active. Fall through to the recency guard below.
   end
 
+  # If any repo landed via a merged/closed PR, the dir's work is provably done —
+  # delete regardless of how recently it was touched. Otherwise every repo is
+  # merely pushed with nothing landed; nothing is at risk, but we can't prove the
+  # work finished, so let recency keep a still-active dir (e.g. a fresh clone).
+  return [:delete, nil, pr_notes] if merged_confirmed
+  return [:keep, "modified within cutoff", pr_notes] if recent
   [:delete, nil, pr_notes]
 end
 
@@ -1883,7 +1923,8 @@ def cmd_aidirs_prune(args)
   end
 
   puts "Scanned #{dirs.length} dir(s) under #{AI_ROOT}."
-  puts "Keeping anything modified within #{days} day(s) or holding unsaved work (uncommitted, stashed, detached, unexpected files, or local-only commits without a merged/closed PR)."
+  puts "Deleting any dir whose every repo has landed (merged/closed PR) or is fully pushed, even if touched recently."
+  puts "Keeping unsaved work (uncommitted, stashed, detached, unexpected files, or local-only commits without a merged/closed PR), and un-landed dirs modified within #{days} day(s)."
   puts ""
   puts "Keeping #{keep.length}:"
   keep.each { |d, r, _| puts "  #{File.basename(d)}  (#{r})" }
