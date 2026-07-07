@@ -1245,11 +1245,16 @@ def commit_and_open_pr(clone, branch, draft:)
   return { status: :error, error: "commit failed: #{commit_out}" } unless commit_ok
   push_ok, push_out = run_step(["git", "push", "-u", "origin", branch], clone, false, +"")
   return { status: :error, error: "push failed: #{push_out}" } unless push_ok
-  create = ["gh", "pr", "create", "--fill"]
+  # --head: the clone is single-branch (--depth=1), so its fetch refspec only
+  # maps main and `git push -u` never creates refs/remotes/origin/<branch>.
+  # Without --head, gh aborts with "you must first push the current branch".
+  create = ["gh", "pr", "create", "--fill", "--head", branch]
   create << "--draft" if draft
-  _, create_out = run_step(create, clone, false, +"")
+  create_ok, create_out = run_step(create, clone, false, +"")
   url = create_out[%r{https://github\.com/\S+/pull/\d+}]
-  return { status: :needs_attention, error: "PR create produced no URL (clone left at #{clone})" } unless url
+  unless create_ok && url
+    return { status: :needs_attention, error: "PR create failed (clone left at #{clone}): #{create_out.to_s.strip}" }
+  end
   { status: :pr_opened, pr_url: url }
 end
 
