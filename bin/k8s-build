@@ -63,6 +63,7 @@ class K8sBuild
   def validate_environment
     Util.assert_installed("docker")
     Util.assert_installed("sbt")
+    Util.assert_installed("doctl", "https://docs.digitalocean.com/reference/doctl/how-to/install/")
 
     if !File.exist?(TEMPLATE_PATH)
       Util.exit_with_error("Dockerfile template not found: #{TEMPLATE_PATH}")
@@ -156,6 +157,7 @@ class K8sBuild
   def push_docker_image
     puts ""
     puts Util.underline("Pushing Docker image")
+    Util.registry_login
     Util.run("docker push #{image_name}")
   end
 
