@@ -50,6 +50,21 @@ module Util
       end
     end
 
+    # Ensure Docker is authenticated to the DigitalOcean container registry
+    # before a push. `doctl registry login` mints a fresh credential (30-day
+    # default) and writes it to Docker's credential store, so a stale/expired
+    # token can never surface as a `401 Unauthorized` mid-release. We run it
+    # unconditionally before every push: it's idempotent, fast, and — without
+    # --never-expire — produces an ephemeral OAuth credential that is NOT a
+    # never-expiring token and does NOT accumulate in the DO token list.
+    # Requires doctl itself to be authenticated (`doctl auth init`); if that
+    # parent token has expired the login fails loudly here rather than leaving
+    # `docker push` to fail with an opaque 401.
+    def Util.registry_login
+      Util.assert_installed("doctl", "https://docs.digitalocean.com/reference/doctl/how-to/install/")
+      Util.run("doctl registry login")
+    end
+
     def Util.run(cmd, params={})
       quiet = (params.has_key?(:quiet) && params[:quiet]) ? true  : false
       ignore_error = (params.has_key?(:ignore_error) && params[:ignore_error]) ? true : false
