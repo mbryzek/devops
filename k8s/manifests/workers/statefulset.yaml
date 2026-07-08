@@ -23,8 +23,8 @@ spec:
     spec:
       # Dedicated `tier: crawler` node pool so a Chromium scrape doesn't
       # compete with web traffic (tier: web) or backend jobs (tier: job).
-      # Currently a single s-1vcpu-2gb node — bump pool size or size class
-      # if the crawler queue grows.
+      # Currently a single s-2vcpu-4gb node (pool-crawler-4gb) — bump pool
+      # size or size class if the crawler queue grows.
       nodeSelector:
         tier: crawler
       # 90s gives an in-flight Chromium scrape time to finish + closeSession()
@@ -52,21 +52,25 @@ spec:
             - name: browser-profile
               mountPath: /app/browser-profile
           # Sized for actual Chromium-headful usage: ~250Mi idle, ~500-900Mi
-          # during a scrape, ~1.2Gi observed peak on a 3-year members batch
-          # (picklejar, wrq-138672cd2b364b5a85c3c04157c027b1, 2026-05-12).
-          # The s-1vcpu-2gb crawler node has ~1.4Gi allocatable, of which
-          # ~500Mi is already requested by system daemonsets — leaving only
-          # ~960Mi schedulable. A 1Gi request therefore left the pod Pending
-          # forever. 800Mi fits with headroom; 1200Mi limit still gives the
-          # scrape room above its observed 1.18Gi peak before OOMKill. If we
-          # need more than this, bump the node class (s-1vcpu-3gb / s-2vcpu-4gb).
+          # during a scrape, ~1.2Gi observed peaks (3-year members batch on
+          # picklejar, wrq-138672cd2b364b5a85c3c04157c027b1, 2026-05-12; a
+          # sales_detail saveAsExcel export on bounce-malvern, 2026-07-07).
+          # The request MUST cover the observed peak: a pod running above its
+          # request is the kubelet's first eviction victim under node memory
+          # pressure — on the old s-1vcpu-2gb node the pod hit 1056Mi against
+          # an 800Mi request and was evicted mid-download, stranding the
+          # invocation in Running until the platform's fallback expiry
+          # (win-ab1cf891866448efbb4ec0a7bc48f165). The s-2vcpu-4gb node's
+          # ~2.9Gi allocatable minus ~500Mi of system daemonsets leaves
+          # ~2.5Gi schedulable: 1400Mi request covers the 1.2Gi peak, and
+          # the 2Gi limit gives a heavy export headroom before OOMKill.
           resources:
             requests:
-              cpu: 200m
-              memory: 800Mi
+              cpu: 500m
+              memory: 1400Mi
             limits:
-              cpu: 900m
-              memory: 1200Mi
+              cpu: 1800m
+              memory: 2Gi
           # Liveness is intentionally lenient: a Chromium scrape can saturate
           # the Node event loop for tens of seconds at a time. Failing here
           # restarts the pod mid-scrape. 60s * 5 = 5min before kill.
