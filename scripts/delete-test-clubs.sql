@@ -60,6 +60,7 @@ create unique index on _del_invocations (id);
 do $$ begin raise notice 'Clubs targeted: %', (select count(*) from _del_clubs); end $$;
 
 -- ---- Playbook insight cluster (deepest children first) ---------------------
+delete from playbook.insight_work_items            where insight_id in (select id from _del_insights);
 delete from playbook.insight_section_chat_messages where insight_section_chat_id in (select id from _del_insight_section_chats);
 delete from playbook.insight_section_chats         where insight_section_id in (select id from _del_insight_sections);
 delete from playbook.insight_section_votes         where insight_section_id in (select id from _del_insight_sections);
