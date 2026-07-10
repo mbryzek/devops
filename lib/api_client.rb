@@ -45,7 +45,11 @@ class ApiClient
     list.map { |e| e.merge(active_url: use_localhost ? e[:localhost] : e[:url]) }
   end
 
-  def self.request(endpoint, method, path, body: nil, auth_required: true)
+  # session_id: pass an explicit session token to authenticate with instead of
+  # reading the app's on-disk session file. Used for ephemeral, non-persisted
+  # logins (e.g. the clubaid tenant admin behind `dev feedback`), which share a
+  # host + header with an app but must not touch that app's `dev login` session.
+  def self.request(endpoint, method, path, body: nil, auth_required: true, session_id: nil)
     uri = URI.parse("#{endpoint[:active_url]}#{path}")
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = (uri.scheme == "https")
@@ -61,8 +65,8 @@ class ApiClient
     req["Content-Type"] = "application/json"
     if auth_required
       cfg = SESSION_CONFIG.fetch(endpoint[:app])
-      sid = session_id_for(endpoint[:app]) or
-        raise SessionExpired, "No session for #{endpoint[:app]}. Run 'dev login'."
+      sid = session_id || session_id_for(endpoint[:app])
+      raise SessionExpired, "No session for #{endpoint[:app]}. Run 'dev login'." if sid.nil? || sid.empty?
       req[cfg[:header]] = sid
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body

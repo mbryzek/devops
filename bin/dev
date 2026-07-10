@@ -40,6 +40,8 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
+  "feedback claim"      => 'feedback claim [--localhost] [--yes]',
+  "feedback status"     => 'feedback status <id> --status STATUS [--note "TEXT"] [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -149,6 +151,21 @@ USAGE = <<~USAGE
         arg forwarded to them (a leading `--` separator is dropped) — including
         their own `--env`/`--prod` flags.
 
+    #{INVOCATIONS["feedback claim"]}
+        Claim graph-feedback items (app.clubaid.co/feedback) into a local plan for
+        a Claude session to work on. Lists the open items, and — after you confirm
+        (or with --yes) — atomically claims everything past the server's 1h quiet
+        window and writes ONE plan to ~/code/claude/plans/<date>-graph-feedback.md.
+        Prints the plan path; it does not start a session. Authenticates as the
+        clubaid tenant admin from $CLUBAID_FEEDBACK_EMAIL / $CLUBAID_FEEDBACK_PASSWORD
+        (~/code/env) — the feedback API requires a clubaid admin, not `dev login`.
+
+    #{INVOCATIONS["feedback status"]}
+        Close a claimed feedback item. STATUS is one of open, claimed, fixed,
+        dismissed, needs_input; --note carries the PR URL (fixed) or the question
+        (needs_input). The generated plan tells the fix session to call this so no
+        session token is written into the plan file.
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -173,7 +190,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts codegen].freeze
+COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts codegen feedback].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
@@ -184,6 +201,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
+  "feedback"     => %w[claim status],
 }.freeze
 
 def levenshtein(a, b)
@@ -721,6 +739,201 @@ def cmd_tasks_requeue(args)
 
   puts ""
   exit 1 unless all_ok
+end
+
+# ---------- feedback ----------
+
+CLUBAID_TENANT = "clubaid"
+FEEDBACK_STATUSES = %w[open claimed fixed dismissed needs_input].freeze
+
+# The feedback API is authorized for a clubaid tenant admin, not the platform
+# tenant that `dev login` stores. Mint an ephemeral (unpersisted) session from
+# the service credentials in ~/code/env, so `dev feedback` never touches the
+# human `dev login` session files.
+def clubaid_session_id(use_localhost)
+  email = ENV["CLUBAID_FEEDBACK_EMAIL"]
+  password = ENV["CLUBAID_FEEDBACK_PASSWORD"]
+  if email.nil? || email.empty? || password.nil? || password.empty?
+    Util.exit_with_error("Set CLUBAID_FEEDBACK_EMAIL and CLUBAID_FEEDBACK_PASSWORD (from ~/code/env) to use `dev feedback`.")
+  end
+  res = ApiClient.request(platform_endpoint(use_localhost), :post, "/tenant/#{CLUBAID_TENANT}/session/logins",
+                          body: { email: email, password: password }, auth_required: false)
+  raise ApiError, "clubaid login failed: #{res.inspect}" unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
+  sid = res.dig("session", "id")
+  raise ApiError, "clubaid login response missing session.id: #{res.inspect}" if sid.nil? || sid.empty?
+  sid
+end
+
+def feedback_chart_label(comment)
+  key = comment["chart_key"]
+  key.nil? || key.empty? ? "page-level" : key
+end
+
+def feedback_summary_line(comment, index)
+  club = comment.dig("club", "name") || comment.dig("club", "id") || "?"
+  created = (comment["created_at"] || "").to_s[0, 10]
+  snippet = comment["comment"].to_s.gsub(/\s+/, " ").strip
+  snippet = "#{snippet[0, 57]}..." if snippet.length > 60
+  "  #{index}. #{club} · #{created} · #{feedback_chart_label(comment)} — #{snippet}"
+end
+
+# One claimed comment rendered as a plan section. Kept separate (and pure) so the
+# plan output is unit-testable without any network calls.
+def feedback_render_item(comment, index)
+  screenshot = comment.dig("screenshot", "url")
+  lines = []
+  lines << "### #{index}. #{comment.dig('club', 'name')} — #{feedback_chart_label(comment)}"
+  lines << ""
+  lines << "- Comment id: `#{comment['id']}`"
+  lines << "- Club: #{comment.dig('club', 'name')} (`#{comment.dig('club', 'id')}`)"
+  lines << "- Page: `#{comment['page_url']}`"
+  lines << if comment["chart_key"].nil? || comment["chart_key"].empty?
+             "- Scope: page-level feedback (no single chart)"
+           else
+             "- Chart: `#{comment['chart_key']}` (chart_key = slugified GraphCard title)"
+           end
+  lines << "- Viewport: #{comment['viewport'] || 'unknown'}"
+  lines << "- Created: #{comment['created_at']}"
+  lines << "- Screenshot: #{screenshot && !screenshot.empty? ? screenshot : 'none captured'}"
+  lines << ""
+  lines << "> #{comment['comment'].to_s.gsub("\n", "\n> ")}"
+  lines.join("\n")
+end
+
+# Durable graph-feedback orientation (pipeline map, decoding guide, working
+# rules) shared with the headless claude-feedback-fix job. Single source of
+# truth — read from disk so the two consumers never drift.
+def feedback_body_text
+  File.read(File.expand_path("../claude-feedback/graph-feedback-body.md", __dir__))
+end
+
+def feedback_plan_markdown(items:, date:, body:)
+  rendered = items.each_with_index.map { |c, i| feedback_render_item(c, i + 1) }.join("\n\n")
+  <<~PLAN
+    # Graph feedback — #{items.length} item(s) claimed #{date}
+
+    Generated by `dev feedback claim`. These items are CLAIMED (status `claimed`)
+    and waiting for you. Implement the fixes, open PRs, and close each item with
+    `dev feedback status` (below) so nothing stays stuck in `claimed`.
+
+    ## Items to fix
+
+    #{rendered}
+
+    ---
+
+    #{body.strip}
+
+    ## Closing each item (do this — items must not stay `claimed`)
+
+    Run from anywhere (re-authenticates from ~/code/env each call):
+
+    - Fixed in a PR → `dev feedback status <id> --status fixed --note "<PR URL>"`
+    - Needs a human decision, or not actionable / already fixed →
+      `dev feedback status <id> --status needs_input --note "<question or reason>"`
+  PLAN
+end
+
+def write_feedback_plan(items)
+  date = Time.now.strftime("%Y-%m-%d")
+  dir = File.expand_path("~/code/claude/plans")
+  FileUtils.mkdir_p(dir)
+  base = "#{date}-graph-feedback"
+  path = File.join(dir, "#{base}.md")
+  n = 2
+  while File.exist?(path)
+    path = File.join(dir, "#{base}-#{n}.md")
+    n += 1
+  end
+  File.write(path, feedback_plan_markdown(items: items, date: date, body: feedback_body_text))
+  path
+end
+
+def cmd_feedback_claim(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  assume_yes = false
+  leftover = []
+  rest.each { |a| %w[--yes -y].include?(a) ? (assume_yes = true) : leftover << a }
+  reject_unknown_args("feedback claim", leftover)
+
+  handle_errors do
+    sid = clubaid_session_id(use_localhost)
+    endpoint = platform_endpoint(use_localhost)
+    open = ApiClient.request(endpoint, :get, "/playbook/feedback/comments?status=open&limit=100&offset=0", session_id: sid) || []
+    if open.empty?
+      puts "No open feedback."
+      return
+    end
+
+    puts ""
+    puts Util.underline("Open feedback (#{open.length})")
+    open.each_with_index { |c, i| puts feedback_summary_line(c, i + 1) }
+    puts ""
+
+    unless assume_yes
+      print "Claim #{open.length} item(s) and write a plan? [y/N] "
+      answer = $stdin.gets&.strip&.downcase
+      unless %w[y yes].include?(answer)
+        puts "Aborted. Nothing claimed."
+        return
+      end
+    end
+
+    claimed = ApiClient.request(endpoint, :post, "/playbook/feedback/comments/claims", session_id: sid) || []
+    if claimed.empty?
+      puts "Nothing claimed — the open item(s) are newer than the 1h quiet window (or were just claimed elsewhere). No plan written."
+      return
+    end
+
+    path = write_feedback_plan(claimed)
+    puts "Claimed #{claimed.length} of #{open.length} open item(s). Plan written to:"
+    puts "  #{path}"
+    puts ""
+    puts "Hand it to a session with:  claude \"read the plan at #{path} and implement it\""
+  end
+end
+
+def cmd_feedback_status(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  status = nil
+  note = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--status"
+      status = rest[i + 1]
+      usage_exit("--status requires a value", example: usage_for("feedback status")) if status.nil?
+      i += 2
+    when "--note"
+      note = rest[i + 1]
+      usage_exit("--note requires a value", example: usage_for("feedback status")) if note.nil?
+      i += 2
+    else
+      leftover << a
+      i += 1
+    end
+  end
+
+  id = leftover.shift
+  problems = []
+  problems << "missing comment id (positional argument)" if id.nil? || id.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--status is required" if status.nil? || status.empty?
+  problems << "--status must be one of: #{FEEDBACK_STATUSES.join(', ')}" if status && !status.empty? && !FEEDBACK_STATUSES.include?(status)
+  report_arg_problems("feedback status", problems, usage_for("feedback status"))
+
+  body = { status: status }
+  body[:note] = note if note && !note.empty?
+
+  handle_errors do
+    sid = clubaid_session_id(use_localhost)
+    res = ApiClient.request(platform_endpoint(use_localhost), :put,
+                            "/playbook/feedback/comments/#{URI.encode_www_form_component(id)}/status",
+                            body: body, session_id: sid)
+    puts "#{id}: status set to #{res['status']}"
+  end
 end
 
 # ---------- docker prune ----------
@@ -2418,6 +2631,14 @@ when "scripts"
   when "list" then cmd_scripts_list(argv)
   when "run"  then cmd_scripts_run(argv)
   else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
+  end
+when "feedback"
+  sub = argv.shift
+  case sub
+  when "claim"  then cmd_feedback_claim(argv)
+  when "status" then cmd_feedback_status(argv)
+  when nil      then require_subcommand("feedback")
+  else               unknown("feedback subcommand", sub, SUBCOMMANDS["feedback"])
   end
 else
   unknown("command", command, COMMANDS)
