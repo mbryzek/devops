@@ -60,7 +60,9 @@ USAGE = <<~USAGE
         --email is passed it is reused for both; password is always
         re-prompted. Per-app failures warn but do not abort others.
         Pass `--app acumen` or `--app platform` to target just one.
-        Sessions are stored under ~/.platform/.
+        `--app clubaid` logs in to the clubaid tenant admin (used by
+        `dev feedback`); it is opt-in only, never part of the default
+        login. Sessions are stored under ~/.platform/.
 
     #{INVOCATIONS["logout"]}
         Clear the cached devops sessions (platform + acumen).
@@ -156,9 +158,9 @@ USAGE = <<~USAGE
         a Claude session to work on. Lists the open items, and — after you confirm
         (or with --yes) — atomically claims everything past the server's 1h quiet
         window and writes ONE plan to ~/code/claude/plans/<date>-graph-feedback.md.
-        Prints the plan path; it does not start a session. Authenticates as the
-        clubaid tenant admin from $CLUBAID_FEEDBACK_EMAIL / $CLUBAID_FEEDBACK_PASSWORD
-        (~/code/env) — the feedback API requires a clubaid admin, not `dev login`.
+        Prints the plan path; it does not start a session. Authenticates with your
+        persisted clubaid session — run `dev login --app clubaid` once first (the
+        feedback API requires a clubaid admin, not the platform `dev login`).
 
     #{INVOCATIONS["feedback status"]}
         Close a claimed feedback item. STATUS is one of open, claimed, fixed,
@@ -354,6 +356,25 @@ def login_acumen(use_localhost, email, password)
   puts "Logged in to acumen as #{user_email}"
 end
 
+def login_clubaid(use_localhost, email, password)
+  ep = ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+  res = ApiClient.request(ep, :post, "/tenant/clubaid/session/logins",
+                          body: { email: email, password: password },
+                          auth_required: false)
+  raise ApiError, "unexpected response: #{res.inspect}" unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
+
+  session_id = res.dig("session", "id")
+  raise ApiError, "response missing session.id: #{res.inspect}" if session_id.nil? || session_id.empty?
+
+  ApiClient.write_session_id_for("clubaid", session_id)
+  user_email = res.dig("user", "email") || email
+  puts "Logged in to clubaid as #{user_email}"
+end
+
+# clubaid is a tenant login, opt-in via `--app clubaid` only — never part of the
+# default `dev login` fanout (which is the deployable apps in ENDPOINTS).
+LOGIN_APPS = (ApiClient::ENDPOINTS.map { |e| e[:app] } + ["clubaid"]).freeze
+
 def cmd_login(args)
   email = nil
   use_localhost = false
@@ -379,16 +400,22 @@ def cmd_login(args)
   end
 
   apps = if app_filter
-           valid = ApiClient::ENDPOINTS.map { |e| e[:app] }
-           unless valid.include?(app_filter)
-             usage_exit("--app must be one of: #{valid.join(', ')}", example: usage_for("login"))
+           unless LOGIN_APPS.include?(app_filter)
+             usage_exit("--app must be one of: #{LOGIN_APPS.join(', ')}", example: usage_for("login"))
            end
            [app_filter]
          else
+           # Default fanout is the deployable apps only; clubaid is opt-in.
            ApiClient::ENDPOINTS.map { |e| e[:app] }
          end
 
-  targets = ApiClient.endpoints(use_localhost: use_localhost).select { |e| apps.include?(e[:app]) }
+  targets = apps.map do |app|
+    if app == "clubaid"
+      ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+    else
+      ApiClient.endpoints(use_localhost: use_localhost, app_filter: app).first
+    end
+  end
   puts "Logging in to: #{targets.map { |e| "#{e[:name]} (#{e[:active_url]})" }.join(', ')}"
 
   any_ok = false
@@ -418,6 +445,7 @@ def cmd_login(args)
       case target[:app]
       when "platform" then login_platform(use_localhost, target_email, password)
       when "acumen"   then login_acumen(use_localhost, target_email, password)
+      when "clubaid"  then login_clubaid(use_localhost, target_email, password)
       else
         warn "  unknown app: #{target[:app]}"
         next
@@ -442,8 +470,9 @@ def cmd_logout(args)
 
   platform_sid = ApiClient.session_id_for("platform")
   acumen_sid   = ApiClient.session_id_for("acumen")
+  clubaid_sid  = ApiClient.session_id_for("clubaid")
 
-  if platform_sid.nil? && acumen_sid.nil?
+  if platform_sid.nil? && acumen_sid.nil? && clubaid_sid.nil?
     puts "No active session"
     return
   end
@@ -465,6 +494,16 @@ def cmd_logout(args)
       # ignore - we'll clear locally anyway
     end
     ApiClient.clear_session_id_for("acumen")
+  end
+
+  if clubaid_sid
+    begin
+      clubaid_ep = ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+      ApiClient.request(clubaid_ep, :delete, "/tenant/clubaid/session", auth_required: true)
+    rescue SessionExpired, ApiError
+      # ignore - we'll clear locally anyway
+    end
+    ApiClient.clear_session_id_for("clubaid")
   end
 
   puts "Logged out"
@@ -743,25 +782,20 @@ end
 
 # ---------- feedback ----------
 
-CLUBAID_TENANT = "clubaid"
 FEEDBACK_STATUSES = %w[open claimed fixed dismissed needs_input].freeze
 
 # The feedback API is authorized for a clubaid tenant admin, not the platform
-# tenant that `dev login` stores. Mint an ephemeral (unpersisted) session from
-# the service credentials in ~/code/env, so `dev feedback` never touches the
-# human `dev login` session files.
-def clubaid_session_id(use_localhost)
-  email = ENV["CLUBAID_FEEDBACK_EMAIL"]
-  password = ENV["CLUBAID_FEEDBACK_PASSWORD"]
-  if email.nil? || email.empty? || password.nil? || password.empty?
-    Util.exit_with_error("Set CLUBAID_FEEDBACK_EMAIL and CLUBAID_FEEDBACK_PASSWORD (from ~/code/env) to use `dev feedback`.")
-  end
-  res = ApiClient.request(platform_endpoint(use_localhost), :post, "/tenant/#{CLUBAID_TENANT}/session/logins",
-                          body: { email: email, password: password }, auth_required: false)
-  raise ApiError, "clubaid login failed: #{res.inspect}" unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
-  sid = res.dig("session", "id")
-  raise ApiError, "clubaid login response missing session.id: #{res.inspect}" if sid.nil? || sid.empty?
-  sid
+# tenant that `dev login` stores — authenticate with the persisted clubaid
+# session (`dev login --app clubaid`) on the platform host.
+def feedback_endpoint(use_localhost)
+  ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+end
+
+# Fail with the exact login command when there is no clubaid session yet, rather
+# than the generic "run 'dev login'" that handle_errors emits on a 401.
+def require_clubaid_session!
+  return unless ApiClient.session_id_for("clubaid").nil?
+  Util.exit_with_error("No clubaid session. Run `dev login --app clubaid` first.")
 end
 
 def feedback_chart_label(comment)
@@ -855,11 +889,11 @@ def cmd_feedback_claim(args)
   leftover = []
   rest.each { |a| %w[--yes -y].include?(a) ? (assume_yes = true) : leftover << a }
   reject_unknown_args("feedback claim", leftover)
+  require_clubaid_session!
 
   handle_errors do
-    sid = clubaid_session_id(use_localhost)
-    endpoint = platform_endpoint(use_localhost)
-    open = ApiClient.request(endpoint, :get, "/playbook/feedback/comments?status=open&limit=100&offset=0", session_id: sid) || []
+    endpoint = feedback_endpoint(use_localhost)
+    open = ApiClient.request(endpoint, :get, "/playbook/feedback/comments?status=open&limit=100&offset=0") || []
     if open.empty?
       puts "No open feedback."
       return
@@ -879,7 +913,7 @@ def cmd_feedback_claim(args)
       end
     end
 
-    claimed = ApiClient.request(endpoint, :post, "/playbook/feedback/comments/claims", session_id: sid) || []
+    claimed = ApiClient.request(endpoint, :post, "/playbook/feedback/comments/claims") || []
     if claimed.empty?
       puts "Nothing claimed — the open item(s) are newer than the 1h quiet window (or were just claimed elsewhere). No plan written."
       return
@@ -926,12 +960,12 @@ def cmd_feedback_status(args)
 
   body = { status: status }
   body[:note] = note if note && !note.empty?
+  require_clubaid_session!
 
   handle_errors do
-    sid = clubaid_session_id(use_localhost)
-    res = ApiClient.request(platform_endpoint(use_localhost), :put,
+    res = ApiClient.request(feedback_endpoint(use_localhost), :put,
                             "/playbook/feedback/comments/#{URI.encode_www_form_component(id)}/status",
-                            body: body, session_id: sid)
+                            body: body)
     puts "#{id}: status set to #{res['status']}"
   end
 end

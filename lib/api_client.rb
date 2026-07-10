@@ -12,11 +12,16 @@ class ApiClient
     { name: "Platform", url: "https://idempotent.io",      localhost: "http://localhost:9300", app: "platform" }
   ].freeze
 
-  # Each app gets its own session file + session header. Platform's session
-  # cookie is named `session_id`; acumen's is `acumen_session_id`.
+  # Each app (and tenant login) gets its own session file + session header.
+  # Platform's session cookie is named `session_id`; acumen's is
+  # `acumen_session_id`. `clubaid` is not a deployable app (it is a tenant admin
+  # surface on the platform host, so it is deliberately absent from ENDPOINTS)
+  # but gets its own persisted session via `dev login --app clubaid`, on the
+  # platform `session_id` header.
   SESSION_CONFIG = {
-    "platform" => { file: File.expand_path("~/.platform/devops"),        header: "session_id" },
-    "acumen"   => { file: File.expand_path("~/.platform/devops_acumen"), header: "acumen_session_id" },
+    "platform" => { file: File.expand_path("~/.platform/devops"),         header: "session_id" },
+    "acumen"   => { file: File.expand_path("~/.platform/devops_acumen"),  header: "acumen_session_id" },
+    "clubaid"  => { file: File.expand_path("~/.platform/devops_clubaid"), header: "session_id" },
   }.freeze
 
   def self.session_id_for(app)
@@ -45,11 +50,15 @@ class ApiClient
     list.map { |e| e.merge(active_url: use_localhost ? e[:localhost] : e[:url]) }
   end
 
-  # session_id: pass an explicit session token to authenticate with instead of
-  # reading the app's on-disk session file. Used for ephemeral, non-persisted
-  # logins (e.g. the clubaid tenant admin behind `dev feedback`), which share a
-  # host + header with an app but must not touch that app's `dev login` session.
-  def self.request(endpoint, method, path, body: nil, auth_required: true, session_id: nil)
+  # An endpoint for a tenant login that lives on the platform host but is not a
+  # deployable app in ENDPOINTS (e.g. `clubaid`). Carries the platform host but
+  # the tenant's own `app` so request/session lookups use its SESSION_CONFIG.
+  def self.tenant_endpoint(app, use_localhost:)
+    platform = endpoints(use_localhost: use_localhost, app_filter: "platform").first
+    { name: app.capitalize, app: app, active_url: platform[:active_url] }
+  end
+
+  def self.request(endpoint, method, path, body: nil, auth_required: true)
     uri = URI.parse("#{endpoint[:active_url]}#{path}")
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = (uri.scheme == "https")
@@ -65,8 +74,8 @@ class ApiClient
     req["Content-Type"] = "application/json"
     if auth_required
       cfg = SESSION_CONFIG.fetch(endpoint[:app])
-      sid = session_id || session_id_for(endpoint[:app])
-      raise SessionExpired, "No session for #{endpoint[:app]}. Run 'dev login'." if sid.nil? || sid.empty?
+      sid = session_id_for(endpoint[:app]) or
+        raise SessionExpired, "No session for #{endpoint[:app]}. Run 'dev login#{endpoint[:app] == 'platform' ? '' : " --app #{endpoint[:app]}"}'."
       req[cfg[:header]] = sid
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body

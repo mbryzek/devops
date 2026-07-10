@@ -125,15 +125,44 @@ class TestDevFeedback < Minitest::Test
     assert_match(/unexpected argument/, out)
   end
 
-  # ---- clubaid credential guard ----
+  # ---- clubaid tenant login wiring ----
 
-  def test_clubaid_session_id_exits_without_credentials
-    saved = [ENV.delete("CLUBAID_FEEDBACK_EMAIL"), ENV.delete("CLUBAID_FEEDBACK_PASSWORD")]
-    out, status = capture_stderr_and_exit { clubaid_session_id(false) }
+  def test_feedback_endpoint_is_clubaid_on_platform_host
+    ep = feedback_endpoint(false)
+    assert_equal "clubaid", ep[:app]
+    assert_equal "https://idempotent.io", ep[:active_url], "clubaid rides the platform host"
+    assert_equal "http://localhost:9300", feedback_endpoint(true)[:active_url]
+  end
+
+  def test_clubaid_has_its_own_session_file
+    cfg = ApiClient::SESSION_CONFIG.fetch("clubaid")
+    assert_match(%r{/\.platform/devops_clubaid$}, cfg[:file])
+    assert_equal "session_id", cfg[:header]
+  end
+
+  def test_clubaid_is_not_a_deployable_endpoint
+    # Must stay out of ENDPOINTS so `dev tasks`/`invariants`/`version` fanout
+    # never hits clubaid with platform-only paths.
+    refute_includes ApiClient::ENDPOINTS.map { |e| e[:app] }, "clubaid"
+  end
+
+  def test_clubaid_is_an_opt_in_login_app
+    assert_includes LOGIN_APPS, "clubaid"
+  end
+
+  def test_login_rejects_unknown_app_and_lists_clubaid
+    out, status = capture_stderr_and_exit { cmd_login(["--app", "bogus"]) }
     assert_equal 1, status
-    assert_match(/CLUBAID_FEEDBACK_EMAIL and CLUBAID_FEEDBACK_PASSWORD/, out)
+    assert_match(/--app must be one of:.*clubaid/, out)
+  end
+
+  def test_require_clubaid_session_names_exact_login_command
+    orig = ApiClient.method(:session_id_for)
+    ApiClient.define_singleton_method(:session_id_for) { |app| app == "clubaid" ? nil : orig.call(app) }
+    out, status = capture_stderr_and_exit { require_clubaid_session! }
+    assert_equal 1, status
+    assert_match(/dev login --app clubaid/, out)
   ensure
-    ENV["CLUBAID_FEEDBACK_EMAIL"] = saved[0] if saved[0]
-    ENV["CLUBAID_FEEDBACK_PASSWORD"] = saved[1] if saved[1]
+    ApiClient.define_singleton_method(:session_id_for, orig)
   end
 end

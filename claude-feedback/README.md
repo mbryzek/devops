@@ -7,7 +7,9 @@ Claude session that fixes them and opens PRs.
 
 For a manual, non-automated alternative, `dev feedback claim` does the same claim but
 writes a plan to `~/code/claude/plans/` for you to hand to an interactive session; it
-reuses `graph-feedback-body.md` and closes items via `dev feedback status`.
+reuses `graph-feedback-body.md` and closes items via `dev feedback status`. It
+authenticates with your persisted clubaid session (`dev login --app clubaid`) rather
+than the job's `CLUBAID_FEEDBACK_*` service credentials.
 
 ## Pieces
 
