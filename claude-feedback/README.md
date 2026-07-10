@@ -2,8 +2,8 @@
 
 Closes the loop for graph feedback (platform PR #1328, clubaid-app PR #124): an admin
 comments on charts at app.clubaid.co/graphs/*; comments land in the `feedback` schema;
-this job claims them (server-side atomic claim, 1h quiet window) and runs a headless
-Claude session that fixes them and opens PRs.
+this job claims them (server-side atomic claim, SELECT ... FOR UPDATE) and runs a
+headless Claude session that fixes them and opens PRs.
 
 For a manual, non-automated alternative, `dev feedback claim` does the same claim but
 writes a plan to `~/code/claude/plans/` for you to hand to an interactive session; it

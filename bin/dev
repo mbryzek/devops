@@ -156,8 +156,8 @@ USAGE = <<~USAGE
     #{INVOCATIONS["feedback claim"]}
         Claim graph-feedback items (app.clubaid.co/feedback) into a local plan for
         a Claude session to work on. Lists the open items, and — after you confirm
-        (or with --yes) — atomically claims everything past the server's 1h quiet
-        window and writes ONE plan to ~/code/claude/plans/<date>-graph-feedback.md.
+        (or with --yes) — atomically claims all of them and writes ONE plan to
+        ~/code/claude/plans/<date>-graph-feedback.md.
         Prints the plan path; it does not start a session. Authenticates with your
         persisted clubaid session — run `dev login --app clubaid` once first (the
         feedback API requires a clubaid admin, not the platform `dev login`).
@@ -915,7 +915,7 @@ def cmd_feedback_claim(args)
 
     claimed = ApiClient.request(endpoint, :post, "/playbook/feedback/comments/claims") || []
     if claimed.empty?
-      puts "Nothing claimed — the open item(s) are newer than the 1h quiet window (or were just claimed elsewhere). No plan written."
+      puts "Nothing claimed — the open item(s) were just claimed by another session. No plan written."
       return
     end
 
