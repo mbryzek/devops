@@ -10,8 +10,8 @@
     <string>/Users/mbryzek/code/devops/bin/claude-feedback-fix</string>
   </array>
 
-  <!-- Hourly. The claim endpoint's server-side quiet window makes the cadence safe:
-       nothing is claimed while a review session is still in flight. -->
+  <!-- Hourly. The claim endpoint is atomic (SELECT ... FOR UPDATE); it grabs whatever
+       open comments exist at run time, so overlapping runs never double-claim. -->
   <key>StartInterval</key>
   <integer>3600</integer>
 

@@ -3,9 +3,8 @@
 #
 # Claims unactioned graph-feedback comments (playbook-feedback API) and hands them
 # to a local headless Claude session that fixes them and opens PRs. The claim
-# endpoint is atomic and quiet-window-guarded server-side (claims nothing while the
-# newest open comment is <1h old), so this script is safe to run on any cadence and
-# exits quietly when there is nothing to do.
+# endpoint is atomic server-side (SELECT ... FOR UPDATE), so concurrent runs
+# serialize and this script exits quietly when there is nothing to do.
 #
 # Auth: mints a session via the tenant login endpoint using an admin's credentials.
 #   CLUBAID_FEEDBACK_EMAIL     admin email (from ~/code/env)
