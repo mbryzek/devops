@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bryzek.claude-feedback-fix</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mbryzek/code/devops/bin/claude-feedback-fix</string>
+  </array>
+
+  <!-- Hourly. The claim endpoint's server-side quiet window makes the cadence safe:
+       nothing is claimed while a review session is still in flight. -->
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Fill in from ~/code/env before loading. -->
+    <key>CLUBAID_FEEDBACK_EMAIL</key>
+    <string>CHANGE_ME</string>
+    <key>CLUBAID_FEEDBACK_PASSWORD</key>
+    <string>CHANGE_ME</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/claude-feedback-fix.err</string>
+</dict>
+</plist>
