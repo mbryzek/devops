@@ -17,7 +17,11 @@ set -euo pipefail
 
 API_BASE="${CLUBAID_API_BASE:-https://idempotent.io}"
 TENANT="clubaid"
-PROMPT_FILE="$(cd "$(dirname "$0")/.." && pwd)/claude-feedback/prompt.md"
+# Headless-specific wrapper (env inputs + status curl) followed by the durable
+# orientation shared with `dev feedback` (graph-feedback-body.md) — one copy.
+PROMPT_DIR="$(cd "$(dirname "$0")/.." && pwd)/claude-feedback"
+PROMPT_FILE="$PROMPT_DIR/prompt.md"
+BODY_FILE="$PROMPT_DIR/graph-feedback-body.md"
 LOG_DIR="${HOME}/code/claude/logs"
 WORK_DIR="$(mktemp -d /tmp/claude-feedback-fix.XXXXXX)"
 
@@ -58,6 +62,6 @@ export CLAUDE_FEEDBACK_API_BASE="$API_BASE"
 export CLAUDE_FEEDBACK_SESSION_ID="$SESSION_ID"
 export CLAUDE_FEEDBACK_CLAIMED_FILE="$CLAIMED_FILE"
 
-claude --print "$(cat "$PROMPT_FILE")" >> "$LOG_FILE" 2>&1 || log "ERROR claude session exited non-zero"
+claude --print "$(cat "$PROMPT_FILE" "$BODY_FILE")" >> "$LOG_FILE" 2>&1 || log "ERROR claude session exited non-zero"
 
 log "fix session finished for $COUNT item(s)"
