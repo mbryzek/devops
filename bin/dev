@@ -835,8 +835,8 @@ def feedback_render_item(comment, index)
 end
 
 # Durable graph-feedback orientation (pipeline map, decoding guide, working
-# rules) shared with the headless claude-feedback-fix job. Single source of
-# truth — read from disk so the two consumers never drift.
+# rules) appended to every generated plan. Read from disk rather than inlined so
+# the prose lives in one editable place.
 def feedback_body_text
   File.read(File.expand_path("../claude-feedback/graph-feedback-body.md", __dir__))
 end

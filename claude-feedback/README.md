@@ -1,43 +1,13 @@
-# claude-feedback-fix — hourly graph-feedback fix job
+# graph-feedback prompt content
 
-Closes the loop for graph feedback (platform PR #1328, clubaid-app PR #124): an admin
-comments on charts at app.clubaid.co/graphs/*; comments land in the `feedback` schema;
-this job claims them (server-side atomic claim, SELECT ... FOR UPDATE) and runs a
-headless Claude session that fixes them and opens PRs.
+`graph-feedback-body.md` is the durable orientation (pipeline map, decoding guide,
+working rules) for fixing graph-feedback items left on the ClubAid dashboards
+(app.clubaid.co/feedback).
 
-For a manual, non-automated alternative, `dev feedback claim` does the same claim but
-writes a plan to `~/code/claude/plans/` for you to hand to an interactive session; it
-reuses `graph-feedback-body.md` and closes items via `dev feedback status`. It
-authenticates with your persisted clubaid session (`dev login --app clubaid`) rather
-than the job's `CLUBAID_FEEDBACK_*` service credentials.
+It is read by **`dev feedback claim`** (`bin/dev`), which claims open items and
+appends this body to the plan it writes under `~/code/claude/plans/`. Edit the
+prose here; the command picks it up automatically.
 
-## Pieces
-
-- `bin/claude-feedback-fix` — login → claim → hand claimed JSON to `claude --print`
-  with `claude-feedback/prompt.md`. Exits quietly when the queue is empty or a review
-  session is still in flight. Logs to `~/code/claude/logs/claude-feedback-fix.log`.
-- `claude-feedback/prompt.md` — the headless-specific wrapper (env inputs +
-  status-update curl), researched per `rules/llm.ticket.prompts.mdc`.
-- `claude-feedback/graph-feedback-body.md` — the durable orientation (pipeline
-  map, decoding guide, working rules), shared verbatim with `dev feedback claim`
-  so the two never drift. The job runs `cat prompt.md graph-feedback-body.md`.
-- `claude-feedback/com.bryzek.claude-feedback-fix.plist` — launchd template (hourly).
-
-## Setup (one-time, deliberate — this schedules an autonomous token-spending job)
-
-1. Credentials: add an admin login for the job to `~/code/env` and export
-   `CLUBAID_FEEDBACK_EMAIL` / `CLUBAID_FEEDBACK_PASSWORD` in the plist (or your shell
-   for manual runs).
-2. Install the schedule:
-   ```bash
-   cp ~/code/devops/claude-feedback/com.bryzek.claude-feedback-fix.plist ~/Library/LaunchAgents/
-   # edit the EnvironmentVariables block with the real credentials first
-   launchctl load ~/Library/LaunchAgents/com.bryzek.claude-feedback-fix.plist
-   ```
-3. Manual run (uses your shell env): `~/code/devops/bin/claude-feedback-fix`
-
-## Removing the feature
-
-Drop the `feedback` schema, delete `spec/playbook-feedback.json` +
-`dao/spec/db-feedback.json` + the clubaid-app capture UI, `launchctl unload` the plist,
-and delete this directory.
+The former automated hourly job (`claude-feedback-fix` + launchd plist) was removed
+— `dev feedback claim` is the manual replacement. See platform PR #1328 / clubaid-app
+PR #124 for the feedback capture pipeline.
