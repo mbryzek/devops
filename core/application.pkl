@@ -25,22 +25,20 @@ class Application {
 }
 
 class SvelteKit {
-    /// Cloudflare deploy targets, in order. Each names the Cloudflare account by login
-    /// email; the email -> account id + api token mapping lives in the env repo
-    /// (cloudflare-accounts.pkl, git-crypt encrypted). Defaults to a single deploy to the
-    /// primary account with no named wrangler environment — i.e. current behavior for every
-    /// existing app. An app mirrored to a second account (e.g. plybk.us) lists both targets.
-    ///
-    /// Empty by default: an unset list means "one deploy to the primary account", resolved
-    /// in release-sveltekit. (A non-empty pkl default would be *amended* — not replaced — by
-    /// an app that sets its own targets, silently prepending the default entry.)
-    deploy_targets: Listing<CloudflareDeploy> = new Listing {}
+    /// Cloudflare deploy targets, in order. REQUIRED and non-empty: every sveltekit app
+    /// must say explicitly which Cloudflare account(s) it deploys to — there is no implicit
+    /// default account. Each target names its account by label (e.g. "personal",
+    /// "playbook"); the label -> login email + account id mapping lives in the env repo
+    /// (cloudflare-accounts.pkl, git-crypt encrypted). An app mirrored to a second account
+    /// (e.g. plybk.us) lists both targets.
+    deploy_targets: Listing<CloudflareDeploy>(!isEmpty)
 }
 
 class CloudflareDeploy {
-    /// Cloudflare account, by login email. Resolved to account id + api token via the env
-    /// repo's cloudflare-accounts.pkl. Defaults to the primary account.
-    cloudflare_email: String = "mbryzek@gmail.com"
+    /// Cloudflare account label (a stable identifier like "playbook", NOT the login email —
+    /// emails change). REQUIRED — no default account. Resolved to login email + account id
+    /// via the env repo's cloudflare-accounts.pkl.
+    cloudflare_account: String(!isEmpty)
 
     /// Wrangler environment to deploy. Null = the top-level environment (built via
     /// `npm run build`; deployed `wrangler deploy --env=""` when other named envs exist).

@@ -141,8 +141,8 @@ class Args
                 av.add("app", app)
             end
 
-            opts.on("--cloudflare-account EMAIL", "Deploy only the sveltekit target for this Cloudflare login email (default: all targets)") do |email|
-                av.add("cloudflare_account", email)
+            opts.on("--cloudflare-account LABEL", "Deploy only the sveltekit target(s) for this Cloudflare account label, e.g. personal or playbook (default: all targets)") do |label|
+                av.add("cloudflare_account", label)
             end
 
             opts.on("--dir DIR", "Specify the directory") do |dir|
