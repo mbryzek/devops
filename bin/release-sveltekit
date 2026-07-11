@@ -4,10 +4,18 @@
 # Deploys a SvelteKit app to one or more Cloudflare accounts/domains.
 #
 # Deploy targets come from the app config (sveltekit.deploy_targets in
-# env/apps/<app>/config.pkl). Each target names its Cloudflare account by login
-# email; the email -> account id + api token mapping lives in the (git-crypt)
-# env/cloudflare-accounts.pkl. An app with no targets listed deploys once to the
-# primary account, exactly as before.
+# env/apps/<app>/config.pkl) — REQUIRED, no implicit default account. Each target
+# names its Cloudflare account by label (e.g. "personal", "playbook"); the
+# label -> login email + account id mapping lives in the (git-crypt)
+# env/cloudflare-accounts.pkl.
+#
+# Authentication: each account label has its own persistent `wrangler login` OAuth
+# profile under ~/.cloudflare/<label> (isolated via XDG_CONFIG_HOME, which wrangler
+# honors for its global config path). We never use API tokens. Before anything is
+# tagged or built, every selected target's profile is verified with `wrangler whoami`
+# — a missing/expired profile prompts an interactive `wrangler login` on the spot, and
+# a profile logged into the wrong account fails with instructions. A bare `release`
+# therefore deploys ALL configured accounts sequentially in one run.
 #
 # Supports both @sveltejs/adapter-static (build/) and @sveltejs/adapter-cloudflare
 # (.svelte-kit/cloudflare). Version tagging happens once; each target is then built
@@ -17,6 +25,55 @@ require 'json'
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
+
+PROFILES_DIR = File.expand_path("~/.cloudflare")
+
+# `wrangler <cmd>` under the label's isolated login profile. XDG_CONFIG_HOME moves
+# wrangler's global config (the OAuth session) into ~/.cloudflare/<label> without
+# affecting anything else — set only on the wrangler command, not the whole process.
+def wrangler_cmd(label, cmd)
+  "XDG_CONFIG_HOME=#{File.join(PROFILES_DIR, label)} wrangler #{cmd}"
+end
+
+# Verify the label's wrangler profile is logged in AND can reach the expected account.
+# Missing/expired profile -> offer an interactive `wrangler login` right here (one-time
+# per account; wrangler auto-refreshes the OAuth token on later runs). Logged into the
+# wrong account -> fail with the logout command. Runs BEFORE tagging/building so an auth
+# problem leaves nothing half-deployed.
+def ensure_wrangler_profile(label, acct)
+  email = acct['email']
+  account_id = acct['account_id']
+
+  2.times do |attempt|
+    whoami = `#{wrangler_cmd(label, "whoami")} 2>&1`
+    if whoami.include?(account_id)
+      puts "Cloudflare profile '#{label}' OK (#{email})"
+      return
+    end
+
+    if logged_in_as = whoami[/associated with the email\s+([^\s.]+@[^\s.]+\.\S+?)\.?\s/, 1]
+      # Logged in, but the expected account id is not visible: wrong account.
+      Util.exit_with_error(
+        "Cloudflare profile '#{label}' is logged in as #{logged_in_as}, which cannot access " \
+        "account #{account_id} (expected login: #{email}).\n" \
+        "Reset it with: #{wrangler_cmd(label, "logout")}"
+      )
+    end
+
+    if attempt > 0
+      Util.exit_with_error("Cloudflare profile '#{label}' (#{email}) is still not authenticated after login")
+    end
+
+    puts ""
+    puts "Cloudflare profile '#{label}' is not authenticated."
+    unless Ask.for_boolean("Run `wrangler login` now? Authorize as #{email} in the browser.")
+      Util.exit_with_error("Cannot deploy the '#{label}' target without a wrangler login")
+    end
+    unless system(wrangler_cmd(label, "login"))
+      Util.exit_with_error("wrangler login failed for profile '#{label}'")
+    end
+  end
+end
 
 helper = ReleaseHelper.new("sveltekit")
 
@@ -28,33 +85,46 @@ unless File.exist?(".env.production")
   Util.exit_with_error(".env.production not found (required for the primary Vite build)")
 end
 
-# Cloudflare account map: email -> { account_id }. When present, every deploy target's
-# email must resolve here and pins CLOUDFLARE_ACCOUNT_ID for that deploy. Authentication
-# is always the ambient `wrangler login` OAuth session (we do not use API tokens), so each
-# target's account must be the one you are currently `wrangler login`'d into. When absent
-# (older checkout), fall back to the ambient login for a single primary deploy.
+# Cloudflare account map: label -> { email, account_id }. Every deploy target's label must
+# resolve here: the email identifies the `wrangler login` for the label's profile and the
+# account_id pins CLOUDFLARE_ACCOUNT_ID for the deploy.
 accounts_path = File.expand_path(File.join(dir, "../../env/cloudflare-accounts.pkl"))
-accounts = nil
-if File.exist?(accounts_path)
-  json = `pkl eval -f json #{accounts_path}`
-  Util.exit_with_error("Failed to evaluate #{accounts_path}") unless $?.success?
-  accounts = JSON.parse(json)["accounts"]
+unless File.exist?(accounts_path)
+  Util.exit_with_error("#{accounts_path} not found (label -> Cloudflare account map)")
 end
+json = `pkl eval -f json #{accounts_path}`
+Util.exit_with_error("Failed to evaluate #{accounts_path}") unless $?.success?
+accounts = JSON.parse(json)["accounts"]
 
 targets = helper.app_config.deploy_targets
+if targets.empty? || targets.any? { |t| t.cloudflare_account.to_s.strip.empty? }
+  Util.exit_with_error("#{helper.app} must declare sveltekit.deploy_targets (each with an explicit cloudflare_account) in env/apps/#{helper.app}/config.pkl")
+end
 
-# --cloudflare-account EMAIL narrows the release to a single account's target, so you can
-# `wrangler login` to that account and deploy just it (auth is the ambient login — a run
-# can only reach the account you are logged into). Omit it to deploy every target in turn.
+# --cloudflare-account LABEL narrows the release to a single account's target(s) — useful
+# to redeploy one side (e.g. after a failed deploy) without re-releasing the other.
+# Default (no flag): deploy every target configured for the app, in order.
 if account = Args.parse(ARGV).cloudflare_account
-  matching = targets.select { |t| t.cloudflare_email == account }
+  matching = targets.select { |t| t.cloudflare_account == account }
   if matching.empty?
-    configured = targets.map(&:cloudflare_email).uniq.join(", ")
+    configured = targets.map(&:cloudflare_account).uniq.join(", ")
     Util.exit_with_error("No deploy target for cloudflare account '#{account}' in #{helper.app}. Configured: #{configured}")
   end
   puts "Deploying only the '#{account}' target (--cloudflare-account)"
   targets = matching
 end
+
+# Resolve + verify every selected account up front, before tagging or building, so a
+# failed auth cannot leave the accounts on different versions.
+resolved = targets.map(&:cloudflare_account).uniq.map do |label|
+  acct = accounts[label]
+  if acct.nil?
+    Util.exit_with_error("No entry for Cloudflare account '#{label}' in #{accounts_path}. Configured: #{accounts.keys.join(", ")}")
+  end
+  [label, acct]
+end.to_h
+
+resolved.each { |label, acct| ensure_wrangler_profile(label, acct) }
 
 # Tag + write version once — one released version, deployed to every selected target.
 tag = Tag.ask
@@ -71,24 +141,19 @@ is_worker = toml.match?(/^\s*(?!#)main\s*=/) &&
 has_named_env = toml.match?(/^\s*(?!#)\[env\./)
 
 targets.each do |target|
-  email = target.cloudflare_email
+  label = target.cloudflare_account
+  acct = resolved[label]
   env = target.wrangler_env
   env = nil if env && env.strip.empty?
 
   # Pin CLOUDFLARE_ACCOUNT_ID so the deploy targets the intended account deterministically
-  # (and overrides any stray CLOUDFLARE_ACCOUNT_ID in the shell). Auth is always the ambient
-  # `wrangler login` OAuth session — we never set CLOUDFLARE_API_TOKEN, and clear any stray one.
+  # (and overrides any stray CLOUDFLARE_ACCOUNT_ID in the shell). Auth is the label's own
+  # `wrangler login` profile — we never set CLOUDFLARE_API_TOKEN, and clear any stray one.
   ENV.delete('CLOUDFLARE_API_TOKEN')
-  if accounts
-    acct = accounts[email]
-    Util.exit_with_error("No entry for Cloudflare account '#{email}' in #{accounts_path}") if acct.nil?
-    ENV['CLOUDFLARE_ACCOUNT_ID'] = acct['account_id']
-  else
-    ENV.delete('CLOUDFLARE_ACCOUNT_ID')
-  end
+  ENV['CLOUDFLARE_ACCOUNT_ID'] = acct['account_id']
 
   puts ""
-  puts "==> Deploying #{helper.app} to #{email}#{env ? " (env #{env})" : " (primary)"}"
+  puts "==> Deploying #{helper.app} to #{label}#{env ? " (env #{env})" : " (primary)"}"
 
   # Clean + build for this target. A named env builds via `npm run build:<env>`
   # (loads .env.<env>); the primary builds via `npm run build` (.env.production).
@@ -112,9 +177,9 @@ targets.each do |target|
 
   if is_worker
     env_flag = if env then "--env #{env}" elsif has_named_env then '--env=""' else "" end
-    helper.run_system("wrangler deploy #{env_flag}".strip)
+    helper.run_system(wrangler_cmd(label, "deploy #{env_flag}".strip))
   else
     project_flag = target.pages_project ? "--project-name #{target.pages_project}" : ""
-    helper.run_system("wrangler pages deploy #{output_dir} #{project_flag}".strip)
+    helper.run_system(wrangler_cmd(label, "pages deploy #{output_dir} #{project_flag}".strip))
   end
 end

@@ -30,19 +30,17 @@ class SveltekitConfig
   attr_reader :deploy_targets
 
   def initialize(json_data)
-    # Defaults in the pkl schema guarantee at least one target, but tolerate an
-    # older dist json (no deploy_targets) by falling back to a single primary deploy.
-    targets = json_data['deploy_targets']
-    targets = [{}] if targets.nil? || targets.empty?
-    @deploy_targets = targets.map { |d| CloudflareDeploy.new(d) }
+    # The pkl schema requires a non-empty deploy_targets with an explicit
+    # cloudflare_account per target — there is no implicit default account.
+    @deploy_targets = (json_data['deploy_targets'] || []).map { |d| CloudflareDeploy.new(d) }
   end
 end
 
 class CloudflareDeploy
-  attr_reader :cloudflare_email, :wrangler_env, :pages_project
+  attr_reader :cloudflare_account, :wrangler_env, :pages_project
 
   def initialize(json_data)
-    @cloudflare_email = json_data['cloudflare_email'] || "mbryzek@gmail.com"
+    @cloudflare_account = json_data['cloudflare_account']
     @wrangler_env = json_data['wrangler_env']
     @pages_project = json_data['pages_project']
   end
