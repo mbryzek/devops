@@ -24,7 +24,35 @@ class Application {
     ignored: Boolean = false
 }
 
-class SvelteKit {}
+class SvelteKit {
+    /// Cloudflare deploy targets, in order. Each names the Cloudflare account by login
+    /// email; the email -> account id + api token mapping lives in the env repo
+    /// (cloudflare-accounts.pkl, git-crypt encrypted). Defaults to a single deploy to the
+    /// primary account with no named wrangler environment — i.e. current behavior for every
+    /// existing app. An app mirrored to a second account (e.g. plybk.us) lists both targets.
+    ///
+    /// Empty by default: an unset list means "one deploy to the primary account", resolved
+    /// in release-sveltekit. (A non-empty pkl default would be *amended* — not replaced — by
+    /// an app that sets its own targets, silently prepending the default entry.)
+    deploy_targets: Listing<CloudflareDeploy> = new Listing {}
+}
+
+class CloudflareDeploy {
+    /// Cloudflare account, by login email. Resolved to account id + api token via the env
+    /// repo's cloudflare-accounts.pkl. Defaults to the primary account.
+    cloudflare_email: String = "mbryzek@gmail.com"
+
+    /// Wrangler environment to deploy. Null = the top-level environment (built via
+    /// `npm run build`; deployed `wrangler deploy --env=""` when other named envs exist).
+    /// A value like "plybk" is built via `npm run build:plybk` and deployed
+    /// `wrangler deploy --env plybk` (Workers) — see pages_project for Pages apps.
+    wrangler_env: String?
+
+    /// Cloudflare Pages project name for this target (Pages apps only). Null = use the
+    /// project named in wrangler.toml (the primary target). A mirror target sets this to the
+    /// second account's project, e.g. "plybk-www".
+    pages_project: String?
+}
 
 /// Release config for hand-written-manifest k8s apps built as a Docker image
 /// (e.g. workers). Released via `release-docker-k8s` which:
