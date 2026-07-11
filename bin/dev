@@ -5,6 +5,7 @@ require 'io/console'
 require 'json'
 require 'open3'
 require 'set'
+require 'time'
 require 'timeout'
 require 'uri'
 
@@ -41,7 +42,8 @@ INVOCATIONS = {
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
   "feedback claim"      => 'feedback claim [--localhost] [--yes]',
-  "feedback status"     => 'feedback status <id> --status STATUS [--note "TEXT"] [--localhost]',
+  "feedback status"     => 'feedback status <id> --status STATUS [--note "TEXT"] [--app APP --pr URL] [--localhost]',
+  "feedback reconcile"  => 'feedback reconcile [--apply] [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -164,9 +166,18 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["feedback status"]}
         Close a claimed feedback item. STATUS is one of open, claimed, fixed,
-        dismissed, needs_input; --note carries the PR URL (fixed) or the question
-        (needs_input). The generated plan tells the fix session to call this so no
-        session token is written into the plan file.
+        deployed, verified, dismissed, needs_input. Marking `fixed` requires
+        --app <deployable-app> (the app the fix ships in) and --pr <url> (the merged
+        PR): these are stored so `dev feedback reconcile` can later flip the item to
+        `deployed` once that app releases. --note carries the question (needs_input)
+        or a reason (dismissed). The generated plan tells the fix session to call
+        this so no session token is written into the plan file.
+
+    #{INVOCATIONS["feedback reconcile"]}
+        Flip `fixed` items to `deployed` once their target app has released past the
+        fix. Read-only against the deploy registry (same live-version signal as
+        `dev versions`) — the release pipeline is untouched. Dry-run by default;
+        pass --apply to record the transitions (e.g. from a cron).
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -203,7 +214,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
-  "feedback"     => %w[claim status],
+  "feedback"     => %w[claim status reconcile],
 }.freeze
 
 def levenshtein(a, b)
@@ -782,7 +793,7 @@ end
 
 # ---------- feedback ----------
 
-FEEDBACK_STATUSES = %w[open claimed fixed dismissed needs_input].freeze
+FEEDBACK_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
 
 # The feedback API is authorized for a clubaid tenant admin, not the platform
 # tenant that `dev login` stores — authenticate with the persisted clubaid
@@ -872,7 +883,9 @@ def feedback_plan_markdown(items:, date:, body:)
 
     Run from anywhere (re-authenticates from ~/code/env each call):
 
-    - Fixed in a PR → `dev feedback status <id> --status fixed --note "<PR URL>"`
+    - Fixed in a PR → `dev feedback status <id> --status fixed --app <deployable-app> --pr "<PR URL>"`
+      (the app + PR let `dev feedback reconcile` flip the item to `deployed` once that
+      app releases; run `dev versions` to see the deployable app names)
     - Needs a human decision, or not actionable / already fixed →
       `dev feedback status <id> --status needs_input --note "<question or reason>"`
   PLAN
@@ -938,9 +951,10 @@ def cmd_feedback_claim(args)
 end
 
 def cmd_feedback_status(args)
-  rest, _app, use_localhost = parse_common_flags(args)
+  rest, target_app, use_localhost = parse_common_flags(args)
   status = nil
   note = nil
+  pr = nil
   leftover = []
   i = 0
   while i < rest.length
@@ -954,6 +968,10 @@ def cmd_feedback_status(args)
       note = rest[i + 1]
       usage_exit("--note requires a value", example: usage_for("feedback status")) if note.nil?
       i += 2
+    when "--pr"
+      pr = rest[i + 1]
+      usage_exit("--pr requires a value", example: usage_for("feedback status")) if pr.nil?
+      i += 2
     else
       leftover << a
       i += 1
@@ -966,10 +984,32 @@ def cmd_feedback_status(args)
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   problems << "--status is required" if status.nil? || status.empty?
   problems << "--status must be one of: #{FEEDBACK_STATUSES.join(', ')}" if status && !status.empty? && !FEEDBACK_STATUSES.include?(status)
+  # `fixed` drives deployed-detection: the app + PR let `dev feedback reconcile` know
+  # which release must ship before the item flips to `deployed`.
+  problems << "marking fixed requires --app <deployable-app> (the app the fix ships in)" if status == "fixed" && (target_app.nil? || target_app.empty?)
+  problems << "marking fixed requires --pr <url> (the merged PR)" if status == "fixed" && (pr.nil? || pr.empty?)
   report_arg_problems("feedback status", problems, usage_for("feedback status"))
 
   body = { status: status }
   body[:note] = note if note && !note.empty?
+
+  if status == "fixed"
+    registry = Work::Registry.load
+    app = registry.deployable.find { |a| a.name == target_app }
+    unless app
+      valid = registry.deployable.map(&:name).sort.join(", ")
+      Util.exit_with_error("Unknown --app '#{target_app}'. Valid apps: #{valid}")
+    end
+    body[:pull_request_url] = pr
+    body[:target_app] = target_app
+    baseline = fetch_app_version(registry, app)
+    if baseline[:error]
+      Util.warning("Could not read live version for #{target_app} (#{baseline[:error]}); recording without a baseline.")
+    elsif baseline["version"] && !baseline["version"].empty?
+      body[:baseline_version] = baseline["version"]
+    end
+  end
+
   require_clubaid_session!
 
   handle_errors do
@@ -977,7 +1017,91 @@ def cmd_feedback_status(args)
                             "/playbook/feedback/comments/#{URI.encode_www_form_component(id)}/status",
                             body: body)
     puts "#{id}: status set to #{res['status']}"
+    puts "  target app: #{target_app} (baseline #{body[:baseline_version] || 'unknown'})" if status == "fixed"
   end
+end
+
+# Flip `fixed` items to `deployed` once their target app has released past the fix.
+# Read-only against the deploy registry (the same live-version signal `dev versions`
+# uses) — the release pipeline is never touched. Dry-run by default; --apply records
+# the transitions.
+def cmd_feedback_reconcile(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  apply = false
+  leftover = []
+  rest.each { |a| a == "--apply" ? (apply = true) : leftover << a }
+  reject_unknown_args("feedback reconcile", leftover)
+  require_clubaid_session!
+
+  registry = Work::Registry.load
+  version_cache = {}
+
+  handle_errors do
+    endpoint = feedback_endpoint(use_localhost)
+    fixed = ApiClient.request(endpoint, :get, "/playbook/feedback/comments?status=fixed&limit=100&offset=0") || []
+    if fixed.empty?
+      puts "No fixed feedback awaiting deploy."
+      return
+    end
+
+    deployed = 0
+    skipped = 0
+    fixed.each do |c|
+      app_name = c["target_app"]
+      if app_name.nil? || app_name.empty?
+        puts "  skip #{c['id']}: no target_app (fixed via web UI)"
+        skipped += 1
+        next
+      end
+      info = version_cache[app_name] ||= begin
+        app = registry.deployable.find { |a| a.name == app_name }
+        app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
+      end
+      if info[:error]
+        puts "  skip #{c['id']} (#{app_name}): #{info[:error]}"
+        skipped += 1
+        next
+      end
+
+      live = info["version"]
+      if feedback_released_since_fix?(info, c)
+        if apply
+          ApiClient.request(endpoint, :put,
+                            "/playbook/feedback/comments/#{URI.encode_www_form_component(c['id'])}/status",
+                            body: { status: "deployed", note: "Deployed in #{app_name} #{live}" })
+          puts "  deployed #{c['id']} (#{app_name}: #{c['baseline_version'] || '?'} -> #{live})"
+        else
+          puts "  would deploy #{c['id']} (#{app_name}: #{c['baseline_version'] || '?'} -> #{live})"
+        end
+        deployed += 1
+      else
+        puts "  waiting  #{c['id']} (#{app_name}: still #{live})"
+      end
+    end
+
+    puts ""
+    puts "#{deployed} #{apply ? 'deployed' : 'would deploy'}, #{skipped} skipped, #{fixed.length} fixed total."
+    puts "Re-run with --apply to record the transitions." if !apply && deployed > 0
+  end
+end
+
+# True when the target app has released since the fix was recorded. Primary signal:
+# release timestamp is newer than fixed_at (can't false-positive on a later tag that
+# predates the fix). Falls back to "live tag differs from the fix-time baseline" when a
+# timestamp is missing or unparseable.
+def feedback_released_since_fix?(info, comment)
+  released_at = info["released_at"]
+  fixed_at = comment["fixed_at"]
+  if released_at && fixed_at
+    begin
+      return Time.parse(released_at) > Time.parse(fixed_at)
+    rescue ArgumentError
+      # fall through to tag comparison
+    end
+  end
+  baseline = comment["baseline_version"]
+  live = info["version"]
+  !baseline.nil? && !live.nil? && live != baseline
 end
 
 # ---------- docker prune ----------
@@ -2679,9 +2803,10 @@ when "scripts"
 when "feedback"
   sub = argv.shift
   case sub
-  when "claim"  then cmd_feedback_claim(argv)
-  when "status" then cmd_feedback_status(argv)
-  when nil      then require_subcommand("feedback")
+  when "claim"     then cmd_feedback_claim(argv)
+  when "status"    then cmd_feedback_status(argv)
+  when "reconcile" then cmd_feedback_reconcile(argv)
+  when nil         then require_subcommand("feedback")
   else               unknown("feedback subcommand", sub, SUBCOMMANDS["feedback"])
   end
 else
