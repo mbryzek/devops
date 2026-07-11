@@ -2,7 +2,8 @@ require 'optparse'
 
 class Args
     attr_reader :env, :app, :file, :node, :format, :quiet, :tag, :dir, :profile, :path, :no_download,
-                :version, :push, :wait, :namespace, :timeout, :no_cache, :dry_run, :output, :job_suffix
+                :version, :push, :wait, :namespace, :timeout, :no_cache, :dry_run, :output, :job_suffix,
+                :cloudflare_account
     def initialize(args)
         @quiet = !args[:quiet].to_s.empty?
         @env = args[:env]
@@ -25,6 +26,7 @@ class Args
         @dry_run = args[:dry_run] ? true : false
         @output = args[:output]
         @job_suffix = args[:job_suffix]
+        @cloudflare_account = args[:cloudflare_account]
     end
 
     def info(msg)
@@ -137,6 +139,10 @@ class Args
 
             opts.on("--app NAME", "Specify the application name") do |app|
                 av.add("app", app)
+            end
+
+            opts.on("--cloudflare-account EMAIL", "Deploy only the sveltekit target for this Cloudflare login email (default: all targets)") do |email|
+                av.add("cloudflare_account", email)
             end
 
             opts.on("--dir DIR", "Specify the directory") do |dir|
