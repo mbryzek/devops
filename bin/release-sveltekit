@@ -43,7 +43,20 @@ end
 
 targets = helper.app_config.deploy_targets
 
-# Tag + write version once — one released version, deployed to every target.
+# --cloudflare-account EMAIL narrows the release to a single account's target, so you can
+# `wrangler login` to that account and deploy just it (auth is the ambient login — a run
+# can only reach the account you are logged into). Omit it to deploy every target in turn.
+if account = Args.parse(ARGV).cloudflare_account
+  matching = targets.select { |t| t.cloudflare_email == account }
+  if matching.empty?
+    configured = targets.map(&:cloudflare_email).uniq.join(", ")
+    Util.exit_with_error("No deploy target for cloudflare account '#{account}' in #{helper.app}. Configured: #{configured}")
+  end
+  puts "Deploying only the '#{account}' target (--cloudflare-account)"
+  targets = matching
+end
+
+# Tag + write version once — one released version, deployed to every selected target.
 tag = Tag.ask
 helper.maybe_tag_and_push(tag)
 helper.run(File.expand_path("~/code/claude/bin/set-version") + " --app #{helper.app} --version #{tag}")
