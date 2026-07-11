@@ -16,8 +16,9 @@ devops/bin/k8s-secrets --app workers
 ```
 
 Applies every `*.yaml` here with `__IMAGE_TAG__` substituted. The container reads
-`workers-secrets` (Secret) + `workers-config` (ConfigMap, optional) and mounts the
-`workers-browser-profile` PVC.
+`workers-secrets` (Secret) + `workers-config` (ConfigMap, optional) and mounts an
+ephemeral `emptyDir` browser profile (no persistent volume — the worker keeps no
+session state on disk across pod restarts).
 
 ## Internal DNS
 
