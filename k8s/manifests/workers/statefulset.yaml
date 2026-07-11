@@ -7,9 +7,13 @@ metadata:
     app: workers
     app.kubernetes.io/name: workers
 spec:
-  # Replicas MUST stay at 1. The persistent browser-profile PVC is RWO (DO block
-  # storage), and the in-process browser context is a singleton; a second pod
-  # would deadlock on the volume and corrupt session state.
+  # Replicas held at 1 by deliberate deferral, NOT a storage constraint anymore:
+  # the browser profile is now an ephemeral emptyDir (no RWO PVC to deadlock on),
+  # and the worker re-logins every batch (it reads no session state back from
+  # disk), so there is no cross-pod session affinity. Raising this to 3 for
+  # concurrent crawls is a separate change that also relaxes the platform's
+  # single-flight dispatch gate and grows the crawler node pool. See
+  # ~/code/claude/plans/cr-worker-parallelism-design.md (Phase B).
   replicas: 1
   serviceName: workers
   selector:
@@ -91,6 +95,11 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
       volumes:
+        # Ephemeral per-pod profile. The worker re-logins every batch and reads
+        # no session/profile state back from disk, so nothing needs to survive a
+        # pod restart. emptyDir persists across container restarts within the
+        # pod's life (so Cloudflare-clearance warmth is kept while the pod runs)
+        # and is cleared when the pod is removed. Replaces the RWO PVC that used
+        # to pin replicas to 1.
         - name: browser-profile
-          persistentVolumeClaim:
-            claimName: workers-browser-profile
+          emptyDir: {}
