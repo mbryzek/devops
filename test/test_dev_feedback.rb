@@ -101,7 +101,7 @@ class TestDevFeedback < Minitest::Test
     assert_includes md, "### 2. Padel Haus — page-level"
     assert_includes md, "BODY-ORIENTATION"
     assert_includes md, "## Closing each item"
-    assert_includes md, 'dev feedback status <id> --status fixed --note "<PR URL>"'
+    assert_includes md, 'dev feedback status <id> --status fixed --app <deployable-app> --pr "<PR URL>"'
     assert_includes md, "--status needs_input"
   end
 
@@ -156,6 +156,43 @@ class TestDevFeedback < Minitest::Test
     out, status = capture_stderr_and_exit { cmd_feedback_status(["cmt-1", "extra", "--status", "fixed"]) }
     assert_equal 1, status
     assert_match(/unexpected argument/, out)
+  end
+
+  def test_status_fixed_requires_app_and_pr
+    out, status = capture_stderr_and_exit { cmd_feedback_status(["cmt-1", "--status", "fixed"]) }
+    assert_equal 1, status
+    assert_match(/marking fixed requires --app/, out)
+    assert_match(/marking fixed requires --pr/, out)
+  end
+
+  def test_status_fixed_with_app_still_requires_pr
+    out, status = capture_stderr_and_exit { cmd_feedback_status(["cmt-1", "--status", "fixed", "--app", "clubaid-app"]) }
+    assert_equal 1, status
+    assert_match(/marking fixed requires --pr/, out)
+    refute_match(/marking fixed requires --app/, out)
+  end
+
+  # ---- feedback_released_since_fix? (deployed-detection logic) ----
+
+  def test_released_since_fix_true_when_release_newer_than_fix
+    info = { "version" => "0.1.5", "released_at" => "2026-07-10T12:00:00Z" }
+    comment = { "fixed_at" => "2026-07-10T09:00:00Z", "baseline_version" => "0.1.4" }
+    assert feedback_released_since_fix?(info, comment)
+  end
+
+  def test_released_since_fix_false_when_release_predates_fix
+    info = { "version" => "0.1.9", "released_at" => "2026-07-10T08:00:00Z" }
+    comment = { "fixed_at" => "2026-07-10T09:00:00Z", "baseline_version" => "0.1.4" }
+    refute feedback_released_since_fix?(info, comment)
+  end
+
+  def test_released_since_fix_falls_back_to_tag_when_timestamp_missing
+    # No released_at → compare live tag to the fix-time baseline.
+    moved = { "version" => "0.1.5" }
+    same = { "version" => "0.1.4" }
+    comment = { "fixed_at" => "2026-07-10T09:00:00Z", "baseline_version" => "0.1.4" }
+    assert feedback_released_since_fix?(moved, comment)
+    refute feedback_released_since_fix?(same, comment)
   end
 
   # ---- clubaid tenant login wiring ----
