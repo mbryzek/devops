@@ -1,91 +1,111 @@
 #!/usr/bin/env ruby
 
-# Run this script from the project root directory
-# Deploys SvelteKit apps to Cloudflare Pages
-# Supports both @sveltejs/adapter-static (outputs to build/)
-# and @sveltejs/adapter-cloudflare (outputs to .svelte-kit/cloudflare)
+# Run this script from the project root directory.
+# Deploys a SvelteKit app to one or more Cloudflare accounts/domains.
+#
+# Deploy targets come from the app config (sveltekit.deploy_targets in
+# env/apps/<app>/config.pkl). Each target names its Cloudflare account by login
+# email; the email -> account id + api token mapping lives in the (git-crypt)
+# env/cloudflare-accounts.pkl. An app with no targets listed deploys once to the
+# primary account, exactly as before.
+#
+# Supports both @sveltejs/adapter-static (build/) and @sveltejs/adapter-cloudflare
+# (.svelte-kit/cloudflare). Version tagging happens once; each target is then built
+# (primary via `npm run build`, a named env via `npm run build:<env>`) and deployed.
+
+require 'json'
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
 
 helper = ReleaseHelper.new("sveltekit")
 
-# Check if wrangler is installed
 unless system('which wrangler > /dev/null 2>&1')
-  puts "Error: wrangler CLI not found"
-  puts "Install with: npm install -g wrangler"
-  exit 1
+  Util.exit_with_error("wrangler CLI not found. Install with: npm install -g wrangler")
 end
 
-# Check if logged in
-unless system('wrangler whoami > /dev/null 2>&1')
-  helper.run "wrangler login"
-  exit 1
-end
-
-# Verify .env.production exists (required for Vite build-time env vars)
 unless File.exist?(".env.production")
-  puts "Error: .env.production not found"
-  puts "This file is required for production builds (VITE_API_BASE_URL, etc.)"
-  exit 1
+  Util.exit_with_error(".env.production not found (required for the primary Vite build)")
 end
 
-# Clean previous builds
-helper.run "rm -rf build .svelte-kit/cloudflare"
+# Cloudflare account map: email -> { account_id, api_token }. When present, every
+# deploy target's email must resolve here. When absent (older checkout), fall back to
+# the ambient `wrangler login` for a single primary deploy.
+accounts_path = File.expand_path(File.join(dir, "../../env/cloudflare-accounts.pkl"))
+accounts = nil
+if File.exist?(accounts_path)
+  json = `pkl eval -f json #{accounts_path}`
+  Util.exit_with_error("Failed to evaluate #{accounts_path}") unless $?.success?
+  accounts = JSON.parse(json)["accounts"]
+end
 
+targets = helper.app_config.deploy_targets
+
+# Tag + write version once — one released version, deployed to every target.
 tag = Tag.ask
 helper.maybe_tag_and_push(tag)
+helper.run(File.expand_path("~/code/claude/bin/set-version") + " --app #{helper.app} --version #{tag}")
 
-# Write .env.version so the deployed app can serve /_internal_/version
-set_version_cmd = File.expand_path("~/code/claude/bin/set-version") +
-  " --app #{helper.app} --version #{tag}"
-helper.run(set_version_cmd)
-
-# Build the project
-helper.run_system("npm run build")
-
-# Detect output directory based on adapter
-output_dir = if Dir.exist?("build")
-  "build"
-elsif Dir.exist?(".svelte-kit/cloudflare")
-  ".svelte-kit/cloudflare"
-else
-  puts "Error: No build output found"
-  puts "Expected 'build/' (adapter-static) or '.svelte-kit/cloudflare' (adapter-cloudflare)"
-  exit 1
-end
-
-# Deploy mechanism: Cloudflare Pages vs. Workers.
-#
-# Most SvelteKit apps here deploy to Cloudflare Pages. The owner app
-# (`clubaid`, see SP-A/SP-B of the club-subdomains program) must deploy as a
-# *Worker* so it can bind the wildcard route `*.clubaid.co/*` (Pages custom
-# domains are not wildcard-capable). The signal is wrangler.toml: a Pages
-# project declares `pages_build_output_dir`; a Worker declares `main` (its
-# entry) and `routes`. `wrangler deploy` reads wrangler.toml directly, so no
-# output_dir argument is passed for the Worker path.
-#
-# NOTE (SP-A spike sketch — SP-B owns the production version): SP-B will pin
-# the exact adapter-cloudflare Worker wrangler.toml (`main` =
-# `.svelte-kit/cloudflare/_worker.js`, an `assets` binding to the build dir,
-# and the `routes` block) when it scaffolds the new repo. This branch only
-# routes the deploy command; it does not yet generate that config.
-# Read once; ignore commented-out lines so a `# main = ...` note in a Pages
-# wrangler.toml is not misread as a Worker.
+# Worker vs Pages, read once from wrangler.toml. A Pages project declares
+# `pages_build_output_dir`; a Worker declares `main` + `routes`. Ignore commented lines.
 toml = File.exist?("wrangler.toml") ? File.read("wrangler.toml") : ""
 is_worker = toml.match?(/^\s*(?!#)main\s*=/) &&
   !toml.match?(/^\s*(?!#)pages_build_output_dir\s*=/)
+# A named env (e.g. [env.plybk]) makes a bare `wrangler deploy` ambiguous in wrangler 4.x,
+# so the primary (top-level) Worker deploy is made explicit with --env="".
+has_named_env = toml.match?(/^\s*(?!#)\[env\./)
 
-if is_worker
-  # When wrangler.toml declares named environments (e.g. [env.plybk] for the plybk.us
-  # mirror running alongside clubaid.co), a bare `wrangler deploy` is ambiguous and wrangler
-  # warns. Target the top-level environment explicitly with --env="". For a single-environment
-  # config --env="" is identical to a bare deploy, so we only add it when a named env exists.
-  has_named_env = toml.match?(/^\s*(?!#)\[env\./)
-  deploy_cmd = has_named_env ? 'wrangler deploy --env=""' : "wrangler deploy"
-  puts "Deploying #{output_dir} as a Cloudflare Worker (#{deploy_cmd})"
-  helper.run_system(deploy_cmd)
-else
-  puts "Deploying #{output_dir} to Cloudflare Pages"
-  helper.run_system("wrangler pages deploy #{output_dir}")
+targets.each do |target|
+  email = target.cloudflare_email
+  env = target.wrangler_env
+  env = nil if env && env.strip.empty?
+
+  # Per-target Cloudflare credentials. Pinning CLOUDFLARE_ACCOUNT_ID makes the deploy
+  # deterministic (and overrides any stray CLOUDFLARE_ACCOUNT_ID in the shell).
+  if accounts
+    acct = accounts[email]
+    Util.exit_with_error("No entry for Cloudflare account '#{email}' in #{accounts_path}") if acct.nil?
+    ENV['CLOUDFLARE_ACCOUNT_ID'] = acct['account_id']
+    token = acct['api_token']
+    if token && !token.empty? && !token.start_with?('REPLACE_')
+      ENV['CLOUDFLARE_API_TOKEN'] = token
+    else
+      # No real token: deploy this account via the ambient `wrangler login`.
+      ENV.delete('CLOUDFLARE_API_TOKEN')
+    end
+  else
+    ENV.delete('CLOUDFLARE_ACCOUNT_ID')
+    ENV.delete('CLOUDFLARE_API_TOKEN')
+  end
+
+  puts ""
+  puts "==> Deploying #{helper.app} to #{email}#{env ? " (env #{env})" : " (primary)"}"
+
+  # Clean + build for this target. A named env builds via `npm run build:<env>`
+  # (loads .env.<env>); the primary builds via `npm run build` (.env.production).
+  helper.run "rm -rf build .svelte-kit/cloudflare"
+  if env
+    unless File.exist?(".env.#{env}")
+      Util.exit_with_error(".env.#{env} not found (required to build the '#{env}' target)")
+    end
+    helper.run_system("npm run build:#{env}")
+  else
+    helper.run_system("npm run build")
+  end
+
+  output_dir = if Dir.exist?("build")
+    "build"
+  elsif Dir.exist?(".svelte-kit/cloudflare")
+    ".svelte-kit/cloudflare"
+  else
+    Util.exit_with_error("No build output found (expected build/ or .svelte-kit/cloudflare)")
+  end
+
+  if is_worker
+    env_flag = if env then "--env #{env}" elsif has_named_env then '--env=""' else "" end
+    helper.run_system("wrangler deploy #{env_flag}".strip)
+  else
+    project_flag = target.pages_project ? "--project-name #{target.pages_project}" : ""
+    helper.run_system("wrangler pages deploy #{output_dir} #{project_flag}".strip)
+  end
 end
