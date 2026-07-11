@@ -7,14 +7,17 @@ metadata:
     app: workers
     app.kubernetes.io/name: workers
 spec:
-  # Replicas held at 1 by deliberate deferral, NOT a storage constraint anymore:
-  # the browser profile is now an ephemeral emptyDir (no RWO PVC to deadlock on),
-  # and the worker re-logins every batch (it reads no session state back from
-  # disk), so there is no cross-pod session affinity. Raising this to 3 for
-  # concurrent crawls is a separate change that also relaxes the platform's
-  # single-flight dispatch gate and grows the crawler node pool. See
+  # 2 replicas so two crawls run concurrently, each on its own pod + egress IP.
+  # Safe because the worker is stateless: the browser profile is an ephemeral
+  # emptyDir (no RWO PVC to deadlock on) and per-club login state is fed from the
+  # platform DB (court_reserve.sessions), so any pod can serve any club. The
+  # platform's report-lane dispatch gate is set to match (maxConcurrentInvocations
+  # = 2 in AbstractInvocationProcessor); the ClusterIP Service round-robins across
+  # pods and a collision just bounces on the worker 409 and retries.
+  # REQUIRES the tier: crawler node pool to have room for 2 pods (see nodeSelector
+  # note below) — a 2nd node, or one larger node. See
   # ~/code/claude/plans/cr-worker-parallelism-design.md (Phase B).
-  replicas: 1
+  replicas: 2
   serviceName: workers
   selector:
     matchLabels:
@@ -27,8 +30,11 @@ spec:
     spec:
       # Dedicated `tier: crawler` node pool so a Chromium scrape doesn't
       # compete with web traffic (tier: web) or backend jobs (tier: job).
-      # Currently a single s-2vcpu-4gb node (pool-crawler-4gb) — bump pool
-      # size or size class if the crawler queue grows.
+      # Each pod requests 1400Mi; two won't fit one s-2vcpu-4gb node (~2.5Gi
+      # schedulable), so running 2 replicas needs the pool scaled to 2 nodes
+      # (doctl kubernetes cluster node-pool update ... --count 2) or one larger
+      # size class. Until the pool has room the 2nd pod stays Pending (harmless:
+      # the 1st keeps serving and surplus dispatch bounces on the worker 409).
       nodeSelector:
         tier: crawler
       # 90s gives an in-flight Chromium scrape time to finish + closeSession()
