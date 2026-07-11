@@ -803,12 +803,22 @@ def feedback_chart_label(comment)
   key.nil? || key.empty? ? "page-level" : key
 end
 
+# Human label for the club a comment belongs to. Child clubs are named bare
+# ("Baltimore", "Fountain") and are ambiguous without their parent, so render
+# "Parent / Child" when the club has a parent. Falls back to the club id, then "?".
+def feedback_club_label(comment)
+  club = comment["club"] || {}
+  name = club["name"] || club["id"] || "?"
+  parent = club["parent"]
+  parent_name = parent && (parent["name"] || parent["id"])
+  parent_name.nil? || parent_name.empty? ? name : "#{parent_name} / #{name}"
+end
+
 def feedback_summary_line(comment, index)
-  club = comment.dig("club", "name") || comment.dig("club", "id") || "?"
   created = (comment["created_at"] || "").to_s[0, 10]
   snippet = comment["comment"].to_s.gsub(/\s+/, " ").strip
   snippet = "#{snippet[0, 57]}..." if snippet.length > 60
-  "  #{index}. #{club} · #{created} · #{feedback_chart_label(comment)} — #{snippet}"
+  "  #{index}. #{feedback_club_label(comment)} · #{created} · #{feedback_chart_label(comment)} — #{snippet}"
 end
 
 # One claimed comment rendered as a plan section. Kept separate (and pure) so the
@@ -816,10 +826,10 @@ end
 def feedback_render_item(comment, index)
   screenshot = comment.dig("screenshot", "url")
   lines = []
-  lines << "### #{index}. #{comment.dig('club', 'name')} — #{feedback_chart_label(comment)}"
+  lines << "### #{index}. #{feedback_club_label(comment)} — #{feedback_chart_label(comment)}"
   lines << ""
   lines << "- Comment id: `#{comment['id']}`"
-  lines << "- Club: #{comment.dig('club', 'name')} (`#{comment.dig('club', 'id')}`)"
+  lines << "- Club: #{feedback_club_label(comment)} (`#{comment.dig('club', 'id')}`)"
   lines << "- Page: `#{comment['page_url']}`"
   lines << if comment["chart_key"].nil? || comment["chart_key"].empty?
              "- Scope: page-level feedback (no single chart)"

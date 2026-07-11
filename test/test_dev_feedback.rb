@@ -36,6 +36,14 @@ class TestDevFeedback < Minitest::Test
     }
   end
 
+  # Child club (bare name "Baltimore") with a parent — ambiguous without it.
+  def child_comment
+    chart_comment.merge(
+      "id" => "cmt-3",
+      "club" => { "id" => "bounce-baltimore", "name" => "Baltimore", "parent" => { "id" => "bounce", "name" => "Bounce" } },
+    )
+  end
+
   # ---- feedback_render_item ----
 
   def test_render_item_with_chart_and_screenshot
@@ -60,6 +68,27 @@ class TestDevFeedback < Minitest::Test
     c = chart_comment.merge("comment" => "line one\nline two")
     out = feedback_render_item(c, 1)
     assert_includes out, "> line one\n> line two"
+  end
+
+  def test_render_item_prefixes_parent_club
+    out = feedback_render_item(child_comment, 1)
+    assert_includes out, "### 1. Bounce / Baltimore — revenue-by-type"
+    assert_includes out, "- Club: Bounce / Baltimore (`bounce-baltimore`)"
+  end
+
+  # ---- feedback_club_label ----
+
+  def test_club_label_prefixes_parent_when_present
+    assert_equal "Bounce / Baltimore", feedback_club_label(child_comment)
+  end
+
+  def test_club_label_bare_name_without_parent
+    assert_equal "Padel Haus", feedback_club_label(chart_comment)
+  end
+
+  def test_club_label_falls_back_to_id_then_placeholder
+    assert_equal "club-x", feedback_club_label("club" => { "id" => "club-x" })
+    assert_equal "?", feedback_club_label({})
   end
 
   # ---- feedback_plan_markdown ----
@@ -88,6 +117,10 @@ class TestDevFeedback < Minitest::Test
 
   def test_summary_line_page_level_label
     assert_includes feedback_summary_line(page_comment, 1), "page-level"
+  end
+
+  def test_summary_line_prefixes_parent_club
+    assert_includes feedback_summary_line(child_comment, 4), "  4. Bounce / Baltimore · 2026-07-10 · revenue-by-type — "
   end
 
   # ---- shared body file is real and reachable ----
