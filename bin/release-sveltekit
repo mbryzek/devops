@@ -28,11 +28,13 @@ unless File.exist?(".env.production")
   Util.exit_with_error(".env.production not found (required for the primary Vite build)")
 end
 
-# Cloudflare account map: email -> { account_id }. When present, every deploy target's
-# email must resolve here and pins CLOUDFLARE_ACCOUNT_ID for that deploy. Authentication
-# is always the ambient `wrangler login` OAuth session (we do not use API tokens), so each
-# target's account must be the one you are currently `wrangler login`'d into. When absent
-# (older checkout), fall back to the ambient login for a single primary deploy.
+# Cloudflare account map: email -> { account_id, api_token }. When present, every deploy
+# target's email must resolve here. Each target pins CLOUDFLARE_ACCOUNT_ID and, when the
+# account has a real api_token, CLOUDFLARE_API_TOKEN — so a release can deploy to a SECOND
+# account the ambient `wrangler login` cannot reach (the plybk.us / clubaid.ai case). Leave
+# a token as the REPLACE_… placeholder to fall back to the ambient login for that account
+# (fine for the primary you deploy interactively). When the map is absent (older checkout),
+# fall back to the ambient login for a single primary deploy.
 accounts_path = File.expand_path(File.join(dir, "../../env/cloudflare-accounts.pkl"))
 accounts = nil
 if File.exist?(accounts_path)
@@ -62,16 +64,24 @@ targets.each do |target|
   env = target.wrangler_env
   env = nil if env && env.strip.empty?
 
-  # Pin CLOUDFLARE_ACCOUNT_ID so the deploy targets the intended account deterministically
-  # (and overrides any stray CLOUDFLARE_ACCOUNT_ID in the shell). Auth is always the ambient
-  # `wrangler login` OAuth session — we never set CLOUDFLARE_API_TOKEN, and clear any stray one.
-  ENV.delete('CLOUDFLARE_API_TOKEN')
+  # Per-target Cloudflare credentials. Pinning CLOUDFLARE_ACCOUNT_ID makes the deploy
+  # deterministic (and overrides any stray CLOUDFLARE_ACCOUNT_ID in the shell). A real
+  # api_token pins CLOUDFLARE_API_TOKEN so this target authenticates to ITS OWN account —
+  # required to reach a second account the ambient `wrangler login` can't (plybk.us). A
+  # placeholder/empty token falls back to the ambient login for that account.
   if accounts
     acct = accounts[email]
     Util.exit_with_error("No entry for Cloudflare account '#{email}' in #{accounts_path}") if acct.nil?
     ENV['CLOUDFLARE_ACCOUNT_ID'] = acct['account_id']
+    token = acct['api_token']
+    if token && !token.empty? && !token.start_with?('REPLACE_')
+      ENV['CLOUDFLARE_API_TOKEN'] = token
+    else
+      ENV.delete('CLOUDFLARE_API_TOKEN')
+    end
   else
     ENV.delete('CLOUDFLARE_ACCOUNT_ID')
+    ENV.delete('CLOUDFLARE_API_TOKEN')
   end
 
   puts ""
