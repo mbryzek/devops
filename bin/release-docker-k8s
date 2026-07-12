@@ -54,6 +54,7 @@ puts ""
 
 # Step 1: build + push Docker image (script handles `docker buildx --push`).
 puts "Building + pushing Docker image..."
+Util.registry_login
 Dir.chdir(source_dir) do
   Util.run("#{build_script} #{version}")
 end

@@ -201,6 +201,7 @@ if deployed
       build_log = "/tmp/platformdb-image-build-#{tag}.log"
       puts "Building and pushing platformdb Docker image for schema tag #{tag}..."
       puts "  (dev-only build output -> #{build_log}; shown here only on failure)"
+      Util.registry_login
       cmd = "#{Shellwords.shellescape(build_script)} #{Shellwords.shellescape(tag)} " \
             "> #{Shellwords.shellescape(build_log)} 2>&1"
       unless system(cmd)
