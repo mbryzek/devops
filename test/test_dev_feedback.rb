@@ -132,6 +132,20 @@ class TestDevFeedback < Minitest::Test
     assert_includes body, "mbryzek/clubaid-app"
   end
 
+  # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
+
+  def test_feedback_session_prompt_names_the_plan
+    assert_equal "read the plan at /p/x.md and implement it", feedback_session_prompt("/p/x.md")
+  end
+
+  def test_feedback_claude_command_is_ccd_pinned_to_opus_1m
+    cmd = feedback_claude_command("/p/x.md")
+    assert_equal "claude", cmd[0]
+    assert_includes cmd, "--dangerously-skip-permissions"          # the `ccd` alias
+    assert_equal "claude-opus-4-8[1m]", cmd[cmd.index("--model") + 1]
+    assert_equal feedback_session_prompt("/p/x.md"), cmd.last       # prompt is the final arg
+  end
+
   # ---- cmd_feedback_status arg validation (exits before any network) ----
 
   def test_status_requires_id

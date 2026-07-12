@@ -41,7 +41,7 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
-  "feedback claim"      => 'feedback claim [--localhost] [--yes]',
+  "feedback claim"      => 'feedback claim [--localhost] [--yes] [--no-spawn]',
   "feedback status"     => 'feedback status <id> --status STATUS [--note "TEXT"] [--app APP --pr URL] [--localhost]',
   "feedback reconcile"  => 'feedback reconcile [--apply] [--localhost]',
 }.freeze
@@ -160,9 +160,11 @@ USAGE = <<~USAGE
         a Claude session to work on. Lists the open items, and — after you confirm
         (or with --yes) — atomically claims all of them and writes ONE plan to
         ~/code/claude/plans/<date>-graph-feedback.md.
-        Prints the plan path; it does not start a session. Authenticates with your
-        persisted clubaid session — run `dev login --app clubaid` once first (the
-        feedback API requires a clubaid admin, not the platform `dev login`).
+        Then hands the terminal to an interactive Claude session (Opus 4.8, 1M
+        context — the `ccd` model) to implement the plan; pass --no-spawn to just
+        write the plan and print its path. Authenticates with your persisted
+        clubaid session — run `dev login --app clubaid` once first (the feedback
+        API requires a clubaid admin, not the platform `dev login`).
 
     #{INVOCATIONS["feedback status"]}
         Close a claimed feedback item. STATUS is one of open, claimed, fixed,
@@ -795,6 +797,23 @@ end
 
 FEEDBACK_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
 
+# Model the spawned session runs on: Opus 4.8 with the 1M-context window. This is
+# the interactive default (the `ccd` alias's model), NOT the headless-codegen
+# `CODEGEN_CLAUDE_MODEL` (haiku) — a human is driving this one to fix real bugs.
+FEEDBACK_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
+
+# The prompt handed to the spawned Claude session.
+def feedback_session_prompt(path)
+  "read the plan at #{path} and implement it"
+end
+
+# Pure, testable seam: the argv for the interactive session `dev feedback claim`
+# launches after writing the plan. Mirrors the `ccd` alias
+# (`claude --dangerously-skip-permissions`) pinned to Opus 4.8 (1M context).
+def feedback_claude_command(path)
+  ["claude", "--dangerously-skip-permissions", "--model", FEEDBACK_CLAUDE_MODEL, feedback_session_prompt(path)]
+end
+
 # The feedback API is authorized for a clubaid tenant admin, not the platform
 # tenant that `dev login` stores — authenticate with the persisted clubaid
 # session (`dev login --app clubaid`) on the platform host.
@@ -909,8 +928,15 @@ end
 def cmd_feedback_claim(args)
   rest, _app, use_localhost = parse_common_flags(args)
   assume_yes = false
+  spawn_session = true
   leftover = []
-  rest.each { |a| %w[--yes -y].include?(a) ? (assume_yes = true) : leftover << a }
+  rest.each do |a|
+    case a
+    when "--yes", "-y"   then assume_yes = true
+    when "--no-spawn"    then spawn_session = false
+    else leftover << a
+    end
+  end
   reject_unknown_args("feedback claim", leftover)
   require_clubaid_session!
 
@@ -946,7 +972,26 @@ def cmd_feedback_claim(args)
     puts "Claimed #{claimed.length} of #{open.length} open item(s). Plan written to:"
     puts "  #{path}"
     puts ""
-    puts "Hand it to a session with:  claude \"read the plan at #{path} and implement it\""
+
+    unless spawn_session
+      puts "Hand it to a session with:  claude \"#{feedback_session_prompt(path)}\""
+      return
+    end
+
+    # Hand the terminal directly to an interactive Claude session (Opus 4.8, 1M
+    # context) so it starts working the plan immediately. exec replaces this
+    # process, so the session inherits the TTY and this is the last thing we do.
+    puts "Starting Claude session (Opus 4.8, 1M context) to implement the plan..."
+    puts "  (re-run with --no-spawn to just write the plan)"
+    puts ""
+    begin
+      exec(*feedback_claude_command(path))
+    rescue SystemCallError => e
+      # `claude` not on PATH (or otherwise unlaunchable). The plan is already
+      # written, so degrade to the manual hand-off rather than a stack trace.
+      warn "Could not start Claude (#{e.message}). The plan is saved — run it with:"
+      warn "  claude \"#{feedback_session_prompt(path)}\""
+    end
   end
 end
 
