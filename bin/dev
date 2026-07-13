@@ -326,8 +326,8 @@ end
 
 def handle_errors
   yield
-rescue SessionExpired
-  warn "session expired or invalid - run 'dev login'"
+rescue SessionExpired => e
+  warn e.message
   exit 1
 rescue ApiError => e
   warn e.message
@@ -349,7 +349,7 @@ def login_platform(use_localhost, email, password)
   session_id = res.dig("session", "id")
   raise ApiError, "response missing session.id: #{res.inspect}" if session_id.nil? || session_id.empty?
 
-  ApiClient.write_session_id_for("platform", session_id)
+  ApiClient.write_session_id_for("platform", session_id, use_localhost: use_localhost)
   user_email = res.dig("user", "email") || email
   puts "Logged in to platform as #{user_email}"
 end
@@ -364,7 +364,7 @@ def login_acumen(use_localhost, email, password)
   session_id = res["id"]
   raise ApiError, "response missing session id: #{res.inspect}" if session_id.nil? || session_id.empty?
 
-  ApiClient.write_session_id_for("acumen", session_id)
+  ApiClient.write_session_id_for("acumen", session_id, use_localhost: use_localhost)
   user_email = res.dig("user", "email") || email
   puts "Logged in to acumen as #{user_email}"
 end
@@ -379,7 +379,7 @@ def login_clubaid(use_localhost, email, password)
   session_id = res.dig("session", "id")
   raise ApiError, "response missing session.id: #{res.inspect}" if session_id.nil? || session_id.empty?
 
-  ApiClient.write_session_id_for("clubaid", session_id)
+  ApiClient.write_session_id_for("clubaid", session_id, use_localhost: use_localhost)
   user_email = res.dig("user", "email") || email
   puts "Logged in to clubaid as #{user_email}"
 end
@@ -481,9 +481,9 @@ def cmd_logout(args)
     end
   end
 
-  platform_sid = ApiClient.session_id_for("platform")
-  acumen_sid   = ApiClient.session_id_for("acumen")
-  clubaid_sid  = ApiClient.session_id_for("clubaid")
+  platform_sid = ApiClient.session_id_for("platform", use_localhost: use_localhost)
+  acumen_sid   = ApiClient.session_id_for("acumen", use_localhost: use_localhost)
+  clubaid_sid  = ApiClient.session_id_for("clubaid", use_localhost: use_localhost)
 
   if platform_sid.nil? && acumen_sid.nil? && clubaid_sid.nil?
     puts "No active session"
@@ -496,7 +496,7 @@ def cmd_logout(args)
     rescue SessionExpired, ApiError
       # ignore - we'll clear locally anyway
     end
-    ApiClient.clear_session_id_for("platform")
+    ApiClient.clear_session_id_for("platform", use_localhost: use_localhost)
   end
 
   if acumen_sid
@@ -506,7 +506,7 @@ def cmd_logout(args)
     rescue SessionExpired, ApiError
       # ignore - we'll clear locally anyway
     end
-    ApiClient.clear_session_id_for("acumen")
+    ApiClient.clear_session_id_for("acumen", use_localhost: use_localhost)
   end
 
   if clubaid_sid
@@ -516,7 +516,7 @@ def cmd_logout(args)
     rescue SessionExpired, ApiError
       # ignore - we'll clear locally anyway
     end
-    ApiClient.clear_session_id_for("clubaid")
+    ApiClient.clear_session_id_for("clubaid", use_localhost: use_localhost)
   end
 
   puts "Logged out"
@@ -823,9 +823,9 @@ end
 
 # Fail with the exact login command when there is no clubaid session yet, rather
 # than the generic "run 'dev login'" that handle_errors emits on a 401.
-def require_clubaid_session!
-  return unless ApiClient.session_id_for("clubaid").nil?
-  Util.exit_with_error("No clubaid session. Run `dev login --app clubaid` first.")
+def require_clubaid_session!(use_localhost)
+  return unless ApiClient.session_id_for("clubaid", use_localhost: use_localhost).nil?
+  Util.exit_with_error("No clubaid session#{use_localhost ? ' (localhost)' : ''}. Run `dev login --app clubaid#{use_localhost ? ' --localhost' : ''}` first.")
 end
 
 def feedback_chart_label(comment)
@@ -938,7 +938,7 @@ def cmd_feedback_claim(args)
     end
   end
   reject_unknown_args("feedback claim", leftover)
-  require_clubaid_session!
+  require_clubaid_session!(use_localhost)
 
   handle_errors do
     endpoint = feedback_endpoint(use_localhost)
@@ -1058,7 +1058,7 @@ def cmd_feedback_status(args)
     end
   end
 
-  require_clubaid_session!
+  require_clubaid_session!(use_localhost)
 
   handle_errors do
     res = ApiClient.request(feedback_endpoint(use_localhost), :put,
@@ -1079,7 +1079,7 @@ def cmd_feedback_reconcile(args)
   leftover = []
   rest.each { |a| a == "--apply" ? (apply = true) : leftover << a }
   reject_unknown_args("feedback reconcile", leftover)
-  require_clubaid_session!
+  require_clubaid_session!(use_localhost)
 
   registry = Work::Registry.load
   version_cache = {}
