@@ -1040,9 +1040,12 @@ def cmd_feedback_status(args)
 
   if status == "fixed"
     registry = Work::Registry.load
-    app = registry.deployable.find { |a| a.name == target_app }
+    # deploy_tracked, not deployable: a fix can ship in an app (e.g. clubaid-app)
+    # that has no pingable prod URL. The baseline read below tolerates a missing
+    # version, so it's fine that such apps aren't `deployable`.
+    app = registry.deploy_tracked.find { |a| a.name == target_app }
     unless app
-      valid = registry.deployable.map(&:name).sort.join(", ")
+      valid = registry.deploy_tracked.map(&:name).sort.join(", ")
       Util.exit_with_error("Unknown --app '#{target_app}'. Valid apps: #{valid}")
     end
     body[:pull_request_url] = pr
@@ -1099,7 +1102,7 @@ def cmd_feedback_reconcile(args)
         next
       end
       info = version_cache[app_name] ||= begin
-        app = registry.deployable.find { |a| a.name == app_name }
+        app = registry.deploy_tracked.find { |a| a.name == app_name }
         app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
       end
       if info[:error]
@@ -1310,13 +1313,16 @@ end
 
 def pending_items
   registry = Work::Registry.load
-  items = registry.deployable.map { |app| [app.name, File.expand_path("~/code/#{app.name}")] }
+  # deploy_tracked (not deployable): we release every non-ignored app with a real
+  # deploy path, including host-derived-tenant apps like clubaid-app that have no
+  # single pingable prod URL and so are absent from `deployable`.
+  items = registry.deploy_tracked.map { |app| [app.name, File.expand_path("~/code/#{app.name}")] }
   # DB repos are derived from the apps registry, not a filesystem glob: every
   # deployable scala app declares a database in its config.pkl and ships a
   # conventional "<app>-postgresql" repo checked out next to it. Driving
   # discovery from the registry keeps stray/abandoned *-postgresql checkouts
-  # out of the list; scoping to `deployable` excludes ignored/archived apps.
-  registry.deployable.select { |app| app.stack == :scala }.each do |app|
+  # out of the list; scoping to deploy_tracked excludes ignored/archived apps.
+  registry.deploy_tracked.select { |app| app.stack == :scala }.each do |app|
     db = "#{app.name}-postgresql"
     items << [db, File.expand_path("~/code/#{db}")]
   end

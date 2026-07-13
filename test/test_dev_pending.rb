@@ -82,18 +82,18 @@ class TestPendingItems < Minitest::Test
   FakeApp = Struct.new(:name, :stack, keyword_init: true)
 
   class FakeRegistry
-    def initialize(apps, deployable)
+    def initialize(apps, deploy_tracked)
       @apps = apps
-      @deployable = deployable
+      @deploy_tracked = deploy_tracked
     end
     attr_reader :apps
-    def deployable = @deployable
+    def deploy_tracked = @deploy_tracked
   end
 
-  def with_registry(apps, deployable = nil)
-    deployable ||= apps
+  def with_registry(apps, deploy_tracked = nil)
+    deploy_tracked ||= apps
     orig = Work::Registry.method(:load)
-    Work::Registry.define_singleton_method(:load) { FakeRegistry.new(apps, deployable) }
+    Work::Registry.define_singleton_method(:load) { FakeRegistry.new(apps, deploy_tracked) }
     yield
   ensure
     Work::Registry.define_singleton_method(:load, orig)
@@ -123,7 +123,7 @@ class TestPendingItems < Minitest::Test
   end
 
   def test_non_deployable_scala_app_gets_no_db_repo
-    # An ignored/archived scala app is in `apps` but not in `deployable`; its
+    # An ignored/archived scala app is in `apps` but not in `deploy_tracked`; its
     # DB repo must not show up as a phantom pending entry.
     scala = FakeApp.new(name: "archived", stack: :scala)
     with_registry([scala], []) do
