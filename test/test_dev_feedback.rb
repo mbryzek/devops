@@ -242,11 +242,29 @@ class TestDevFeedback < Minitest::Test
 
   def test_require_clubaid_session_names_exact_login_command
     orig = ApiClient.method(:session_id_for)
-    ApiClient.define_singleton_method(:session_id_for) { |app| app == "clubaid" ? nil : orig.call(app) }
-    out, status = capture_stderr_and_exit { require_clubaid_session! }
+    ApiClient.define_singleton_method(:session_id_for) { |app, use_localhost:| app == "clubaid" ? nil : orig.call(app, use_localhost: use_localhost) }
+    out, status = capture_stderr_and_exit { require_clubaid_session!(false) }
     assert_equal 1, status
     assert_match(/dev login --app clubaid/, out)
   ensure
     ApiClient.define_singleton_method(:session_id_for, orig)
+  end
+
+  def test_require_clubaid_session_localhost_names_localhost_login_command
+    orig = ApiClient.method(:session_id_for)
+    ApiClient.define_singleton_method(:session_id_for) { |app, use_localhost:| app == "clubaid" ? nil : orig.call(app, use_localhost: use_localhost) }
+    out, status = capture_stderr_and_exit { require_clubaid_session!(true) }
+    assert_equal 1, status
+    assert_match(/dev login --app clubaid --localhost/, out)
+  ensure
+    ApiClient.define_singleton_method(:session_id_for, orig)
+  end
+
+  def test_clubaid_session_file_is_scoped_by_localhost
+    prod = ApiClient.session_file("clubaid", false)
+    local = ApiClient.session_file("clubaid", true)
+    refute_equal prod, local
+    assert_match(%r{/\.platform/devops_clubaid$}, prod)
+    assert_match(%r{/\.platform/devops_clubaid_localhost$}, local)
   end
 end

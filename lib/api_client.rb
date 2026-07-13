@@ -24,30 +24,40 @@ class ApiClient
     "clubaid"  => { file: File.expand_path("~/.platform/devops_clubaid"), header: "session_id" },
   }.freeze
 
-  def self.session_id_for(app)
+  # Prod and localhost are different servers with disjoint session stores, so a
+  # session id from one is simply invalid on the other. Suffix the file so
+  # logging in to one target never clobbers or gets misread as the other -
+  # previously a single prod clubaid session id would get silently replayed
+  # against localhost and rejected with a generic "session expired" error.
+  def self.session_file(app, use_localhost)
     cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
-    return nil unless File.exist?(cfg[:file])
-    id = File.read(cfg[:file]).strip
+    use_localhost ? "#{cfg[:file]}_localhost" : cfg[:file]
+  end
+
+  def self.session_id_for(app, use_localhost:)
+    file = session_file(app, use_localhost)
+    return nil unless File.exist?(file)
+    id = File.read(file).strip
     id.empty? ? nil : id
   end
 
-  def self.write_session_id_for(app, id)
-    cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
-    dir = File.dirname(cfg[:file])
+  def self.write_session_id_for(app, id, use_localhost:)
+    file = session_file(app, use_localhost)
+    dir = File.dirname(file)
     FileUtils.mkdir_p(dir, mode: 0700)
-    tmp = "#{cfg[:file]}.tmp.#{Process.pid}"
+    tmp = "#{file}.tmp.#{Process.pid}"
     File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0600) { |f| f.write(id) }
-    File.rename(tmp, cfg[:file])
+    File.rename(tmp, file)
   end
 
-  def self.clear_session_id_for(app)
-    cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
-    File.delete(cfg[:file]) if File.exist?(cfg[:file])
+  def self.clear_session_id_for(app, use_localhost:)
+    file = session_file(app, use_localhost)
+    File.delete(file) if File.exist?(file)
   end
 
   def self.endpoints(use_localhost:, app_filter: nil)
     list = app_filter ? ENDPOINTS.select { |e| e[:app] == app_filter.downcase } : ENDPOINTS
-    list.map { |e| e.merge(active_url: use_localhost ? e[:localhost] : e[:url]) }
+    list.map { |e| e.merge(active_url: use_localhost ? e[:localhost] : e[:url], use_localhost: use_localhost) }
   end
 
   # An endpoint for a tenant login that lives on the platform host but is not a
@@ -55,7 +65,7 @@ class ApiClient
   # the tenant's own `app` so request/session lookups use its SESSION_CONFIG.
   def self.tenant_endpoint(app, use_localhost:)
     platform = endpoints(use_localhost: use_localhost, app_filter: "platform").first
-    { name: app.capitalize, app: app, active_url: platform[:active_url] }
+    { name: app.capitalize, app: app, active_url: platform[:active_url], use_localhost: use_localhost }
   end
 
   def self.request(endpoint, method, path, body: nil, auth_required: true)
@@ -70,12 +80,15 @@ class ApiClient
       patch: Net::HTTP::Patch, delete: Net::HTTP::Delete
     }.fetch(method.to_sym)
 
+    use_localhost = endpoint.fetch(:use_localhost)
+    login_cmd = "dev login#{endpoint[:app] == 'platform' ? '' : " --app #{endpoint[:app]}"}#{use_localhost ? ' --localhost' : ''}"
+
     req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
     if auth_required
       cfg = SESSION_CONFIG.fetch(endpoint[:app])
-      sid = session_id_for(endpoint[:app]) or
-        raise SessionExpired, "No session for #{endpoint[:app]}. Run 'dev login#{endpoint[:app] == 'platform' ? '' : " --app #{endpoint[:app]}"}'."
+      sid = session_id_for(endpoint[:app], use_localhost: use_localhost) or
+        raise SessionExpired, "No session for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
       req[cfg[:header]] = sid
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body
@@ -86,7 +99,7 @@ class ApiClient
     when 200..299
       res.body && !res.body.empty? ? JSON.parse(res.body) : nil
     when 401
-      raise SessionExpired, "Session expired or invalid. Run 'dev login'."
+      raise SessionExpired, "Session expired or invalid for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
     else
       raise ApiError, "HTTP #{code} #{method.to_s.upcase} #{path}: #{res.body}"
     end
