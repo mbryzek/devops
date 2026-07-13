@@ -129,6 +129,25 @@ delete from court_reserve.sales_summaries            where club_id in (select id
 delete from court_reserve.sales_categories           where club_id in (select id from _del_clubs);
 delete from court_reserve.sessions                   where club_id in (select id from _del_clubs);
 delete from court_reserve.transactions               where club_id in (select id from _del_clubs);
+delete from court_reserve.refunds                    where club_id in (select id from _del_clubs);
+
+-- ---- court_reserve gap-scan cluster (windows -> sweeps) ---------------------
+delete from court_reserve.gap_scan_windows          where club_id in (select id from _del_clubs);
+delete from court_reserve.gap_scan_sweeps           where club_id in (select id from _del_clubs);
+delete from court_reserve.gap_scan_states           where club_id in (select id from _del_clubs);
+delete from court_reserve.gap_scan_findings         where club_id in (select id from _del_clubs);
+
+-- ---- court_reserve memberships (memberships -> membership_types) ------------
+delete from court_reserve.memberships               where club_id in (select id from _del_clubs);
+delete from court_reserve.membership_types          where club_id in (select id from _del_clubs);
+
+-- ---- playbook members (scores/transitions -> members) ----------------------
+delete from playbook.member_engagement_scores       where club_id in (select id from _del_clubs);
+delete from playbook.member_segment_transitions     where club_id in (select id from _del_clubs);
+delete from playbook.members                        where club_id in (select id from _del_clubs);
+
+-- ---- feedback --------------------------------------------------------------
+delete from feedback.comments                       where club_id in (select id from _del_clubs);
 
 -- ---- integrations + rallyd -------------------------------------------------
 delete from integrations.credentials                 where club_id in (select id from _del_clubs);
