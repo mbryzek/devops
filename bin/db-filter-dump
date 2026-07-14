@@ -169,6 +169,9 @@ def load_schema_and_index(input_path, dbname)
         end
 
         # Non-COPY line: part of the schema. Emit to psql and harvest FK edges.
+        # Skip the one ownership statement the unprivileged api role cannot execute
+        # (present when the source cluster's public schema is owned by postgres).
+        next if line == 'ALTER SCHEMA public OWNER TO postgres;'
         psql.write(raw)
         if (m = line.match(/\AALTER TABLE (?:ONLY )?(\S+)/))
           cur_alter = m[1]

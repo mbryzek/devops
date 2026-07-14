@@ -93,7 +93,11 @@ else
     bin_esc = Shellwords.shellescape(FILTER_DUMP_BIN)
     Util.run("#{bin_esc} --db #{db_esc} --input #{file_esc}")
   else
-    Util.run("psql --set ON_ERROR_STOP=on -U api -f #{file_esc} #{db_esc}")
+    # pg_dump emits `ALTER SCHEMA public OWNER TO postgres;` when the source cluster's public
+    # schema is owned by the bootstrap superuser. The local restore runs as the unprivileged
+    # `api` role, which cannot assign ownership to postgres ("must be able to SET ROLE"), so
+    # drop that one statement; local ownership of public stays with the database owner (api).
+    Util.run("sed '/^ALTER SCHEMA public OWNER TO postgres;$/d' #{file_esc} | psql --set ON_ERROR_STOP=on -U api -f - #{db_esc}")
   end
 end
 
