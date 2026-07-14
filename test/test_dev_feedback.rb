@@ -61,7 +61,16 @@ class TestDevFeedback < Minitest::Test
     assert_includes out, "- Scope: page-level feedback (no single chart)"
     assert_includes out, "- Viewport: unknown"
     assert_includes out, "- Screenshot: none captured"
+    assert_includes out, "- Attachments: none"
     refute_includes out, "- Chart:"
+  end
+
+  def test_render_item_lists_attachment_urls
+    c = chart_comment.merge(
+      "attachments" => [{ "url" => "https://img/a1.png" }, { "url" => "https://img/a2.png" }],
+    )
+    out = feedback_render_item(c, 1)
+    assert_includes out, "- Attachments: https://img/a1.png, https://img/a2.png"
   end
 
   def test_render_item_quotes_multiline_comment

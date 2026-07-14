@@ -15,9 +15,11 @@
 - `chart_key` is the slugified GraphCard `title` (`src/lib/feedback/context.ts`). Find the
   chart by grepping the title text: `grep -rin "revenue by type" src/routes/graphs/`.
 - `page_url` carries the exact filters/date range the admin was viewing.
-- **Screenshots are ground truth.** Local session DBs are schema-only (no prod data), so
-  download each item's screenshot url (curl) into your working dir and LOOK at it before
-  theorizing.
+- **Screenshots and attachments are ground truth.** Local session DBs are schema-only (no
+  prod data), so download each item's screenshot url AND every attachment url (curl) into
+  your working dir and LOOK at them before theorizing. Attachments are images the admin
+  chose to include (their own screenshots, annotated captures); they usually show the
+  problem more directly than the automatic snapshot.
 
 ## Working rules (from ~/code/CLAUDE.md — read it)
 
