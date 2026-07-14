@@ -869,6 +869,8 @@ def feedback_render_item(comment, index)
   lines << "- Viewport: #{comment['viewport'] || 'unknown'}"
   lines << "- Created: #{comment['created_at']}"
   lines << "- Screenshot: #{screenshot && !screenshot.empty? ? screenshot : 'none captured'}"
+  attachment_urls = (comment["attachments"] || []).map { |a| a["url"] }.reject { |u| u.nil? || u.empty? }
+  lines << "- Attachments: #{attachment_urls.empty? ? 'none' : attachment_urls.join(', ')}"
   lines << ""
   lines << "> #{comment['comment'].to_s.gsub("\n", "\n> ")}"
   lines.join("\n")
