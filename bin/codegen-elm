@@ -151,33 +151,42 @@ def generate_type_page_msg(files)
     content
 end
 
-# We want to parse the list of args and identify one of 3 possible scenarios:
-# 1. No args
-# 2. The first arg optionally refers to some sort of global state (Name will start with GlobalState).
-# 3. The next arg, if specified, will be a generic arg named "params"
-# 4. There can be no more than 2 args
+# Each init arg is bound positionally by its TYPE, so pages can combine them in
+# any order:
+#   - a global-state type (name starts with "GlobalState", or "GameGlobalState")
+#     -> the global var ("global", or "g" inside a wrapper lambda)
+#   - a sticky-filters arg (type `Dict String String`) -> `stickyFilters`
+#     (threaded through Main.elm from the flags; see getPageFromRoute)
+#   - anything else -> the generic `params` value
+# Examples: [], [GlobalState*], [params], [GlobalState*, params],
+#   [Dict String String, params], [GlobalState*, Dict String String, params],
+#   [params, GlobalState*].
+def init_arg_is_global_state?(arg)
+  arg.start_with?("GlobalState") || arg == "GameGlobalState"
+end
+
+def init_arg_is_sticky_filters?(arg)
+  arg == "Dict String String"
+end
+
+def uses_sticky_filters?(args)
+  args.any? { |a| init_arg_is_sticky_filters?(a) }
+end
+
 def build_init_param(f, args, code=[])
   global_param_name = args.first == "GlobalState" ? "global" : "g"
-  page_param_name = "params"
 
-  if args.empty?
-    ""
-  elsif args.length == 1
-    if args[0].start_with?("GlobalState")
-      " #{global_param_name}"
+  parts = args.map do |a|
+    if init_arg_is_global_state?(a)
+      global_param_name
+    elsif init_arg_is_sticky_filters?(a)
+      "stickyFilters"
     else
-      " #{page_param_name}"
+      "params"
     end
-
-  elsif args.length == 2
-    if !args[0].start_with?("GlobalState") && !args[0] == "GameGlobalState"
-      raise "File #{f.path}: Invalid arguments for init.  When two args are provided, the first must start with GlobalState: #{args.inspect}"
-    end
-    " #{global_param_name} #{page_param_name}"
-
-  else
-    raise "File #{f.path}: Invalid arguments for init. #{args.inspect}"
   end
+
+  parts.empty? ? "" : " " + parts.join(" ")
 end
 
 def filters(f)
@@ -199,15 +208,22 @@ end
 def generate_get_page_from_route(global_state_info, files)
   (global_decl, global_var) = (global_state_info.n > 1) ? ["GlobalState -> ", "global "] : ["", ""]
 
+  # If any page's init takes sticky filters, thread a `stickyFilters` value
+  # (supplied by Main.elm from the flags) through getPageFromRoute.
+  needs_sticky = files.any? { |f| f.init && uses_sticky_filters?(f.init.args) }
+  (sticky_decl, sticky_var) = needs_sticky ? ["Dict String String -> ", "stickyFilters "] : ["", ""]
+
   all = []
-  all << "getPageFromRoute : #{global_decl}Maybe Route -> ( Page, Cmd PageMsg )"
-  all << "getPageFromRoute #{global_var}maybeRoute ="
+  all << "getPageFromRoute : #{global_decl}#{sticky_decl}Maybe Route -> ( Page, Cmd PageMsg )"
+  all << "getPageFromRoute #{global_var}#{sticky_var}maybeRoute ="
   all << "    case maybeRoute of"
   spaces = " " * 8
   files.filter { |f| f.init }.each_with_index { |f, i|
         sep = i == 0 ? "" : "\n"
         args = f.init.args
-        if args.last.to_s.include?("params") || args.last.to_s.include?("Params")
+        # The route carries a params value if ANY init arg is a params type
+        # (it need not be the last arg — e.g. `init params global`).
+        if args.any? { |a| a.to_s.include?("params") || a.to_s.include?("Params") }
           all << "#{sep}#{spaces}Just (Route.#{f.route.name} params)->"
         else
           all << "#{sep}#{spaces}Just Route.#{f.route.name} ->"
@@ -241,7 +257,10 @@ def generate_get_page_from_route(global_state_info, files)
           raise "File #{f.path}: Unsupported init return: #{f.init.returns.inspect}"
         end
 
-        global_var = args_contain_global_state?(args) ? "g" : "_"
+        # Bind the wrapper lambda's global var only when the init method actually
+        # references `g`. A page whose arg type is exactly `GlobalState` is called
+        # with the outer `global`, so the lambda param would otherwise be unused.
+        global_var = param.split(" ").include?("g") ? "g" : "_"
         if f.requires_admin?
           all << wrap_get_page(f, "pageAdminData", global_var, method)
 
