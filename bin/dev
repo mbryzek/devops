@@ -32,6 +32,7 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "version"             => 'version [--app APP] [--localhost]',
+  "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "pending check"       => 'pending [check] [--app APP]',
   "pending release"     => 'pending release [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
@@ -2773,6 +2774,97 @@ def run_sql_script(path, name, args)
   end
 end
 
+# ---------- slow-routes ----------
+
+def slow_routes_truncate(str, width)
+  str.length > width ? str[0, width - 3] + "..." : str
+end
+
+def cmd_slow_routes(args)
+  days = 7
+  sort = "-p95"
+  limit = 10
+  app = nil
+  use_localhost = false
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--app"
+      app = args[i + 1] || usage_exit("--app requires a value", example: usage_for("slow-routes"))
+      i += 2
+    when "--days"
+      days = Integer(args[i + 1] || usage_exit("--days requires a value", example: usage_for("slow-routes")))
+      i += 2
+    when "--sort"
+      sort = args[i + 1] || usage_exit("--sort requires a value", example: usage_for("slow-routes"))
+      i += 2
+    when "--limit"
+      limit = Integer(args[i + 1] || usage_exit("--limit requires a value", example: usage_for("slow-routes")))
+      i += 2
+    when "--localhost"
+      use_localhost = true
+      i += 1
+    when "-h", "--help"
+      usage_exit
+    else
+      usage_exit("Unknown flag: #{args[i]}", example: usage_for("slow-routes"))
+    end
+  end
+
+  endpoint = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "clubaid").first
+  Util.exit_with_error("No clubaid endpoint configured") if endpoint.nil?
+
+  since = (Time.now - days * 86_400).utc.iso8601
+  params = { "since" => since, "sort" => sort, "limit" => limit.to_s }
+  params["app"] = app if app
+  query = params.map { |k, v| "#{k}=#{URI.encode_www_form_component(v)}" }.join("&")
+
+  rows = begin
+    ApiClient.request(endpoint, :get, "/admin/user/tracking/page/views/latency?#{query}")
+  rescue SessionExpired
+    Util.exit_with_error("session expired - run 'dev login'")
+  rescue ApiError => e
+    Util.exit_with_error(e.message)
+  end
+
+  puts ""
+  puts Util.underline("Slowest routes - last #{days}d#{app ? " (#{app})" : ''}, sort #{sort}")
+  puts ""
+  if rows.nil? || rows.empty?
+    puts "No page-view timing data in the window."
+    return
+  end
+
+  printf("%-7s %-40s %8s %7s %7s %7s %7s %7s\n", "app", "route", "views", "p50", "p75", "p95", "p99", "ttfb")
+  rows.each do |r|
+    printf(
+      "%-7s %-40s %8d %7d %7d %7d %7d %7d\n",
+      r["app"], slow_routes_truncate(r["route"].to_s, 40), r["view_count"],
+      r["p50_load_ms"], r["p75_load_ms"], r["p95_load_ms"], r["p99_load_ms"], r["p75_ttfb_ms"]
+    )
+  end
+
+  top = rows.first
+  server_dominant = top["p75_ttfb_ms"].to_f >= 0.5 * [top["p75_load_ms"].to_f, 1.0].max
+  app_repo = top["app"] == "admin" ? "clubaid-admin" : "clubaid-app"
+  puts ""
+  puts Util.underline("Claude handoff - paste to investigate the worst route")
+  puts <<~PROMPT
+
+    Investigate why the #{top['app']} route `#{top['route']}` is slow for end users. Over the last
+    #{days} days it had #{top['view_count']} views with load p50=#{top['p50_load_ms']}ms
+    p75=#{top['p75_load_ms']}ms p95=#{top['p95_load_ms']}ms p99=#{top['p99_load_ms']}ms, and
+    time-to-first-byte p75=#{top['p75_ttfb_ms']}ms.
+
+    Attribution: p75 TTFB is #{server_dominant ? 'a large' : 'a small'} share of p75 load, so the cost is
+    likely #{server_dominant ? 'server-side (backend endpoint / SSR load function)' : 'client-side (hydration, bundle, render)'}.
+
+    Use the systematic-debugging skill: instrument this route's load path, drive an authenticated load,
+    measure per-call timing, find the dominant cost, fix the one thing, and verify p95 drops. The app is
+    #{app_repo}; its backend is the platform clubaid subproject.
+  PROMPT
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -2797,6 +2889,8 @@ when "invariants"
   end
 when "version", "versions"
   cmd_versions(argv)
+when "slow-routes"
+  cmd_slow_routes(argv)
 when "pending"
   sub = resolve_subcommand(argv, default: "check")
   case sub
