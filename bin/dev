@@ -2811,8 +2811,9 @@ def cmd_slow_routes(args)
     end
   end
 
-  endpoint = ApiClient.endpoints(use_localhost: use_localhost, app_filter: "clubaid").first
-  Util.exit_with_error("No clubaid endpoint configured") if endpoint.nil?
+  # The clubaid admin API lives on the platform host but authenticates with the clubaid
+  # tenant session, so use tenant_endpoint (clubaid is deliberately not in ENDPOINTS).
+  endpoint = ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
 
   since = (Time.now - days * 86_400).utc.iso8601
   params = { "since" => since, "sort" => sort, "limit" => limit.to_s }
