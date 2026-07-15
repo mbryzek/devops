@@ -44,6 +44,14 @@ class CloudflareDeploy
     @wrangler_env = json_data['wrangler_env']
     @pages_project = json_data['pages_project']
   end
+
+  # The Cloudflare Pages project this target deploys to. Defaults to the app name: every
+  # Pages app names its project after itself, and only a mirror target that deviates (e.g.
+  # clubaid-www -> "plybk-www") sets pages_project explicitly. Always resolving a name keeps
+  # `wrangler pages deploy` non-interactive — see release-sveltekit.
+  def pages_project_for(app_name)
+    @pages_project || app_name
+  end
 end
 
 class ElmConfig

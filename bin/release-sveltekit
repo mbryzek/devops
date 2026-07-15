@@ -179,7 +179,11 @@ targets.each do |target|
     env_flag = if env then "--env #{env}" elsif has_named_env then '--env=""' else "" end
     helper.run_system(wrangler_cmd(label, "deploy #{env_flag}".strip))
   else
-    project_flag = target.pages_project ? "--project-name #{target.pages_project}" : ""
-    helper.run_system(wrangler_cmd(label, "pages deploy #{output_dir} #{project_flag}".strip))
+    # Always name the project. Without --project-name, wrangler falls back to whatever it
+    # cached in node_modules/.cache/wrangler/pages.json and prompts interactively when that
+    # cache is absent (fresh clone, reinstalled node_modules) — offering "Create a new
+    # project", which spawns a duplicate alongside the real one.
+    project = target.pages_project_for(helper.app)
+    helper.run_system(wrangler_cmd(label, "pages deploy #{output_dir} --project-name #{project}"))
   end
 end

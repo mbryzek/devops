@@ -46,9 +46,9 @@ class CloudflareDeploy {
     /// `wrangler deploy --env plybk` (Workers) — see pages_project for Pages apps.
     wrangler_env: String?
 
-    /// Cloudflare Pages project name for this target (Pages apps only). Null = use the
-    /// project named in wrangler.toml (the primary target). A mirror target sets this to the
-    /// second account's project, e.g. "plybk-www".
+    /// Cloudflare Pages project name for this target (Pages apps only). Null = the app's own
+    /// name, which is what every primary target uses. Set this only when the project name
+    /// deviates from the app name — e.g. clubaid-www's mirror target deploys to "plybk-www".
     pages_project: String?
 }
 
