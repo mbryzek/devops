@@ -300,7 +300,13 @@ resources: Listing<K8sResource> = new {
     }
   }
 
-  // Job Server StatefulSet - handles async job processing
+  // Job Server StatefulSet - handles async job processing.
+  //
+  // Updates are shutdown-then-start: the StatefulSet RollingUpdate strategy
+  // (the apps/v1 default) deletes the old pod and waits for it to fully
+  // terminate before creating the new one, so old and new job servers never
+  // run concurrently. The brief job-tier outage this causes on every deploy
+  // is accepted — it's a background batch tier with no traffic SLA.
   new StatefulSet {
     metadata {
       name = "\(appName)-job"
@@ -403,15 +409,10 @@ resources: Listing<K8sResource> = new {
                 runAsNonRoot = true
                 runAsUser = 1000
               }
-              lifecycle {
-                preStop {
-                  exec {
-                    // Wait for LB health checks to fail and drain connections
-                    // LB check_interval=3s, unhealthy_threshold=2 = 6s max detection
-                    command = new { "/bin/sh"; "-c"; "sleep 10" }
-                  }
-                }
-              }
+              // No preStop drain: the job tier sits behind a headless service
+              // with no load balancer, and a brief outage is accepted on every
+              // deploy. Shutdown starts immediately on SIGTERM (Play drains
+              // in-flight work via coordinated shutdown).
               volumeMounts = new {
                 new {
                   name = "heap-dumps"

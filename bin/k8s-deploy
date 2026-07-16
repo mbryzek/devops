@@ -128,23 +128,21 @@ def log_cluster_state(app, namespace, label = nil)
   end
 end
 
-# Deploy resources sequentially for zero-downtime:
+# Deploy in two stages:
 # 1. Services and PDBs (non-disruptive)
-# 2. Verify job pod is ready and in endpoints (pre-flight check)
-# 3. Deployment (web) - job handles traffic during Recreate
-# 4. StatefulSet (job) - deployed last after web is ready
+# 2. Deployment (web) and StatefulSet (job) applied together, both rollouts
+#    awaited in parallel
 #
-# The service routes to both web and job pods (selector: app=appname),
-# so the EXISTING job server handles traffic while web is being recreated.
-Util.detail("Deploying resources sequentially for zero-downtime...")
-Util.detail("  Note: Verify job ready, then web deploys (job handles traffic), then job updates")
+# Web zero-downtime comes from the Deployment's own RollingUpdate strategy
+# (the web Service selects tier=web only, so job pods never back web
+# traffic). The job tier accepts a brief outage: the StatefulSet update
+# shuts down the old job pod, then starts the new one, so old and new job
+# servers never run concurrently.
+Util.detail("Deploying web and job in parallel (job tier tolerates a brief outage)...")
 Util.detail("")
 
-statefulset_success = nil
-deployment_success = nil
-
 # Step 1: Apply Services and PodDisruptionBudget only (non-disruptive)
-Util.detail("  [1/4] Applying Services and PodDisruptionBudget...")
+Util.detail("  [1/2] Applying Services and PodDisruptionBudget...")
 log_cluster_state(args.app, K8S_NAMESPACE, "BEFORE deploy")
 
 # Extract only Service and PodDisruptionBudget resources from manifest
@@ -156,101 +154,61 @@ Util.run("kubectl apply -f #{svc_pdb_file}")
 FileUtils.rm_f(svc_pdb_file)
 Util.detail("  ✓ Services and PDB applied")
 
-# Step 2: Verify job pod is ready and in endpoints
-Util.detail("")
-Util.detail("  [2/4] Verifying job pod is ready...")
-job_ready = false
-5.times do |i|
-  endpoints = `kubectl get endpoints #{args.app}-web -n #{K8S_NAMESPACE} -o jsonpath='{.subsets[*].addresses[*].targetRef.name}' 2>/dev/null`.strip
-  job_in_endpoints = endpoints.include?("#{args.app}-job")
-
-  # Check if pod shows 1/1 Ready
-  pod_status = `kubectl get pod #{args.app}-job-0 -n #{K8S_NAMESPACE} --no-headers 2>/dev/null`.strip
-  job_pod_ready = pod_status.include?("1/1") && pod_status.include?("Running")
-
-  if job_in_endpoints && job_pod_ready
-    job_ready = true
-    Util.detail("  ✓ Job pod ready and in endpoints (#{endpoints})")
-    break
-  else
-    Util.detail("    Waiting for job pod... (attempt #{i + 1}/5) endpoints=#{endpoints} pod=#{pod_status}")
-    sleep 2
-  end
-end
-
-unless job_ready
-  puts "  ⚠ Warning: Job pod not fully ready, proceeding anyway"
-end
-
-# In quiet mode the rollout wait shows a single "Deploying <name>... done (94s)"
-# line; kubectl's own "Waiting for..." stream goes to the release log.
+# Runs concurrently for web and job, so each rollout prints one
+# self-contained completion line in quiet mode; kubectl's own "Waiting
+# for..." stream goes to the release log.
 def wait_for_rollout(label, rollout_cmd)
   started = Time.now
   if Util.quiet?
-    print "Deploying #{label}... "
-    $stdout.flush
     Util.log("==> #{rollout_cmd}")
     rollout_cmd = "(#{rollout_cmd}) >> '#{Util.log_file}' 2>&1"
   end
   success = system(rollout_cmd)
   if Util.quiet?
-    puts success ? "done (#{(Time.now - started).round}s)" : "FAILED (#{(Time.now - started).round}s)"
+    puts "  #{label} #{success ? 'done' : 'FAILED'} (#{(Time.now - started).round}s)"
   end
   success
 end
 
-# Step 3: Apply Deployment and wait for it to be ready (job handles traffic)
+# Step 2: Apply web Deployment + job StatefulSet, wait for both in parallel
 Util.detail("")
-Util.detail("  [3/4] Applying and waiting for Deployment #{deployment_name}...")
+Util.detail("  [2/2] Applying Deployment #{deployment_name} and StatefulSet #{statefulset_name}...")
 Util.run("kubectl apply -f #{manifest_file} -l tier=web")
+Util.run("kubectl apply -f #{manifest_file} -l tier=job")
+
+puts "Deploying #{deployment_name} + #{statefulset_name} in parallel..." if Util.quiet?
 
 # Monitor state during rollout
 monitor_thread = Thread.new do
   10.times do
     sleep 2
-    log_cluster_state(args.app, K8S_NAMESPACE, "DURING web rollout")
+    log_cluster_state(args.app, K8S_NAMESPACE, "DURING rollout")
   end
 end
 
-deployment_success = wait_for_rollout(deployment_name,
-  "kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+deployment_thread = Thread.new do
+  wait_for_rollout(deployment_name,
+    "kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+end
+statefulset_thread = Thread.new do
+  wait_for_rollout(statefulset_name,
+    "kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+end
+
+deployment_success = deployment_thread.value
+statefulset_success = statefulset_thread.value
 monitor_thread.kill rescue nil
 
-log_cluster_state(args.app, K8S_NAMESPACE, "AFTER web rollout")
+log_cluster_state(args.app, K8S_NAMESPACE, "AFTER rollout")
 if deployment_success
   Util.detail("  ✓ Deployment #{deployment_name} ready")
 else
   puts "  ✗ Deployment #{deployment_name} failed"
 end
-
-# Step 4: Apply StatefulSet last, after web is ready
-if deployment_success
-  Util.detail("")
-  Util.detail("  [4/4] Applying and waiting for StatefulSet #{statefulset_name}...")
-  Util.run("kubectl apply -f #{manifest_file} -l tier=job")
-
-  # Monitor state during rollout
-  monitor_thread = Thread.new do
-    10.times do
-      sleep 2
-      log_cluster_state(args.app, K8S_NAMESPACE, "DURING job rollout")
-    end
-  end
-
-  statefulset_success = wait_for_rollout(statefulset_name,
-    "kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-  monitor_thread.kill rescue nil
-
-  log_cluster_state(args.app, K8S_NAMESPACE, "AFTER job rollout")
-  if statefulset_success
-    Util.detail("  ✓ StatefulSet #{statefulset_name} ready")
-  else
-    puts "  ✗ StatefulSet #{statefulset_name} failed"
-  end
+if statefulset_success
+  Util.detail("  ✓ StatefulSet #{statefulset_name} ready")
 else
-  puts ""
-  puts "  Skipping StatefulSet - Deployment failed"
-  statefulset_success = false
+  puts "  ✗ StatefulSet #{statefulset_name} failed"
 end
 
 if deployment_success && statefulset_success
