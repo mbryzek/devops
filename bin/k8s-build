@@ -53,9 +53,9 @@ class K8sBuild
 
     push_docker_image
 
-    puts ""
-    puts "Docker image pushed: #{image_name}"
-    puts ""
+    Util.detail("")
+    Util.detail("Docker image pushed: #{image_name}")
+    Util.detail("")
   end
 
   private
@@ -87,14 +87,14 @@ class K8sBuild
   end
 
   def build_sbt_dist
-    puts ""
-    puts Util.underline("Building sbt distribution")
-    Util.run("sbt dist")
+    Util.step("Building sbt distribution") do
+      Util.run("sbt dist")
+    end
   end
 
   def generate_dockerfile
-    puts ""
-    puts Util.underline("Generating Dockerfile")
+    Util.detail("")
+    Util.detail(Util.underline("Generating Dockerfile"))
 
     run_script = AppConfig.run_script(@app)
     template = IO.read(TEMPLATE_PATH)
@@ -109,12 +109,12 @@ class K8sBuild
     FileUtils.mkdir_p(TMP_DIR)
     @dockerfile_path = File.join(TMP_DIR, "Dockerfile.#{@app}")
     File.open(@dockerfile_path, 'w') { |f| f.write(dockerfile) }
-    puts "Generated #{@dockerfile_path} with PORT=#{@config.port}, ARTIFACT=#{run_script}"
+    Util.detail("Generated #{@dockerfile_path} with PORT=#{@config.port}, ARTIFACT=#{run_script}")
   end
 
   def extract_distribution
-    puts ""
-    puts Util.underline("Extracting distribution")
+    Util.detail("")
+    Util.detail(Util.underline("Extracting distribution"))
 
     artifact = AppConfig.artifact(@app)
     sbt_dist_dir = "#{artifact}/target/universal"
@@ -145,20 +145,20 @@ class K8sBuild
     # Remove Windows batch files
     Util.run("rm -f dist/bin/*.bat")
 
-    puts "Distribution extracted to dist/"
+    Util.detail("Distribution extracted to dist/")
   end
 
   def build_docker_image
-    puts ""
-    puts Util.underline("Building Docker image")
-    Util.run("docker build --platform linux/amd64 -f #{@dockerfile_path} -t #{image_name} .")
+    Util.step("Building Docker image") do
+      Util.run("docker build --platform linux/amd64 -f #{@dockerfile_path} -t #{image_name} .")
+    end
   end
 
   def push_docker_image
-    puts ""
-    puts Util.underline("Pushing Docker image")
-    Util.registry_login
-    Util.run("docker push #{image_name}")
+    Util.step("Pushing Docker image") do
+      Util.registry_login
+      Util.run("docker push #{image_name}")
+    end
   end
 
   def image_name

@@ -36,9 +36,10 @@ files = if config.scala
 
 files.each do |file|
   cmd = File.join(dir, file) + " --app #{args.app}"
+  cmd += " --verbose" if args.verbose
   # Only release-sveltekit understands per-account target selection.
   if file == "release-sveltekit" && args.cloudflare_account
     cmd += " --cloudflare-account #{args.cloudflare_account}"
   end
-  Util.run cmd
+  Util.run cmd, quiet: true
 end
