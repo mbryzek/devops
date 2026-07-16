@@ -42,11 +42,10 @@ INVOCATIONS = {
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
-  "version"             => 'version [--app APP] [--localhost]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
-  "pending check"       => 'pending [check] [--app APP]',
-  "pending list"        => 'pending list [--app APP]',
-  "pending release"     => 'pending release [--app APP] [--concurrency N]',
+  "deploy check"        => 'deploy [check] [--app APP]',
+  "deploy status"       => 'deploy status [--app APP]',
+  "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
   "docker prune"        => 'docker prune [--days N] [--apply]',
@@ -99,30 +98,26 @@ USAGE = <<~USAGE
     #{INVOCATIONS["tasks requeue"]}
         Requeue failed async tasks.
 
-    #{INVOCATIONS["version"]}
-    versions [--localhost]
-        Show deployed app version(s) and release timestamp.
-
     #{INVOCATIONS["slow-routes"]}
         Show the slowest routes by response time over the last N days
         (default 7). Sort with --sort (default -p95), cap rows with
         --limit (default 10), filter with --app member|admin.
 
-    #{INVOCATIONS["pending check"]}
+    #{INVOCATIONS["deploy check"]}
         List apps and *-postgresql repos that need a release: origin/main is
         ahead of the latest tag, OR production is running a version other
         than the latest tag (tagged but never deployed). The prod version
-        comes from the same probes as `versions` (/_internal_/version or the
-        live k8s image tag); *-postgresql repos and apps with no prod probe
-        are checked on git state only. `check` is the default when no
-        subcommand is given. --app APP matches an app or DB name exactly
-        (e.g. `platform` vs `platform-postgresql`).
-    #{INVOCATIONS["pending list"]}
+        comes from /_internal_/version or the live k8s image tag;
+        *-postgresql repos and apps with no prod probe are checked on git
+        state only. `check` is the default when no subcommand is given.
+        --app APP matches an app or DB name exactly (e.g. `platform` vs
+        `platform-postgresql`).
+    #{INVOCATIONS["deploy status"]}
         Print every tracked app and DB repo with its latest tag, the version
         production is running, and a status — the full fleet picture even
         when everything is up to date.
-    #{INVOCATIONS["pending release"]}
-        Release every item `pending check` would report. Two phases:
+    #{INVOCATIONS["deploy all"]}
+        Release every item `deploy check` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
           2. Apps release in parallel (concurrency defaults to 10) via
@@ -204,7 +199,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["feedback reconcile"]}
         Flip `fixed` items to `deployed` once their target app has released past the
         fix. Read-only against the deploy registry (same live-version signal as
-        `dev versions`) — the release pipeline is untouched. Dry-run by default;
+        `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
   Common options:
@@ -231,11 +226,11 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks version versions pending config docker aidirs browserslist scripts codegen feedback].freeze
+COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen feedback].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
-  "pending"      => %w[check list release],
+  "deploy"       => %w[check status all],
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "aidirs"       => %w[prune],
@@ -296,7 +291,7 @@ end
 
 # Pick the subcommand for `dev <command> [subcommand] ...`. The first token names
 # it, unless it's absent or a flag — those belong to the default subcommand's own
-# args, so `dev pending --app X` and bare `dev invariants` both run the default.
+# args, so `dev deploy --app X` and bare `dev invariants` both run the default.
 # Shifts the token off `argv` only when it named a subcommand, leaving flags and
 # positionals for the handler. Returns the chosen (or default) subcommand name;
 # an unrecognized name is returned as-is so the caller can report it.
@@ -932,7 +927,7 @@ def feedback_plan_markdown(items:, date:, body:)
 
     - Fixed in a PR → `dev feedback status <id> --status fixed --app <deployable-app> --pr "<PR URL>"`
       (the app + PR let `dev feedback reconcile` flip the item to `deployed` once that
-      app releases; run `dev versions` to see the deployable app names)
+      app releases; run `dev deploy status` to see the deployable app names)
     - Needs a human decision, or not actionable / already fixed →
       `dev feedback status <id> --status needs_input --note "<question or reason>"`
   PLAN
@@ -1098,7 +1093,7 @@ def cmd_feedback_status(args)
 end
 
 # Flip `fixed` items to `deployed` once their target app has released past the fix.
-# Read-only against the deploy registry (the same live-version signal `dev versions`
+# Read-only against the deploy registry (the same live-version signal `dev deploy status`
 # uses) — the release pipeline is never touched. Dry-run by default; --apply records
 # the transitions.
 def cmd_feedback_reconcile(args)
@@ -1226,7 +1221,7 @@ def cmd_docker_prune(args)
   system("docker", "system", "df")
 end
 
-# ---------- versions ----------
+# ---------- prod version probes ----------
 
 def fetch_version(url)
   uri = URI.parse("#{url}/_internal_/version")
@@ -1294,42 +1289,13 @@ def fetch_app_version(registry, app)
   { error: "no prod url or docker_k8s config" }
 end
 
-def cmd_versions(args)
-  rest, app_filter, _ = parse_common_flags(args)
-  reject_unknown_args("version", rest)
-
-  registry = Work::Registry.load
-  apps = registry.deployable.sort_by(&:name)
-  apps = apps.select { |a| a.name == app_filter } if app_filter
-
-  if apps.empty?
-    valid = registry.deployable.map(&:name).sort.join(", ")
-    Util.exit_with_error("Unknown app '#{app_filter}'. Valid apps: #{valid}")
-  end
-
-  rows = apps.map do |app|
-    Thread.new { [app.name, fetch_app_version(registry, app)] }
-  end.map(&:value)
-
-  name_w = rows.map { |n, _| n.length }.max
-  ver_w  = rows.map { |_, d| (d["version"] || "").to_s.length }.max
-  rows.each do |name, d|
-    if d[:error]
-      puts "#{name.ljust(name_w)}  ERROR - #{d[:error]}"
-    else
-      ver = (d["version"] || "(unknown)").ljust(ver_w)
-      puts "#{name.ljust(name_w)}  #{ver}  released #{d['released_at'] || '(unknown)'}"
-    end
-  end
-end
-
-# ---------- pending deploys ----------
+# ---------- deploy (fleet release state) ----------
 
 def db_repo?(name)
   name.end_with?("-postgresql")
 end
 
-def pending_for(name, dir, app: nil, registry: nil)
+def deploy_state_for(name, dir, app: nil, registry: nil)
   return { error: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
   fetch_err = `git -C #{dir} fetch -q origin 2>&1`
@@ -1351,7 +1317,7 @@ end
 # Compare the *running* production version against the latest tag. Git state
 # alone cannot distinguish "released and deployed" from "tagged but the deploy
 # failed or never ran" — only asking prod catches the latter. Reuses the same
-# probes as `dev versions` (/_internal_/version, or the live k8s image tag).
+# probes as `dev deploy status` (/_internal_/version, or the live k8s image tag).
 # Items with nothing to ask — *-postgresql repos and apps with no prod probe
 # (host-derived-tenant frontends like clubaid-app) — stay git-only.
 def prod_status(registry, app, tag)
@@ -1366,12 +1332,12 @@ end
 
 # The single definition of "needs a release": unreleased commits on
 # origin/main, or the latest tag is not what production is running.
-# Shared by `pending check` and `pending release` so they never disagree.
-def pending_row?(d)
+# Shared by `deploy check` and `deploy all` so they never disagree.
+def needs_deploy?(d)
   d[:error].nil? && (d[:ahead].to_i > 0 || d[:prod_stale])
 end
 
-def pending_items(registry = Work::Registry.load)
+def deploy_items(registry = Work::Registry.load)
   # deploy_tracked (not deployable): we release every non-ignored app with a real
   # deploy path, including host-derived-tenant apps like clubaid-app that have no
   # single pingable prod URL and so are absent from `deployable`.
@@ -1390,23 +1356,23 @@ def pending_items(registry = Work::Registry.load)
   items.uniq { |name, _| name }.sort_by { |name, _| name }
 end
 
-def resolve_pending_items(name_filter)
+def resolve_deploy_items(name_filter)
   registry = Work::Registry.load
-  all_items = pending_items(registry)
+  all_items = deploy_items(registry)
   items = name_filter ? all_items.select { |name, _| name == name_filter } : all_items
   if items.empty?
     valid = all_items.map(&:first).join(", ")
     Util.exit_with_error("Unknown app '#{name_filter}'. Valid names: #{valid}")
   end
-  items.map { |name, dir, app| Thread.new { [name, pending_for(name, dir, app: app, registry: registry)] } }.map(&:value)
+  items.map { |name, dir, app| Thread.new { [name, deploy_state_for(name, dir, app: app, registry: registry)] } }.map(&:value)
 end
 
-def cmd_pending_check(args)
+def cmd_deploy_check(args)
   rest, name_filter, _ = parse_common_flags(args)
-  reject_unknown_args("pending check", rest)
-  rows = resolve_pending_items(name_filter)
+  reject_unknown_args("deploy check", rest)
+  rows = resolve_deploy_items(name_filter)
 
-  pending  = rows.select { |_, d| pending_row?(d) }
+  pending  = rows.select { |_, d| needs_deploy?(d) }
   errors   = rows.select { |_, d| d[:error] }
   warnings = rows.select { |_, d| d[:prod_error] }
 
@@ -1439,10 +1405,10 @@ end
 # Unlike `check` (which prints only what needs a release), `list` prints every
 # tracked item with its latest tag, the version production is running, and a
 # status — the full fleet picture even when everything is up to date.
-def cmd_pending_list(args)
+def cmd_deploy_status(args)
   rest, name_filter, _ = parse_common_flags(args)
-  reject_unknown_args("pending list", rest)
-  rows = resolve_pending_items(name_filter)
+  reject_unknown_args("deploy status", rest)
+  rows = resolve_deploy_items(name_filter)
 
   name_w = rows.map { |n, _| n.length }.max
   tag_w  = [rows.map { |_, d| (d[:tag] || "").length }.max, "tag".length].max
@@ -1463,7 +1429,7 @@ def cmd_pending_list(args)
   end
 end
 
-def parse_pending_release_args(args)
+def parse_deploy_all_args(args)
   app_filter = nil
   concurrency = 10
   i = 0
@@ -1472,15 +1438,15 @@ def parse_pending_release_args(args)
     case a
     when "--app"
       app_filter = args[i + 1]
-      usage_exit("--app requires a value", example: usage_for("pending release")) if app_filter.nil?
+      usage_exit("--app requires a value", example: usage_for("deploy all")) if app_filter.nil?
       i += 2
     when "--concurrency"
       raw = args[i + 1]
-      usage_exit("--concurrency requires a positive integer", example: usage_for("pending release")) if raw.nil? || raw.to_i <= 0
+      usage_exit("--concurrency requires a positive integer", example: usage_for("deploy all")) if raw.nil? || raw.to_i <= 0
       concurrency = raw.to_i
       i += 2
     else
-      usage_exit("Unknown argument: #{a}", example: usage_for("pending release"))
+      usage_exit("Unknown argument: #{a}", example: usage_for("deploy all"))
     end
   end
   [app_filter, concurrency]
@@ -2045,11 +2011,11 @@ def release_concurrent(names, concurrency, results, results_mutex)
   workers.each(&:join)
 end
 
-def cmd_pending_release(args)
-  name_filter, concurrency = parse_pending_release_args(args)
-  rows = resolve_pending_items(name_filter)
+def cmd_deploy_all(args)
+  name_filter, concurrency = parse_deploy_all_args(args)
+  rows = resolve_deploy_items(name_filter)
 
-  pending = rows.select { |_, d| pending_row?(d) }.map(&:first)
+  pending = rows.select { |_, d| needs_deploy?(d) }.map(&:first)
   errors  = rows.select { |_, d| d[:error] }
 
   if pending.empty?
@@ -2115,7 +2081,7 @@ def cmd_pending_release(args)
 
   unless errors.empty?
     puts ""
-    puts "Pending-detection errors:"
+    puts "Deploy-detection errors:"
     errors.each { |name, d| puts "  #{name}: #{d[:error]}" }
   end
 
@@ -2990,17 +2956,15 @@ when "invariants"
   when "unsnooze" then cmd_invariants_unsnooze(argv)
   else                 unknown("invariants subcommand", sub, SUBCOMMANDS["invariants"])
   end
-when "version", "versions"
-  cmd_versions(argv)
 when "slow-routes"
   cmd_slow_routes(argv)
-when "pending"
+when "deploy"
   sub = resolve_subcommand(argv, default: "check")
   case sub
-  when "check"   then cmd_pending_check(argv)
-  when "list"    then cmd_pending_list(argv)
-  when "release" then cmd_pending_release(argv)
-  else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
+  when "check"  then cmd_deploy_check(argv)
+  when "status" then cmd_deploy_status(argv)
+  when "all"    then cmd_deploy_all(argv)
+  else               unknown("deploy subcommand", sub, SUBCOMMANDS["deploy"])
   end
 when "config"
   sub = argv.shift

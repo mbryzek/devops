@@ -71,7 +71,7 @@ class TestDevArgUsage < Minitest::Test
       "login unknown arg"         => [-> { cmd_login(["--nope"]) },                    "dev login [--email EMAIL]"],
       "invariants check bad flag" => [-> { cmd_invariants_check(["--bogus"]) },        "dev invariants [check]"],
       "docker prune bad days"     => [-> { cmd_docker_prune(["--days", "abc"]) },      "dev docker prune"],
-      "pending release bad conc"  => [-> { cmd_pending_release(["--concurrency", "0"]) }, "dev pending release"],
+      "deploy all bad conc"       => [-> { cmd_deploy_all(["--concurrency", "0"]) }, "dev deploy all"],
       "browserslist stray arg"    => [-> { cmd_browserslist_update(["foo"]) },         "dev browserslist update"],
       "scripts run no name"       => [-> { cmd_scripts_run([]) },                      "dev scripts run <name>"],
     }
@@ -111,8 +111,7 @@ class TestDevArgUsage < Minitest::Test
     {
       "invariants snoozes" => -> { cmd_invariants_snoozes(["--typo"]) },
       "tasks requeue"      => -> { cmd_tasks_requeue(["--typo"]) },
-      "version"            => -> { cmd_versions(["--typo"]) },
-      "pending check"      => -> { cmd_pending_check(["--typo"]) },
+      "deploy check"       => -> { cmd_deploy_check(["--typo"]) },
       "config check"       => -> { cmd_config_check(["--typo"]) },
       "config rollout"     => -> { cmd_config_rollout(["--typo"]) },
     }.each do |command, callable|

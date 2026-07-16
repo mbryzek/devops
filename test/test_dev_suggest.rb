@@ -33,7 +33,7 @@ class TestDevSuggest < Minitest::Test
   def test_suggest_single_char_typo
     assert_equal "tasks", suggest("task", COMMANDS)
     assert_equal "requeue", suggest("requeu", SUBCOMMANDS["tasks"])
-    assert_equal "release", suggest("relese", SUBCOMMANDS["pending"])
+    assert_equal "all", suggest("al", SUBCOMMANDS["deploy"])
   end
 
   def test_suggest_unique_prefix
