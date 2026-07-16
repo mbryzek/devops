@@ -45,6 +45,7 @@ INVOCATIONS = {
   "version"             => 'version [--app APP] [--localhost]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "pending check"       => 'pending [check] [--app APP]',
+  "pending list"        => 'pending list [--app APP]',
   "pending release"     => 'pending release [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
@@ -116,6 +117,10 @@ USAGE = <<~USAGE
         are checked on git state only. `check` is the default when no
         subcommand is given. --app APP matches an app or DB name exactly
         (e.g. `platform` vs `platform-postgresql`).
+    #{INVOCATIONS["pending list"]}
+        Print every tracked app and DB repo with its latest tag, the version
+        production is running, and a status — the full fleet picture even
+        when everything is up to date.
     #{INVOCATIONS["pending release"]}
         Release every item `pending check` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
@@ -230,7 +235,7 @@ COMMANDS = %w[login logout invariants tasks version versions pending config dock
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
-  "pending"      => %w[check release],
+  "pending"      => %w[check list release],
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "aidirs"       => %w[prune],
@@ -1428,6 +1433,33 @@ def cmd_pending_check(args)
   unless errors.empty?
     puts ""
     errors.each { |name, d| puts "#{name}: #{d[:error]}" }
+  end
+end
+
+# Unlike `check` (which prints only what needs a release), `list` prints every
+# tracked item with its latest tag, the version production is running, and a
+# status — the full fleet picture even when everything is up to date.
+def cmd_pending_list(args)
+  rest, name_filter, _ = parse_common_flags(args)
+  reject_unknown_args("pending list", rest)
+  rows = resolve_pending_items(name_filter)
+
+  name_w = rows.map { |n, _| n.length }.max
+  tag_w  = [rows.map { |_, d| (d[:tag] || "").length }.max, "tag".length].max
+  prod_w = [rows.map { |_, d| (d[:prod] || "-").length }.max, "prod".length].max
+
+  puts "#{'app'.ljust(name_w)}  #{'tag'.ljust(tag_w)}  #{'prod'.ljust(prod_w)}  status"
+  rows.each do |name, d|
+    if d[:error]
+      puts "#{name.ljust(name_w)}  ERROR - #{d[:error]}"
+      next
+    end
+    status = []
+    status << "+#{d[:ahead]} unreleased" if d[:ahead] > 0
+    status << "tag #{d[:tag]} not deployed" if d[:prod_stale]
+    status << "prod check failed: #{d[:prod_error]}" if d[:prod_error]
+    status << "up to date" if status.empty?
+    puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  #{(d[:prod] || '-').ljust(prod_w)}  #{status.join(', ')}"
   end
 end
 
@@ -2966,6 +2998,7 @@ when "pending"
   sub = resolve_subcommand(argv, default: "check")
   case sub
   when "check"   then cmd_pending_check(argv)
+  when "list"    then cmd_pending_list(argv)
   when "release" then cmd_pending_release(argv)
   else                unknown("pending subcommand", sub, SUBCOMMANDS["pending"])
   end

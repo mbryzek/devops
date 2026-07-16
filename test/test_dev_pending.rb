@@ -512,3 +512,47 @@ class TestPendingCheckOutput < Minitest::Test
     assert_match(/rallyd: prod check failed: HTTP 503/, out)
   end
 end
+
+# cmd_pending_list prints every row (not just pending ones) with tag + prod.
+class TestPendingListOutput < Minitest::Test
+  def with_rows(rows)
+    orig = Object.instance_method(:resolve_pending_items)
+    Object.send(:define_method, :resolve_pending_items) { |_| rows }
+    yield
+  ensure
+    Object.send(:define_method, :resolve_pending_items, orig)
+  end
+
+  def capture_io
+    old = $stdout
+    $stdout = StringIO.new
+    yield
+    $stdout.string
+  ensure
+    $stdout = old
+  end
+
+  def test_lists_all_rows_including_up_to_date
+    rows = [
+      ["acumen",              { tag: "0.9.52", ahead: 0, last: "a", prod: "0.9.52", prod_stale: false }],
+      ["platform-postgresql", { tag: "0.5.1",  ahead: 0, last: "b" }],
+      ["rallyd",              { tag: "0.3.16", ahead: 2, last: "c", prod: "0.3.15", prod_stale: true }],
+    ]
+    out = with_rows(rows) { capture_io { cmd_pending_list([]) } }
+    assert_match(/acumen\s+0\.9\.52\s+0\.9\.52\s+up to date/, out)
+    assert_match(/platform-postgresql\s+0\.5\.1\s+-\s+up to date/, out)
+    assert_match(/rallyd\s+0\.3\.16\s+0\.3\.15\s+\+2 unreleased, tag 0\.3\.16 not deployed/, out)
+  end
+
+  def test_prod_error_shown_in_status
+    rows = [["rallyd", { tag: "0.3.16", ahead: 0, last: "c", prod_error: "HTTP 503" }]]
+    out = with_rows(rows) { capture_io { cmd_pending_list([]) } }
+    assert_match(/rallyd\s+0\.3\.16\s+-\s+prod check failed: HTTP 503/, out)
+  end
+
+  def test_detection_error_row
+    rows = [["broken", { error: "no checkout" }]]
+    out = with_rows(rows) { capture_io { cmd_pending_list([]) } }
+    assert_match(/broken\s+ERROR - no checkout/, out)
+  end
+end
