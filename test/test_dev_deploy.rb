@@ -7,40 +7,40 @@ load File.expand_path('../lib/tag.rb', __dir__)
 # RELEASE_AUTO_TAG escape hatch that lets `pending release` run releases
 # without interactive prompts.
 class TestDevPending < Minitest::Test
-  def test_parse_pending_release_args_defaults
-    app_filter, concurrency = parse_pending_release_args([])
+  def test_parse_deploy_all_args_defaults
+    app_filter, concurrency = parse_deploy_all_args([])
     assert_nil app_filter
     assert_equal 10, concurrency
   end
 
-  def test_parse_pending_release_args_app_filter
-    app_filter, concurrency = parse_pending_release_args(["--app", "acumen"])
+  def test_parse_deploy_all_args_app_filter
+    app_filter, concurrency = parse_deploy_all_args(["--app", "acumen"])
     assert_equal "acumen", app_filter
     assert_equal 10, concurrency
   end
 
-  def test_parse_pending_release_args_concurrency
-    app_filter, concurrency = parse_pending_release_args(["--concurrency", "8"])
+  def test_parse_deploy_all_args_concurrency
+    app_filter, concurrency = parse_deploy_all_args(["--concurrency", "8"])
     assert_nil app_filter
     assert_equal 8, concurrency
   end
 
-  def test_parse_pending_release_args_both_flags
-    app_filter, concurrency = parse_pending_release_args(["--app", "rallyd", "--concurrency", "2"])
+  def test_parse_deploy_all_args_both_flags
+    app_filter, concurrency = parse_deploy_all_args(["--app", "rallyd", "--concurrency", "2"])
     assert_equal "rallyd", app_filter
     assert_equal 2, concurrency
   end
 
-  def test_parse_pending_release_args_rejects_unknown
-    assert_raises(SystemExit) { parse_pending_release_args(["--bogus"]) }
+  def test_parse_deploy_all_args_rejects_unknown
+    assert_raises(SystemExit) { parse_deploy_all_args(["--bogus"]) }
   end
 
-  def test_parse_pending_release_args_rejects_zero_concurrency
-    assert_raises(SystemExit) { parse_pending_release_args(["--concurrency", "0"]) }
+  def test_parse_deploy_all_args_rejects_zero_concurrency
+    assert_raises(SystemExit) { parse_deploy_all_args(["--concurrency", "0"]) }
   end
 
-  def test_parse_pending_release_args_requires_app_value
-    assert_raises(SystemExit) { parse_pending_release_args(["--app"]) }
+  def test_parse_deploy_all_args_requires_app_value
+    assert_raises(SystemExit) { parse_deploy_all_args(["--app"]) }
   end
 
   def test_tag_auto_false_by_default
@@ -75,7 +75,7 @@ class TestDevPending < Minitest::Test
   end
 end
 
-# pending_items derives DB repos from the apps registry (scala apps ship a
+# deploy_items derives DB repos from the apps registry (scala apps ship a
 # "<app>-postgresql" repo), NOT from a filesystem glob — so abandoned
 # *-postgresql checkouts next to the apps are never picked up.
 class TestPendingItems < Minitest::Test
@@ -99,7 +99,7 @@ class TestPendingItems < Minitest::Test
     Work::Registry.define_singleton_method(:load, orig)
   end
 
-  def names = pending_items.map(&:first)
+  def names = deploy_items.map(&:first)
 
   def test_derives_db_repo_per_scala_app
     apps = [
@@ -143,7 +143,7 @@ class TestPendingItems < Minitest::Test
   def test_db_repo_path_is_sibling_of_apps
     apps = [FakeApp.new(name: "platform", stack: :scala)]
     with_registry(apps) do
-      _, dir = pending_items.find { |n, _| n == "platform-postgresql" }
+      _, dir = deploy_items.find { |n, _| n == "platform-postgresql" }
       assert_equal File.expand_path("~/code/platform-postgresql"), dir
     end
   end
@@ -160,8 +160,8 @@ class TestPendingItems < Minitest::Test
   end
 end
 
-# cmd_pending_release orchestrates DB-first + parallel-app workers.
-# Stub resolve_pending_items + release_one so tests do no real I/O.
+# cmd_deploy_all orchestrates DB-first + parallel-app workers.
+# Stub resolve_deploy_items + release_one so tests do no real I/O.
 class TestPendingReleaseOrchestration < Minitest::Test
   def setup
     @rows = []
@@ -169,7 +169,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     @released = []
     @released_mutex = Mutex.new
 
-    @orig_resolve = Object.instance_method(:resolve_pending_items)
+    @orig_resolve = Object.instance_method(:resolve_deploy_items)
     @orig_release = Object.instance_method(:release_one)
 
     rows_ref = -> { @rows }
@@ -177,7 +177,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     released_ref = -> { @released }
     released_mutex = @released_mutex
 
-    Object.send(:define_method, :resolve_pending_items) { |_| rows_ref.call }
+    Object.send(:define_method, :resolve_deploy_items) { |_| rows_ref.call }
     Object.send(:define_method, :release_one) do |name|
       released_mutex.synchronize { released_ref.call << name }
       results_ref.call.fetch(name) { { ok: true, log: "ok" } }
@@ -185,7 +185,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
   end
 
   def teardown
-    Object.send(:define_method, :resolve_pending_items, @orig_resolve)
+    Object.send(:define_method, :resolve_deploy_items, @orig_resolve)
     Object.send(:define_method, :release_one, @orig_release)
   end
 
@@ -198,7 +198,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     $stdout = old_stdout
   end
 
-  # Like capture_io, but tolerates SystemExit (cmd_pending_release calls
+  # Like capture_io, but tolerates SystemExit (cmd_deploy_all calls
   # `exit 1` on failure). Returns [output, system_exit_or_nil] so callers
   # can assert on both.
   def capture_io_with_exit
@@ -222,7 +222,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["rallyd",   { tag: "0.0.2", ahead: 0, last: "def msg" }],
       ["michaelb", { tag: "0.0.3", ahead: 2, last: "ghi msg" }],
     ]
-    out = capture_io { cmd_pending_release(["--concurrency", "2"]) }
+    out = capture_io { cmd_deploy_all(["--concurrency", "2"]) }
     assert_equal %w[acumen michaelb].sort, @released.sort
     assert_match(/released: acumen, michaelb|released: michaelb, acumen/, out)
   end
@@ -232,9 +232,9 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }],
       ["broken", { error: "no checkout" }],
     ]
-    out = capture_io { cmd_pending_release([]) }
+    out = capture_io { cmd_deploy_all([]) }
     assert_equal ["acumen"], @released
-    assert_match(/Pending-detection errors:/, out)
+    assert_match(/Deploy-detection errors:/, out)
     assert_match(/broken: no checkout/, out)
   end
 
@@ -248,14 +248,14 @@ class TestPendingReleaseOrchestration < Minitest::Test
       "rallyd" => { ok: false, log: "boom" },
     }
     err = assert_raises(SystemExit) do
-      capture_io { cmd_pending_release([]) }
+      capture_io { cmd_deploy_all([]) }
     end
     assert_equal 1, err.status
   end
 
   def test_no_pending_prints_up_to_date_and_does_not_release
     @rows = [["acumen", { tag: "0.0.1", ahead: 0, last: "abc" }]]
-    out = capture_io { cmd_pending_release([]) }
+    out = capture_io { cmd_deploy_all([]) }
     assert_empty @released
     assert_match(/All apps up to date/, out)
   end
@@ -264,7 +264,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }]]
     Object.send(:define_method, :release_one) { |_| raise "kaboom" }
     err = assert_raises(SystemExit) do
-      capture_io { cmd_pending_release([]) }
+      capture_io { cmd_deploy_all([]) }
     end
     assert_equal 1, err.status
   end
@@ -274,7 +274,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["acumen", { tag: "0.0.2", ahead: 0, last: "a", prod: "0.0.1", prod_stale: true }],
       ["rallyd", { tag: "0.0.3", ahead: 0, last: "b", prod: "0.0.3", prod_stale: false }],
     ]
-    capture_io { cmd_pending_release([]) }
+    capture_io { cmd_deploy_all([]) }
     assert_equal ["acumen"], @released
   end
 
@@ -287,7 +287,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["platform",            { tag: "0.0.3", ahead: 1, last: "c" }],
       ["platform-postgresql", { tag: "0.0.4", ahead: 1, last: "d" }],
     ]
-    capture_io { cmd_pending_release([]) }
+    capture_io { cmd_deploy_all([]) }
     db_idx = @released.each_index.select { |i| @released[i].end_with?("-postgresql") }
     app_idx = @released.each_index.reject { |i| @released[i].end_with?("-postgresql") }
     assert db_idx.max < app_idx.min, "expected all DBs before any app, got #{@released.inspect}"
@@ -306,7 +306,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       order_mutex.synchronize { order << "end:#{name}" }
       { ok: true, log: "" }
     end
-    capture_io { cmd_pending_release(["--concurrency", "8"]) }
+    capture_io { cmd_deploy_all(["--concurrency", "8"]) }
     # Serial: every start is immediately followed by its end with no other start
     # interleaved between them.
     pairs = order.each_slice(2).to_a
@@ -326,7 +326,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     @release_results = {
       "acumen-postgresql" => { ok: false, log: "migration died" },
     }
-    _, exc = capture_io_with_exit { cmd_pending_release([]) }
+    _, exc = capture_io_with_exit { cmd_deploy_all([]) }
     refute_nil exc
     assert_equal 1, exc.status
     # acumen-postgresql attempted (and failed); platform attempted; acumen skipped.
@@ -343,7 +343,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     @release_results = {
       "acumen-postgresql" => { ok: false, log: "boom" },
     }
-    out, exc = capture_io_with_exit { cmd_pending_release([]) }
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
     refute_nil exc
     assert_match(/skipped:\s+acumen \(db release failed/, out)
   end
@@ -356,7 +356,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     @release_results = {
       "athena-postgresql" => { ok: false, log: "boom" },
     }
-    out, exc = capture_io_with_exit { cmd_pending_release([]) }
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
     refute_nil exc
     assert_includes @released, "platform"
     refute_match(/skipped:/, out)
@@ -364,14 +364,14 @@ class TestPendingReleaseOrchestration < Minitest::Test
 
   def test_only_apps_pending_no_phase_1_header
     @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
-    out = capture_io { cmd_pending_release([]) }
+    out = capture_io { cmd_deploy_all([]) }
     refute_match(/Phase 1/, out)
     assert_match(/Phase 2/, out)
   end
 
   def test_only_dbs_pending_no_phase_2_header
     @rows = [["platform-postgresql", { tag: "0.0.1", ahead: 1, last: "a" }]]
-    out = capture_io { cmd_pending_release([]) }
+    out = capture_io { cmd_deploy_all([]) }
     assert_match(/Phase 1/, out)
     refute_match(/Phase 2/, out)
   end
@@ -381,27 +381,27 @@ end
 # other than the latest tag. Used by both `pending check` and `pending release`.
 class TestPendingRow < Minitest::Test
   def test_ahead_is_pending
-    assert pending_row?({ tag: "0.0.1", ahead: 1, last: "x" })
+    assert needs_deploy?({ tag: "0.0.1", ahead: 1, last: "x" })
   end
 
   def test_up_to_date_not_pending
-    refute pending_row?({ tag: "0.0.1", ahead: 0, last: "x" })
+    refute needs_deploy?({ tag: "0.0.1", ahead: 0, last: "x" })
   end
 
   def test_prod_stale_is_pending_even_with_no_new_commits
-    assert pending_row?({ tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true })
+    assert needs_deploy?({ tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true })
   end
 
   def test_prod_matching_tag_not_pending
-    refute pending_row?({ tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.2", prod_stale: false })
+    refute needs_deploy?({ tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.2", prod_stale: false })
   end
 
   def test_prod_error_alone_not_pending
-    refute pending_row?({ tag: "0.0.2", ahead: 0, last: "x", prod_error: "HTTP 503" })
+    refute needs_deploy?({ tag: "0.0.2", ahead: 0, last: "x", prod_error: "HTTP 503" })
   end
 
   def test_detection_error_not_pending
-    refute pending_row?({ error: "no checkout" })
+    refute needs_deploy?({ error: "no checkout" })
   end
 end
 
@@ -466,14 +466,14 @@ class TestProdStatus < Minitest::Test
   end
 end
 
-# cmd_pending_check rendering of prod-stale rows and prod-check warnings.
+# cmd_deploy_check rendering of prod-stale rows and prod-check warnings.
 class TestPendingCheckOutput < Minitest::Test
   def with_rows(rows)
-    orig = Object.instance_method(:resolve_pending_items)
-    Object.send(:define_method, :resolve_pending_items) { |_| rows }
+    orig = Object.instance_method(:resolve_deploy_items)
+    Object.send(:define_method, :resolve_deploy_items) { |_| rows }
     yield
   ensure
-    Object.send(:define_method, :resolve_pending_items, orig)
+    Object.send(:define_method, :resolve_deploy_items, orig)
   end
 
   def capture_io
@@ -487,40 +487,40 @@ class TestPendingCheckOutput < Minitest::Test
 
   def test_prod_stale_row_is_reported
     rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true }]]
-    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
     assert_match(/rallyd\s+0\.0\.2\s+prod running 0\.0\.1 \(tag 0\.0\.2 not deployed\)/, out)
     refute_match(/All apps up to date/, out)
   end
 
   def test_up_to_date_when_prod_matches
     rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.2", prod_stale: false }]]
-    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
     assert_match(/All apps up to date/, out)
   end
 
   def test_ahead_and_prod_stale_shows_both
     rows = [["rallyd", { tag: "0.0.2", ahead: 3, last: "abc msg", prod: "0.0.1", prod_stale: true }]]
-    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
     assert_match(/\+3  abc msg/, out)
     assert_match(/prod running 0\.0\.1/, out)
   end
 
   def test_prod_check_failure_is_a_warning_not_pending
     rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod_error: "HTTP 503" }]]
-    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
     assert_match(/All apps up to date/, out)
     assert_match(/rallyd: prod check failed: HTTP 503/, out)
   end
 end
 
-# cmd_pending_list prints every row (not just pending ones) with tag + prod.
+# cmd_deploy_status prints every row (not just pending ones) with tag + prod.
 class TestPendingListOutput < Minitest::Test
   def with_rows(rows)
-    orig = Object.instance_method(:resolve_pending_items)
-    Object.send(:define_method, :resolve_pending_items) { |_| rows }
+    orig = Object.instance_method(:resolve_deploy_items)
+    Object.send(:define_method, :resolve_deploy_items) { |_| rows }
     yield
   ensure
-    Object.send(:define_method, :resolve_pending_items, orig)
+    Object.send(:define_method, :resolve_deploy_items, orig)
   end
 
   def capture_io
@@ -538,7 +538,7 @@ class TestPendingListOutput < Minitest::Test
       ["platform-postgresql", { tag: "0.5.1",  ahead: 0, last: "b" }],
       ["rallyd",              { tag: "0.3.16", ahead: 2, last: "c", prod: "0.3.15", prod_stale: true }],
     ]
-    out = with_rows(rows) { capture_io { cmd_pending_list([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_status([]) } }
     assert_match(/acumen\s+0\.9\.52\s+0\.9\.52\s+up to date/, out)
     assert_match(/platform-postgresql\s+0\.5\.1\s+-\s+up to date/, out)
     assert_match(/rallyd\s+0\.3\.16\s+0\.3\.15\s+\+2 unreleased, tag 0\.3\.16 not deployed/, out)
@@ -546,13 +546,13 @@ class TestPendingListOutput < Minitest::Test
 
   def test_prod_error_shown_in_status
     rows = [["rallyd", { tag: "0.3.16", ahead: 0, last: "c", prod_error: "HTTP 503" }]]
-    out = with_rows(rows) { capture_io { cmd_pending_list([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_status([]) } }
     assert_match(/rallyd\s+0\.3\.16\s+-\s+prod check failed: HTTP 503/, out)
   end
 
   def test_detection_error_row
     rows = [["broken", { error: "no checkout" }]]
-    out = with_rows(rows) { capture_io { cmd_pending_list([]) } }
+    out = with_rows(rows) { capture_io { cmd_deploy_status([]) } }
     assert_match(/broken\s+ERROR - no checkout/, out)
   end
 end
