@@ -111,7 +111,7 @@ class TestDevArgUsage < Minitest::Test
     {
       "invariants snoozes" => -> { cmd_invariants_snoozes(["--typo"]) },
       "tasks requeue"      => -> { cmd_tasks_requeue(["--typo"]) },
-      "deploy check"       => -> { cmd_deploy_check(["--typo"]) },
+      "deploy status"      => -> { cmd_deploy_status(["--typo"]) },
       "config check"       => -> { cmd_config_check(["--typo"]) },
       "config rollout"     => -> { cmd_config_rollout(["--typo"]) },
     }.each do |command, callable|

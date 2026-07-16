@@ -466,14 +466,26 @@ class TestProdStatus < Minitest::Test
   end
 end
 
-# cmd_deploy_check rendering of prod-stale rows and prod-check warnings.
-class TestPendingCheckOutput < Minitest::Test
-  def with_rows(rows)
-    orig = Object.instance_method(:resolve_deploy_items)
+# Stubs for the seams cmd_deploy_status touches: the rows it renders, whether a
+# terminal is attached (it prompts only if so), and the prompt itself.
+module DeployStatusStubs
+  def with_rows(rows, interactive: false, answer: nil)
+    orig_resolve = Object.instance_method(:resolve_deploy_items)
+    orig_tty     = Object.instance_method(:interactive_terminal?)
+    @prompted = nil
+    prompted_ref = ->(v) { @prompted = v }
     Object.send(:define_method, :resolve_deploy_items) { |_| rows }
+    Object.send(:define_method, :interactive_terminal?) { interactive }
+    Ask.singleton_class.send(:alias_method, :orig_select_multiple_from_list, :select_multiple_from_list)
+    Ask.define_singleton_method(:select_multiple_from_list) do |_msg, values, _opts = {}|
+      prompted_ref.call(values)
+      answer.nil? ? values : answer
+    end
     yield
   ensure
-    Object.send(:define_method, :resolve_deploy_items, orig)
+    Object.send(:define_method, :resolve_deploy_items, orig_resolve)
+    Object.send(:define_method, :interactive_terminal?, orig_tty)
+    Ask.singleton_class.send(:alias_method, :select_multiple_from_list, :orig_select_multiple_from_list)
   end
 
   def capture_io
@@ -483,54 +495,12 @@ class TestPendingCheckOutput < Minitest::Test
     $stdout.string
   ensure
     $stdout = old
-  end
-
-  def test_prod_stale_row_is_reported
-    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true }]]
-    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
-    assert_match(/rallyd\s+0\.0\.2\s+prod running 0\.0\.1 \(tag 0\.0\.2 not deployed\)/, out)
-    refute_match(/All apps up to date/, out)
-  end
-
-  def test_up_to_date_when_prod_matches
-    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.2", prod_stale: false }]]
-    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
-    assert_match(/All apps up to date/, out)
-  end
-
-  def test_ahead_and_prod_stale_shows_both
-    rows = [["rallyd", { tag: "0.0.2", ahead: 3, last: "abc msg", prod: "0.0.1", prod_stale: true }]]
-    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
-    assert_match(/\+3  abc msg/, out)
-    assert_match(/prod running 0\.0\.1/, out)
-  end
-
-  def test_prod_check_failure_is_a_warning_not_pending
-    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod_error: "HTTP 503" }]]
-    out = with_rows(rows) { capture_io { cmd_deploy_check([]) } }
-    assert_match(/All apps up to date/, out)
-    assert_match(/rallyd: prod check failed: HTTP 503/, out)
   end
 end
 
 # cmd_deploy_status prints every row (not just pending ones) with tag + prod.
-class TestPendingListOutput < Minitest::Test
-  def with_rows(rows)
-    orig = Object.instance_method(:resolve_deploy_items)
-    Object.send(:define_method, :resolve_deploy_items) { |_| rows }
-    yield
-  ensure
-    Object.send(:define_method, :resolve_deploy_items, orig)
-  end
-
-  def capture_io
-    old = $stdout
-    $stdout = StringIO.new
-    yield
-    $stdout.string
-  ensure
-    $stdout = old
-  end
+class TestDeployStatusOutput < Minitest::Test
+  include DeployStatusStubs
 
   def test_lists_all_rows_including_up_to_date
     rows = [
@@ -544,15 +514,99 @@ class TestPendingListOutput < Minitest::Test
     assert_match(/rallyd\s+0\.3\.16\s+0\.3\.15\s+\+2 unreleased, tag 0\.3\.16 not deployed/, out)
   end
 
-  def test_prod_error_shown_in_status
-    rows = [["rallyd", { tag: "0.3.16", ahead: 0, last: "c", prod_error: "HTTP 503" }]]
+  def test_prod_stale_row_is_reported
+    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true }]]
     out = with_rows(rows) { capture_io { cmd_deploy_status([]) } }
+    assert_match(/rallyd\s+0\.0\.2\s+0\.0\.1\s+tag 0\.0\.2 not deployed/, out)
+  end
+
+  # A prod probe failure is a warning, not a pending release: it must be visible
+  # but must not offer to deploy.
+  def test_prod_error_shown_in_status_and_does_not_prompt
+    rows = [["rallyd", { tag: "0.3.16", ahead: 0, last: "c", prod_error: "HTTP 503" }]]
+    out = with_rows(rows, interactive: true) { capture_io { cmd_deploy_status([]) } }
     assert_match(/rallyd\s+0\.3\.16\s+-\s+prod check failed: HTTP 503/, out)
+    assert_nil @prompted, "prod-probe failure must not be treated as pending"
   end
 
   def test_detection_error_row
     rows = [["broken", { error: "no checkout" }]]
     out = with_rows(rows) { capture_io { cmd_deploy_status([]) } }
     assert_match(/broken\s+ERROR - no checkout/, out)
+  end
+end
+
+# The deploy prompt `dev deploy` shows when something is pending.
+class TestDeployStatusPrompt < Minitest::Test
+  include DeployStatusStubs
+
+  def setup
+    @released = []
+    @orig_release = Object.instance_method(:release_one)
+    released_ref = @released
+    Object.send(:define_method, :release_one) do |name|
+      released_ref << name
+      { ok: true, log: "ok" }
+    end
+  end
+
+  def teardown
+    Object.send(:define_method, :release_one, @orig_release)
+  end
+
+  def pending_rows
+    [
+      ["acumen", { tag: "0.9.52", ahead: 0, last: "a", prod: "0.9.52", prod_stale: false }],
+      ["rallyd", { tag: "0.3.16", ahead: 2, last: "c", prod: "0.3.15", prod_stale: true }],
+      ["hackathon", { tag: "0.1.0", ahead: 1, last: "d", prod: "0.1.0", prod_stale: false }],
+    ]
+  end
+
+  def test_prompts_with_only_pending_items_and_releases_selection
+    out = with_rows(pending_rows, interactive: true, answer: ["rallyd"]) do
+      capture_io { cmd_deploy_status([]) }
+    end
+    assert_equal %w[rallyd hackathon], @prompted, "prompt must offer exactly the pending items"
+    assert_equal %w[rallyd], @released, "only the selected item may be released"
+    assert_match(/released: rallyd/, out)
+  end
+
+  # `all` is the default answer, so the common case is a bare Enter.
+  def test_default_answer_releases_every_pending_item
+    with_rows(pending_rows, interactive: true) { capture_io { cmd_deploy_status([]) } }
+    assert_equal %w[rallyd hackathon].sort, @released.sort
+  end
+
+  def test_none_selected_releases_nothing
+    out = with_rows(pending_rows, interactive: true, answer: []) do
+      capture_io { cmd_deploy_status([]) }
+    end
+    assert_empty @released
+    assert_match(/Nothing selected/, out)
+  end
+
+  def test_no_prompt_when_nothing_pending
+    rows = [["acumen", { tag: "0.9.52", ahead: 0, last: "a", prod: "0.9.52", prod_stale: false }]]
+    with_rows(rows, interactive: true) { capture_io { cmd_deploy_status([]) } }
+    assert_nil @prompted
+    assert_empty @released
+  end
+
+  # Piped/cron callers have no one to answer: print the hint and exit, never block.
+  def test_non_interactive_prints_hint_and_does_not_prompt
+    out = with_rows(pending_rows, interactive: false) { capture_io { cmd_deploy_status([]) } }
+    assert_nil @prompted
+    assert_empty @released
+    assert_match(/2 pending: rallyd, hackathon \(run `dev deploy all` to release\)/, out)
+  end
+
+  # Selecting a DB and its app must keep deploy_all's DB-first ordering.
+  def test_selection_releases_dbs_before_apps
+    rows = [
+      ["platform", { tag: "0.1.0", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.5.1", ahead: 1, last: "b" }],
+    ]
+    with_rows(rows, interactive: true) { capture_io { cmd_deploy_status([]) } }
+    assert_equal %w[platform-postgresql platform], @released
   end
 end

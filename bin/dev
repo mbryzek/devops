@@ -43,8 +43,7 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
-  "deploy check"        => 'deploy [check] [--app APP]',
-  "deploy status"       => 'deploy status [--app APP]',
+  "deploy status"       => 'deploy [status] [--app APP]',
   "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
@@ -103,21 +102,26 @@ USAGE = <<~USAGE
         (default 7). Sort with --sort (default -p95), cap rows with
         --limit (default 10), filter with --app member|admin.
 
-    #{INVOCATIONS["deploy check"]}
-        List apps and *-postgresql repos that need a release: origin/main is
-        ahead of the latest tag, OR production is running a version other
-        than the latest tag (tagged but never deployed). The prod version
-        comes from /_internal_/version or the live k8s image tag;
-        *-postgresql repos and apps with no prod probe are checked on git
-        state only. `check` is the default when no subcommand is given.
-        --app APP matches an app or DB name exactly (e.g. `platform` vs
-        `platform-postgresql`).
     #{INVOCATIONS["deploy status"]}
         Print every tracked app and DB repo with its latest tag, the version
         production is running, and a status — the full fleet picture even
-        when everything is up to date.
+        when everything is up to date. `status` is the default when no
+        subcommand is given.
+
+        An item needs a release when origin/main is ahead of the latest tag,
+        OR production is running a version other than the latest tag (tagged
+        but never deployed). The prod version comes from /_internal_/version
+        or the live k8s image tag; *-postgresql repos and apps with no prod
+        probe are checked on git state only. --app APP matches an app or DB
+        name exactly (e.g. `platform` vs `platform-postgresql`).
+
+        If anything is pending, you are prompted to pick which items to
+        release — numbers (e.g. 1,3), `all` (the default), or `none` — and
+        the selection releases exactly as `deploy all` would. The prompt is
+        skipped when stdin is not a terminal (pipes, cron), so scripted
+        callers just get the table.
     #{INVOCATIONS["deploy all"]}
-        Release every item `deploy check` would report. Two phases:
+        Release every pending item without prompting. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
           2. Apps release in parallel (concurrency defaults to 10) via
@@ -230,7 +234,7 @@ COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browsers
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
-  "deploy"       => %w[check status all],
+  "deploy"       => %w[status all],
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "aidirs"       => %w[prune],
@@ -1332,7 +1336,7 @@ end
 
 # The single definition of "needs a release": unreleased commits on
 # origin/main, or the latest tag is not what production is running.
-# Shared by `deploy check` and `deploy all` so they never disagree.
+# Shared by `deploy status` and `deploy all` so they never disagree.
 def needs_deploy?(d)
   d[:error].nil? && (d[:ahead].to_i > 0 || d[:prod_stale])
 end
@@ -1367,49 +1371,10 @@ def resolve_deploy_items(name_filter)
   items.map { |name, dir, app| Thread.new { [name, deploy_state_for(name, dir, app: app, registry: registry)] } }.map(&:value)
 end
 
-def cmd_deploy_check(args)
-  rest, name_filter, _ = parse_common_flags(args)
-  reject_unknown_args("deploy check", rest)
-  rows = resolve_deploy_items(name_filter)
-
-  pending  = rows.select { |_, d| needs_deploy?(d) }
-  errors   = rows.select { |_, d| d[:error] }
-  warnings = rows.select { |_, d| d[:prod_error] }
-
-  if pending.empty?
-    puts "All apps up to date"
-  else
-    name_w = pending.map { |n, _| n.length }.max
-    tag_w  = pending.map { |_, d| d[:tag].length }.max
-    pending.each do |name, d|
-      details = []
-      details << "+#{d[:ahead]}  #{d[:last]}" if d[:ahead] > 0
-      details << "prod running #{d[:prod]} (tag #{d[:tag]} not deployed)" if d[:prod_stale]
-      puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  #{details.join('  |  ')}"
-    end
-  end
-
-  # A failed prod probe means we could not verify what production is running —
-  # it does NOT mark the app pending, but it must not pass silently either.
-  unless warnings.empty?
-    puts ""
-    warnings.each { |name, d| puts "#{name}: prod check failed: #{d[:prod_error]}" }
-  end
-
-  unless errors.empty?
-    puts ""
-    errors.each { |name, d| puts "#{name}: #{d[:error]}" }
-  end
-end
-
-# Unlike `check` (which prints only what needs a release), `list` prints every
-# tracked item with its latest tag, the version production is running, and a
-# status — the full fleet picture even when everything is up to date.
-def cmd_deploy_status(args)
-  rest, name_filter, _ = parse_common_flags(args)
-  reject_unknown_args("deploy status", rest)
-  rows = resolve_deploy_items(name_filter)
-
+# Prints every tracked item with its latest tag, the version production is
+# running, and a status — the full fleet picture even when everything is up to
+# date.
+def print_deploy_status_table(rows)
   name_w = rows.map { |n, _| n.length }.max
   tag_w  = [rows.map { |_, d| (d[:tag] || "").length }.max, "tag".length].max
   prod_w = [rows.map { |_, d| (d[:prod] || "-").length }.max, "prod".length].max
@@ -1423,15 +1388,59 @@ def cmd_deploy_status(args)
     status = []
     status << "+#{d[:ahead]} unreleased" if d[:ahead] > 0
     status << "tag #{d[:tag]} not deployed" if d[:prod_stale]
+    # A failed prod probe means we could not verify what production is running —
+    # it does NOT mark the app pending, but it must not pass silently either.
     status << "prod check failed: #{d[:prod_error]}" if d[:prod_error]
     status << "up to date" if status.empty?
     puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  #{(d[:prod] || '-').ljust(prod_w)}  #{status.join(', ')}"
   end
 end
 
+# Whether we can prompt. A pipe or cron has no one to answer, so the caller must
+# print and exit instead of blocking on stdin forever.
+def interactive_terminal?
+  $stdin.tty?
+end
+
+# The default `dev deploy`: show the fleet, then offer to release whatever is
+# pending. Selecting items runs the same orchestration as `deploy all`.
+def cmd_deploy_status(args)
+  rest, name_filter, _ = parse_common_flags(args)
+  reject_unknown_args("deploy status", rest)
+  rows = resolve_deploy_items(name_filter)
+
+  print_deploy_status_table(rows)
+
+  pending = rows.select { |_, d| needs_deploy?(d) }.map(&:first)
+  return if pending.empty?
+
+  unless interactive_terminal?
+    puts ""
+    puts "#{pending.length} pending: #{pending.join(', ')} (run `dev deploy all` to release)"
+    return
+  end
+
+  puts ""
+  noun = pending.length == 1 ? "item needs" : "items need"
+  selected = Ask.select_multiple_from_list("#{pending.length} #{noun} a release. Deploy which?", pending)
+  if selected.empty?
+    puts ""
+    puts "Nothing selected."
+    return
+  end
+
+  puts ""
+  # Detection errors are already shown in the table above, so they are not
+  # repeated in the release summary.
+  run_deploys(selected, concurrency: DEPLOY_CONCURRENCY_DEFAULT)
+end
+
+# Apps release in parallel; DBs are always serial regardless of this.
+DEPLOY_CONCURRENCY_DEFAULT = 10
+
 def parse_deploy_all_args(args)
   app_filter = nil
-  concurrency = 10
+  concurrency = DEPLOY_CONCURRENCY_DEFAULT
   i = 0
   while i < args.length
     a = args[i]
@@ -2027,6 +2036,15 @@ def cmd_deploy_all(args)
     return
   end
 
+  run_deploys(pending, concurrency: concurrency, errors: errors)
+end
+
+# Releases `names` (DBs first, serially; then apps in parallel) and prints the
+# summary. Shared by `deploy all` and the `deploy status` prompt, so both get
+# identical ordering, skip-on-DB-failure, and exit-code behavior. `errors` are
+# deploy-detection failures to report alongside the summary; callers that have
+# already displayed them pass none. Exits non-zero if any release fails.
+def run_deploys(pending, concurrency:, errors: [])
   db_pending  = pending.select { |n| db_repo?(n) }
   app_pending = pending.reject { |n| db_repo?(n) }
 
@@ -2959,9 +2977,8 @@ when "invariants"
 when "slow-routes"
   cmd_slow_routes(argv)
 when "deploy"
-  sub = resolve_subcommand(argv, default: "check")
+  sub = resolve_subcommand(argv, default: "status")
   case sub
-  when "check"  then cmd_deploy_check(argv)
   when "status" then cmd_deploy_status(argv)
   when "all"    then cmd_deploy_all(argv)
   else               unknown("deploy subcommand", sub, SUBCOMMANDS["deploy"])

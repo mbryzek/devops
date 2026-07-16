@@ -2,7 +2,9 @@ class Ask
 
   TRUE = ['y', 'yes']
   FALSE = ['n', 'no']
-  
+  ALL = ['all', 'a', '*']
+  NONE = ['none', 'n', 'no', 'q', 'quit']
+
   def Ask.for_string(msg, opts={})
     default = opts.has_key?(:default) ? opts[:default].to_s.strip : nil
     prompt = default.nil? || msg.include?("[#{default}]")? msg : "#{msg} [#{default}]"
@@ -43,6 +45,39 @@ class Ask
       puts "Please enter a positive integer"
       Ask.for_positive_integer(message, opts)
     end
+  end
+
+  # Multi-select over `values`. Accepts 1-based indexes ("1,3" or "1 3"), `all`,
+  # or `none`; empty input takes opts[:default] ("all" unless given). Returns the
+  # selected subset, in list order. Re-prompts until the input parses.
+  def Ask.select_multiple_from_list(message, values, opts={})
+    default = opts.has_key?(:default) ? opts[:default].to_s : ALL.first
+    labels = values.map.with_index { |v, i| "  #{i+1}. #{v}" }
+    # The "[default]" marker is inline so for_string doesn't append its own after
+    # the (multi-line) list, where it would read as belonging to the last item.
+    prompt = "#{message}\n\n#{labels.join("\n")}\n\nEnter numbers (e.g. 1,3), `all`, or `none` [#{default}]:"
+    loop do
+      selected = Ask.parse_selection(Ask.for_string(prompt, default: default), values)
+      return selected if selected
+      puts ""
+      puts "Invalid selection. Enter numbers between 1 and #{values.length} (e.g. 1,3), `all`, or `none`."
+    end
+  end
+
+  # Parses one multi-select answer: the subset of `values` it names, or nil if
+  # the input is unparseable (the caller re-prompts). Split from the prompt loop
+  # so the accepted forms are testable without stdin.
+  def Ask.parse_selection(raw, values)
+    s = raw.to_s.strip.downcase
+    return values.dup if ALL.include?(s)
+    return [] if NONE.include?(s)
+
+    tokens = s.split(/[\s,]+/).reject(&:empty?)
+    return nil if tokens.empty?
+    return nil unless tokens.all? { |t| t.match?(/\A\d+\z/) }
+    indexes = tokens.map(&:to_i)
+    return nil unless indexes.all? { |i| i >= 1 && i <= values.length }
+    indexes.uniq.sort.map { |i| values[i - 1] }
   end
 
   def Ask.select_from_list(message, values, opts={})
