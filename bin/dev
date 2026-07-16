@@ -1,5 +1,16 @@
 #!/usr/bin/env ruby
 
+# Cron/exec invocations have no locale set, so Ruby's default external encoding
+# falls back to US-ASCII and any non-ASCII byte in repo files or subprocess
+# output raises "invalid byte sequence in US-ASCII". Force UTF-8 here — and
+# hand child processes (api, git, gh, claude) a UTF-8 locale — so behavior
+# never depends on the ambient environment.
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+unless [ENV["LC_ALL"], ENV["LANG"]].any? { |v| v.to_s.match?(/utf-?8/i) }
+  ENV["LC_ALL"] = "en_US.UTF-8"
+end
+
 require 'fileutils'
 require 'io/console'
 require 'json'
@@ -1629,6 +1640,7 @@ def run_repo(name, workdir, stack, opts, branch, &announce)
   note.call("reverted #{reverted} no-op (timestamp/whitespace) file(s)") if reverted.positive?
 
   porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
+  porcelain = porcelain.force_encoding(Encoding::UTF_8).scrub
   return { status: :in_sync } if Codegen::Sync.classify_diff(porcelain) == :in_sync
   return { status: :changed, note: "diff only (dry-run)" } if opts[:dry_run]
 
@@ -1740,6 +1752,9 @@ def spawn_claude(clone, prompt)
     end
 
   status = wait_thr.value
+  # Same scrub as run_step: the PR-URL regex below must not crash on a
+  # malformed byte in Claude's output.
+  output = output.to_s.force_encoding(Encoding::UTF_8).scrub
   unless status.success?
     return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{output}" }
   end
@@ -2140,6 +2155,9 @@ def run_step(cmd, path, verbose, captured_log)
     [ok, nil]
   else
     out, status = Open3.capture2e(*cmd, chdir: path)
+    # Subprocess output can contain arbitrary bytes; scrub so one malformed
+    # byte can't crash the regex/string matching every caller does on it.
+    out = out.force_encoding(Encoding::UTF_8).scrub
     captured_log << out
     [status.success?, out]
   end

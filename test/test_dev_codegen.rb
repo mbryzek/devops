@@ -492,3 +492,46 @@ class TestCodegenRunPlan < Minitest::Test
     assert_empty plan[:run_names]
   end
 end
+
+# `dev codegen sync` runs from cron/exec with NO ambient locale, which makes
+# Ruby's default external encoding US-ASCII — regex/string ops on non-ASCII
+# repo content or subprocess output then raise "invalid byte sequence in
+# US-ASCII" (crashed hackathon/properties/rallyd in the 2026-07-15 sweep).
+# bin/dev must force UTF-8 itself so behavior never depends on invocation
+# environment, and a single malformed byte must be scrubbed, not crash the run.
+class TestDevCodegenEncoding < Minitest::Test
+  NO_LOCALE = { "LANG" => nil, "LC_ALL" => nil, "LC_CTYPE" => nil }.freeze
+
+  def test_run_step_output_survives_missing_locale_and_malformed_bytes
+    script = <<~RUBY
+      load #{File.expand_path('../bin/dev', __dir__).inspect}
+      _, out = run_step(["cat", ARGV[0]], Dir.pwd, false, +"")
+      out =~ /curly/ or raise "expected to match scrubbed output"
+      Codegen::Sync.noise_only_diff?(out)
+      puts "ENCODING_OK"
+    RUBY
+    Dir.mktmpdir do |dir|
+      fixture = File.join(dir, "smart-quotes.txt")
+      # UTF-8 smart quotes plus one genuinely malformed byte (\xFF).
+      File.binwrite(fixture, "a \xE2\x80\x9Ccurly\xE2\x80\x9D quote \xFF\n")
+      out, status = Open3.capture2e(NO_LOCALE, RbConfig.ruby, "-e", script, fixture)
+      assert status.success?, "run_step under empty locale crashed: #{out}"
+      assert_includes out, "ENCODING_OK"
+    end
+  end
+
+  def test_file_read_survives_missing_locale
+    script = <<~RUBY
+      load #{File.expand_path('../bin/dev', __dir__).inspect}
+      File.read(ARGV[0]) =~ /dash/ or raise "expected to match file content"
+      puts "ENCODING_OK"
+    RUBY
+    Dir.mktmpdir do |dir|
+      fixture = File.join(dir, "em-dash.txt")
+      File.binwrite(fixture, "an em\xE2\x80\x94dash\n")
+      out, status = Open3.capture2e(NO_LOCALE, RbConfig.ruby, "-e", script, fixture)
+      assert status.success?, "File.read under empty locale crashed: #{out}"
+      assert_includes out, "ENCODING_OK"
+    end
+  end
+end
