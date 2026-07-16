@@ -269,6 +269,15 @@ class TestPendingReleaseOrchestration < Minitest::Test
     assert_equal 1, err.status
   end
 
+  def test_releases_prod_stale_app_with_no_new_commits
+    @rows = [
+      ["acumen", { tag: "0.0.2", ahead: 0, last: "a", prod: "0.0.1", prod_stale: true }],
+      ["rallyd", { tag: "0.0.3", ahead: 0, last: "b", prod: "0.0.3", prod_stale: false }],
+    ]
+    capture_io { cmd_pending_release([]) }
+    assert_equal ["acumen"], @released
+  end
+
   # ---- Two-phase ordering + DB-failure skip ----
 
   def test_dbs_release_before_apps
@@ -365,5 +374,141 @@ class TestPendingReleaseOrchestration < Minitest::Test
     out = capture_io { cmd_pending_release([]) }
     assert_match(/Phase 1/, out)
     refute_match(/Phase 2/, out)
+  end
+end
+
+# The shared pending predicate: unreleased commits OR prod running something
+# other than the latest tag. Used by both `pending check` and `pending release`.
+class TestPendingRow < Minitest::Test
+  def test_ahead_is_pending
+    assert pending_row?({ tag: "0.0.1", ahead: 1, last: "x" })
+  end
+
+  def test_up_to_date_not_pending
+    refute pending_row?({ tag: "0.0.1", ahead: 0, last: "x" })
+  end
+
+  def test_prod_stale_is_pending_even_with_no_new_commits
+    assert pending_row?({ tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true })
+  end
+
+  def test_prod_matching_tag_not_pending
+    refute pending_row?({ tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.2", prod_stale: false })
+  end
+
+  def test_prod_error_alone_not_pending
+    refute pending_row?({ tag: "0.0.2", ahead: 0, last: "x", prod_error: "HTTP 503" })
+  end
+
+  def test_detection_error_not_pending
+    refute pending_row?({ error: "no checkout" })
+  end
+end
+
+# prod_status: how a row acquires prod/prod_stale/prod_error.
+class TestProdStatus < Minitest::Test
+  FakeApp = Struct.new(:name, :docker_k8s, keyword_init: true)
+
+  class FakeRegistry
+    def initialize(url) = @url = url
+    def prod_url(_) = @url
+  end
+
+  def with_fetch_app_version(result)
+    orig = Object.instance_method(:fetch_app_version)
+    Object.send(:define_method, :fetch_app_version) { |_r, _a| result }
+    yield
+  ensure
+    Object.send(:define_method, :fetch_app_version, orig)
+  end
+
+  def app = FakeApp.new(name: "rallyd", docker_k8s: nil)
+
+  def test_git_only_without_registry_or_app
+    assert_equal({}, prod_status(nil, nil, "0.0.1"))
+    assert_equal({}, prod_status(FakeRegistry.new("https://x"), nil, "0.0.1"))
+  end
+
+  def test_git_only_when_no_prod_probe
+    # No prod url and no docker_k8s (e.g. clubaid-app): nothing to ask.
+    assert_equal({}, prod_status(FakeRegistry.new(nil), app, "0.0.1"))
+  end
+
+  def test_stale_when_prod_behind_tag
+    with_fetch_app_version({ "version" => "0.0.1" }) do
+      s = prod_status(FakeRegistry.new("https://x"), app, "0.0.2")
+      assert_equal "0.0.1", s[:prod]
+      assert s[:prod_stale]
+    end
+  end
+
+  def test_not_stale_when_prod_matches_tag
+    with_fetch_app_version({ "version" => "0.0.2" }) do
+      s = prod_status(FakeRegistry.new("https://x"), app, "0.0.2")
+      refute s[:prod_stale]
+    end
+  end
+
+  def test_fetch_error_reported_not_stale
+    with_fetch_app_version({ error: "HTTP 503" }) do
+      s = prod_status(FakeRegistry.new("https://x"), app, "0.0.2")
+      assert_equal "HTTP 503", s[:prod_error]
+      refute s[:prod_stale]
+    end
+  end
+
+  def test_empty_prod_version_reported_as_error
+    with_fetch_app_version({ "version" => "  " }) do
+      s = prod_status(FakeRegistry.new("https://x"), app, "0.0.2")
+      assert_match(/empty/, s[:prod_error])
+      refute s[:prod_stale]
+    end
+  end
+end
+
+# cmd_pending_check rendering of prod-stale rows and prod-check warnings.
+class TestPendingCheckOutput < Minitest::Test
+  def with_rows(rows)
+    orig = Object.instance_method(:resolve_pending_items)
+    Object.send(:define_method, :resolve_pending_items) { |_| rows }
+    yield
+  ensure
+    Object.send(:define_method, :resolve_pending_items, orig)
+  end
+
+  def capture_io
+    old = $stdout
+    $stdout = StringIO.new
+    yield
+    $stdout.string
+  ensure
+    $stdout = old
+  end
+
+  def test_prod_stale_row_is_reported
+    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.1", prod_stale: true }]]
+    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    assert_match(/rallyd\s+0\.0\.2\s+prod running 0\.0\.1 \(tag 0\.0\.2 not deployed\)/, out)
+    refute_match(/All apps up to date/, out)
+  end
+
+  def test_up_to_date_when_prod_matches
+    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod: "0.0.2", prod_stale: false }]]
+    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    assert_match(/All apps up to date/, out)
+  end
+
+  def test_ahead_and_prod_stale_shows_both
+    rows = [["rallyd", { tag: "0.0.2", ahead: 3, last: "abc msg", prod: "0.0.1", prod_stale: true }]]
+    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    assert_match(/\+3  abc msg/, out)
+    assert_match(/prod running 0\.0\.1/, out)
+  end
+
+  def test_prod_check_failure_is_a_warning_not_pending
+    rows = [["rallyd", { tag: "0.0.2", ahead: 0, last: "x", prod_error: "HTTP 503" }]]
+    out = with_rows(rows) { capture_io { cmd_pending_check([]) } }
+    assert_match(/All apps up to date/, out)
+    assert_match(/rallyd: prod check failed: HTTP 503/, out)
   end
 end
