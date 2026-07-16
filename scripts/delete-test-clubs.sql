@@ -56,6 +56,9 @@ create unique index on _del_ai_chats (id);
 create temp table _del_invocations on commit drop as
   select id from worker.invocations where club_id in (select id from _del_clubs);
 create unique index on _del_invocations (id);
+create temp table _del_issues on commit drop as
+  select id from issues.issues where club_id in (select id from _del_clubs);
+create unique index on _del_issues (id);
 
 do $$ begin raise notice 'Clubs targeted: %', (select count(*) from _del_clubs); end $$;
 
@@ -146,8 +149,14 @@ delete from playbook.member_engagement_scores       where club_id in (select id 
 delete from playbook.member_segment_transitions     where club_id in (select id from _del_clubs);
 delete from playbook.members                        where club_id in (select id from _del_clubs);
 
--- ---- feedback --------------------------------------------------------------
-delete from feedback.comments                       where club_id in (select id from _del_clubs);
+-- ---- issues (tickets/attachments/comments/fixes -> issues) -----------------
+-- log_review_tickets FK-references issues.issues, and a Court Reserve finding scoped to a
+-- single club carries that club_id — so its ticket must go before the issue it points at.
+delete from court_reserve.log_review_tickets        where issue_id in (select id from _del_issues);
+delete from issues.issue_attachments                where issue_id in (select id from _del_issues);
+delete from issues.issue_comments                   where issue_id in (select id from _del_issues);
+delete from issues.issue_fixes                      where issue_id in (select id from _del_issues);
+delete from issues.issues                           where club_id in (select id from _del_clubs);
 
 -- ---- integrations + rallyd -------------------------------------------------
 delete from integrations.credentials                 where club_id in (select id from _del_clubs);
