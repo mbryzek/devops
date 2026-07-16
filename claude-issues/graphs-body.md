@@ -10,24 +10,28 @@
 - **Backend**: repo `mbryzek/platform`, subproject `playbook/` (Scala 3 / Play); aggregate
   endpoints in `spec/playbook.json`, implemented under `platform/playbook/app/`.
 
-## Decoding the feedback context
+## Decoding the issue
 
-- `chart_key` is the slugified GraphCard `title` (`src/lib/feedback/context.ts`). Find the
-  chart by grepping the title text: `grep -rin "revenue by type" src/routes/graphs/`.
-- `page_url` carries the exact filters/date range the admin was viewing.
-- **Screenshots and attachments are ground truth.** Local session DBs are schema-only (no
-  prod data), so download each item's screenshot url AND every attachment url (curl) into
-  your working dir and LOOK at them before theorizing. Attachments are images the admin
-  chose to include (their own screenshots, annotated captures); they usually show the
-  problem more directly than the automatic snapshot.
+- The **title** is the admin's one-line complaint; the **body** carries what they typed.
+  Find the chart by grepping the GraphCard title they name:
+  `grep -rin "revenue by type" src/routes/graphs/`.
+- **Attachments are ground truth.** An in-app capture uploads the automatic screenshot as the
+  FIRST attachment, and its description carries the rendering context: the page url (with the
+  exact filters/date range the admin was viewing), the chart, and the viewport. Any later
+  attachment is an image the admin chose to add (their own screenshot, an annotated capture);
+  those usually show the problem more directly than the automatic snapshot.
+- Local session DBs are schema-only (no prod data), so curl every attachment url into your
+  working dir and LOOK at the images before theorizing.
+- **Club** (when present) is the club the admin was viewing — reproduce against that club's
+  shape of data.
 
 ## Working rules (from ~/code/CLAUDE.md — read it)
 
 1. Read `~/code/CLAUDE.md` and the relevant `~/code/claude/rules/*.mdc` files first.
-2. Work in a feature dir under `~/code/ai/` (branch name ≤ 19 chars, e.g. `gf-fix-<date>`);
+2. Work in a feature dir under `~/code/ai/` (branch name ≤ 19 chars, e.g. `iss-graphs-<date>`);
    clone `clubaid-app` (and `platform` + `devops` sibling only if the fix is backend/codegen).
    Never edit `~/code/clubaid-app` or `~/code/platform` directly.
-3. Group related items into one branch/PR; unrelated fixes may share the branch too —
+3. Group related issues into one branch/PR; unrelated fixes may share the branch too —
    these are small dashboard fixes, one PR set per run is fine.
 4. Verify: `npm run check` + `npm run test:unit` (clubaid-app); scoped `sbt` specs for any
    platform change; visual pass with the `browse` tool against your own dev server (never

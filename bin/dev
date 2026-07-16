@@ -53,9 +53,9 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
-  "feedback claim"      => 'feedback claim [--localhost] [--yes] [--no-spawn]',
-  "feedback status"     => 'feedback status <id> --status STATUS [--note "TEXT"] [--app APP --pr URL] [--localhost]',
-  "feedback reconcile"  => 'feedback reconcile [--apply] [--localhost]',
+  "issue claim"         => 'issue claim --category CATEGORY [--localhost] [--yes] [--no-spawn]',
+  "issue status"        => 'issue status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
+  "issue reconcile"     => 'issue reconcile [--apply] [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -75,7 +75,7 @@ USAGE = <<~USAGE
         re-prompted. Per-app failures warn but do not abort others.
         Pass `--app acumen` or `--app platform` to target just one.
         `--app clubaid` logs in to the clubaid tenant admin (used by
-        `dev feedback`); it is opt-in only, never part of the default
+        `dev issue`); it is opt-in only, never part of the default
         login. Sessions are stored under ~/.platform/.
 
     #{INVOCATIONS["logout"]}
@@ -176,28 +176,33 @@ USAGE = <<~USAGE
         arg forwarded to them (a leading `--` separator is dropped) — including
         their own `--env`/`--prod` flags.
 
-    #{INVOCATIONS["feedback claim"]}
-        Claim graph-feedback items (app.clubaid.co/feedback) into a local plan for
-        a Claude session to work on. Lists the open items, and — after you confirm
-        (or with --yes) — atomically claims all of them and writes ONE plan to
-        ~/code/claude/plans/<date>-graph-feedback.md.
+    #{INVOCATIONS["issue claim"]}
+        Claim the open issues in ONE category into a local plan for a Claude session
+        to work on. CATEGORY is required — one session per category — and is one of
+        graphs, court_reserve, app, admin, platform, infra. Lists that category's
+        open issues, and — after you confirm (or with --yes) — atomically claims all
+        of them and writes ONE plan to
+        ~/code/claude/plans/<date>-issues-<category>.md.
         Then hands the terminal to an interactive Claude session (Opus 4.8, 1M
         context — the `ccd` model) to implement the plan; pass --no-spawn to just
         write the plan and print its path. Authenticates with your persisted
-        clubaid session — run `dev login --app clubaid` once first (the feedback
+        clubaid session — run `dev login --app clubaid` once first (the issues
         API requires a clubaid admin, not the platform `dev login`).
 
-    #{INVOCATIONS["feedback status"]}
-        Close a claimed feedback item. STATUS is one of open, claimed, fixed,
-        deployed, verified, dismissed, needs_input. Marking `fixed` requires
-        --app <deployable-app> (the app the fix ships in) and --pr <url> (the merged
-        PR): these are stored so `dev feedback reconcile` can later flip the item to
-        `deployed` once that app releases. --note carries the question (needs_input)
-        or a reason (dismissed). The generated plan tells the fix session to call
-        this so no session token is written into the plan file.
+    #{INVOCATIONS["issue status"]}
+        Close a claimed issue. NUMBER is the per-tenant issue number shown as
+        ISS-<number> (034, or unpadded 34). STATUS is one of open, claimed, fixed,
+        deployed, verified, dismissed, needs_input. Marking `fixed` requires --url:
+        the merged PR, or a document describing a manual/process fix. Pass --app
+        <deployable-app> and --baseline-version <live release tag> TOGETHER (both or
+        neither) for a code fix: they are what let `dev issue reconcile` flip the
+        issue to `deployed` once that app releases past the baseline; a
+        document-linked fix has neither and is advanced by hand. --comment carries
+        the question (needs_input) or a reason (dismissed). The generated plan tells
+        the fix session to call this so no session token is written into the plan file.
 
-    #{INVOCATIONS["feedback reconcile"]}
-        Flip `fixed` items to `deployed` once their target app has released past the
+    #{INVOCATIONS["issue reconcile"]}
+        Flip `fixed` issues to `deployed` once their target app has released past the
         fix. Read-only against the deploy registry (same live-version signal as
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
@@ -226,7 +231,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen feedback].freeze
+COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen issue].freeze
 SUBCOMMANDS = {
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
@@ -237,7 +242,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
-  "feedback"     => %w[claim status reconcile],
+  "issue"        => %w[claim status reconcile],
 }.freeze
 
 def levenshtein(a, b)
@@ -814,32 +819,46 @@ def cmd_tasks_requeue(args)
   exit 1 unless all_ok
 end
 
-# ---------- feedback ----------
+# ---------- issues ----------
 
-FEEDBACK_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
+ISSUE_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
+
+# Routing key for a fix session: one category per session, one durable prompt
+# body per category (devops/claude-issues/<category>-body.md). Mirrors the
+# issue_category enum in the platform `issues` spec — keep them in step.
+ISSUE_CATEGORIES = %w[graphs court_reserve app admin platform infra].freeze
 
 # Model the spawned session runs on: Opus 4.8 with the 1M-context window. This is
 # the interactive default (the `ccd` alias's model), NOT the headless-codegen
 # `CODEGEN_CLAUDE_MODEL` (haiku) — a human is driving this one to fix real bugs.
-FEEDBACK_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
+ISSUE_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
 
 # The prompt handed to the spawned Claude session.
-def feedback_session_prompt(path)
+def issue_session_prompt(path)
   "read the plan at #{path} and implement it"
 end
 
-# Pure, testable seam: the argv for the interactive session `dev feedback claim`
+# Pure, testable seam: the argv for the interactive session `dev issue claim`
 # launches after writing the plan. Mirrors the `ccd` alias
 # (`claude --dangerously-skip-permissions`) pinned to Opus 4.8 (1M context).
-def feedback_claude_command(path)
-  ["claude", "--dangerously-skip-permissions", "--model", FEEDBACK_CLAUDE_MODEL, feedback_session_prompt(path)]
+def issue_claude_command(path)
+  ["claude", "--dangerously-skip-permissions", "--model", ISSUE_CLAUDE_MODEL, issue_session_prompt(path)]
 end
 
-# The feedback API is authorized for a clubaid tenant admin, not the platform
-# tenant that `dev login` stores — authenticate with the persisted clubaid
-# session (`dev login --app clubaid`) on the platform host.
-def feedback_endpoint(use_localhost)
+# The issue tracker is tenant-scoped (/:tenant_id/issues) and authorized for a
+# clubaid tenant admin, not the platform tenant that `dev login` stores —
+# authenticate with the persisted clubaid session (`dev login --app clubaid`) on
+# the platform host.
+def issue_endpoint(use_localhost)
   ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+end
+
+# Every issues path is scoped to the clubaid tenant; the session that authorizes
+# the call is the same tenant's, so the id is a constant here.
+ISSUE_TENANT_ID = "clubaid".freeze
+
+def issues_path(suffix = "")
+  "/#{ISSUE_TENANT_ID}/issues#{suffix}"
 end
 
 # Fail with the exact login command when there is no clubaid session yet, rather
@@ -849,71 +868,83 @@ def require_clubaid_session!(use_localhost)
   Util.exit_with_error("No clubaid session#{use_localhost ? ' (localhost)' : ''}. Run `dev login --app clubaid#{use_localhost ? ' --localhost' : ''}` first.")
 end
 
-def feedback_chart_label(comment)
-  key = comment["chart_key"]
-  key.nil? || key.empty? ? "page-level" : key
+# Display identity of an issue: the per-tenant number, e.g. ISS-034.
+def issue_label(issue)
+  "ISS-#{issue['number']}"
 end
 
-# Human label for the club a comment belongs to. Child clubs are named bare
+# Human label for the club an issue belongs to. Child clubs are named bare
 # ("Baltimore", "Fountain") and are ambiguous without their parent, so render
 # "Parent / Child" when the club has a parent. Falls back to the club id, then "?".
-def feedback_club_label(comment)
-  club = comment["club"] || {}
+def issue_club_label(issue)
+  club = issue["club"] || {}
   name = club["name"] || club["id"] || "?"
   parent = club["parent"]
   parent_name = parent && (parent["name"] || parent["id"])
   parent_name.nil? || parent_name.empty? ? name : "#{parent_name} / #{name}"
 end
 
-def feedback_summary_line(comment, index)
-  created = (comment["created_at"] || "").to_s[0, 10]
-  snippet = comment["comment"].to_s.gsub(/\s+/, " ").strip
-  snippet = "#{snippet[0, 57]}..." if snippet.length > 60
-  "  #{index}. #{feedback_club_label(comment)} · #{created} · #{feedback_chart_label(comment)} — #{snippet}"
+# Who filed it: audit_stamp.by, most identifying field first.
+def issue_author_label(issue)
+  by = issue.dig("created", "by") || {}
+  by["name"] || by["nickname"] || by["email"] || by["id"] || "?"
 end
 
-# One claimed comment rendered as a plan section. Kept separate (and pure) so the
+def issue_summary_line(issue, index)
+  title = issue["title"].to_s.gsub(/\s+/, " ").strip
+  title = "#{title[0, 57]}..." if title.length > 60
+  # club is clubaid-only context: absent on fleet-wide auto-filed issues.
+  club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
+  "  #{index}. #{issue_label(issue)} · #{issue['category']} · #{issue['status']} · #{club}#{title}"
+end
+
+# One claimed issue rendered as a plan section. Kept separate (and pure) so the
 # plan output is unit-testable without any network calls.
-def feedback_render_item(comment, index)
-  screenshot = comment.dig("screenshot", "url")
+def issue_render_item(issue, index)
   lines = []
-  lines << "### #{index}. #{feedback_club_label(comment)} — #{feedback_chart_label(comment)}"
+  lines << "### #{index}. #{issue_label(issue)} — #{issue['title']}"
   lines << ""
-  lines << "- Comment id: `#{comment['id']}`"
-  lines << "- Club: #{feedback_club_label(comment)} (`#{comment.dig('club', 'id')}`)"
-  lines << "- Page: `#{comment['page_url']}`"
-  lines << if comment["chart_key"].nil? || comment["chart_key"].empty?
-             "- Scope: page-level feedback (no single chart)"
-           else
-             "- Chart: `#{comment['chart_key']}` (chart_key = slugified GraphCard title)"
-           end
-  lines << "- Viewport: #{comment['viewport'] || 'unknown'}"
-  lines << "- Created: #{comment['created_at']}"
-  lines << "- Screenshot: #{screenshot && !screenshot.empty? ? screenshot : 'none captured'}"
-  attachment_urls = (comment["attachments"] || []).map { |a| a["url"] }.reject { |u| u.nil? || u.empty? }
-  lines << "- Attachments: #{attachment_urls.empty? ? 'none' : attachment_urls.join(', ')}"
-  lines << ""
-  lines << "> #{comment['comment'].to_s.gsub("\n", "\n> ")}"
+  lines << "- Issue: `#{issue_label(issue)}` (id `#{issue['id']}`)"
+  lines << "- Category: #{issue['category']}"
+  lines << "- Status: #{issue['status']}"
+  lines << "- Severity: #{issue['severity'] || 'unspecified'}"
+  lines << "- Club: #{issue_club_label(issue)} (`#{issue.dig('club', 'id')}`)" if issue["club"]
+  lines << "- Created: #{issue.dig('created', 'at')} by #{issue_author_label(issue)}"
+  lines << "- Occurrences: #{issue['occurrence_count'] || 1}"
+  lines << "- Fingerprint: `#{issue['fingerprint']}`" if issue["fingerprint"] && !issue["fingerprint"].empty?
+  attachments = (issue["attachments"] || []).map do |a|
+    url = a.dig("file", "url")
+    next if url.nil? || url.empty?
+    desc = a["description"]
+    desc.nil? || desc.empty? ? url : "#{url} (#{desc})"
+  end.compact
+  lines << "- Attachments: #{attachments.empty? ? 'none' : attachments.join(', ')}"
+  body = issue["body"].to_s
+  unless body.empty?
+    lines << ""
+    lines << "> #{body.gsub("\n", "\n> ")}"
+  end
   lines.join("\n")
 end
 
-# Durable graph-feedback orientation (pipeline map, decoding guide, working
-# rules) appended to every generated plan. Read from disk rather than inlined so
-# the prose lives in one editable place.
-def feedback_body_text
-  File.read(File.expand_path("../claude-feedback/graph-feedback-body.md", __dir__))
+# Durable per-category orientation (pipeline map, decoding guide, working rules)
+# appended to every generated plan. Read from disk rather than inlined so the
+# prose lives in one editable place, and one file per category so a session only
+# ever sees the pipeline it is working in.
+def issue_body_text(category)
+  File.read(File.expand_path("../claude-issues/#{category}-body.md", __dir__))
 end
 
-def feedback_plan_markdown(items:, date:, body:)
-  rendered = items.each_with_index.map { |c, i| feedback_render_item(c, i + 1) }.join("\n\n")
+def issue_plan_markdown(items:, date:, category:, body:)
+  rendered = items.each_with_index.map { |c, i| issue_render_item(c, i + 1) }.join("\n\n")
   <<~PLAN
-    # Graph feedback — #{items.length} item(s) claimed #{date}
+    # #{category} issues — #{items.length} item(s) claimed #{date}
 
-    Generated by `dev feedback claim`. These items are CLAIMED (status `claimed`)
-    and waiting for you. Implement the fixes, open PRs, and close each item with
-    `dev feedback status` (below) so nothing stays stuck in `claimed`.
+    Generated by `dev issue claim --category #{category}`. These issues are CLAIMED
+    (status `claimed`) and waiting for you. Implement the fixes, open PRs, and close
+    each issue with `dev issue status` (below) so nothing stays stuck in `claimed`.
 
-    ## Items to fix
+    ## Issues to fix
 
     #{rendered}
 
@@ -921,63 +952,89 @@ def feedback_plan_markdown(items:, date:, body:)
 
     #{body.strip}
 
-    ## Closing each item (do this — items must not stay `claimed`)
+    ## Closing each issue (do this — issues must not stay `claimed`)
 
-    Run from anywhere (re-authenticates from ~/code/env each call):
+    Run from anywhere (re-authenticates from ~/code/env each call). `<number>` is the
+    issue number shown above (e.g. `034`; unpadded `34` works too):
 
-    - Fixed in a PR → `dev feedback status <id> --status fixed --app <deployable-app> --pr "<PR URL>"`
-      (the app + PR let `dev feedback reconcile` flip the item to `deployed` once that
-      app releases; run `dev deploy status` to see the deployable app names)
+    - Fixed in a merged PR → `dev issue status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
+      (--app + --baseline-version let `dev issue reconcile` flip the issue to `deployed`
+      once that app releases past the baseline. `dev deploy status` lists the deployable
+      app names and their live release tags — read the tag BEFORE your fix ships.)
+    - Fixed by a document (process/manual fix, e.g. a Google Doc) →
+      `dev issue status <number> --status fixed --url "<doc URL>"`
+      (no app/baseline: nothing to detect, so `deployed` is set by hand later)
     - Needs a human decision, or not actionable / already fixed →
-      `dev feedback status <id> --status needs_input --note "<question or reason>"`
+      `dev issue status <number> --status needs_input --comment "<question or reason>"`
   PLAN
 end
 
-def write_feedback_plan(items)
+def write_issue_plan(items, category)
   date = Time.now.strftime("%Y-%m-%d")
   dir = File.expand_path("~/code/claude/plans")
   FileUtils.mkdir_p(dir)
-  base = "#{date}-graph-feedback"
+  base = "#{date}-issues-#{category}"
   path = File.join(dir, "#{base}.md")
   n = 2
   while File.exist?(path)
     path = File.join(dir, "#{base}-#{n}.md")
     n += 1
   end
-  File.write(path, feedback_plan_markdown(items: items, date: date, body: feedback_body_text))
+  File.write(path, issue_plan_markdown(items: items, date: date, category: category, body: issue_body_text(category)))
   path
 end
 
-def cmd_feedback_claim(args)
+def cmd_issue_claim(args)
   rest, _app, use_localhost = parse_common_flags(args)
   assume_yes = false
   spawn_session = true
+  category = nil
   leftover = []
-  rest.each do |a|
+  i = 0
+  while i < rest.length
+    a = rest[i]
     case a
-    when "--yes", "-y"   then assume_yes = true
-    when "--no-spawn"    then spawn_session = false
-    else leftover << a
+    when "--category"
+      category = rest[i + 1]
+      usage_exit("--category requires a value", example: usage_for("issue claim")) if category.nil?
+      i += 2
+    when "--yes", "-y"
+      assume_yes = true
+      i += 1
+    when "--no-spawn"
+      spawn_session = false
+      i += 1
+    else
+      leftover << a
+      i += 1
     end
   end
-  reject_unknown_args("feedback claim", leftover)
+
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  # One session per category: the claim is category-scoped server-side and each
+  # category has its own orientation body, so there is no sensible default.
+  problems << "--category is required (one of: #{ISSUE_CATEGORIES.join(', ')})" if category.nil? || category.empty?
+  problems << "--category must be one of: #{ISSUE_CATEGORIES.join(', ')}" if category && !category.empty? && !ISSUE_CATEGORIES.include?(category)
+  report_arg_problems("issue claim", problems, usage_for("issue claim"))
+
   require_clubaid_session!(use_localhost)
 
   handle_errors do
-    endpoint = feedback_endpoint(use_localhost)
-    open = ApiClient.request(endpoint, :get, "/playbook/feedback/comments?status=open&limit=100&offset=0") || []
+    endpoint = issue_endpoint(use_localhost)
+    open = ApiClient.request(endpoint, :get, issues_path("?status=open&category=#{URI.encode_www_form_component(category)}&limit=100&offset=0")) || []
     if open.empty?
-      puts "No open feedback."
+      puts "No open #{category} issues."
       return
     end
 
     puts ""
-    puts Util.underline("Open feedback (#{open.length})")
-    open.each_with_index { |c, i| puts feedback_summary_line(c, i + 1) }
+    puts Util.underline("Open #{category} issues (#{open.length})")
+    open.each_with_index { |c, i| puts issue_summary_line(c, i + 1) }
     puts ""
 
     unless assume_yes
-      print "Claim #{open.length} item(s) and write a plan? [y/N] "
+      print "Claim #{open.length} #{category} issue(s) and write a plan? [y/N] "
       answer = $stdin.gets&.strip&.downcase
       unless %w[y yes].include?(answer)
         puts "Aborted. Nothing claimed."
@@ -985,19 +1042,19 @@ def cmd_feedback_claim(args)
       end
     end
 
-    claimed = ApiClient.request(endpoint, :post, "/playbook/feedback/comments/claims") || []
+    claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { category: category }) || []
     if claimed.empty?
-      puts "Nothing claimed — the open item(s) were just claimed by another session. No plan written."
+      puts "Nothing claimed — the open issue(s) were just claimed by another session. No plan written."
       return
     end
 
-    path = write_feedback_plan(claimed)
-    puts "Claimed #{claimed.length} of #{open.length} open item(s). Plan written to:"
+    path = write_issue_plan(claimed, category)
+    puts "Claimed #{claimed.length} of #{open.length} open #{category} issue(s). Plan written to:"
     puts "  #{path}"
     puts ""
 
     unless spawn_session
-      puts "Hand it to a session with:  claude \"#{feedback_session_prompt(path)}\""
+      puts "Hand it to a session with:  claude \"#{issue_session_prompt(path)}\""
       return
     end
 
@@ -1008,21 +1065,22 @@ def cmd_feedback_claim(args)
     puts "  (re-run with --no-spawn to just write the plan)"
     puts ""
     begin
-      exec(*feedback_claude_command(path))
+      exec(*issue_claude_command(path))
     rescue SystemCallError => e
       # `claude` not on PATH (or otherwise unlaunchable). The plan is already
       # written, so degrade to the manual hand-off rather than a stack trace.
       warn "Could not start Claude (#{e.message}). The plan is saved — run it with:"
-      warn "  claude \"#{feedback_session_prompt(path)}\""
+      warn "  claude \"#{issue_session_prompt(path)}\""
     end
   end
 end
 
-def cmd_feedback_status(args)
+def cmd_issue_status(args)
   rest, target_app, use_localhost = parse_common_flags(args)
   status = nil
-  note = nil
-  pr = nil
+  comment = nil
+  url = nil
+  baseline_version = nil
   leftover = []
   i = 0
   while i < rest.length
@@ -1030,15 +1088,19 @@ def cmd_feedback_status(args)
     case a
     when "--status"
       status = rest[i + 1]
-      usage_exit("--status requires a value", example: usage_for("feedback status")) if status.nil?
+      usage_exit("--status requires a value", example: usage_for("issue status")) if status.nil?
       i += 2
-    when "--note"
-      note = rest[i + 1]
-      usage_exit("--note requires a value", example: usage_for("feedback status")) if note.nil?
+    when "--comment"
+      comment = rest[i + 1]
+      usage_exit("--comment requires a value", example: usage_for("issue status")) if comment.nil?
       i += 2
-    when "--pr"
-      pr = rest[i + 1]
-      usage_exit("--pr requires a value", example: usage_for("feedback status")) if pr.nil?
+    when "--url"
+      url = rest[i + 1]
+      usage_exit("--url requires a value", example: usage_for("issue status")) if url.nil?
+      i += 2
+    when "--baseline-version"
+      baseline_version = rest[i + 1]
+      usage_exit("--baseline-version requires a value", example: usage_for("issue status")) if baseline_version.nil?
       i += 2
     else
       leftover << a
@@ -1046,107 +1108,114 @@ def cmd_feedback_status(args)
     end
   end
 
-  id = leftover.shift
+  number = leftover.shift
+  has_app = !(target_app.nil? || target_app.empty?)
+  has_baseline = !(baseline_version.nil? || baseline_version.empty?)
   problems = []
-  problems << "missing comment id (positional argument)" if id.nil? || id.empty?
+  problems << "missing issue number (positional argument, e.g. 034)" if number.nil? || number.empty?
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   problems << "--status is required" if status.nil? || status.empty?
-  problems << "--status must be one of: #{FEEDBACK_STATUSES.join(', ')}" if status && !status.empty? && !FEEDBACK_STATUSES.include?(status)
-  # `fixed` drives deployed-detection: the app + PR let `dev feedback reconcile` know
-  # which release must ship before the item flips to `deployed`.
-  problems << "marking fixed requires --app <deployable-app> (the app the fix ships in)" if status == "fixed" && (target_app.nil? || target_app.empty?)
-  problems << "marking fixed requires --pr <url> (the merged PR)" if status == "fixed" && (pr.nil? || pr.empty?)
-  report_arg_problems("feedback status", problems, usage_for("feedback status"))
+  problems << "--status must be one of: #{ISSUE_STATUSES.join(', ')}" if status && !status.empty? && !ISSUE_STATUSES.include?(status)
+  # Every fix links to how it shipped: a merged PR, or a document describing a
+  # manual/process fix.
+  problems << "marking fixed requires --url <url> (the merged PR, or a document describing the fix)" if status == "fixed" && (url.nil? || url.empty?)
+  # --app + --baseline-version are the deploy-detection pair: together they let
+  # `dev issue reconcile` flip the issue to `deployed`. One without the other
+  # detects nothing, so it is always a mistake.
+  problems << "--app requires --baseline-version (the app's live release tag at fix time)" if has_app && !has_baseline
+  problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
+  report_arg_problems("issue status", problems, usage_for("issue status"))
 
   body = { status: status }
-  body[:note] = note if note && !note.empty?
+  body[:comment] = comment if comment && !comment.empty?
+  body[:url] = url if url && !url.empty?
 
-  if status == "fixed"
+  if has_app
     registry = Work::Registry.load
     # deploy_tracked, not deployable: a fix can ship in an app (e.g. clubaid-app)
-    # that has no pingable prod URL. The baseline read below tolerates a missing
-    # version, so it's fine that such apps aren't `deployable`.
+    # that has no pingable prod URL, and reconcile reads its live version from k8s.
     app = registry.deploy_tracked.find { |a| a.name == target_app }
     unless app
       valid = registry.deploy_tracked.map(&:name).sort.join(", ")
       Util.exit_with_error("Unknown --app '#{target_app}'. Valid apps: #{valid}")
     end
-    body[:pull_request_url] = pr
-    body[:target_app] = target_app
-    baseline = fetch_app_version(registry, app)
-    if baseline[:error]
-      Util.warning("Could not read live version for #{target_app} (#{baseline[:error]}); recording without a baseline.")
-    elsif baseline["version"] && !baseline["version"].empty?
-      body[:baseline_version] = baseline["version"]
-    end
+    body[:app] = target_app
+    body[:baseline_version] = baseline_version
   end
 
   require_clubaid_session!(use_localhost)
 
   handle_errors do
-    res = ApiClient.request(feedback_endpoint(use_localhost), :put,
-                            "/playbook/feedback/comments/#{URI.encode_www_form_component(id)}/status",
+    res = ApiClient.request(issue_endpoint(use_localhost), :put,
+                            issues_path("/#{URI.encode_www_form_component(number)}/status"),
                             body: body)
-    puts "#{id}: status set to #{res['status']}"
-    puts "  target app: #{target_app} (baseline #{body[:baseline_version] || 'unknown'})" if status == "fixed"
+    puts "#{issue_label(res)}: status set to #{res['status']}"
+    puts "  target app: #{target_app} (baseline #{baseline_version})" if has_app
   end
 end
 
-# Flip `fixed` items to `deployed` once their target app has released past the fix.
+# The deploy-detection info of the most recent fix, or nil when the latest fix
+# shipped without one (a document fix — advanced to `deployed` by hand).
+def issue_fix_deployment(issue)
+  (issue["fixes"] || []).last&.fetch("deployment", nil)
+end
+
+# Flip `fixed` issues to `deployed` once their target app has released past the fix.
 # Read-only against the deploy registry (the same live-version signal `dev deploy status`
 # uses) — the release pipeline is never touched. Dry-run by default; --apply records
 # the transitions.
-def cmd_feedback_reconcile(args)
+def cmd_issue_reconcile(args)
   rest, _app, use_localhost = parse_common_flags(args)
   apply = false
   leftover = []
   rest.each { |a| a == "--apply" ? (apply = true) : leftover << a }
-  reject_unknown_args("feedback reconcile", leftover)
+  reject_unknown_args("issue reconcile", leftover)
   require_clubaid_session!(use_localhost)
 
   registry = Work::Registry.load
   version_cache = {}
 
   handle_errors do
-    endpoint = feedback_endpoint(use_localhost)
-    fixed = ApiClient.request(endpoint, :get, "/playbook/feedback/comments?status=fixed&limit=100&offset=0") || []
+    endpoint = issue_endpoint(use_localhost)
+    fixed = ApiClient.request(endpoint, :get, issues_path("?status=fixed&limit=100&offset=0")) || []
     if fixed.empty?
-      puts "No fixed feedback awaiting deploy."
+      puts "No fixed issues awaiting deploy."
       return
     end
 
     deployed = 0
     skipped = 0
     fixed.each do |c|
-      app_name = c["target_app"]
-      if app_name.nil? || app_name.empty?
-        puts "  skip #{c['id']}: no target_app (fixed via web UI)"
+      deployment = issue_fix_deployment(c)
+      if deployment.nil?
+        puts "  skip #{issue_label(c)}: no deploy info (document fix — advance manually)"
         skipped += 1
         next
       end
+      app_name = deployment["app"]
       info = version_cache[app_name] ||= begin
         app = registry.deploy_tracked.find { |a| a.name == app_name }
         app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
       end
       if info[:error]
-        puts "  skip #{c['id']} (#{app_name}): #{info[:error]}"
+        puts "  skip #{issue_label(c)} (#{app_name}): #{info[:error]}"
         skipped += 1
         next
       end
 
       live = info["version"]
-      if feedback_released_since_fix?(info, c)
+      if issue_released_since_fix?(info, c)
         if apply
           ApiClient.request(endpoint, :put,
-                            "/playbook/feedback/comments/#{URI.encode_www_form_component(c['id'])}/status",
-                            body: { status: "deployed", note: "Deployed in #{app_name} #{live}" })
-          puts "  deployed #{c['id']} (#{app_name}: #{c['baseline_version'] || '?'} -> #{live})"
+                            issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
+                            body: { status: "deployed", comment: "Deployed in #{app_name} #{live}" })
+          puts "  deployed #{issue_label(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
         else
-          puts "  would deploy #{c['id']} (#{app_name}: #{c['baseline_version'] || '?'} -> #{live})"
+          puts "  would deploy #{issue_label(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
         end
         deployed += 1
       else
-        puts "  waiting  #{c['id']} (#{app_name}: still #{live})"
+        puts "  waiting  #{issue_label(c)} (#{app_name}: still #{live})"
       end
     end
 
@@ -1160,9 +1229,9 @@ end
 # release timestamp is newer than fixed_at (can't false-positive on a later tag that
 # predates the fix). Falls back to "live tag differs from the fix-time baseline" when a
 # timestamp is missing or unparseable.
-def feedback_released_since_fix?(info, comment)
+def issue_released_since_fix?(info, issue)
   released_at = info["released_at"]
-  fixed_at = comment["fixed_at"]
+  fixed_at = issue["fixed_at"]
   if released_at && fixed_at
     begin
       return Time.parse(released_at) > Time.parse(fixed_at)
@@ -1170,7 +1239,7 @@ def feedback_released_since_fix?(info, comment)
       # fall through to tag comparison
     end
   end
-  baseline = comment["baseline_version"]
+  baseline = issue_fix_deployment(issue)&.fetch("baseline_version", nil)
   live = info["version"]
   !baseline.nil? && !live.nil? && live != baseline
 end
@@ -3015,14 +3084,14 @@ when "scripts"
   when "run"  then cmd_scripts_run(argv)
   else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
   end
-when "feedback"
+when "issue"
   sub = argv.shift
   case sub
-  when "claim"     then cmd_feedback_claim(argv)
-  when "status"    then cmd_feedback_status(argv)
-  when "reconcile" then cmd_feedback_reconcile(argv)
-  when nil         then require_subcommand("feedback")
-  else               unknown("feedback subcommand", sub, SUBCOMMANDS["feedback"])
+  when "claim"     then cmd_issue_claim(argv)
+  when "status"    then cmd_issue_status(argv)
+  when "reconcile" then cmd_issue_reconcile(argv)
+  when nil         then require_subcommand("issue")
+  else               unknown("issue subcommand", sub, SUBCOMMANDS["issue"])
   end
 else
   unknown("command", command, COMMANDS)
