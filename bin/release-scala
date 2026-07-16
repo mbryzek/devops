@@ -3,18 +3,27 @@
 # Releases a Scala application to Kubernetes.
 # Builds Docker image and deploys to K8s cluster.
 #
-# Usage: release-scala --app <app_name>
+# By default output is concise: one line per stage, with the full output of
+# every underlying command appended to a log file (path printed up front).
+# Pass --verbose for the traditional full streaming output.
+#
+# Usage: release-scala --app <app_name> [--verbose]
 
 require_relative '../lib/common'
 
 args = Args.parse(ARGV, ["app"])
 app = args.app
 
-# Get version tag
+# Get version tag (interactive - must happen before quiet mode)
 version = Tag.ask
+
+if !args.verbose
+  Util.quiet!("/tmp/devops-release/#{app}-#{version}.log")
+end
 
 puts ""
 puts Util.underline("Releasing #{app} version #{version}")
+puts "Full log: #{Util.log_file}" if Util.quiet?
 puts ""
 
 # Write conf/version.txt so the deployed app can serve /_internal_/version
@@ -22,25 +31,21 @@ set_version_cmd = File.expand_path("~/code/claude/bin/set-version") +
   " --app #{app} --version #{version}"
 Util.run(set_version_cmd)
 
-# Build Docker image
-puts "Building Docker image..."
+# Build + push Docker image (prints its own stage lines)
 build_cmd = File.join(__dir__, "k8s-build") + " --app #{app} --tag #{version}"
-Util.run(build_cmd)
-
-puts ""
+Util.run(build_cmd, passthrough: true)
 
 # Sync ConfigMap + Secrets so the new pods load current env values.
 # release-scala used to skip this, which left stale config in the cluster.
-puts "Syncing ConfigMap + Secrets..."
-Util.sync_k8s_secrets(app)
+Util.step("Syncing ConfigMap + Secrets") do
+  Util.sync_k8s_secrets(app)
+end
 
-puts ""
-
-# Deploy to Kubernetes
-puts "Deploying to Kubernetes..."
+# Deploy to Kubernetes (prints its own stage lines)
 deploy_cmd = File.join(__dir__, "k8s-deploy") + " --app #{app} --tag #{version}"
-Util.run(deploy_cmd)
+Util.run(deploy_cmd, passthrough: true)
 
 puts ""
 puts "Release complete: #{app} #{version}"
+puts "Full log: #{Util.log_file}" if Util.quiet?
 puts ""

@@ -1,8 +1,65 @@
 require 'pathname'
 require 'json'
 require 'tempfile'
+require 'fileutils'
 
 module Util
+    # Quiet release mode. When enabled, Util.run appends subprocess output to
+    # a log file instead of streaming it, Util.detail messages go to the log,
+    # and Util.step prints one concise "label... done (12s)" line per stage.
+    # State lives in ENV so child scripts spawned by a release (k8s-build,
+    # k8s-secrets, k8s-deploy) inherit it automatically; the same scripts run
+    # standalone stay fully verbose.
+    QUIET_ENV = "DEVOPS_QUIET"
+    LOG_FILE_ENV = "DEVOPS_LOG_FILE"
+
+    def Util.quiet!(log_file)
+      FileUtils.mkdir_p(File.dirname(log_file))
+      File.write(log_file, "")
+      ENV[QUIET_ENV] = "1"
+      ENV[LOG_FILE_ENV] = log_file
+    end
+
+    def Util.quiet?
+      ENV[QUIET_ENV] == "1" && !ENV[LOG_FILE_ENV].to_s.empty?
+    end
+
+    def Util.log_file
+      ENV[LOG_FILE_ENV]
+    end
+
+    # Append a message to the quiet-mode log. No-op when not in quiet mode.
+    def Util.log(msg)
+      return if !Util.quiet?
+      File.open(Util.log_file, 'a') { |f| f.puts msg }
+    end
+
+    # Progress detail: printed in verbose mode, logged in quiet mode.
+    def Util.detail(msg)
+      if Util.quiet?
+        Util.log(msg)
+      else
+        puts msg
+      end
+    end
+
+    # A named stage of a release. Quiet mode: "label... done (12s)" on one
+    # line. Verbose mode: the traditional underlined section header. Returns
+    # the block's value.
+    def Util.step(label)
+      if Util.quiet?
+        print "#{label}... "
+        $stdout.flush
+        started = Time.now
+        result = yield
+        puts "done (#{(Time.now - started).round}s)"
+        result
+      else
+        puts ""
+        puts Util.underline(label)
+        yield
+      end
+    end
     # Sync <app>-config + <app>-secrets from the git-crypt env repo to the
     # cluster via bin/k8s-secrets (which requires env/apps/<app>/env files).
     # Aborts the caller on failure (Util.run semantics) — never release
@@ -10,7 +67,7 @@ module Util
     def Util.sync_k8s_secrets(app, namespace: nil)
       cmd = File.join(File.dirname(__FILE__), "../bin/k8s-secrets") + " --app #{app}"
       cmd += " --namespace #{namespace}" if namespace
-      Util.run(cmd)
+      Util.run(cmd, passthrough: true)
     end
 
     # Sync a Secret/ConfigMap from a manifest file so the live object ends up
@@ -65,10 +122,32 @@ module Util
       Util.run("doctl registry login")
     end
 
+    # params:
+    #   :quiet        - do not echo the command line
+    #   :ignore_error - do not abort when the command fails
+    #   :passthrough  - the command is a devops script that manages its own
+    #                   quiet-mode output (and may prompt the user); never
+    #                   redirect its output to the log
     def Util.run(cmd, params={})
       quiet = (params.has_key?(:quiet) && params[:quiet]) ? true  : false
       ignore_error = (params.has_key?(:ignore_error) && params[:ignore_error]) ? true : false
-      if !quiet
+      passthrough = (params.has_key?(:passthrough) && params[:passthrough]) ? true : false
+
+      if Util.quiet? && !passthrough
+        Util.log("==> #{cmd}")
+        ok = system("(#{cmd}) >> '#{Util.log_file}' 2>&1")
+        if !ok && !ignore_error
+          $stderr.puts ""
+          $stderr.puts "Command failed: #{cmd}"
+          $stderr.puts ""
+          $stderr.puts "Last 40 lines of #{Util.log_file}:"
+          $stderr.puts `tail -40 '#{Util.log_file}'`
+          Util.exit_with_error("Command failed (full log: #{Util.log_file})")
+        end
+        return
+      end
+
+      if !quiet && !(Util.quiet? && passthrough)
           puts "==> #{cmd}"
       end
       if !system(cmd)

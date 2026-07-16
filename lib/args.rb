@@ -3,9 +3,10 @@ require 'optparse'
 class Args
     attr_reader :env, :app, :file, :node, :format, :quiet, :tag, :dir, :profile, :path, :no_download,
                 :version, :push, :wait, :namespace, :timeout, :no_cache, :dry_run, :output, :job_suffix,
-                :cloudflare_account
+                :cloudflare_account, :verbose
     def initialize(args)
         @quiet = !args[:quiet].to_s.empty?
+        @verbose = args[:verbose] ? true : false
         @env = args[:env]
         @app = args[:app]
         @file = args[:file]
@@ -175,6 +176,10 @@ class Args
 
             opts.on("--quiet", "If specified, indicate quiet mode") do
                 av.add("quiet", true)
+            end
+
+            opts.on("--verbose", "Stream full output of every command (release scripts are concise by default)") do
+                av.add("verbose", true)
             end
 
             opts.on("--no-download", "If specified, do not download files") do
