@@ -102,11 +102,20 @@ USAGE = <<~USAGE
     versions [--localhost]
         Show deployed app version(s) and release timestamp.
 
+    #{INVOCATIONS["slow-routes"]}
+        Show the slowest routes by response time over the last N days
+        (default 7). Sort with --sort (default -p95), cap rows with
+        --limit (default 10), filter with --app member|admin.
+
     #{INVOCATIONS["pending check"]}
-        List apps and *-postgresql repos whose origin/main is ahead of the
-        latest tag (need deploy). `check` is the default when no subcommand
-        is given. --app APP matches an app or DB name exactly (e.g.
-        `platform` vs `platform-postgresql`).
+        List apps and *-postgresql repos that need a release: origin/main is
+        ahead of the latest tag, OR production is running a version other
+        than the latest tag (tagged but never deployed). The prod version
+        comes from the same probes as `versions` (/_internal_/version or the
+        live k8s image tag); *-postgresql repos and apps with no prod probe
+        are checked on git state only. `check` is the default when no
+        subcommand is given. --app APP matches an app or DB name exactly
+        (e.g. `platform` vs `platform-postgresql`).
     #{INVOCATIONS["pending release"]}
         Release every item `pending check` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
@@ -1216,14 +1225,23 @@ end
 
 def fetch_version(url)
   uri = URI.parse("#{url}/_internal_/version")
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = (uri.scheme == "https")
-  http.open_timeout = 5
-  http.read_timeout = 10
-  res = http.request(Net::HTTP::Get.new(uri.request_uri))
-  return { error: "HTTP #{res.code}" } unless res.code.to_i.between?(200, 299)
-  return { error: "empty body" } if res.body.nil? || res.body.empty?
-  JSON.parse(res.body)
+  # Follow a few redirects: a registry-resolved domain may 301 to the
+  # canonical host (e.g. clubaid-admin) while still serving the endpoint there.
+  3.times do
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == "https")
+    http.open_timeout = 5
+    http.read_timeout = 10
+    res = http.request(Net::HTTP::Get.new(uri.request_uri))
+    if res.is_a?(Net::HTTPRedirection) && res["location"]
+      uri = URI.join(uri.to_s, res["location"])
+      next
+    end
+    return { error: "HTTP #{res.code}" } unless res.code.to_i.between?(200, 299)
+    return { error: "empty body" } if res.body.nil? || res.body.empty?
+    return JSON.parse(res.body)
+  end
+  { error: "too many redirects" }
 rescue => e
   { error: e.message }
 end
@@ -1306,7 +1324,7 @@ def db_repo?(name)
   name.end_with?("-postgresql")
 end
 
-def pending_for(name, dir)
+def pending_for(name, dir, app: nil, registry: nil)
   return { error: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
   fetch_err = `git -C #{dir} fetch -q origin 2>&1`
@@ -1322,15 +1340,37 @@ def pending_for(name, dir)
 
   count = `git -C #{dir} rev-list --count #{tag}..#{ref}`.strip.to_i
   last = `git -C #{dir} log -1 --format=%h\\ %s #{ref}`.strip
-  { tag: tag, ahead: count, last: last }
+  { tag: tag, ahead: count, last: last }.merge(prod_status(registry, app, tag))
 end
 
-def pending_items
-  registry = Work::Registry.load
+# Compare the *running* production version against the latest tag. Git state
+# alone cannot distinguish "released and deployed" from "tagged but the deploy
+# failed or never ran" — only asking prod catches the latter. Reuses the same
+# probes as `dev versions` (/_internal_/version, or the live k8s image tag).
+# Items with nothing to ask — *-postgresql repos and apps with no prod probe
+# (host-derived-tenant frontends like clubaid-app) — stay git-only.
+def prod_status(registry, app, tag)
+  return {} unless registry && app
+  return {} unless registry.prod_url(app) || app.docker_k8s
+  v = fetch_app_version(registry, app)
+  return { prod_error: v[:error] } if v[:error]
+  prod = (v["version"] || "").to_s.strip
+  return { prod_error: "prod reported an empty version" } if prod.empty?
+  { prod: prod, prod_stale: prod != tag }
+end
+
+# The single definition of "needs a release": unreleased commits on
+# origin/main, or the latest tag is not what production is running.
+# Shared by `pending check` and `pending release` so they never disagree.
+def pending_row?(d)
+  d[:error].nil? && (d[:ahead].to_i > 0 || d[:prod_stale])
+end
+
+def pending_items(registry = Work::Registry.load)
   # deploy_tracked (not deployable): we release every non-ignored app with a real
   # deploy path, including host-derived-tenant apps like clubaid-app that have no
   # single pingable prod URL and so are absent from `deployable`.
-  items = registry.deploy_tracked.map { |app| [app.name, File.expand_path("~/code/#{app.name}")] }
+  items = registry.deploy_tracked.map { |app| [app.name, File.expand_path("~/code/#{app.name}"), app] }
   # DB repos are derived from the apps registry, not a filesystem glob: every
   # deployable scala app declares a database in its config.pkl and ships a
   # conventional "<app>-postgresql" repo checked out next to it. Driving
@@ -1338,7 +1378,7 @@ def pending_items
   # out of the list; scoping to deploy_tracked excludes ignored/archived apps.
   registry.deploy_tracked.select { |app| app.stack == :scala }.each do |app|
     db = "#{app.name}-postgresql"
-    items << [db, File.expand_path("~/code/#{db}")]
+    items << [db, File.expand_path("~/code/#{db}"), nil]
   end
   # Array#uniq keeps the first occurrence, so deployable-app entries win over a
   # DB entry if a name collides. Don't reorder.
@@ -1346,13 +1386,14 @@ def pending_items
 end
 
 def resolve_pending_items(name_filter)
-  all_items = pending_items
+  registry = Work::Registry.load
+  all_items = pending_items(registry)
   items = name_filter ? all_items.select { |name, _| name == name_filter } : all_items
   if items.empty?
     valid = all_items.map(&:first).join(", ")
     Util.exit_with_error("Unknown app '#{name_filter}'. Valid names: #{valid}")
   end
-  items.map { |name, dir| Thread.new { [name, pending_for(name, dir)] } }.map(&:value)
+  items.map { |name, dir, app| Thread.new { [name, pending_for(name, dir, app: app, registry: registry)] } }.map(&:value)
 end
 
 def cmd_pending_check(args)
@@ -1360,8 +1401,9 @@ def cmd_pending_check(args)
   reject_unknown_args("pending check", rest)
   rows = resolve_pending_items(name_filter)
 
-  pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }
-  errors  = rows.select { |_, d| d[:error] }
+  pending  = rows.select { |_, d| pending_row?(d) }
+  errors   = rows.select { |_, d| d[:error] }
+  warnings = rows.select { |_, d| d[:prod_error] }
 
   if pending.empty?
     puts "All apps up to date"
@@ -1369,8 +1411,18 @@ def cmd_pending_check(args)
     name_w = pending.map { |n, _| n.length }.max
     tag_w  = pending.map { |_, d| d[:tag].length }.max
     pending.each do |name, d|
-      puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  +#{d[:ahead]}  #{d[:last]}"
+      details = []
+      details << "+#{d[:ahead]}  #{d[:last]}" if d[:ahead] > 0
+      details << "prod running #{d[:prod]} (tag #{d[:tag]} not deployed)" if d[:prod_stale]
+      puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  #{details.join('  |  ')}"
     end
+  end
+
+  # A failed prod probe means we could not verify what production is running —
+  # it does NOT mark the app pending, but it must not pass silently either.
+  unless warnings.empty?
+    puts ""
+    warnings.each { |name, d| puts "#{name}: prod check failed: #{d[:prod_error]}" }
   end
 
   unless errors.empty?
@@ -1965,7 +2017,7 @@ def cmd_pending_release(args)
   name_filter, concurrency = parse_pending_release_args(args)
   rows = resolve_pending_items(name_filter)
 
-  pending = rows.select { |_, d| d[:error].nil? && d[:ahead] > 0 }.map(&:first)
+  pending = rows.select { |_, d| pending_row?(d) }.map(&:first)
   errors  = rows.select { |_, d| d[:error] }
 
   if pending.empty?
