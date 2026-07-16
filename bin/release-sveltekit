@@ -22,6 +22,7 @@
 # (primary via `npm run build`, a named env via `npm run build:<env>`) and deployed.
 
 require 'json'
+require 'time'
 
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
@@ -129,7 +130,17 @@ resolved.each { |label, acct| ensure_wrangler_profile(label, acct) }
 # Tag + write version once — one released version, deployed to every selected target.
 tag = Tag.ask
 helper.maybe_tag_and_push(tag)
-helper.run(File.expand_path("~/code/claude/bin/set-version") + " --app #{helper.app} --version #{tag}")
+
+# Stamp the release under ~/.devops/versions (set-version no longer writes a
+# .env.version into the repo checkout) and expose the same values to every
+# build below: $env/static/public bakes PUBLIC_VERSION / PUBLIC_RELEASED_AT
+# into /_internal_/version at build time, overriding the empty defaults each
+# repo commits in its .env.
+released_at = Time.now.utc.iso8601
+helper.run(File.expand_path("~/code/claude/bin/set-version") +
+  " --app #{helper.app} --version #{tag} --released-at #{released_at}")
+ENV['PUBLIC_VERSION'] = tag
+ENV['PUBLIC_RELEASED_AT'] = released_at
 
 # Worker vs Pages, read once from wrangler.toml. A Pages project declares
 # `pages_build_output_dir`; a Worker declares `main` + `routes`. Ignore commented lines.
