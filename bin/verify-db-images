@@ -4,7 +4,7 @@
 # Default scope: LATEST ONLY.  Only the current schema tag (resolved via
 # `sem-info tag latest` in platform-postgresql) is checked.  Historical tags
 # are intentionally skipped — retention (Task 7) purges images older than
-# 10 days, so backfilling 100+ historical tags would be pointless and slow.
+# 3 days, so backfilling historical tags would be pointless and slow.
 #
 # Usage:
 #   verify-db-images             Audit latest schema tag; build if missing.
@@ -26,7 +26,7 @@ puts Util.underline("verify-db-images")
 puts ""
 puts "Scope  : latest tag only"
 puts "         (historical tags intentionally skipped — retention policy"
-puts "          purges images older than 10 days; backfill would be wasteful)"
+puts "          purges images older than 3 days; backfill would be wasteful)"
 puts ""
 
 # Resolve the tag to check.

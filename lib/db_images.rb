@@ -143,14 +143,14 @@ module DbImages
     system(cmd)
   end
 
-  # Purge registry images older than 10 days, while always retaining:
+  # Purge registry images older than 3 days, while always retaining:
   #   (a) the current latest tag (from current_tag)
   #   (b) the baseline anchor BASELINE_TAG
   #
   # Inject `now:` for testable age logic.  Pass `dry_run: true` to print
   # what would be purged without deleting anything.
   BASELINE_TAG    = "0.3.44"
-  PURGE_AGE_DAYS  = 10
+  PURGE_AGE_DAYS  = 3
 
   def DbImages.purge_old(now: Time.now, dry_run: false)
     require 'json'
