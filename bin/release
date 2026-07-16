@@ -5,6 +5,10 @@
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
 
+# A stale local main would silently release old code — fast-forward it first,
+# and only stop if the checkout can't be brought current.
+ReleaseFreshness.ensure!
+
 pwd = `pwd`.strip
 if pwd.end_with?("-postgresql")
   Util.run File.join(dir, "release-db")
