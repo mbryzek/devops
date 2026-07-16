@@ -120,7 +120,7 @@ USAGE = <<~USAGE
         Release every item `pending check` would report. Two phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
-          2. Apps release in parallel (concurrency defaults to 4) via
+          2. Apps release in parallel (concurrency defaults to 10) via
              `release` with RELEASE_AUTO_TAG=1.
         If a DB release fails, the matching app (foo for foo-postgresql)
         is skipped to avoid deploying an app against an unmigrated schema.
@@ -1433,7 +1433,7 @@ end
 
 def parse_pending_release_args(args)
   app_filter = nil
-  concurrency = 4
+  concurrency = 10
   i = 0
   while i < args.length
     a = args[i]

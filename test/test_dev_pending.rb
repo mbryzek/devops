@@ -10,13 +10,13 @@ class TestDevPending < Minitest::Test
   def test_parse_pending_release_args_defaults
     app_filter, concurrency = parse_pending_release_args([])
     assert_nil app_filter
-    assert_equal 4, concurrency
+    assert_equal 10, concurrency
   end
 
   def test_parse_pending_release_args_app_filter
     app_filter, concurrency = parse_pending_release_args(["--app", "acumen"])
     assert_equal "acumen", app_filter
-    assert_equal 4, concurrency
+    assert_equal 10, concurrency
   end
 
   def test_parse_pending_release_args_concurrency
