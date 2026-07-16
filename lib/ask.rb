@@ -13,9 +13,18 @@ class Ask
     while value.empty?
       puts prompt
       system("stty -echo") if hide_input
-      value = STDIN.gets
+      line = $stdin.gets
       system("stty echo") if hide_input
-      value.strip!
+      # nil == EOF / closed stdin: nobody to answer. This happens whenever we run
+      # non-interactively — a pipe, cron, or Open3.capture* (which closes the
+      # child's stdin). Re-looping would spin forever and `nil.strip!` crashes
+      # obscurely (masking the real prompt). Take the default if there is one,
+      # otherwise fail with a message that names the unanswered prompt.
+      if line.nil?
+        return default if default
+        raise "Cannot read input: stdin is not interactive (EOF). Prompt was: #{msg}"
+      end
+      value = line.strip
       if value.empty? && default
         value = default
       end
