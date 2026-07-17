@@ -13,7 +13,7 @@
 -- could be named "Club Med" -> "club-med" and would match.
 --
 -- All FKs onto these tables are NO ACTION (no cascade). Delete order is the full
--- reverse-topological order of the 29-edge FK DAG across the delete universe.
+-- reverse-topological order of the FK DAG across the delete universe.
 -- Multi-level subtrees are flattened into id temp tables so no delete needs deep
 -- nesting. One transaction: any missed edge aborts + rolls back with zero changes.
 --
@@ -59,6 +59,12 @@ create unique index on _del_invocations (id);
 create temp table _del_issues on commit drop as
   select id from issues.issues where club_id in (select id from _del_clubs);
 create unique index on _del_issues (id);
+create temp table _del_suggestions on commit drop as
+  select id from clubaid.suggestions where club_id in (select id from _del_clubs);
+create unique index on _del_suggestions (id);
+create temp table _del_checklist_items on commit drop as
+  select id from playbook.checklist_items where club_id in (select id from _del_clubs);
+create unique index on _del_checklist_items (id);
 
 do $$ begin raise notice 'Clubs targeted: %', (select count(*) from _del_clubs); end $$;
 
@@ -71,13 +77,17 @@ delete from playbook.insight_claims
   where insight_id in (select id from _del_insights)
      or insight_section_id in (select id from _del_insight_sections)
      or insight_tool_call_id in (select id from _del_insight_tool_calls);
-delete from playbook.insight_recommendations       where club_id in (select id from _del_clubs);
+delete from playbook.checklist_item_insights
+  where checklist_item_id in (select id from _del_checklist_items)
+     or insight_id in (select id from _del_insights)
+     or insight_section_id in (select id from _del_insight_sections);
 delete from playbook.insight_sections              where insight_id in (select id from _del_insights);
 delete from playbook.insight_reviews               where insight_id in (select id from _del_insights);
 delete from playbook.insight_tool_calls            where insight_run_id in (select id from _del_insight_runs);
 delete from playbook.insight_findings              where insight_run_id in (select id from _del_insight_runs);
 delete from playbook.insight_judgments             where insight_run_id in (select id from _del_insight_runs);
 delete from playbook.insight_run_stages            where insight_run_id in (select id from _del_insight_runs);
+delete from playbook.insight_rule_logs             where club_id in (select id from _del_clubs);
 delete from playbook.insights                       where club_id in (select id from _del_clubs);
 delete from playbook.insight_runs                   where club_id in (select id from _del_clubs);
 delete from playbook.revenue_entries               where club_id in (select id from _del_clubs);
@@ -86,15 +96,14 @@ delete from playbook.club_insight_settings          where club_id in (select id 
 delete from playbook.club_memory_facts              where club_id in (select id from _del_clubs);
 delete from playbook.membership_categories          where club_id in (select id from _del_clubs);
 delete from playbook.report_exports                 where club_id in (select id from _del_clubs);
+delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
 delete from playbook.watermarks                     where club_id in (select id from _del_clubs);
 
 -- ---- clubaid ---------------------------------------------------------------
-delete from clubaid.account_links                   where credential_id in (select id from _del_credentials);
 delete from clubaid.ai_messages                     where chat_id in (select id from _del_ai_chats);
 delete from clubaid.ai_chats                         where club_id in (select id from _del_clubs);
-delete from clubaid.upload_logs                     where club_id in (select id from _del_clubs);
-delete from clubaid.uploads                          where club_id in (select id from _del_clubs);
-delete from clubaid.export_watermarks               where club_id in (select id from _del_clubs);
+delete from clubaid.suggestion_notes                where suggestion_id in (select id from _del_suggestions);
+delete from clubaid.suggestions                      where club_id in (select id from _del_clubs);
 delete from clubaid.user_club_notification_optouts  where club_id in (select id from _del_clubs);
 delete from clubaid.user_clubs                       where club_id in (select id from _del_clubs);
 delete from clubaid.user_invitations                where club_id in (select id from _del_clubs);
@@ -123,7 +132,6 @@ delete from court_reserve.club_crawler_states       where club_id in (select id 
 delete from court_reserve.clubs                      where club_id in (select id from _del_clubs);
 delete from court_reserve.direct_fetch_windows      where club_id in (select id from _del_clubs);
 delete from court_reserve.families                   where club_id in (select id from _del_clubs);
-delete from court_reserve.guest_member_numbers      where club_id in (select id from _del_clubs);
 delete from court_reserve.member_membership_intervals where club_id in (select id from _del_clubs);
 delete from court_reserve.members                    where club_id in (select id from _del_clubs);
 delete from court_reserve.report_urls                where club_id in (select id from _del_clubs);
@@ -162,6 +170,9 @@ delete from issues.issues                           where club_id in (select id 
 delete from integrations.credentials                 where club_id in (select id from _del_clubs);
 delete from integrations.disabled_integrations       where club_id in (select id from _del_clubs);
 delete from rallyd.courts                            where club_id in (select id from _del_clubs);
+
+-- ---- user_tracking ---------------------------------------------------------
+delete from user_tracking.page_views                where club_id in (select id from _del_clubs);
 
 -- ---- finally the clubs (self-FK NO ACTION handles parent/child subset) ------
 delete from clubaid.clubs where id like 'club-%';
