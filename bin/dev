@@ -183,7 +183,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["issue claim"]}
         Claim the open issues in ONE category into a local plan for a Claude session
         to work on. CATEGORY is required — one session per category — and is one of
-        graphs, court_reserve, app, admin, platform, infra. Lists that category's
+        graphs, worker, insights. Lists that category's
         open issues, and — after you confirm (or with --yes) — atomically claims all
         of them and writes ONE plan to
         ~/code/claude/plans/<date>-issues-<category>.md.
@@ -830,7 +830,7 @@ ISSUE_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].
 # Routing key for a fix session: one category per session, one durable prompt
 # body per category (devops/claude-issues/<category>-body.md). Mirrors the
 # issue_category enum in the platform `issues` spec — keep them in step.
-ISSUE_CATEGORIES = %w[graphs court_reserve app admin platform infra].freeze
+ISSUE_CATEGORIES = %w[graphs worker insights].freeze
 
 # Model the spawned session runs on: Opus 4.8 with the 1M-context window. This is
 # the interactive default (the `ccd` alias's model), NOT the headless-codegen

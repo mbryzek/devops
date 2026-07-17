@@ -47,7 +47,7 @@ class TestDevIssue < Minitest::Test
     {
       "id" => "iss-2",
       "number" => "035",
-      "category" => "court_reserve",
+      "category" => "worker",
       "status" => "open",
       "title" => "Members export empty for 3 clubs",
       "created" => { "at" => "2026-07-09T08:30:00Z", "by" => { "nickname" => "logreview" } },
@@ -154,7 +154,7 @@ class TestDevIssue < Minitest::Test
   end
 
   def test_summary_line_omits_club_when_absent
-    assert_equal "  2. ISS-035 · court_reserve · open · Members export empty for 3 clubs",
+    assert_equal "  2. ISS-035 · worker · open · Members export empty for 3 clubs",
                  issue_summary_line(crawl_issue, 2)
   end
 
@@ -179,18 +179,25 @@ class TestDevIssue < Minitest::Test
   end
 
   def test_categories_match_the_spec_enum
-    assert_equal %w[graphs court_reserve app admin platform infra], ISSUE_CATEGORIES
+    assert_equal %w[graphs worker insights], ISSUE_CATEGORIES
   end
 
   def test_graphs_body_orients_to_clubaid_app
     assert_includes issue_body_text("graphs"), "mbryzek/clubaid-app"
   end
 
-  def test_court_reserve_body_orients_to_the_crawl_pipeline
-    body = issue_body_text("court_reserve")
+  def test_worker_body_orients_to_the_crawl_pipeline
+    body = issue_body_text("worker")
     assert_includes body, "mbryzek/workers"           # the browser scraper
     assert_includes body, "courtreserve"              # the platform ingest/parse package
     assert_includes body, "log review"                # where these issues come from
+  end
+
+  def test_insights_body_orients_to_generation_quality
+    body = issue_body_text("insights")
+    assert_includes body, "playbook"                  # the generation subproject
+    assert_includes body, "mbryzek/clubaid-admin"     # where insights are reviewed
+    assert_includes body, "checklist"                 # rejected-checklist-item feedback
   end
 
   # ---- issues list path filters by `statuses` (plural), never `status` ----
@@ -246,7 +253,7 @@ class TestDevIssue < Minitest::Test
   def test_claim_rejects_invalid_category
     out, status = capture_stderr_and_exit { cmd_issue_claim(["--category", "bogus"]) }
     assert_equal 1, status
-    assert_match(/--category must be one of: graphs, court_reserve, app, admin, platform, infra/, out)
+    assert_match(/--category must be one of: graphs, worker, insights/, out)
   end
 
   def test_claim_rejects_category_without_value
