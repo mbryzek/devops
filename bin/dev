@@ -52,7 +52,7 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
-  "issue claim"         => 'issue claim --category CATEGORY [--localhost] [--yes] [--no-spawn]',
+  "issue claim"         => 'issue claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
   "issue status"        => 'issue status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issue reconcile"     => 'issue reconcile [--apply] [--localhost]',
 }.freeze
@@ -181,17 +181,18 @@ USAGE = <<~USAGE
         their own `--env`/`--prod` flags.
 
     #{INVOCATIONS["issue claim"]}
-        Claim the open issues in ONE category into a local plan for a Claude session
-        to work on. CATEGORY is required — one session per category — and is one of
-        graphs, worker, insights. Lists that category's
-        open issues, and — after you confirm (or with --yes) — atomically claims all
-        of them and writes ONE plan to
-        ~/code/claude/plans/<date>-issues-<category>.md.
-        Then hands the terminal to an interactive Claude session (Opus 4.8, 1M
-        context — the `ccd` model) to implement the plan; pass --no-spawn to just
-        write the plan and print its path. Authenticates with your persisted
-        clubaid session — run `dev login --app clubaid` once first (the issues
-        API requires a clubaid admin, not the platform `dev login`).
+        Claim open issues into local plans for a Claude session to work on. With no
+        --category (the default) it scans every category (graphs, worker, insights),
+        lists the open issues grouped by category, and — after you confirm (or with
+        --yes) — atomically claims each category and writes ONE plan per category to
+        ~/code/claude/plans/<date>-issues-<category>.md. Pass --category CATEGORY to
+        scope to a single one. It then hands the terminal to an interactive Claude
+        session (Opus 4.8, 1M context — the `ccd` model): one plan → it implements
+        the plan directly; several → it dispatches one subagent per plan and works
+        them in parallel. Pass --no-spawn to just write the plan(s) and print their
+        paths. Authenticates with your persisted clubaid session — run
+        `dev login --app clubaid` once first (the issues API requires a clubaid
+        admin, not the platform `dev login`).
 
     #{INVOCATIONS["issue status"]}
         Close a claimed issue. NUMBER is the per-tenant issue number shown as
@@ -837,16 +838,49 @@ ISSUE_CATEGORIES = %w[graphs worker insights].freeze
 # `CODEGEN_CLAUDE_MODEL` (haiku) — a human is driving this one to fix real bugs.
 ISSUE_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
 
-# The prompt handed to the spawned Claude session.
+# The prompt handed to the spawned Claude session when exactly one category was
+# claimed (one plan). Unchanged: the session works the plan directly.
 def issue_session_prompt(path)
   "read the plan at #{path} and implement it"
 end
 
+# The prompt when several categories were claimed at once (one plan each). A
+# single session can only take one TTY (we `exec`), so the parallelism moves
+# INSIDE it: the session fans out one subagent per plan. Categories are
+# independent pipelines/repos, so the subagents share no state.
+def issue_fanout_prompt(plans)
+  listed = plans.map { |category, path| "- #{category}: #{path}" }.join("\n")
+  "#{plans.length} issue plans have been claimed, one per category. Dispatch ONE " \
+    "subagent per plan and work them in parallel — do NOT implement the fixes " \
+    "yourself in this session. Give each subagent its plan path and tell it to read " \
+    "the plan, implement the fixes, open PRs, and close each issue with " \
+    "`dev issue status`. Plans:\n#{listed}"
+end
+
+# The prompt for the spawned session, keyed on how many category plans were
+# claimed: today's single-plan prompt for one, the subagent fan-out for several.
+# `plans` is a list of [category, plan_path].
+def issue_claim_prompt(plans)
+  plans.length == 1 ? issue_session_prompt(plans.first[1]) : issue_fanout_prompt(plans)
+end
+
 # Pure, testable seam: the argv for the interactive session `dev issue claim`
-# launches after writing the plan. Mirrors the `ccd` alias
+# launches after writing the plan(s). Mirrors the `ccd` alias
 # (`claude --dangerously-skip-permissions`) pinned to Opus 4.8 (1M context).
+def issue_claude_argv(prompt)
+  ["claude", "--dangerously-skip-permissions", "--model", ISSUE_CLAUDE_MODEL, prompt]
+end
+
+# Single-plan argv (kept as the one-plan spawn path and its regression test).
 def issue_claude_command(path)
-  ["claude", "--dangerously-skip-permissions", "--model", ISSUE_CLAUDE_MODEL, issue_session_prompt(path)]
+  issue_claude_argv(issue_session_prompt(path))
+end
+
+# Known categories (in ISSUE_CATEGORIES order) that have at least one open issue
+# in `open`. Drives both the grouped preview and the per-category claim loop, so
+# an unknown/retired category in the tracker is simply never claimed here.
+def issue_categories_present(open)
+  ISSUE_CATEGORIES.select { |cat| open.any? { |c| c["category"] == cat } }
 end
 
 # The issue tracker is tenant-scoped (/:tenant_id/issues) and authorized for a
@@ -1031,9 +1065,8 @@ def cmd_issue_claim(args)
 
   problems = []
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
-  # One session per category: the claim is category-scoped server-side and each
-  # category has its own orientation body, so there is no sensible default.
-  problems << "--category is required (one of: #{ISSUE_CATEGORIES.join(', ')})" if category.nil? || category.empty?
+  # --category is optional: with none, discover open issues across ALL categories
+  # and claim each. When given it must still name a real category.
   problems << "--category must be one of: #{ISSUE_CATEGORIES.join(', ')}" if category && !category.empty? && !ISSUE_CATEGORIES.include?(category)
   report_arg_problems("issue claim", problems, usage_for("issue claim"))
 
@@ -1041,19 +1074,28 @@ def cmd_issue_claim(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
+    # No --category => one call returns every open issue (grouped below); with a
+    # category the server filters to it. `present` is the enum-ordered set of
+    # categories we will actually claim.
     open = ApiClient.request(endpoint, :get, issues_list_path(statuses: "open", category: category)) || []
-    if open.empty?
-      puts "No open #{category} issues."
+    present = issue_categories_present(open)
+    if present.empty?
+      puts category ? "No open #{category} issues." : "No open issues."
       return
     end
 
+    claimable = open.count { |c| present.include?(c["category"]) }
     puts ""
-    puts Util.underline("Open #{category} issues (#{open.length})")
-    open.each_with_index { |c, i| puts issue_summary_line(c, i + 1) }
-    puts ""
+    present.each do |cat|
+      issues = open.select { |c| c["category"] == cat }
+      puts Util.underline("#{cat} (#{issues.length})")
+      issues.each_with_index { |c, i| puts issue_summary_line(c, i + 1) }
+      puts ""
+    end
 
     unless assume_yes
-      print "Claim #{open.length} #{category} issue(s) and write a plan? [y/N] "
+      scope = present.length == 1 ? "#{present.first} issue(s)" : "issue(s) across #{present.length} categories"
+      print "Claim #{claimable} open #{scope} and write plan(s)? [y/N] "
       answer = $stdin.gets&.strip&.downcase
       unless %w[y yes].include?(answer)
         puts "Aborted. Nothing claimed."
@@ -1061,35 +1103,54 @@ def cmd_issue_claim(args)
       end
     end
 
-    claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { category: category }) || []
-    if claimed.empty?
+    # Claim each present category server-side (one atomic claim per category, as
+    # today) and write one plan per category actually claimed. A category the
+    # race just lost (nothing claimed) is dropped with no plan.
+    plans = []
+    total_claimed = 0
+    present.each do |cat|
+      claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { category: cat }) || []
+      next if claimed.empty?
+      total_claimed += claimed.length
+      path = write_issue_plan(claimed, cat)
+      plans << [cat, path]
+      puts "Claimed #{claimed.length} #{cat} issue(s) → #{path}"
+    end
+
+    if plans.empty?
       puts "Nothing claimed — the open issue(s) were just claimed by another session. No plan written."
       return
     end
 
-    path = write_issue_plan(claimed, category)
-    puts "Claimed #{claimed.length} of #{open.length} open #{category} issue(s). Plan written to:"
-    puts "  #{path}"
     puts ""
+    puts "Claimed #{total_claimed} issue(s) across #{plans.length} categor#{plans.length == 1 ? 'y' : 'ies'}."
 
     unless spawn_session
-      puts "Hand it to a session with:  claude \"#{issue_session_prompt(path)}\""
+      if plans.length == 1
+        puts "Hand it to a session with:  claude \"#{issue_session_prompt(plans.first[1])}\""
+      else
+        puts "Start a session and dispatch one subagent per plan:"
+        plans.each { |cat, p| puts "  #{cat}: #{p}" }
+      end
       return
     end
 
     # Hand the terminal directly to an interactive Claude session (Opus 4.8, 1M
-    # context) so it starts working the plan immediately. exec replaces this
-    # process, so the session inherits the TTY and this is the last thing we do.
-    puts "Starting Claude session (Opus 4.8, 1M context) to implement the plan..."
-    puts "  (re-run with --no-spawn to just write the plan)"
+    # context) so it starts immediately. One plan → it works the plan; several →
+    # it fans out one subagent per plan. exec replaces this process, so the
+    # session inherits the TTY and this is the last thing we do.
+    puts plans.length == 1 ?
+      "Starting Claude session (Opus 4.8, 1M context) to implement the plan..." :
+      "Starting Claude session (Opus 4.8, 1M context) to dispatch one subagent per category plan..."
+    puts "  (re-run with --no-spawn to just write the plan(s))"
     puts ""
     begin
-      exec(*issue_claude_command(path))
+      exec(*issue_claude_argv(issue_claim_prompt(plans)))
     rescue SystemCallError => e
-      # `claude` not on PATH (or otherwise unlaunchable). The plan is already
+      # `claude` not on PATH (or otherwise unlaunchable). The plan(s) are already
       # written, so degrade to the manual hand-off rather than a stack trace.
-      warn "Could not start Claude (#{e.message}). The plan is saved — run it with:"
-      warn "  claude \"#{issue_session_prompt(path)}\""
+      warn "Could not start Claude (#{e.message}). The plan(s) are saved — run with:"
+      warn "  claude \"#{issue_claim_prompt(plans)}\""
     end
   end
 end

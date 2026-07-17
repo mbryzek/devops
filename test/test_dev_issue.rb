@@ -234,20 +234,52 @@ class TestDevIssue < Minitest::Test
     assert_equal issue_session_prompt("/p/x.md"), cmd.last          # prompt is the final arg
   end
 
-  # ---- cmd_issue_claim arg validation (exits before any network) ----
+  # ---- claim prompt: one plan works directly, several fan out subagents ----
 
-  def test_claim_requires_category
-    out, status = capture_stderr_and_exit { cmd_issue_claim([]) }
-    assert_equal 1, status
-    assert_match(/--category is required/, out)
-    ISSUE_CATEGORIES.each { |c| assert_includes out, c, "error must list the valid categories" }
-    assert_includes out, "  Usage: #{usage_for('issue claim')}"
+  def test_claim_prompt_single_plan_is_todays_direct_prompt
+    assert_equal issue_session_prompt("/p/g.md"), issue_claim_prompt([["graphs", "/p/g.md"]])
   end
 
-  def test_claim_requires_category_even_with_yes_and_no_spawn
-    out, status = capture_stderr_and_exit { cmd_issue_claim(["--yes", "--no-spawn"]) }
+  def test_claim_prompt_multi_plan_dispatches_one_subagent_per_plan
+    prompt = issue_claim_prompt([["graphs", "/p/g.md"], ["worker", "/p/w.md"]])
+    assert_includes prompt, "2 issue plans"
+    assert_includes prompt, "ONE subagent per plan"
+    assert_includes prompt, "do NOT implement the fixes yourself"
+    assert_includes prompt, "- graphs: /p/g.md"
+    assert_includes prompt, "- worker: /p/w.md"
+  end
+
+  def test_claim_argv_wraps_any_prompt_as_ccd_opus
+    argv = issue_claude_argv("do the thing")
+    assert_equal "claude", argv[0]
+    assert_includes argv, "--dangerously-skip-permissions"
+    assert_equal "claude-opus-4-8[1m]", argv[argv.index("--model") + 1]
+    assert_equal "do the thing", argv.last
+  end
+
+  # ---- issue_categories_present: enum-ordered, known categories only ----
+
+  def test_categories_present_returns_enum_order_known_only
+    open = [crawl_issue.merge("category" => "insights"), graph_issue.merge("status" => "open"), crawl_issue]
+    # graphs (from graph_issue) + worker (crawl_issue) + insights, listed in enum order.
+    assert_equal %w[graphs worker insights], issue_categories_present(open)
+  end
+
+  def test_categories_present_empty_when_no_known_open
+    assert_empty issue_categories_present([crawl_issue.merge("category" => "mystery")])
+    assert_empty issue_categories_present([])
+  end
+
+  # ---- cmd_issue_claim arg validation (exits before any network) ----
+
+  # No --category is now valid (claim across all categories). Prove it gets PAST
+  # arg validation by running with no clubaid session so it stops at the
+  # credential guard rather than firing a live claim at production.
+  def test_claim_without_category_passes_arg_validation
+    out, status = without_clubaid_session { capture_stderr_and_exit { cmd_issue_claim([]) } }
+    refute_match(/--category is required/, out)
     assert_equal 1, status
-    assert_match(/--category is required/, out)
+    assert_match(/dev login --app clubaid/, out)
   end
 
   def test_claim_rejects_invalid_category
