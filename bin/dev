@@ -1516,29 +1516,49 @@ def resolve_deploy_items(name_filter)
   items.map { |name, dir, app| Thread.new { [name, deploy_state_for(name, dir, app: app, registry: registry)] } }.map(&:value)
 end
 
+# Prints one row of the deploy status table. Column widths are shared across
+# every section so the two buckets stay aligned under one set of headers.
+def print_deploy_status_row(name, d, name_w, tag_w, prod_w)
+  if d[:error]
+    puts "#{name.ljust(name_w)}  ERROR - #{d[:error]}"
+    return
+  end
+  status = []
+  status << "+#{d[:ahead]} unreleased" if d[:ahead] > 0
+  status << "tag #{d[:tag]} not deployed" if d[:prod_stale]
+  # A failed prod probe means we could not verify what production is running —
+  # it does NOT mark the app pending, but it must not pass silently either.
+  status << "prod check failed: #{d[:prod_error]}" if d[:prod_error]
+  status << "up to date" if status.empty?
+  puts "#{name.ljust(name_w)}  #{(d[:tag] || '').ljust(tag_w)}  #{(d[:prod] || '-').ljust(prod_w)}  #{status.join(', ')}"
+end
+
 # Prints every tracked item with its latest tag, the version production is
 # running, and a status — the full fleet picture even when everything is up to
-# date.
+# date. When the fleet is a mix of up-to-date and pending apps, the pending ones
+# are split into a trailing "needs deploy" section so what actually needs a
+# release is easy to pick out; a uniform fleet prints as a single table.
 def print_deploy_status_table(rows)
   name_w = rows.map { |n, _| n.length }.max
   tag_w  = [rows.map { |_, d| (d[:tag] || "").length }.max, "tag".length].max
   prod_w = [rows.map { |_, d| (d[:prod] || "-").length }.max, "prod".length].max
+  header = "#{'app'.ljust(name_w)}  #{'tag'.ljust(tag_w)}  #{'prod'.ljust(prod_w)}  status"
 
-  puts "#{'app'.ljust(name_w)}  #{'tag'.ljust(tag_w)}  #{'prod'.ljust(prod_w)}  status"
-  rows.each do |name, d|
-    if d[:error]
-      puts "#{name.ljust(name_w)}  ERROR - #{d[:error]}"
-      next
-    end
-    status = []
-    status << "+#{d[:ahead]} unreleased" if d[:ahead] > 0
-    status << "tag #{d[:tag]} not deployed" if d[:prod_stale]
-    # A failed prod probe means we could not verify what production is running —
-    # it does NOT mark the app pending, but it must not pass silently either.
-    status << "prod check failed: #{d[:prod_error]}" if d[:prod_error]
-    status << "up to date" if status.empty?
-    puts "#{name.ljust(name_w)}  #{d[:tag].ljust(tag_w)}  #{(d[:prod] || '-').ljust(prod_w)}  #{status.join(', ')}"
+  pending, current = rows.partition { |_, d| needs_deploy?(d) }
+
+  # Uniform fleet (all current, or all pending): one plain table, no sections.
+  if pending.empty? || current.empty?
+    puts header
+    rows.each { |name, d| print_deploy_status_row(name, d, name_w, tag_w, prod_w) }
+    return
   end
+
+  puts header
+  current.each { |name, d| print_deploy_status_row(name, d, name_w, tag_w, prod_w) }
+  puts ""
+  puts "needs deploy"
+  puts header
+  pending.each { |name, d| print_deploy_status_row(name, d, name_w, tag_w, prod_w) }
 end
 
 # Whether we can prompt. A pipe or cron has no one to answer, so the caller must
