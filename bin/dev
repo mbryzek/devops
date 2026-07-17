@@ -865,6 +865,21 @@ def issues_path(suffix = "")
   "/#{ISSUE_TENANT_ID}/issues#{suffix}"
 end
 
+# Path to the issues LIST endpoint filtered to one or more statuses. The spec
+# parameter is `statuses` (a repeatable list of issue_status) — NOT `status`. A
+# singular `status=open` is an unknown parameter the server silently ignores, so
+# it returns issues in EVERY status. That made `dev issue claim` preview (and
+# `dev issue reconcile`) act on the whole tracker: e.g. offering to "claim 35
+# issues" when only the open ones would actually be claimed server-side. Always
+# name the parameter `statuses` so the filter applies.
+def issues_list_path(statuses:, category: nil, limit: 100)
+  params = { "statuses" => Array(statuses) }
+  params["category"] = category if category
+  params["limit"] = limit
+  params["offset"] = 0
+  issues_path("?#{URI.encode_www_form(params)}")
+end
+
 # Fail with the exact login command when there is no clubaid session yet, rather
 # than the generic "run 'dev login'" that handle_errors emits on a 401.
 def require_clubaid_session!(use_localhost)
@@ -1026,7 +1041,7 @@ def cmd_issue_claim(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
-    open = ApiClient.request(endpoint, :get, issues_path("?status=open&category=#{URI.encode_www_form_component(category)}&limit=100&offset=0")) || []
+    open = ApiClient.request(endpoint, :get, issues_list_path(statuses: "open", category: category)) || []
     if open.empty?
       puts "No open #{category} issues."
       return
@@ -1181,7 +1196,7 @@ def cmd_issue_reconcile(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
-    fixed = ApiClient.request(endpoint, :get, issues_path("?status=fixed&limit=100&offset=0")) || []
+    fixed = ApiClient.request(endpoint, :get, issues_list_path(statuses: "fixed")) || []
     if fixed.empty?
       puts "No fixed issues awaiting deploy."
       return
