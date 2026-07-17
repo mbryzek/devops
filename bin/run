@@ -13,16 +13,23 @@
 
 PROJECT=$(basename "$PWD")
 
+# Larger of two integers.
+max() {
+  if [ "$1" -ge "$2" ]; then echo "$1"; else echo "$2"; fi
+}
+
 # Launch a claude session (--dangerously-skip-permissions) to investigate and
 # fix the failures/errors captured in the test log.
 launch_fix() {
   echo "Launching claude to investigate and fix..."
-  claude --dangerously-skip-permissions "The $PROJECT test suite was just run and reported $FAILURES test failure(s), $CANCELED canceled test(s), and $COMPILE_ERRORS compile error(s). The full sbt/ScalaTest output is in $LOG.
+  claude --dangerously-skip-permissions "The $PROJECT test suite was just run: sbt exited $SBT_STATUS, with $FAILURES test failure(s), $CANCELED canceled test(s), and $COMPILE_ERRORS compile error(s)$REPORTER_NOTE. The full sbt/ScalaTest output is in $LOG.
 
 Investigate and fix the errors:
 - Read $LOG and identify each distinct failure/error and its root cause (grep for '[error]', 'TESTS FAILED', 'Tests:', and stack traces).
+- Trust sbt's exit code and the '[error] Failed tests:' list over ScalaTest's 'Tests: succeeded N, failed N' summary lines. If the ScalaTest reporter died mid-run ('Reporter completed abruptly'), those summary lines UNDERCOUNT and can read 'failed 0' on a run that failed.
 - Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
-- Do NOT change production behavior unless you first prove it is in fact a production bug. Starting assumptino is the tests need to be updated.
+- Do NOT change production behavior unless you first prove it is in fact a production bug. Starting assumption is the tests need to be updated.
+- Check CONF_DB_DEV_URL is set to the :5433 session DB first: a suite that silently ran against the :5432 dev DB produces mass stale-data failures that are environmental, not code bugs.
 - After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
 - Work on a feature branch and directory per CLAUDE.md; do not commit to main."
 }
@@ -48,23 +55,70 @@ if [ "$1" = "test" ]; then
 
   LOG="/tmp/$PROJECT-test-$(date +%Y%m%d-%H%M%S).log"
   echo "Logging to $LOG"
-  eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\"" 2>&1 | tee "$LOG"
+
+  # sbt's exit code is the authoritative pass/fail signal, but it is lost through
+  # the `| tee` pipe ($? would be tee's). Stash it in a temp file instead — sh has
+  # no PIPESTATUS. Everything below only ever ADDS problems on top of this.
+  STATUS_FILE=$(mktemp "${TMPDIR:-/tmp}/run-status.XXXXXX")
+  {
+    eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\""
+    echo $? > "$STATUS_FILE"
+  } 2>&1 | tee "$LOG"
+  SBT_STATUS=$(cat "$STATUS_FILE" 2>/dev/null)
+  rm -f "$STATUS_FILE"
+  # No status written => sbt died without the group completing; treat as failure.
+  [ -n "$SBT_STATUS" ] || SBT_STATUS=1
 
   # Summarize results from the log.
-  # Test failures/canceled: summed across each subproject's ScalaTest summary line.
-  FAILURES=$(grep -hEo 'failed [0-9]+'   "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
-  CANCELED=$(grep -hEo 'canceled [0-9]+' "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  #
+  # ScalaTest's per-subproject "Tests: succeeded N, failed N" summary is written by
+  # the reporter, so when the reporter itself dies mid-run ("Reporter completed
+  # abruptly") it reads "failed 0" on a run that failed — that is how a 26-failure
+  # platform run was reported as green on 2026-07-17. Count the per-test
+  # "*** FAILED ***" / "!!! CANCELED !!!" markers too (they are printed as each test
+  # finishes, so they survive a dead reporter) and take whichever is larger.
+  FAILURES_SUMMARY=$(grep -hEo 'failed [0-9]+'   "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  CANCELED_SUMMARY=$(grep -hEo 'canceled [0-9]+' "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  # "*** N TESTS FAILED ***" is a suite total, not a per-test marker: it does not
+  # contain the literal "*** FAILED ***", so it is not double counted here.
+  FAILURES_MARKERS=$(grep -cF '*** FAILED ***' "$LOG")
+  CANCELED_MARKERS=$(grep -cF '!!! CANCELED !!!' "$LOG")
+  FAILURES=$(max "$FAILURES_SUMMARY" "$FAILURES_MARKERS")
+  CANCELED=$(max "$CANCELED_SUMMARY" "$CANCELED_MARKERS")
   # Compile errors: [error] lines pointing at a source location (skips sbt's generic noise).
   COMPILE_ERRORS=$(grep -cE '^\[error\] .*\.(scala|java):[0-9]+' "$LOG")
+  REPORTER_CRASHES=$(grep -cF 'Reporter completed abruptly' "$LOG")
+
   PROBLEMS=$((FAILURES + CANCELED + COMPILE_ERRORS))
+  # A nonzero sbt exit means the run failed even if every count above came back 0
+  # (aborted suite, dead reporter, sbt-level error). Never report green over it.
+  if [ "$SBT_STATUS" -ne 0 ] && [ "$PROBLEMS" -eq 0 ]; then
+    PROBLEMS=1
+  fi
+
+  REPORTER_NOTE=""
+  if [ "$REPORTER_CRASHES" -gt 0 ]; then
+    REPORTER_NOTE=" — NOTE: the ScalaTest reporter crashed mid-run, so these counts may undercount the real number of failures"
+  fi
 
   echo ""
   echo "================ test summary ================"
   echo "  project:        $PROJECT"
+  echo "  sbt exit:       $SBT_STATUS"
   echo "  failed:         $FAILURES"
   echo "  canceled:       $CANCELED"
   echo "  compile errors: $COMPILE_ERRORS"
+  if [ "$REPORTER_CRASHES" -gt 0 ]; then
+    echo "  reporter:       CRASHED ($REPORTER_CRASHES time(s)) — counts may undercount"
+  fi
   echo "============================================="
+
+  if [ "$SBT_STATUS" -ne 0 ]; then
+    # The list sbt prints is reliable even when the ScalaTest summary is not.
+    echo "sbt reported failure. Failed suites:"
+    sed -n '/^\[error\] Failed tests:/,/^\[error\] ([^)]*)/p' "$LOG" | grep -E '^\[error\]\s+\S+$' | sort -u
+    echo ""
+  fi
 
   if [ "$PROBLEMS" -gt 0 ]; then
     if [ "$AUTOFIX" -eq 1 ]; then
@@ -82,9 +136,13 @@ if [ "$1" = "test" ]; then
       # Non-interactive (CI, pipe): don't block; just report.
       echo "Found $PROBLEMS problem(s). Re-run with '--fix' to auto-launch claude to investigate."
     fi
+    # Exit nonzero so callers (CI, scripts, `&&` chains) can detect the failure
+    # rather than inferring it from stdout.
+    exit 1
   else
     echo "All green — no failures or errors."
   fi
+  exit 0
 else
   eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\""
 fi
