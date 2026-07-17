@@ -193,6 +193,26 @@ class TestDevIssue < Minitest::Test
     assert_includes body, "log review"                # where these issues come from
   end
 
+  # ---- issues list path filters by `statuses` (plural), never `status` ----
+  # Regression: the singular `status=open` is an unknown query parameter the
+  # server ignores, so the claim preview and reconcile scan saw EVERY status
+  # instead of just open/fixed. The spec parameter is the repeatable `statuses`.
+
+  def test_issues_list_path_uses_plural_statuses_param
+    path = issues_list_path(statuses: "open", category: "graphs")
+    assert_includes path, "statuses=open"
+    refute_includes path, "status=open"   # the singular, server-ignored form
+    assert_includes path, "category=graphs"
+    assert_includes path, "limit=100"
+    assert_includes path, "offset=0"
+  end
+
+  def test_issues_list_path_omits_category_when_absent
+    path = issues_list_path(statuses: "fixed")
+    assert_includes path, "statuses=fixed"
+    refute_includes path, "category="
+  end
+
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
 
   def test_issue_session_prompt_names_the_plan
