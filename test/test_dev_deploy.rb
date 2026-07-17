@@ -405,6 +405,68 @@ class TestPendingRow < Minitest::Test
   end
 end
 
+# print_deploy_status_table: a mixed fleet splits pending apps into a trailing
+# "needs deploy" section; a uniform fleet stays a single table.
+class TestDeployStatusTable < Minitest::Test
+  def capture_io
+    old_stdout = $stdout
+    $stdout = StringIO.new
+    yield
+    $stdout.string
+  ensure
+    $stdout = old_stdout
+  end
+
+  def up(name, tag)
+    [name, { tag: tag, prod: tag, ahead: 0, prod_stale: false }]
+  end
+
+  def stale(name, tag, prod)
+    [name, { tag: tag, prod: prod, ahead: 0, prod_stale: true }]
+  end
+
+  def test_mixed_fleet_splits_pending_into_needs_deploy_section
+    out = capture_io do
+      print_deploy_status_table([up("account", "0.0.12"), stale("acumen", "0.9.53", "0.9.52")])
+    end
+    lines = out.lines.map(&:chomp)
+    # A "needs deploy" section header separates the two buckets, and pending
+    # rows land after it — the up-to-date row comes before.
+    section = lines.index("needs deploy")
+    refute_nil section, "expected a 'needs deploy' section header"
+    up_to_date = lines.index { |l| l.start_with?("account") }
+    pending    = lines.index { |l| l.start_with?("acumen") }
+    assert up_to_date < section, "up-to-date app should precede the needs-deploy section"
+    assert pending > section, "pending app should follow the needs-deploy section"
+  end
+
+  def test_uniform_up_to_date_fleet_is_single_table
+    out = capture_io do
+      print_deploy_status_table([up("account", "0.0.12"), up("platform", "0.17.21")])
+    end
+    refute_match(/needs deploy/, out)
+    assert_equal 1, out.scan(/^app\s+tag\s+prod\s+status$/).length
+  end
+
+  def test_uniform_pending_fleet_is_single_table
+    out = capture_io do
+      print_deploy_status_table([stale("acumen", "0.9.53", "0.9.52"), stale("rallyd", "0.3.18", "0.3.17")])
+    end
+    refute_match(/needs deploy/, out)
+    assert_equal 1, out.scan(/^app\s+tag\s+prod\s+status$/).length
+  end
+
+  def test_columns_align_across_both_sections
+    # A long name in the up-to-date bucket sets the width; the pending row in the
+    # trailing section must line up under the same header.
+    out = capture_io do
+      print_deploy_status_table([up("acumen-postgresql", "0.1.36"), stale("acumen", "0.9.53", "0.9.52")])
+    end
+    tag_columns = out.lines.select { |l| l.include?("0.") }.map { |l| l.index(/0\./) }.uniq
+    assert_equal 1, tag_columns.length, "tag column should start at the same offset in every data row"
+  end
+end
+
 # prod_status: how a row acquires prod/prod_stale/prod_error.
 class TestProdStatus < Minitest::Test
   FakeApp = Struct.new(:name, :docker_k8s, keyword_init: true)
