@@ -1,8 +1,13 @@
 ## How this pipeline works
 
+This category covers the async/background workers — auto-filed by the daily log review. The
+Court Reserve sync is by far the largest of them, so most issues here are about it; other
+background jobs land here too, and the same "read the evidence, reproduce from a fixture, fix
+the root cause" approach applies.
+
 Court Reserve is ClubAid's upstream club-management system. Nothing is queried live: a browser
 worker downloads each report as an Excel export, the platform converts and parses it, and every
-dashboard number downstream comes from those parsed rows. Issues in this category are almost
+dashboard number downstream comes from those parsed rows. Court Reserve issues are almost
 always "the data is wrong/missing/stale", and the bug lives at one of these stages:
 
 - **Scraper**: repo `mbryzek/workers` (clone `git@github.com:mbryzek/workers.git`; renamed from
@@ -51,7 +56,7 @@ always "the data is wrong/missing/stale", and the bug lives at one of these stag
 
 1. Read `~/code/CLAUDE.md` and the relevant `~/code/claude/rules/*.mdc` files first
    (especially `scala.*.mdc` and `database.general.mdc`).
-2. Work in a feature dir under `~/code/ai/` (branch name ≤ 19 chars, e.g. `iss-cr-<date>`);
+2. Work in a feature dir under `~/code/ai/` (branch name ≤ 19 chars, e.g. `iss-worker-<date>`);
    clone `platform` (plus `workers` if the fix is in the scraper). Never edit `~/code/platform`
    or `~/code/workers` directly.
 3. Group related issues into one branch/PR — findings grouped under one fingerprint are one

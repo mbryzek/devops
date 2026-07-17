@@ -3,14 +3,11 @@
 One `<category>-body.md` per `issue_category` in the platform `issues` spec — the durable
 orientation (pipeline map, decoding guide, working rules) for fixing that category's issues:
 
-| file                    | category        | orients the session to                               |
-| ----------------------- | --------------- | ---------------------------------------------------- |
-| `graphs-body.md`        | `graphs`        | the native graph dashboards in clubaid-app           |
-| `court_reserve-body.md` | `court_reserve` | the Court Reserve scrape → parse → coverage pipeline |
-| `app-body.md`           | `app`           | clubaid-app outside the graphs                       |
-| `admin-body.md`         | `admin`         | the clubaid-admin console (Elm)                      |
-| `platform-body.md`      | `platform`      | backend/API behavior                                 |
-| `infra-body.md`         | `infra`         | devops: k8s, deploys, alerting                       |
+| file               | category   | orients the session to                                    |
+| ------------------ | ---------- | --------------------------------------------------------- |
+| `graphs-body.md`   | `graphs`   | the native graph dashboards in clubaid-app                |
+| `worker-body.md`   | `worker`   | the async workers — chiefly the Court Reserve pipeline    |
+| `insights-body.md` | `insights` | insight-generation quality (playbook + clubaid-admin)     |
 
 Each is read by **`dev issue claim --category <category>`** (`bin/dev`), which claims that
 category's open issues and appends the matching body to the plan it writes under
@@ -22,5 +19,6 @@ Adding a category means all three: the `issue_category` enum in the platform `is
 missing file otherwise).
 
 The issue tracker replaces Linear and the old playbook-feedback queue (`dev feedback`, removed
-along with its API). `court_reserve` issues are auto-filed by the daily log review; the rest are
-filed by hand or captured in-app.
+along with its API). `worker` issues are auto-filed by the daily log review; `insights` issues
+are captured in-app when an admin reviews an insight or rejects a proposed checklist item; the
+rest are filed by hand or captured in-app.
