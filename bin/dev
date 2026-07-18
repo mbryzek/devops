@@ -1577,7 +1577,11 @@ def cmd_deploy_status(args)
   print_deploy_status_table(rows)
 
   pending = rows.select { |_, d| needs_deploy?(d) }.map(&:first)
-  return if pending.empty?
+  if pending.empty?
+    puts ""
+    puts "All production apps are running the latest versions."
+    return
+  end
 
   unless interactive_terminal?
     puts ""
