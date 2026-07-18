@@ -4,20 +4,23 @@ require 'tmpdir'
 require 'fileutils'
 load File.expand_path('../bin/dev', __dir__)
 
-# Covers `dev ai prune`'s classification: which ~/code/ai feature dirs are safe to
-# delete. The rule is "keep unless proven disposable" — a dir is deleted only when
-# every real git repo inside is clean AND either fully pushed or its branch's PR is
-# merged/closed. A merged/closed PR OVERRIDES recency (landed work is deleted even
-# if touched today); recency only shields dirs with no merged PR and nothing local
-# at risk. Uncommitted changes and local-only commits with no merged/closed PR
-# always protect a dir. gh is stubbed via the injected pr_state so no network is
-# touched; git state is exercised against real temp repos.
+# Covers `dev aidirs prune`'s classification of ~/code/ai feature dirs into
+# :keep / :delete / :trash. Feature dirs are throwaway clones, so the posture is
+# aggressive: a dir idle past the cutoff is reaped whatever its git state — clean/
+# pushed dirs are hard-:delete'd, dirs holding work not on a remote (uncommitted,
+# stashed, detached, loose files, or local-only commits) are :trash'd so they stay
+# recoverable. A RECENT dir (touched within the cutoff) keeps the full protection:
+# any at-risk state :keep's it, and gh is consulted so a merged/closed PR still lets
+# a recent, landed dir be deleted. gh is ONLY consulted for recent dirs. gh is
+# stubbed via the injected pr_state so no network is touched; git state is exercised
+# against real temp repos.
 class TestDevAidirs < Minitest::Test
-  # cutoff far in the future => every temp dir counts as "modified within cutoff",
-  # so pass PAST to reach the git checks and FUTURE to assert the recency guard.
-  PAST   = Time.now - 3600
-  FUTURE = Time.now + 3600
-  NO_PR  = ->(_slug, _branch) { nil }
+  # recent = last_activity >= cutoff_time. A temp repo's activity is ~now, so a
+  # cutoff in the PAST makes the dir "recent" (within the window) and a cutoff in
+  # the FUTURE makes it "aged out" (past the window).
+  RECENT_CUTOFF = Time.now - 3600
+  AGED_CUTOFF   = Time.now + 3600
+  NO_PR         = ->(_slug, _branch) { nil }
 
   # pr_state stub: return the {state:, number:} shape gh_pr_state produces.
   def self.pr(state, number = 1) = ->(_slug, _branch) { { state: state, number: number } }
@@ -54,194 +57,267 @@ class TestDevAidirs < Minitest::Test
     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
   end
 
-  # ---- clean + pushed => delete, and gh is never consulted ----
+  # ================================================================
+  # AGED OUT (cutoff in the future): reap regardless of git state.
+  # gh is never consulted.
+  # ================================================================
 
-  def test_clean_and_pushed_is_deletable_without_pr_check
+  # ---- clean + pushed => hard delete, gh never consulted ----
+
+  def test_aged_clean_and_pushed_is_hard_deleted_without_pr_check
     Dir.mktmpdir do |dir|
       make_repo(dir, "acumen-ui", remote: true)
-      called = false
-      pr = ->(_s, _b) { called = true; :open }
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: pr)
-      assert_equal :delete, action
-      refute called, "gh should not be consulted when nothing is local-only"
-    end
-  end
-
-  # ---- local-only commits gated on PR state ----
-
-  def test_local_only_commits_with_merged_pr_is_deletable
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "platform")
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: MERGED)
+      pr = ->(_s, _b) { flunk "aged-out dirs must never consult gh" }
+      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
       assert_equal :delete, action
     end
   end
 
-  def test_local_only_commits_with_closed_pr_is_deletable
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "platform")
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: CLOSED)
-      assert_equal :delete, action
+  # ---- at-risk work => trash (recoverable), gh never consulted ----
+
+  def test_aged_local_only_commits_are_trashed_regardless_of_pr
+    [MERGED, CLOSED, OPEN, NO_PR].each do |pr|
+      Dir.mktmpdir do |dir|
+        make_repo(dir, "platform") # local-only commit, no remote
+        action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
+        assert_equal :trash, action, "aged local-only commits should be trashed"
+        assert_match(/aged out: local-only commits in platform/, reason)
+      end
     end
   end
 
-  def test_local_only_commits_with_open_pr_is_kept
+  def test_aged_uncommitted_changes_are_trashed
     Dir.mktmpdir do |dir|
-      make_repo(dir, "platform")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: OPEN)
-      assert_equal :keep, action
-      assert_match(/local-only commits.*platform#7 OPEN/, reason)
-    end
-  end
-
-  def test_local_only_commits_with_no_pr_is_kept
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "platform")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :keep, action
-      assert_match(/no PR/, reason)
-    end
-  end
-
-  # ---- uncommitted changes always win ----
-
-  def test_uncommitted_changes_kept_even_when_merged
-    Dir.mktmpdir do |dir|
-      repo = make_repo(dir, "platform")
+      repo = make_repo(dir, "platform", remote: true)
       File.write(File.join(repo, "f.txt"), "dirty")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: MERGED)
-      assert_equal :keep, action
-      assert_match(/uncommitted changes/, reason)
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :trash, action
+      assert_match(/aged out: uncommitted changes in platform/, reason)
     end
   end
 
-  # ---- recency guard ----
-  #
-  # A merged/closed PR is proof the work landed, so it deletes the dir even when
-  # it was touched today. Recency only shields dirs we can't prove are finished:
-  # nothing local at risk and no merged PR to point at.
-
-  def test_recent_dir_with_merged_pr_is_deleted
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "platform") # local-only commit, but its PR merged
-      # PAST cutoff => dir is "recent"; the merged PR must still win.
-      action, = classify_ai_dir(dir, cutoff_time: PAST, pr_state: MERGED)
-      assert_equal :delete, action
-    end
-  end
-
-  def test_recent_clean_pushed_dir_is_kept_by_recency
-    Dir.mktmpdir do |dir|
-      # Fully pushed, nothing local at risk, no merged PR — a fresh clone still on
-      # main. Nothing proves it's finished, so recency keeps it and gh is never hit.
-      make_repo(dir, "platform", remote: true)
-      pr = ->(_s, _b) { flunk "no local-only commits => PR must not be consulted" }
-      action, reason = classify_ai_dir(dir, cutoff_time: PAST, pr_state: pr)
-      assert_equal :keep, action
-      assert_equal "modified within cutoff", reason
-    end
-  end
-
-  def test_recent_dir_with_open_pr_is_kept_as_unsaved
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "platform") # local-only commit, PR still open
-      action, reason = classify_ai_dir(dir, cutoff_time: PAST, pr_state: OPEN)
-      assert_equal :keep, action
-      assert_match(/local-only commits.*platform#7 OPEN/, reason)
-    end
-  end
-
-  # ---- empty / symlink-only dirs ----
-
-  def test_empty_dir_is_deletable
-    Dir.mktmpdir do |dir|
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :delete, action
-    end
-  end
-
-  def test_symlink_only_dir_is_deletable
-    Dir.mktmpdir do |dir|
-      File.symlink("/tmp", File.join(dir, "devops"))
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :delete, action, "a dir holding only symlinks loses nothing on delete"
-    end
-  end
-
-  # ---- multi-repo dir: unsafe if ANY repo is unsafe ----
-
-  def test_multi_repo_kept_when_one_repo_unsafe
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "acumen-ui", remote: true) # safe
-      make_repo(dir, "platform")                # local-only, no PR => unsafe
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :keep, action
-      assert_match(/platform/, reason)
-    end
-  end
-
-  # ---- symlinked repo is ignored (deleting the link is harmless) ----
-
-  def test_symlinked_repo_subdir_is_ignored
-    Dir.mktmpdir do |dir|
-      real = make_repo(Dir.mktmpdir, "shared") # dirty real repo elsewhere
-      File.write(File.join(real, "f.txt"), "dirty")
-      File.symlink(real, File.join(dir, "devops"))
-      # only a symlink inside => effectively empty => deletable, real repo untouched
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :delete, action
-    end
-  end
-
-  # ---- safety guards: unsaved work that isn't a plain dirty tree ----
-
-  def test_detached_head_is_kept
+  def test_aged_detached_head_is_trashed_without_pr_check
     Dir.mktmpdir do |dir|
       repo = make_repo(dir, "platform")
-      # a commit made while detached hangs off no branch ref
       git(repo, "checkout", "-q", "--detach")
       File.write(File.join(repo, "f.txt"), "more")
       git(repo, "commit", "-qam", "detached work")
-      # gh must never even be consulted — the detached guard fires first
-      pr = ->(_s, _b) { flunk "detached repo must be kept before any PR check" }
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: pr)
-      assert_equal :keep, action
-      assert_match(/detached HEAD/, reason)
+      pr = ->(_s, _b) { flunk "aged-out detached dir must not consult gh" }
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
+      assert_equal :trash, action
+      assert_match(/aged out: detached HEAD in platform/, reason)
     end
   end
 
-  def test_stashed_changes_are_kept
+  def test_aged_stashed_changes_are_trashed
     Dir.mktmpdir do |dir|
       repo = make_repo(dir, "platform", remote: true) # clean + pushed otherwise
       File.write(File.join(repo, "f.txt"), "wip")
       git(repo, "stash", "push", "-q")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :keep, action
-      assert_match(/stashed changes/, reason)
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :trash, action
+      assert_match(/aged out: stashed changes in platform/, reason)
     end
   end
 
-  def test_loose_nonrepo_content_beside_a_repo_is_kept
+  def test_aged_loose_nonrepo_content_is_trashed
     Dir.mktmpdir do |dir|
       make_repo(dir, "acumen-ui", remote: true) # clean + pushed
       FileUtils.mkdir_p(File.join(dir, "notes"))
       File.write(File.join(dir, "notes", "findings.md"), "irreplaceable")
-      action, reason = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :keep, action
-      assert_match(/non-repo content/, reason)
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :trash, action
+      assert_match(/aged out: unexpected non-repo content/, reason)
     end
   end
 
-  def test_top_level_clone_with_tracked_files_is_not_flagged_as_loose
+  def test_aged_multi_repo_trashed_when_one_repo_has_local_work
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "acumen-ui", remote: true) # clean + pushed
+      make_repo(dir, "platform")                # local-only, no remote
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :trash, action
+      assert_match(/platform/, reason)
+    end
+  end
+
+  def test_aged_empty_dir_is_hard_deleted
+    Dir.mktmpdir do |dir|
+      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_aged_symlink_only_dir_is_hard_deleted
+    Dir.mktmpdir do |dir|
+      File.symlink("/tmp", File.join(dir, "devops"))
+      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :delete, action, "a dir holding only symlinks loses nothing on delete"
+    end
+  end
+
+  def test_aged_symlinked_repo_subdir_is_ignored
+    Dir.mktmpdir do |dir|
+      real = make_repo(Dir.mktmpdir, "shared") # dirty real repo elsewhere
+      File.write(File.join(real, "f.txt"), "dirty")
+      File.symlink(real, File.join(dir, "devops"))
+      # only a symlink inside => effectively empty => hard delete, real repo untouched
+      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_aged_top_level_clone_with_tracked_files_is_not_flagged_as_loose
     Dir.mktmpdir do |parent|
       # repo cloned AT the feature-dir top level: its own files are git-tracked,
       # so git_clean? covers them and they must not read as "loose content".
       dir = make_repo(parent, "feature", remote: true)
       refute ai_dir_has_loose_content?(dir, ai_dir_repos(dir))
-      action, = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
+      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
       assert_equal :delete, action
     end
   end
+
+  def test_aged_clean_pushed_dir_has_no_pr_notes
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "acumen-ui", remote: true)
+      action, _reason, notes = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :delete, action
+      assert_empty notes
+    end
+  end
+
+  # ================================================================
+  # RECENT (cutoff in the past): full protection, gh consulted.
+  # ================================================================
+
+  # ---- clean + pushed, nothing landed => kept by recency, gh never hit ----
+
+  def test_recent_clean_pushed_dir_is_kept_by_recency
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform", remote: true)
+      pr = ->(_s, _b) { flunk "no local-only commits => PR must not be consulted" }
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: pr)
+      assert_equal :keep, action
+      assert_equal "modified within cutoff", reason
+    end
+  end
+
+  # ---- local-only commits gated on PR state ----
+
+  def test_recent_local_only_commits_with_merged_pr_is_deleted
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform")
+      action, = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: MERGED)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_recent_local_only_commits_with_closed_pr_is_deleted
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform")
+      action, = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: CLOSED)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_recent_local_only_commits_with_open_pr_is_kept
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform")
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: OPEN)
+      assert_equal :keep, action
+      assert_match(/local-only commits.*platform#7 OPEN/, reason)
+    end
+  end
+
+  def test_recent_local_only_commits_with_no_pr_is_kept
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform")
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/no PR/, reason)
+    end
+  end
+
+  # ---- at-risk work is protected while recent ----
+
+  def test_recent_uncommitted_changes_kept_even_when_merged
+    Dir.mktmpdir do |dir|
+      repo = make_repo(dir, "platform")
+      File.write(File.join(repo, "f.txt"), "dirty")
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: MERGED)
+      assert_equal :keep, action
+      assert_match(/uncommitted changes/, reason)
+    end
+  end
+
+  def test_recent_detached_head_is_kept_before_any_pr_check
+    Dir.mktmpdir do |dir|
+      repo = make_repo(dir, "platform")
+      git(repo, "checkout", "-q", "--detach")
+      File.write(File.join(repo, "f.txt"), "more")
+      git(repo, "commit", "-qam", "detached work")
+      pr = ->(_s, _b) { flunk "detached repo must be kept before any PR check" }
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: pr)
+      assert_equal :keep, action
+      assert_match(/detached HEAD/, reason)
+    end
+  end
+
+  def test_recent_stashed_changes_are_kept
+    Dir.mktmpdir do |dir|
+      repo = make_repo(dir, "platform", remote: true)
+      File.write(File.join(repo, "f.txt"), "wip")
+      git(repo, "stash", "push", "-q")
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/stashed changes/, reason)
+    end
+  end
+
+  def test_recent_loose_nonrepo_content_is_kept
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "acumen-ui", remote: true)
+      FileUtils.mkdir_p(File.join(dir, "notes"))
+      File.write(File.join(dir, "notes", "findings.md"), "irreplaceable")
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/non-repo content/, reason)
+    end
+  end
+
+  def test_recent_dir_with_merged_pr_is_deleted
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform") # local-only commit, but its PR merged
+      action, = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: MERGED)
+      assert_equal :delete, action
+    end
+  end
+
+  def test_recent_multi_repo_kept_when_one_repo_unsafe
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "acumen-ui", remote: true) # safe
+      make_repo(dir, "platform")                # local-only, no PR => unsafe
+      action, reason = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/platform/, reason)
+    end
+  end
+
+  # ---- PR tie surfaced in output (recent, merged) ----
+
+  def test_recent_merged_pr_number_and_state_surface_in_notes
+    Dir.mktmpdir do |dir|
+      make_repo(dir, "platform") # local-only commit
+      action, _reason, notes = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: TestDevAidirs.pr(:merged, 1204))
+      assert_equal :delete, action
+      assert_equal ["platform#1204 MERGED"], notes
+    end
+  end
+
+  # ================================================================
+  # helpers
+  # ================================================================
 
   def test_gh_pr_state_missing_binary_degrades_to_nil
     # Simulate `gh` absent by emptying PATH; the lookup must return nil (keep),
@@ -252,28 +328,6 @@ class TestDevAidirs < Minitest::Test
   ensure
     ENV["PATH"] = old
   end
-
-  # ---- PR tie surfaced in output ----
-
-  def test_merged_pr_number_and_state_surface_in_notes
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "platform") # local-only commit
-      action, _reason, notes = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: TestDevAidirs.pr(:merged, 1204))
-      assert_equal :delete, action
-      assert_equal ["platform#1204 MERGED"], notes
-    end
-  end
-
-  def test_cleanly_pushed_dir_has_no_pr_notes
-    Dir.mktmpdir do |dir|
-      make_repo(dir, "acumen-ui", remote: true) # no local-only commits => no gh call
-      action, _reason, notes = classify_ai_dir(dir, cutoff_time: FUTURE, pr_state: NO_PR)
-      assert_equal :delete, action
-      assert_empty notes
-    end
-  end
-
-  # ---- helpers ----
 
   def test_git_slug_parses_ssh_and_https
     assert_equal "mbryzek/devops", git_slug_from("git@github.com:mbryzek/devops.git")
