@@ -45,7 +45,7 @@ end
 deploy_cmd = File.join(__dir__, "k8s-deploy") + " --app #{app} --tag #{version}"
 Util.run(deploy_cmd, passthrough: true)
 
+puts "Full log: #{Util.log_file}" if Util.quiet?
 puts ""
 puts "Release complete: #{app} #{version}"
-puts "Full log: #{Util.log_file}" if Util.quiet?
 puts ""
