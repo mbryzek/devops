@@ -2209,6 +2209,18 @@ def cmd_deploy_all(args)
   run_deploys(pending, concurrency: concurrency, errors: errors)
 end
 
+# Phase 2 banner for an app release. A single app releases serially, so the
+# concurrency detail is noise — omit it. For multiple apps, show the effective
+# pool size (`release_concurrent` caps workers at the number of apps), never the
+# raw requested concurrency.
+def deploy_phase2_message(to_run, concurrency)
+  if to_run.length == 1
+    "Phase 2: releasing #{to_run.first}"
+  else
+    "Phase 2: releasing #{to_run.length} app(s) with concurrency=#{[concurrency, to_run.length].min}: #{to_run.join(', ')}"
+  end
+end
+
 # Releases `names` (DBs first, serially; then apps in parallel) and prints the
 # summary. Shared by `deploy all` and the `deploy status` prompt, so both get
 # identical ordering, skip-on-DB-failure, and exit-code behavior. `errors` are
@@ -2246,7 +2258,7 @@ def run_deploys(pending, concurrency:, errors: [])
     puts "Phase 2: all #{app_pending.length} app(s) skipped due to DB failures"
     puts ""
   elsif !to_run.empty?
-    puts "Phase 2: releasing #{to_run.length} app(s) with concurrency=#{concurrency}: #{to_run.join(', ')}"
+    puts deploy_phase2_message(to_run, concurrency)
     puts ""
     release_concurrent(to_run, concurrency, results, results_mutex)
   end
