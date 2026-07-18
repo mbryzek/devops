@@ -671,4 +671,22 @@ class TestDeployStatusPrompt < Minitest::Test
     with_rows(rows, interactive: true) { capture_io { cmd_deploy_status([]) } }
     assert_equal %w[platform-postgresql platform], @released
   end
+
+  # A lone app releases serially, so the banner drops the concurrency detail.
+  def test_phase2_message_single_app_omits_concurrency
+    assert_equal "Phase 2: releasing platform", deploy_phase2_message(["platform"], 10)
+  end
+
+  # Multiple apps show the effective pool, capped at the number of apps.
+  def test_phase2_message_caps_concurrency_to_app_count
+    assert_equal "Phase 2: releasing 2 app(s) with concurrency=2: rallyd, hackathon",
+      deploy_phase2_message(%w[rallyd hackathon], 10)
+  end
+
+  # When fewer apps than the requested concurrency would still saturate, the
+  # requested value is shown unchanged.
+  def test_phase2_message_uses_requested_concurrency_when_lower
+    assert_equal "Phase 2: releasing 5 app(s) with concurrency=2: a, b, c, d, e",
+      deploy_phase2_message(%w[a b c d e], 2)
+  end
 end
