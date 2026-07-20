@@ -77,8 +77,15 @@ if [ "$1" = "test" ]; then
   # platform run was reported as green on 2026-07-17. Count the per-test
   # "*** FAILED ***" / "!!! CANCELED !!!" markers too (they are printed as each test
   # finishes, so they survive a dead reporter) and take whichever is larger.
-  FAILURES_SUMMARY=$(grep -hEo 'failed [0-9]+'   "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
-  CANCELED_SUMMARY=$(grep -hEo 'canceled [0-9]+' "$LOG" | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  #
+  # Match the summary line as a WHOLE line before extracting the counts. Bare
+  # 'failed N' / 'canceled N' also occur in application log output captured in the
+  # same file, and counting those invents failures on a green run — a WARN reading
+  # "a members window failed 3 times" reported a clean platform run as 3 failures
+  # on 2026-07-20.
+  SUMMARY_LINES=$(grep -hE '^\[info\] Tests: succeeded [0-9]+, failed [0-9]+, canceled [0-9]+' "$LOG")
+  FAILURES_SUMMARY=$(echo "$SUMMARY_LINES" | grep -Eo 'failed [0-9]+'   | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+  CANCELED_SUMMARY=$(echo "$SUMMARY_LINES" | grep -Eo 'canceled [0-9]+' | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
   # "*** N TESTS FAILED ***" is a suite total, not a per-test marker: it does not
   # contain the literal "*** FAILED ***", so it is not double counted here.
   FAILURES_MARKERS=$(grep -cF '*** FAILED ***' "$LOG")
