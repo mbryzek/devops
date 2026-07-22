@@ -24,15 +24,15 @@
 # Load order is derived automatically from the dump's foreign-key graph — list order
 # here does not matter.
 #
-# Scope: this starter policy covers the clubaid analytics domain (court_reserve facts,
-# playbook revenue/insights, and the clubaid.clubs dimension) plus the identity records
+# Scope: this starter policy covers the playbook analytics domain (court_reserve facts,
+# playbook revenue/insights, and the playbook.clubs dimension) plus the identity records
 # needed to log in as mbryzek@gmail.com. Tables that reach into other schemas
 # (storage.files, worker.*) are intentionally omitted; add them — together with their
 # cross-schema dependencies — when a dev workflow needs them.
 
 tables:
   # ── dimensions (full copy) ──────────────────────────────────────────────
-  clubaid.clubs:                  all
+  playbook.clubs:                 all
   playbook.transaction_types:     all
 
   # ── identity / org structure ─────────────────────────────────────────────
@@ -50,10 +50,9 @@ tables:
   # users (loaded first), so this resolves the cipher ids from the dump's users rows.
   public.ciphers:      id in public.users.password_cipher_id
 
-  # ── clubaid ─────────────────────────────────────────────────────────────
-  clubaid.ai_chats:               club_id in :clubs
-  clubaid.export_watermarks:      club_id in :clubs
-  clubaid.ai_messages:            chat_id in clubaid.ai_chats.id
+  # ── playbook ────────────────────────────────────────────────────────────
+  playbook.ai_chats:              club_id in :clubs
+  playbook.ai_messages:           chat_id in playbook.ai_chats.id
 
   # ── court_reserve ───────────────────────────────────────────────────────
   court_reserve.clubs:                       club_id in :clubs
