@@ -104,7 +104,7 @@ PII = {
   'court_reserve.guest_member_numbers' => {
     'raw_value' => :generic, # raw guest identifier (may be a name/phone)
   },
-  'clubaid.ai_messages' => {
+  'playbook.ai_messages' => {
     # AI Explorer renders sampled member rows into the message context, so these
     # free-text fields can embed member names/emails — redact them wholesale.
     'content'                => :message,
@@ -148,7 +148,7 @@ def load_schema_and_index(input_path, dbname)
             table, cols = parsed
             blocks[table] = { cols: cols, offset: pos } # pos == start of first data row
             in_copy = true
-            clubs_mode = (table == 'clubaid.clubs')
+            clubs_mode = (table == 'playbook.clubs')
             if clubs_mode
               clubs_id_idx  = cols.index('id')
               clubs_par_idx = cols.index('parent_id')

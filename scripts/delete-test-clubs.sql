@@ -18,12 +18,12 @@
 -- nesting. One transaction: any missed edge aborts + rolls back with zero changes.
 --
 -- To regenerate the table list, query pg_constraint for FKs whose confrelid is
--- a table in the delete universe, starting from clubaid.clubs.
+-- a table in the delete universe, starting from playbook.clubs.
 begin;
 
 -- Root set + flattened id sets for every multi-level / cross subtree.
 create temp table _del_clubs on commit drop as
-  select id from clubaid.clubs where id like 'club-%';
+  select id from playbook.clubs where id like 'club-%';
 create unique index on _del_clubs (id);
 
 create temp table _del_insights on commit drop as
@@ -51,7 +51,7 @@ create temp table _del_credentials on commit drop as
   select id from integrations.credentials where club_id in (select id from _del_clubs);
 create unique index on _del_credentials (id);
 create temp table _del_ai_chats on commit drop as
-  select id from clubaid.ai_chats where club_id in (select id from _del_clubs);
+  select id from playbook.ai_chats where club_id in (select id from _del_clubs);
 create unique index on _del_ai_chats (id);
 create temp table _del_invocations on commit drop as
   select id from worker.invocations where club_id in (select id from _del_clubs);
@@ -60,7 +60,7 @@ create temp table _del_issues on commit drop as
   select id from issues.issues where club_id in (select id from _del_clubs);
 create unique index on _del_issues (id);
 create temp table _del_suggestions on commit drop as
-  select id from clubaid.suggestions where club_id in (select id from _del_clubs);
+  select id from playbook.suggestions where club_id in (select id from _del_clubs);
 create unique index on _del_suggestions (id);
 create temp table _del_checklist_items on commit drop as
   select id from playbook.checklist_items where club_id in (select id from _del_clubs);
@@ -99,14 +99,14 @@ delete from playbook.report_exports                 where club_id in (select id 
 delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
 delete from playbook.watermarks                     where club_id in (select id from _del_clubs);
 
--- ---- clubaid ---------------------------------------------------------------
-delete from clubaid.ai_messages                     where chat_id in (select id from _del_ai_chats);
-delete from clubaid.ai_chats                         where club_id in (select id from _del_clubs);
-delete from clubaid.suggestion_notes                where suggestion_id in (select id from _del_suggestions);
-delete from clubaid.suggestions                      where club_id in (select id from _del_clubs);
-delete from clubaid.user_club_notification_optouts  where club_id in (select id from _del_clubs);
-delete from clubaid.user_clubs                       where club_id in (select id from _del_clubs);
-delete from clubaid.user_invitations                where club_id in (select id from _del_clubs);
+-- ---- playbook (former clubaid schema) --------------------------------------
+delete from playbook.ai_messages                     where chat_id in (select id from _del_ai_chats);
+delete from playbook.ai_chats                         where club_id in (select id from _del_clubs);
+delete from playbook.suggestion_notes                where suggestion_id in (select id from _del_suggestions);
+delete from playbook.suggestions                      where club_id in (select id from _del_clubs);
+delete from playbook.user_club_notification_optouts  where club_id in (select id from _del_clubs);
+delete from playbook.user_clubs                       where club_id in (select id from _del_clubs);
+delete from playbook.user_invitations                where club_id in (select id from _del_clubs);
 
 -- ---- court_reserve event/reservation cluster -------------------------------
 delete from court_reserve.reservation_courts        where reservation_id in (select id from _del_reservations) or court_id in (select id from _del_cr_courts);
@@ -175,12 +175,12 @@ delete from rallyd.courts                            where club_id in (select id
 delete from user_tracking.page_views                where club_id in (select id from _del_clubs);
 
 -- ---- finally the clubs (self-FK NO ACTION handles parent/child subset) ------
-delete from clubaid.clubs where id like 'club-%';
+delete from playbook.clubs where id like 'club-%';
 
 do $$
 declare remaining int;
 begin
-  select count(*) into remaining from clubaid.clubs where id like 'club-%';
+  select count(*) into remaining from playbook.clubs where id like 'club-%';
   if remaining <> 0 then raise exception 'Expected 0 club-%% remaining, found %', remaining; end if;
   raise notice 'All club-%% test clubs and dependent rows deleted.';
 end $$;
