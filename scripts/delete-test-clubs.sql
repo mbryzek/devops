@@ -96,6 +96,7 @@ delete from playbook.club_insight_settings          where club_id in (select id 
 delete from playbook.club_memory_facts              where club_id in (select id from _del_clubs);
 delete from playbook.membership_categories          where club_id in (select id from _del_clubs);
 delete from playbook.report_exports                 where club_id in (select id from _del_clubs);
+delete from playbook.checklist_item_comments        where checklist_item_id in (select id from _del_checklist_items);
 delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
 delete from playbook.watermarks                     where club_id in (select id from _del_clubs);
 
@@ -166,10 +167,11 @@ delete from issues.issue_comments                   where issue_id in (select id
 delete from issues.issue_fixes                      where issue_id in (select id from _del_issues);
 delete from issues.issues                           where club_id in (select id from _del_clubs);
 
--- ---- integrations + rallyd -------------------------------------------------
+-- ---- integrations + playbook courts ----------------------------------------
+delete from integrations.credential_access_audits    where credential_id in (select id from _del_credentials);
 delete from integrations.credentials                 where club_id in (select id from _del_clubs);
 delete from integrations.disabled_integrations       where club_id in (select id from _del_clubs);
-delete from rallyd.courts                            where club_id in (select id from _del_clubs);
+delete from playbook.courts                          where club_id in (select id from _del_clubs);
 
 -- ---- user_tracking ---------------------------------------------------------
 delete from user_tracking.page_views                where club_id in (select id from _del_clubs);
