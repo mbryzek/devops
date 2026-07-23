@@ -55,6 +55,8 @@ INVOCATIONS = {
   "issue claim"         => 'issue claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
   "issue status"        => 'issue status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issue reconcile"     => 'issue reconcile [--apply] [--localhost]',
+  "changelog capture"   => 'changelog [capture] [--app APP]...',
+  "changelog build"     => 'changelog build [--app APP]... [--limit N] [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -213,6 +215,28 @@ USAGE = <<~USAGE
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
+    #{INVOCATIONS["changelog capture"]}
+        Record the changelog for the clubaid* apps into the `changelog` data repo
+        (github.com/mbryzek/changelog, cloned to ~/code/changelog). With no
+        subcommand it runs `capture` then `build`. `capture` reads each tracked app's
+        git tags (clubaid-admin, clubaid-app, clubaid-www) and, for every tag missing
+        a <version>.tag.json, writes all commits since the previous tag — idempotent,
+        so it both records new releases and backfills history. Repeat --app to scope;
+        default is all tracked apps. Runs automatically (best-effort) at the end of
+        `release`; never blocks a release.
+
+    #{INVOCATIONS["changelog build"]}
+        Turn raw <version>.tag.json files into curated <version>.notes.json via a
+        headless Claude session that judges which commits are worth a human note,
+        summarizes them, and links each to its PR and (best-effort) in-house issue
+        (ISS-###). Only versions without a notes file are built (cached — never
+        re-evaluated), one bounded Claude session per version, newest first; pass
+        --limit N to build only the N most recent pending versions (e.g. to seed
+        history without evaluating every past release). Enrichment uses your
+        persisted clubaid session; run
+        `dev login --app clubaid` once first. clubaid-admin assembles these notes
+        into its /admin/changelog page at its own build (not here).
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -237,8 +261,9 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen issue].freeze
+COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen issue changelog].freeze
 SUBCOMMANDS = {
+  "changelog"    => %w[capture build],
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
   "deploy"       => %w[status all],
@@ -3199,6 +3224,294 @@ def cmd_slow_routes(args)
   PROMPT
 end
 
+# ---------- changelog ----------
+
+# Apps whose releases feed the changelog. Each tags independently with its own
+# semver sequence; the app name is also its GitHub repo slug (mbryzek/<app>) and
+# its local sibling checkout (~/code/<app>) we read git history from. platform is
+# intentionally excluded: its monorepo tag spans HOA/acumen/clubaid.
+CHANGELOG_APPS = %w[clubaid-admin clubaid-app clubaid-www].freeze
+
+# Judgment + summarization quality matters here, so use a stronger model than the
+# mechanical codegen sync (haiku).
+CHANGELOG_CLAUDE_MODEL = "sonnet".freeze
+CHANGELOG_CLAUDE_TIMEOUT_SECS = 20 * 60
+
+def changelog_repo_dir
+  File.expand_path("~/code/changelog")
+end
+
+def changelog_app_checkout(app)
+  File.expand_path("~/code/#{app}")
+end
+
+# Array-form git so paths/refs never go through the shell.
+def changelog_git_out(*cmd)
+  IO.popen(["git", *cmd], err: File::NULL, &:read)
+end
+
+# Ensure the changelog data repo is present (clone on first use) and best-effort
+# up to date before we write into it.
+def ensure_changelog_repo!
+  dir = changelog_repo_dir
+  unless Dir.exist?(File.join(dir, ".git"))
+    puts "Cloning changelog repo to #{dir}..."
+    system("git", "clone", "git@github.com:mbryzek/changelog.git", dir) ||
+      Util.exit_with_error("Failed to clone changelog repo")
+  end
+  system("git", "-C", dir, "pull", "--rebase", "--quiet")
+  dir
+end
+
+# Commit + push best-effort. A push failure warns but never raises — capture runs
+# inside the release path and must not fail a release.
+def changelog_git_commit_push!(dir, message)
+  system("git", "-C", dir, "add", "-A")
+  unless system("git", "-C", dir, "commit", "-q", "-m", message)
+    puts "changelog: nothing to commit"
+    return
+  end
+  warn "changelog: push failed (committed locally at #{dir})" unless system("git", "-C", dir, "push", "-q")
+end
+
+# Repeatable --app (defaults to all tracked apps), plus --localhost and --limit.
+# Rejects an unknown app loudly rather than silently producing nothing. Returns
+# { apps:, use_localhost:, limit: } (limit nil = no cap).
+def changelog_parse_flags(args)
+  apps = []
+  use_localhost = false
+  limit = nil
+  i = 0
+  while i < args.length
+    a = args[i]
+    case a
+    when "--app"
+      v = args[i + 1]
+      usage_exit("--app requires a value", example: usage_for("changelog capture")) if v.nil?
+      unknown("--app", v, CHANGELOG_APPS) unless CHANGELOG_APPS.include?(v)
+      apps << v
+      i += 2
+    when "--limit"
+      v = args[i + 1]
+      usage_exit("--limit requires a positive integer", example: usage_for("changelog build")) if v.nil? || v !~ /\A[1-9]\d*\z/
+      limit = v.to_i
+      i += 2
+    when "--localhost"
+      use_localhost = true
+      i += 1
+    when "-h", "--help"
+      usage_exit
+    else
+      usage_exit("unexpected argument: #{a}", example: usage_for("changelog build"))
+    end
+  end
+  apps = CHANGELOG_APPS.dup if apps.empty?
+  { apps: apps.uniq, use_localhost: use_localhost, limit: limit }
+end
+
+# Commits in `range`, oldest-first, no merges. Extracts the squash-merge PR number
+# from the trailing "(#NN)" of the subject when present.
+def changelog_commits(checkout, range)
+  raw = changelog_git_out("-C", checkout, "log", "--no-merges", "--reverse",
+                          "--format=%H%x1f%s%x1f%b%x1e", range)
+  raw.split("\x1e").map(&:strip).reject(&:empty?).map do |rec|
+    sha, subject, body = rec.split("\x1f", 3)
+    subject = (subject || "").strip
+    pr = subject[/\(#(\d+)\)\s*\z/, 1]
+    {
+      "sha" => (sha || "").strip,
+      "subject" => subject,
+      "body" => (body || "").strip,
+      "pr_number" => (pr ? pr.to_i : nil),
+    }
+  end
+end
+
+def cmd_changelog_capture(args)
+  apps = changelog_parse_flags(args)[:apps]
+  repo = ensure_changelog_repo!
+  written = []
+  apps.each do |app|
+    checkout = changelog_app_checkout(app)
+    unless Dir.exist?(File.join(checkout, ".git"))
+      warn "changelog: skipping #{app} (no checkout at #{checkout})"
+      next
+    end
+    tags = changelog_git_out("-C", checkout, "tag", "--list", "--sort=creatordate")
+           .split("\n").map(&:strip).reject(&:empty?)
+    out_dir = File.join(repo, app)
+    FileUtils.mkdir_p(out_dir)
+    tags.each_with_index do |tag, i|
+      file = File.join(out_dir, "#{tag}.tag.json")
+      next if File.exist?(file)
+      prev = i.positive? ? tags[i - 1] : nil
+      range = prev ? "#{prev}..#{tag}" : tag
+      released_at = changelog_git_out("-C", checkout, "log", "-1", "--format=%cI", tag).strip
+      data = {
+        "application" => app,
+        "version" => tag,
+        "previous_version" => prev,
+        "released_at" => released_at,
+        "commits" => changelog_commits(checkout, range),
+      }
+      File.write(file, "#{JSON.pretty_generate(data)}\n")
+      written << "#{app}/#{tag}.tag.json"
+    end
+  end
+  if written.empty?
+    puts "changelog capture: nothing new"
+    return
+  end
+  changelog_git_commit_push!(repo, "changelog: capture #{written.length} release(s)\n\n#{written.join("\n")}")
+  puts "changelog capture: wrote #{written.length} file(s)"
+  written.each { |w| puts "  #{w}" }
+end
+
+# tag.json files (for the selected apps) that do not yet have a sibling notes.json,
+# newest-first (by release timestamp) so a --limit builds the most recent releases.
+def changelog_pending(repo, apps)
+  apps.flat_map do |app|
+    dir = File.join(repo, app)
+    next [] unless Dir.exist?(dir)
+    Dir.glob(File.join(dir, "*.tag.json")).filter_map do |tag_file|
+      version = File.basename(tag_file).sub(/\.tag\.json\z/, "")
+      notes_file = File.join(dir, "#{version}.notes.json")
+      next if File.exist?(notes_file)
+      tag = JSON.parse(File.read(tag_file)) rescue {}
+      { app: app, version: version, tag_file: tag_file, notes_file: notes_file,
+        released_at: tag["released_at"].to_s }
+    end
+  end.sort_by { |p| p[:released_at] }.reverse
+end
+
+# Map "<repo-slug>#<pr-number>" => issue number, from clubaid issues that carry a
+# fix linked to a mbryzek PR. Best-effort: any failure yields an empty map so the
+# build still produces notes, just without ISS links.
+def changelog_issue_map(use_localhost)
+  if ApiClient.session_id_for("clubaid", use_localhost: use_localhost).nil?
+    warn "changelog: no clubaid session; skipping ISS enrichment (run `dev login --app clubaid` to enable)"
+    return {}
+  end
+  map = {}
+  begin
+    issues = ApiClient.request(issue_endpoint(use_localhost), :get,
+                               issues_list_path(statuses: %w[fixed deployed verified])) || []
+    issues.each do |issue|
+      number = issue["number"]
+      (issue["fixes"] || []).each do |fix|
+        m = fix["url"].to_s.match(%r{github\.com/mbryzek/([^/]+)/pull/(\d+)})
+        map["#{m[1]}##{m[2].to_i}"] = number if m
+      end
+    end
+  rescue StandardError => e
+    warn "changelog: issue enrichment unavailable (#{e}); continuing without ISS links"
+  end
+  map
+end
+
+# Headless Claude session that writes the notes files. Unlike spawn_claude (which
+# expects a PR URL), this only asks Claude to write files we validate afterwards.
+def changelog_run_claude(repo, input_path)
+  prompt = <<~PROMPT
+    Follow the process in .claude/skills/changelog-build/SKILL.md exactly.
+    Input file: #{input_path}
+    For each version under "versions", decide which commits are worth telling a human
+    about, write concise plain-language release notes, and write the result as JSON to
+    that version's "notes_file" path. Do not modify any other files; do not commit or push.
+  PROMPT
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions",
+                                           "--model", CHANGELOG_CLAUDE_MODEL, prompt,
+                                           chdir: repo, pgroup: true)
+  stdin.close
+  pid = wait_thr.pid
+  output =
+    begin
+      Timeout.timeout(CHANGELOG_CLAUDE_TIMEOUT_SECS) { out_err.read }
+    rescue Timeout::Error
+      begin Process.kill("TERM", -pid) rescue Errno::ESRCH end
+      begin Process.kill("KILL", -pid) rescue Errno::ESRCH end
+      return "claude timed out after #{CHANGELOG_CLAUDE_TIMEOUT_SECS}s"
+    ensure
+      out_err.close unless out_err.closed?
+    end
+  wait_thr.value
+  output.to_s.force_encoding(Encoding::UTF_8).scrub
+end
+
+# One version's input payload for the Claude session, with ISS numbers resolved.
+def changelog_version_input(p, iss_map)
+  tag = JSON.parse(File.read(p[:tag_file]))
+  commits = (tag["commits"] || []).map do |c|
+    pr = c["pr_number"]
+    {
+      "sha" => c["sha"],
+      "subject" => c["subject"],
+      "body" => c["body"],
+      "pr_number" => pr,
+      "issue_number" => pr ? iss_map["#{p[:app]}##{pr}"] : nil,
+    }
+  end
+  { "versions" => [{
+    "application" => p[:app],
+    "version" => p[:version],
+    "released_at" => tag["released_at"],
+    "notes_file" => p[:notes_file],
+    "commits" => commits,
+  }] }
+end
+
+def cmd_changelog_build(args)
+  flags = changelog_parse_flags(args)
+  repo = ensure_changelog_repo!
+  pending = changelog_pending(repo, flags[:apps])
+  total_pending = pending.length
+  pending = pending.first(flags[:limit]) if flags[:limit]
+  if pending.empty?
+    puts "changelog build: nothing to build"
+    return
+  end
+  if flags[:limit] && total_pending > pending.length
+    puts "changelog build: #{total_pending} versions pending; building the #{pending.length} most recent (--limit)."
+  end
+
+  iss_map = changelog_issue_map(flags[:use_localhost])
+
+  # One bounded Claude session per version: keeps context small, isolates a bad
+  # commit set to a single version, and makes a large backfill resumable (each
+  # written notes file is cached, so a re-run skips what already succeeded).
+  built = []
+  failed = []
+  pending.each_with_index do |p, idx|
+    puts "changelog build [#{idx + 1}/#{pending.length}]: #{p[:app]}/#{p[:version]} via Claude (#{CHANGELOG_CLAUDE_MODEL})..."
+    input_path = File.join(repo, "_build_input.json")
+    File.write(input_path, "#{JSON.pretty_generate(changelog_version_input(p, iss_map))}\n")
+    output = changelog_run_claude(repo, input_path)
+    File.delete(input_path) if File.exist?(input_path)
+
+    if File.exist?(p[:notes_file]) && (JSON.parse(File.read(p[:notes_file])) rescue false)
+      built << p
+    else
+      failed << p
+      warn "  failed (#{p[:app]}/#{p[:version]}): #{output.to_s.lines.last}"
+    end
+  end
+
+  unless built.empty?
+    changelog_git_commit_push!(repo, "changelog: build notes for #{built.length} version(s)\n\n" \
+                                     "#{built.map { |p| "#{p[:app]}/#{p[:version]}" }.join("\n")}")
+    puts "changelog build: wrote #{built.length} notes file(s)"
+  end
+  unless failed.empty?
+    Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry): " \
+                         "#{failed.map { |p| "#{p[:app]}/#{p[:version]}" }.join(', ')}")
+  end
+end
+
+def cmd_changelog_all(args)
+  cmd_changelog_capture(args.dup)
+  cmd_changelog_build(args.dup)
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -3287,6 +3600,14 @@ when "issue"
   when "reconcile" then cmd_issue_reconcile(argv)
   when nil         then require_subcommand("issue")
   else               unknown("issue subcommand", sub, SUBCOMMANDS["issue"])
+  end
+when "changelog"
+  sub = resolve_subcommand(argv, default: "all")
+  case sub
+  when "capture" then cmd_changelog_capture(argv)
+  when "build"   then cmd_changelog_build(argv)
+  when "all"     then cmd_changelog_all(argv)
+  else                unknown("changelog subcommand", sub, SUBCOMMANDS["changelog"])
   end
 else
   unknown("command", command, COMMANDS)
