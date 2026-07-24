@@ -3,11 +3,11 @@ require 'minitest/autorun'
 require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 
-# Covers `dev issue {claim,status,reconcile}`: the pure plan-rendering helpers (no
+# Covers `dev issues {claim,status,reconcile}`: the pure plan-rendering helpers (no
 # network), the claim/status arg validation, and the playbook credential guard.
 # Network paths (claim/status HTTP) are not exercised here — they exit before any
 # request when args or credentials are missing.
-class TestDevIssue < Minitest::Test
+class TestDevIssues < Minitest::Test
   include DevTestSupport
 
   # Run a block as if `dev login --app playbook` had never been run. Guards the
@@ -135,14 +135,14 @@ class TestDevIssue < Minitest::Test
   def test_plan_markdown_structure
     md = issue_plan_markdown(items: [graph_issue, child_club_issue], date: "2026-07-10", category: "graphs", body: "BODY-ORIENTATION")
     assert_includes md, "# graphs issues — 2 item(s) claimed 2026-07-10"
-    assert_includes md, "`dev issue claim --category graphs`"
+    assert_includes md, "`dev issues claim --category graphs`"
     assert_includes md, "## Issues to fix"
     assert_includes md, "### 1. ISS-034 — Bars overflow the axis"
     assert_includes md, "### 2. ISS-036 — Bars overflow the axis"
     assert_includes md, "BODY-ORIENTATION"
     assert_includes md, "## Closing each issue"
-    assert_includes md, 'dev issue status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
-    assert_includes md, 'dev issue status <number> --status fixed --url "<doc URL>"'
+    assert_includes md, 'dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
+    assert_includes md, 'dev issues status <number> --status fixed --url "<doc URL>"'
     assert_includes md, "--status needs_input"
   end
 
@@ -270,64 +270,64 @@ class TestDevIssue < Minitest::Test
     assert_empty issue_categories_present([])
   end
 
-  # ---- cmd_issue_claim arg validation (exits before any network) ----
+  # ---- cmd_issues_claim arg validation (exits before any network) ----
 
   # No --category is now valid (claim across all categories). Prove it gets PAST
   # arg validation by running with no playbook session so it stops at the
   # credential guard rather than firing a live claim at production.
   def test_claim_without_category_passes_arg_validation
-    out, status = without_playbook_session { capture_stderr_and_exit { cmd_issue_claim([]) } }
+    out, status = without_playbook_session { capture_stderr_and_exit { cmd_issues_claim([]) } }
     refute_match(/--category is required/, out)
     assert_equal 1, status
     assert_match(/dev login --app playbook/, out)
   end
 
   def test_claim_rejects_invalid_category
-    out, status = capture_stderr_and_exit { cmd_issue_claim(["--category", "bogus"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "bogus"]) }
     assert_equal 1, status
     assert_match(/--category must be one of: graphs, worker, insights/, out)
   end
 
   def test_claim_rejects_category_without_value
-    out, status = capture_stderr_and_exit { cmd_issue_claim(["--category"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--category"]) }
     assert_equal 1, status
     assert_match(/--category requires a value/, out)
   end
 
   def test_claim_rejects_unexpected_positional
-    out, status = capture_stderr_and_exit { cmd_issue_claim(["--category", "graphs", "extra"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "graphs", "extra"]) }
     assert_equal 1, status
     assert_match(/unexpected argument/, out)
   end
 
-  # ---- cmd_issue_status arg validation (exits before any network) ----
+  # ---- cmd_issues_status arg validation (exits before any network) ----
 
   def test_status_requires_number
-    out, status = capture_stderr_and_exit { cmd_issue_status(["--status", "dismissed"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_status(["--status", "dismissed"]) }
     assert_equal 1, status
     assert_match(/missing issue number/, out)
   end
 
   def test_status_requires_status
-    out, status = capture_stderr_and_exit { cmd_issue_status(["034"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_status(["034"]) }
     assert_equal 1, status
     assert_match(/--status is required/, out)
   end
 
   def test_status_rejects_invalid_status
-    out, status = capture_stderr_and_exit { cmd_issue_status(["034", "--status", "bogus"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_status(["034", "--status", "bogus"]) }
     assert_equal 1, status
     assert_match(/--status must be one of/, out)
   end
 
   def test_status_rejects_unexpected_positional
-    out, status = capture_stderr_and_exit { cmd_issue_status(["034", "extra", "--status", "dismissed"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_status(["034", "extra", "--status", "dismissed"]) }
     assert_equal 1, status
     assert_match(/unexpected argument/, out)
   end
 
   def test_status_fixed_requires_url
-    out, status = capture_stderr_and_exit { cmd_issue_status(["034", "--status", "fixed"]) }
+    out, status = capture_stderr_and_exit { cmd_issues_status(["034", "--status", "fixed"]) }
     assert_equal 1, status
     assert_match(/marking fixed requires --url/, out)
   end
@@ -338,7 +338,7 @@ class TestDevIssue < Minitest::Test
   # ever reaching the network.
   def test_status_fixed_with_url_alone_passes_arg_validation
     out, status = without_playbook_session do
-      capture_stderr_and_exit { cmd_issue_status(["034", "--status", "fixed", "--url", "https://docs.google.com/d/1"]) }
+      capture_stderr_and_exit { cmd_issues_status(["034", "--status", "fixed", "--url", "https://docs.google.com/d/1"]) }
     end
     refute_match(/marking fixed requires/, out)
     refute_match(/--baseline-version requires --app/, out)
@@ -348,7 +348,7 @@ class TestDevIssue < Minitest::Test
 
   def test_status_app_without_baseline_version_is_rejected
     out, status = capture_stderr_and_exit do
-      cmd_issue_status(["034", "--status", "fixed", "--url", "https://pr/1", "--app", "clubaid-app"])
+      cmd_issues_status(["034", "--status", "fixed", "--url", "https://pr/1", "--app", "clubaid-app"])
     end
     assert_equal 1, status
     assert_match(/--app requires --baseline-version/, out)
@@ -356,7 +356,7 @@ class TestDevIssue < Minitest::Test
 
   def test_status_baseline_version_without_app_is_rejected
     out, status = capture_stderr_and_exit do
-      cmd_issue_status(["034", "--status", "fixed", "--url", "https://pr/1", "--baseline-version", "0.1.4"])
+      cmd_issues_status(["034", "--status", "fixed", "--url", "https://pr/1", "--baseline-version", "0.1.4"])
     end
     assert_equal 1, status
     assert_match(/--baseline-version requires --app/, out)
@@ -364,7 +364,7 @@ class TestDevIssue < Minitest::Test
 
   def test_status_rejects_unknown_app
     out, status = capture_stderr_and_exit do
-      cmd_issue_status(["034", "--status", "fixed", "--url", "https://pr/1", "--app", "not-an-app", "--baseline-version", "0.1.4"])
+      cmd_issues_status(["034", "--status", "fixed", "--url", "https://pr/1", "--app", "not-an-app", "--baseline-version", "0.1.4"])
     end
     assert_equal 1, status
     assert_match(/Unknown --app 'not-an-app'/, out)
