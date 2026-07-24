@@ -52,9 +52,9 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
-  "issue claim"         => 'issue claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
-  "issue status"        => 'issue status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
-  "issue reconcile"     => 'issue reconcile [--apply] [--localhost]',
+  "issues claim"        => 'issues claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
+  "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
+  "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "changelog capture"   => 'changelog [capture] [--app APP]...',
   "changelog build"     => 'changelog build [--app APP]... [--limit N] [--localhost]',
 }.freeze
@@ -76,7 +76,7 @@ USAGE = <<~USAGE
         re-prompted. Per-app failures warn but do not abort others.
         Pass `--app acumen` or `--app platform` to target just one.
         `--app playbook` logs in to the playbook tenant admin (used by
-        `dev issue`); it is opt-in only, never part of the default
+        `dev issues`); it is opt-in only, never part of the default
         login. Sessions are stored under ~/.platform/.
 
     #{INVOCATIONS["logout"]}
@@ -183,7 +183,7 @@ USAGE = <<~USAGE
         arg forwarded to them (a leading `--` separator is dropped) — including
         their own `--env`/`--prod` flags.
 
-    #{INVOCATIONS["issue claim"]}
+    #{INVOCATIONS["issues claim"]}
         Claim open issues into local plans for a Claude session to work on. With no
         --category (the default) it scans every category (graphs, worker, insights),
         lists the open issues grouped by category, and — after you confirm (or with
@@ -197,19 +197,19 @@ USAGE = <<~USAGE
         `dev login --app playbook` once first (the issues API requires a playbook
         admin, not the platform `dev login`).
 
-    #{INVOCATIONS["issue status"]}
+    #{INVOCATIONS["issues status"]}
         Close a claimed issue. NUMBER is the per-tenant issue number shown as
         ISS-<number> (034, or unpadded 34). STATUS is one of open, claimed, fixed,
         deployed, verified, dismissed, needs_input. Marking `fixed` requires --url:
         the merged PR, or a document describing a manual/process fix. Pass --app
         <deployable-app> and --baseline-version <live release tag> TOGETHER (both or
-        neither) for a code fix: they are what let `dev issue reconcile` flip the
+        neither) for a code fix: they are what let `dev issues reconcile` flip the
         issue to `deployed` once that app releases past the baseline; a
         document-linked fix has neither and is advanced by hand. --comment carries
         the question (needs_input) or a reason (dismissed). The generated plan tells
         the fix session to call this so no session token is written into the plan file.
 
-    #{INVOCATIONS["issue reconcile"]}
+    #{INVOCATIONS["issues reconcile"]}
         Flip `fixed` issues to `deployed` once their target app has released past the
         fix. Read-only against the deploy registry (same live-version signal as
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
@@ -261,7 +261,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen issue changelog].freeze
+COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen issues changelog].freeze
 SUBCOMMANDS = {
   "changelog"    => %w[capture build],
   "invariants"   => %w[check snoozes snooze unsnooze],
@@ -273,7 +273,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
-  "issue"        => %w[claim status reconcile],
+  "issues"       => %w[claim status reconcile],
 }.freeze
 
 def levenshtein(a, b)
@@ -896,7 +896,7 @@ def issue_fanout_prompt(plans)
     "subagent per plan and work them in parallel — do NOT implement the fixes " \
     "yourself in this session. Give each subagent its plan path and tell it to read " \
     "the plan, implement the fixes, open PRs, and close each issue with " \
-    "`dev issue status`. Plans:\n#{listed}"
+    "`dev issues status`. Plans:\n#{listed}"
 end
 
 # The prompt for the spawned session, keyed on how many category plans were
@@ -906,7 +906,7 @@ def issue_claim_prompt(plans)
   plans.length == 1 ? issue_session_prompt(plans.first[1]) : issue_fanout_prompt(plans)
 end
 
-# Pure, testable seam: the argv for the interactive session `dev issue claim`
+# Pure, testable seam: the argv for the interactive session `dev issues claim`
 # launches after writing the plan(s). Mirrors the `ccd` alias
 # (`claude --dangerously-skip-permissions`) pinned to Opus 4.8 (1M context).
 def issue_claude_argv(prompt)
@@ -944,8 +944,8 @@ end
 # Path to the issues LIST endpoint filtered to one or more statuses. The spec
 # parameter is `statuses` (a repeatable list of issue_status) — NOT `status`. A
 # singular `status=open` is an unknown parameter the server silently ignores, so
-# it returns issues in EVERY status. That made `dev issue claim` preview (and
-# `dev issue reconcile`) act on the whole tracker: e.g. offering to "claim 35
+# it returns issues in EVERY status. That made `dev issues claim` preview (and
+# `dev issues reconcile`) act on the whole tracker: e.g. offering to "claim 35
 # issues" when only the open ones would actually be claimed server-side. Always
 # name the parameter `statuses` so the filter applies.
 def issues_list_path(statuses:, category: nil, limit: 100)
@@ -1035,9 +1035,9 @@ def issue_plan_markdown(items:, date:, category:, body:)
   <<~PLAN
     # #{category} issues — #{items.length} item(s) claimed #{date}
 
-    Generated by `dev issue claim --category #{category}`. These issues are CLAIMED
+    Generated by `dev issues claim --category #{category}`. These issues are CLAIMED
     (status `claimed`) and waiting for you. Implement the fixes, open PRs, and close
-    each issue with `dev issue status` (below) so nothing stays stuck in `claimed`.
+    each issue with `dev issues status` (below) so nothing stays stuck in `claimed`.
 
     ## Issues to fix
 
@@ -1052,15 +1052,15 @@ def issue_plan_markdown(items:, date:, category:, body:)
     Run from anywhere (re-authenticates from ~/code/env each call). `<number>` is the
     issue number shown above (e.g. `034`; unpadded `34` works too):
 
-    - Fixed in a merged PR → `dev issue status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
-      (--app + --baseline-version let `dev issue reconcile` flip the issue to `deployed`
+    - Fixed in a merged PR → `dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
+      (--app + --baseline-version let `dev issues reconcile` flip the issue to `deployed`
       once that app releases past the baseline. `dev deploy status` lists the deployable
       app names and their live release tags — read the tag BEFORE your fix ships.)
     - Fixed by a document (process/manual fix, e.g. a Google Doc) →
-      `dev issue status <number> --status fixed --url "<doc URL>"`
+      `dev issues status <number> --status fixed --url "<doc URL>"`
       (no app/baseline: nothing to detect, so `deployed` is set by hand later)
     - Needs a human decision, or not actionable / already fixed →
-      `dev issue status <number> --status needs_input --comment "<question or reason>"`
+      `dev issues status <number> --status needs_input --comment "<question or reason>"`
   PLAN
 end
 
@@ -1079,7 +1079,7 @@ def write_issue_plan(items, category)
   path
 end
 
-def cmd_issue_claim(args)
+def cmd_issues_claim(args)
   rest, _app, use_localhost = parse_common_flags(args)
   assume_yes = false
   spawn_session = true
@@ -1091,7 +1091,7 @@ def cmd_issue_claim(args)
     case a
     when "--category"
       category = rest[i + 1]
-      usage_exit("--category requires a value", example: usage_for("issue claim")) if category.nil?
+      usage_exit("--category requires a value", example: usage_for("issues claim")) if category.nil?
       i += 2
     when "--yes", "-y"
       assume_yes = true
@@ -1110,7 +1110,7 @@ def cmd_issue_claim(args)
   # --category is optional: with none, discover open issues across ALL categories
   # and claim each. When given it must still name a real category.
   problems << "--category must be one of: #{ISSUE_CATEGORIES.join(', ')}" if category && !category.empty? && !ISSUE_CATEGORIES.include?(category)
-  report_arg_problems("issue claim", problems, usage_for("issue claim"))
+  report_arg_problems("issues claim", problems, usage_for("issues claim"))
 
   require_playbook_session!(use_localhost)
 
@@ -1197,7 +1197,7 @@ def cmd_issue_claim(args)
   end
 end
 
-def cmd_issue_status(args)
+def cmd_issues_status(args)
   rest, target_app, use_localhost = parse_common_flags(args)
   status = nil
   comment = nil
@@ -1210,19 +1210,19 @@ def cmd_issue_status(args)
     case a
     when "--status"
       status = rest[i + 1]
-      usage_exit("--status requires a value", example: usage_for("issue status")) if status.nil?
+      usage_exit("--status requires a value", example: usage_for("issues status")) if status.nil?
       i += 2
     when "--comment"
       comment = rest[i + 1]
-      usage_exit("--comment requires a value", example: usage_for("issue status")) if comment.nil?
+      usage_exit("--comment requires a value", example: usage_for("issues status")) if comment.nil?
       i += 2
     when "--url"
       url = rest[i + 1]
-      usage_exit("--url requires a value", example: usage_for("issue status")) if url.nil?
+      usage_exit("--url requires a value", example: usage_for("issues status")) if url.nil?
       i += 2
     when "--baseline-version"
       baseline_version = rest[i + 1]
-      usage_exit("--baseline-version requires a value", example: usage_for("issue status")) if baseline_version.nil?
+      usage_exit("--baseline-version requires a value", example: usage_for("issues status")) if baseline_version.nil?
       i += 2
     else
       leftover << a
@@ -1242,11 +1242,11 @@ def cmd_issue_status(args)
   # manual/process fix.
   problems << "marking fixed requires --url <url> (the merged PR, or a document describing the fix)" if status == "fixed" && (url.nil? || url.empty?)
   # --app + --baseline-version are the deploy-detection pair: together they let
-  # `dev issue reconcile` flip the issue to `deployed`. One without the other
+  # `dev issues reconcile` flip the issue to `deployed`. One without the other
   # detects nothing, so it is always a mistake.
   problems << "--app requires --baseline-version (the app's live release tag at fix time)" if has_app && !has_baseline
   problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
-  report_arg_problems("issue status", problems, usage_for("issue status"))
+  report_arg_problems("issues status", problems, usage_for("issues status"))
 
   body = { status: status }
   body[:comment] = comment if comment && !comment.empty?
@@ -1286,12 +1286,12 @@ end
 # Read-only against the deploy registry (the same live-version signal `dev deploy status`
 # uses) — the release pipeline is never touched. Dry-run by default; --apply records
 # the transitions.
-def cmd_issue_reconcile(args)
+def cmd_issues_reconcile(args)
   rest, _app, use_localhost = parse_common_flags(args)
   apply = false
   leftover = []
   rest.each { |a| a == "--apply" ? (apply = true) : leftover << a }
-  reject_unknown_args("issue reconcile", leftover)
+  reject_unknown_args("issues reconcile", leftover)
   require_playbook_session!(use_localhost)
 
   registry = Work::Registry.load
@@ -3608,14 +3608,14 @@ when "scripts"
   when "run"  then cmd_scripts_run(argv)
   else             unknown("scripts subcommand", sub, SUBCOMMANDS["scripts"])
   end
-when "issue"
+when "issues"
   sub = argv.shift
   case sub
-  when "claim"     then cmd_issue_claim(argv)
-  when "status"    then cmd_issue_status(argv)
-  when "reconcile" then cmd_issue_reconcile(argv)
-  when nil         then require_subcommand("issue")
-  else               unknown("issue subcommand", sub, SUBCOMMANDS["issue"])
+  when "claim"     then cmd_issues_claim(argv)
+  when "status"    then cmd_issues_status(argv)
+  when "reconcile" then cmd_issues_reconcile(argv)
+  when nil         then require_subcommand("issues")
+  else               unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
   end
 when "changelog"
   sub = resolve_subcommand(argv, default: "all")

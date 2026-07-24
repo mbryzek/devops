@@ -9,7 +9,7 @@ orientation (pipeline map, decoding guide, working rules) for fixing that catego
 | `worker-body.md`   | `worker`   | the async workers — chiefly the Court Reserve pipeline    |
 | `insights-body.md` | `insights` | insight-generation quality (playbook + clubaid-admin)     |
 
-Each is read by **`dev issue claim --category <category>`** (`bin/dev`), which claims that
+Each is read by **`dev issues claim --category <category>`** (`bin/dev`), which claims that
 category's open issues and appends the matching body to the plan it writes under
 `~/code/claude/plans/<date>-issues-<category>.md`. Edit the prose here; the command picks it up
 automatically. One session per category — which is why the bodies do not overlap.
