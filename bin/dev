@@ -234,8 +234,12 @@ USAGE = <<~USAGE
         --limit N to build only the N most recent pending versions (e.g. to seed
         history without evaluating every past release). Enrichment uses your
         persisted playbook session; run
-        `dev login --app playbook` once first. clubaid-admin assembles these notes
-        into its /admin/changelog page at its own build (not here).
+        `dev login --app playbook` once first. After writing notes it regenerates
+        clubaid-admin's committed snapshot (src/lib/changelog/data.json, what
+        /admin/changelog actually renders) in a scratch worktree and force-pushes it
+        to the long-lived `changelog-data` branch, opening the PR if none is open —
+        best-effort, never fails the build. The page updates once that PR is merged
+        AND clubaid-admin is released.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -3476,6 +3480,112 @@ def changelog_version_input(p, iss_map)
   }] }
 end
 
+# --- /admin/changelog snapshot -------------------------------------------------
+#
+# clubaid-admin renders the notes from a COMMITTED snapshot (its
+# src/lib/changelog/data.json, assembled from this data lake by its own
+# scripts/build-changelog.ts). Newly built notes are therefore invisible on the page
+# until that snapshot is regenerated AND merged — which nobody was doing, so the page
+# silently fell months behind the lake. After a successful build we regenerate it and
+# park it on a single long-lived bot branch + PR for Mike to merge (clubaid-admin is
+# PR-reviewed; only the lake itself is direct-push).
+CHANGELOG_ADMIN_APP = "clubaid-admin".freeze
+CHANGELOG_ADMIN_BRANCH = "changelog-data".freeze
+
+# A dedicated git worktree so we never touch whatever Mike has checked out (or
+# half-edited) in ~/code/clubaid-admin. Cheap: it shares the checkout's object store.
+def changelog_admin_worktree
+  File.expand_path("~/.devops/worktrees/#{CHANGELOG_ADMIN_APP}-changelog")
+end
+
+# Point the worktree at a pristine origin/main, creating it on first use.
+# Returns the path, or nil if it could not be prepared.
+def changelog_prepare_admin_worktree(checkout)
+  wt = changelog_admin_worktree
+  FileUtils.mkdir_p(File.dirname(wt))
+  unless system("git", "-C", checkout, "fetch", "--quiet", "origin")
+    warn "changelog: could not fetch #{CHANGELOG_ADMIN_APP}; skipping the /admin/changelog snapshot"
+    return nil
+  end
+
+  if File.exist?(File.join(wt, ".git"))
+    ok = system("git", "-C", wt, "checkout", "-q", "-B", CHANGELOG_ADMIN_BRANCH, "origin/main") &&
+      system("git", "-C", wt, "reset", "-q", "--hard", "origin/main") &&
+      system("git", "-C", wt, "clean", "-qfd")
+  else
+    FileUtils.rm_rf(wt)
+    ok = system("git", "-C", checkout, "worktree", "add", "--quiet", "--force",
+                "-B", CHANGELOG_ADMIN_BRANCH, wt, "origin/main")
+  end
+
+  unless ok
+    warn "changelog: could not prepare #{wt}; skipping the /admin/changelog snapshot"
+    return nil
+  end
+  wt
+end
+
+# Open the bot PR if one is not already open. The branch is long-lived, so a later
+# refresh just force-pushes onto the SAME open PR rather than opening a second one.
+def changelog_open_admin_pr(wt)
+  open = IO.popen(["gh", "pr", "list", "--repo", "mbryzek/#{CHANGELOG_ADMIN_APP}",
+                   "--head", CHANGELOG_ADMIN_BRANCH, "--state", "open", "--json", "number"],
+                  err: File::NULL, &:read).to_s
+  if open.include?("number")
+    puts "changelog: updated the open /admin/changelog snapshot PR"
+    return
+  end
+
+  body = <<~BODY
+    Regenerated `src/lib/changelog/data.json` from the `changelog` data lake after
+    `dev changelog build` curated new release notes. Data only — no code changes.
+
+    Opened automatically by `dev changelog build`. The branch is long-lived: later
+    refreshes force-push onto this same PR until it is merged.
+  BODY
+  ok = system("gh", "pr", "create", "--repo", "mbryzek/#{CHANGELOG_ADMIN_APP}",
+              "--head", CHANGELOG_ADMIN_BRANCH, "--title",
+              "Refresh /admin/changelog data from the changelog data lake",
+              "--body", body, chdir: wt)
+  warn "changelog: `gh pr create` failed; branch #{CHANGELOG_ADMIN_BRANCH} is pushed, open the PR by hand" unless ok
+end
+
+# Regenerate clubaid-admin's committed snapshot and push it to the bot branch/PR.
+# Entirely best-effort: the notes are already committed to the lake by the time we
+# get here, so nothing in this path may fail the build.
+def changelog_refresh_admin_snapshot!(repo)
+  checkout = changelog_app_checkout(CHANGELOG_ADMIN_APP)
+  unless Dir.exist?(File.join(checkout, ".git"))
+    warn "changelog: no #{CHANGELOG_ADMIN_APP} checkout at #{checkout}; skipping the /admin/changelog snapshot"
+    return
+  end
+
+  wt = changelog_prepare_admin_worktree(checkout)
+  return if wt.nil?
+
+  unless system({ "CHANGELOG_REPO_DIR" => repo }, "node", "scripts/build-changelog.ts", chdir: wt)
+    warn "changelog: build-changelog.ts failed in #{wt}; skipping the /admin/changelog snapshot"
+    return
+  end
+
+  if IO.popen(["git", "-C", wt, "status", "--porcelain"], err: File::NULL, &:read).to_s.strip.empty?
+    puts "changelog: /admin/changelog snapshot already current"
+    return
+  end
+
+  system("git", "-C", wt, "add", "-A")
+  unless system("git", "-C", wt, "commit", "-q", "-m",
+                "Refresh changelog data.json from the changelog data lake")
+    warn "changelog: nothing to commit for the /admin/changelog snapshot"
+    return
+  end
+  unless system("git", "-C", wt, "push", "-q", "--force-with-lease", "origin", CHANGELOG_ADMIN_BRANCH)
+    warn "changelog: could not push #{CHANGELOG_ADMIN_BRANCH} (committed locally at #{wt})"
+    return
+  end
+  changelog_open_admin_pr(wt)
+end
+
 def cmd_changelog_build(args)
   flags = changelog_parse_flags(args)
   repo = ensure_changelog_repo!
@@ -3516,6 +3626,8 @@ def cmd_changelog_build(args)
     changelog_git_commit_push!(repo, "changelog: build notes for #{built.length} version(s)\n\n" \
                                      "#{built.map { |p| "#{p[:app]}/#{p[:version]}" }.join("\n")}")
     puts "changelog build: wrote #{built.length} notes file(s)"
+    # New notes are useless until clubaid-admin's committed snapshot catches up.
+    changelog_refresh_admin_snapshot!(repo)
   end
   unless failed.empty?
     Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry): " \
