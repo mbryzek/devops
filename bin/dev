@@ -75,7 +75,7 @@ USAGE = <<~USAGE
         --email is passed it is reused for both; password is always
         re-prompted. Per-app failures warn but do not abort others.
         Pass `--app acumen` or `--app platform` to target just one.
-        `--app clubaid` logs in to the clubaid tenant admin (used by
+        `--app playbook` logs in to the playbook tenant admin (used by
         `dev issue`); it is opt-in only, never part of the default
         login. Sessions are stored under ~/.platform/.
 
@@ -193,8 +193,8 @@ USAGE = <<~USAGE
         session (Opus 4.8, 1M context — the `ccd` model): one plan → it implements
         the plan directly; several → it dispatches one subagent per plan and works
         them in parallel. Pass --no-spawn to just write the plan(s) and print their
-        paths. Authenticates with your persisted clubaid session — run
-        `dev login --app clubaid` once first (the issues API requires a clubaid
+        paths. Authenticates with your persisted playbook session — run
+        `dev login --app playbook` once first (the issues API requires a playbook
         admin, not the platform `dev login`).
 
     #{INVOCATIONS["issue status"]}
@@ -233,8 +233,8 @@ USAGE = <<~USAGE
         re-evaluated), one bounded Claude session per version, newest first; pass
         --limit N to build only the N most recent pending versions (e.g. to seed
         history without evaluating every past release). Enrichment uses your
-        persisted clubaid session; run
-        `dev login --app clubaid` once first. clubaid-admin assembles these notes
+        persisted playbook session; run
+        `dev login --app playbook` once first. clubaid-admin assembles these notes
         into its /admin/changelog page at its own build (not here).
 
   Common options:
@@ -426,9 +426,9 @@ def login_acumen(use_localhost, email, password)
   puts "Logged in to acumen as #{user_email}"
 end
 
-def login_clubaid(use_localhost, email, password)
-  ep = ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
-  res = ApiClient.request(ep, :post, "/tenant/clubaid/session/logins",
+def login_playbook(use_localhost, email, password)
+  ep = ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
+  res = ApiClient.request(ep, :post, "/tenant/playbook/session/logins",
                           body: { email: email, password: password },
                           auth_required: false)
   raise ApiError, "unexpected response: #{res.inspect}" unless res.is_a?(Hash) && res["discriminator"] == "tenant_session"
@@ -436,14 +436,14 @@ def login_clubaid(use_localhost, email, password)
   session_id = res.dig("session", "id")
   raise ApiError, "response missing session.id: #{res.inspect}" if session_id.nil? || session_id.empty?
 
-  ApiClient.write_session_id_for("clubaid", session_id, use_localhost: use_localhost)
+  ApiClient.write_session_id_for("playbook", session_id, use_localhost: use_localhost)
   user_email = res.dig("user", "email") || email
-  puts "Logged in to clubaid as #{user_email}"
+  puts "Logged in to playbook as #{user_email}"
 end
 
-# clubaid is a tenant login, opt-in via `--app clubaid` only — never part of the
+# playbook is a tenant login, opt-in via `--app playbook` only — never part of the
 # default `dev login` fanout (which is the deployable apps in ENDPOINTS).
-LOGIN_APPS = (ApiClient::ENDPOINTS.map { |e| e[:app] } + ["clubaid"]).freeze
+LOGIN_APPS = (ApiClient::ENDPOINTS.map { |e| e[:app] } + ["playbook"]).freeze
 
 def cmd_login(args)
   email = nil
@@ -475,13 +475,13 @@ def cmd_login(args)
            end
            [app_filter]
          else
-           # Default fanout is the deployable apps only; clubaid is opt-in.
+           # Default fanout is the deployable apps only; playbook is opt-in.
            ApiClient::ENDPOINTS.map { |e| e[:app] }
          end
 
   targets = apps.map do |app|
-    if app == "clubaid"
-      ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+    if app == "playbook"
+      ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
     else
       ApiClient.endpoints(use_localhost: use_localhost, app_filter: app).first
     end
@@ -515,7 +515,7 @@ def cmd_login(args)
       case target[:app]
       when "platform" then login_platform(use_localhost, target_email, password)
       when "acumen"   then login_acumen(use_localhost, target_email, password)
-      when "clubaid"  then login_clubaid(use_localhost, target_email, password)
+      when "playbook" then login_playbook(use_localhost, target_email, password)
       else
         warn "  unknown app: #{target[:app]}"
         next
@@ -540,9 +540,9 @@ def cmd_logout(args)
 
   platform_sid = ApiClient.session_id_for("platform", use_localhost: use_localhost)
   acumen_sid   = ApiClient.session_id_for("acumen", use_localhost: use_localhost)
-  clubaid_sid  = ApiClient.session_id_for("clubaid", use_localhost: use_localhost)
+  playbook_sid = ApiClient.session_id_for("playbook", use_localhost: use_localhost)
 
-  if platform_sid.nil? && acumen_sid.nil? && clubaid_sid.nil?
+  if platform_sid.nil? && acumen_sid.nil? && playbook_sid.nil?
     puts "No active session"
     return
   end
@@ -566,14 +566,14 @@ def cmd_logout(args)
     ApiClient.clear_session_id_for("acumen", use_localhost: use_localhost)
   end
 
-  if clubaid_sid
+  if playbook_sid
     begin
-      clubaid_ep = ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
-      ApiClient.request(clubaid_ep, :delete, "/tenant/clubaid/session", auth_required: true)
+      playbook_ep = ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
+      ApiClient.request(playbook_ep, :delete, "/tenant/playbook/session", auth_required: true)
     rescue SessionExpired, ApiError
       # ignore - we'll clear locally anyway
     end
-    ApiClient.clear_session_id_for("clubaid", use_localhost: use_localhost)
+    ApiClient.clear_session_id_for("playbook", use_localhost: use_localhost)
   end
 
   puts "Logged out"
@@ -910,16 +910,16 @@ def issue_categories_present(open)
 end
 
 # The issue tracker is tenant-scoped (/:tenant_id/issues) and authorized for a
-# clubaid tenant admin, not the platform tenant that `dev login` stores —
-# authenticate with the persisted clubaid session (`dev login --app clubaid`) on
+# playbook tenant admin, not the platform tenant that `dev login` stores —
+# authenticate with the persisted playbook session (`dev login --app playbook`) on
 # the platform host.
 def issue_endpoint(use_localhost)
-  ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+  ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
 end
 
-# Every issues path is scoped to the clubaid tenant; the session that authorizes
+# Every issues path is scoped to the playbook tenant; the session that authorizes
 # the call is the same tenant's, so the id is a constant here.
-ISSUE_TENANT_ID = "clubaid".freeze
+ISSUE_TENANT_ID = "playbook".freeze
 
 def issues_path(suffix = "")
   "/#{ISSUE_TENANT_ID}/issues#{suffix}"
@@ -940,11 +940,11 @@ def issues_list_path(statuses:, category: nil, limit: 100)
   issues_path("?#{URI.encode_www_form(params)}")
 end
 
-# Fail with the exact login command when there is no clubaid session yet, rather
+# Fail with the exact login command when there is no playbook session yet, rather
 # than the generic "run 'dev login'" that handle_errors emits on a 401.
-def require_clubaid_session!(use_localhost)
-  return unless ApiClient.session_id_for("clubaid", use_localhost: use_localhost).nil?
-  Util.exit_with_error("No clubaid session#{use_localhost ? ' (localhost)' : ''}. Run `dev login --app clubaid#{use_localhost ? ' --localhost' : ''}` first.")
+def require_playbook_session!(use_localhost)
+  return unless ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
+  Util.exit_with_error("No playbook session#{use_localhost ? ' (localhost)' : ''}. Run `dev login --app playbook#{use_localhost ? ' --localhost' : ''}` first.")
 end
 
 # Display identity of an issue: the per-tenant number, e.g. ISS-034.
@@ -1096,7 +1096,7 @@ def cmd_issue_claim(args)
   problems << "--category must be one of: #{ISSUE_CATEGORIES.join(', ')}" if category && !category.empty? && !ISSUE_CATEGORIES.include?(category)
   report_arg_problems("issue claim", problems, usage_for("issue claim"))
 
-  require_clubaid_session!(use_localhost)
+  require_playbook_session!(use_localhost)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
@@ -1249,7 +1249,7 @@ def cmd_issue_status(args)
     body[:baseline_version] = baseline_version
   end
 
-  require_clubaid_session!(use_localhost)
+  require_playbook_session!(use_localhost)
 
   handle_errors do
     res = ApiClient.request(issue_endpoint(use_localhost), :put,
@@ -1276,7 +1276,7 @@ def cmd_issue_reconcile(args)
   leftover = []
   rest.each { |a| a == "--apply" ? (apply = true) : leftover << a }
   reject_unknown_args("issue reconcile", leftover)
-  require_clubaid_session!(use_localhost)
+  require_playbook_session!(use_localhost)
 
   registry = Work::Registry.load
   version_cache = {}
@@ -3169,9 +3169,9 @@ def cmd_slow_routes(args)
     end
   end
 
-  # The clubaid admin API lives on the platform host but authenticates with the clubaid
-  # tenant session, so use tenant_endpoint (clubaid is deliberately not in ENDPOINTS).
-  endpoint = ApiClient.tenant_endpoint("clubaid", use_localhost: use_localhost)
+  # The playbook admin API lives on the platform host but authenticates with the playbook
+  # tenant session, so use tenant_endpoint (playbook is deliberately not in ENDPOINTS).
+  endpoint = ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
 
   since = (Time.now - days * 86_400).utc.iso8601
   params = { "since" => since, "sort" => sort, "limit" => limit.to_s }
@@ -3220,7 +3220,7 @@ def cmd_slow_routes(args)
 
     Use the systematic-debugging skill: instrument this route's load path, drive an authenticated load,
     measure per-call timing, find the dominant cost, fix the one thing, and verify p95 drops. The app is
-    #{app_repo}; its backend is the platform clubaid subproject.
+    #{app_repo}; its backend is the platform playbook subproject.
   PROMPT
 end
 
@@ -3388,8 +3388,8 @@ end
 # fix linked to a mbryzek PR. Best-effort: any failure yields an empty map so the
 # build still produces notes, just without ISS links.
 def changelog_issue_map(use_localhost)
-  if ApiClient.session_id_for("clubaid", use_localhost: use_localhost).nil?
-    warn "changelog: no clubaid session; skipping ISS enrichment (run `dev login --app clubaid` to enable)"
+  if ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
+    warn "changelog: no playbook session; skipping ISS enrichment (run `dev login --app playbook` to enable)"
     return {}
   end
   map = {}
