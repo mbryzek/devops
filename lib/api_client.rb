@@ -14,20 +14,20 @@ class ApiClient
 
   # Each app (and tenant login) gets its own session file + session header.
   # Platform's session cookie is named `session_id`; acumen's is
-  # `acumen_session_id`. `clubaid` is not a deployable app (it is a tenant admin
+  # `acumen_session_id`. `playbook` is not a deployable app (it is a tenant admin
   # surface on the platform host, so it is deliberately absent from ENDPOINTS)
-  # but gets its own persisted session via `dev login --app clubaid`, on the
+  # but gets its own persisted session via `dev login --app playbook`, on the
   # platform `session_id` header.
   SESSION_CONFIG = {
     "platform" => { file: File.expand_path("~/.platform/devops"),         header: "session_id" },
     "acumen"   => { file: File.expand_path("~/.platform/devops_acumen"),  header: "acumen_session_id" },
-    "clubaid"  => { file: File.expand_path("~/.platform/devops_clubaid"), header: "session_id" },
+    "playbook" => { file: File.expand_path("~/.platform/devops_playbook"), header: "session_id" },
   }.freeze
 
   # Prod and localhost are different servers with disjoint session stores, so a
   # session id from one is simply invalid on the other. Suffix the file so
   # logging in to one target never clobbers or gets misread as the other -
-  # previously a single prod clubaid session id would get silently replayed
+  # previously a single prod playbook session id would get silently replayed
   # against localhost and rejected with a generic "session expired" error.
   def self.session_file(app, use_localhost)
     cfg = SESSION_CONFIG.fetch(app) { raise "ApiClient: no session config for app=#{app.inspect} (known: #{SESSION_CONFIG.keys.inspect})" }
@@ -61,7 +61,7 @@ class ApiClient
   end
 
   # An endpoint for a tenant login that lives on the platform host but is not a
-  # deployable app in ENDPOINTS (e.g. `clubaid`). Carries the platform host but
+  # deployable app in ENDPOINTS (e.g. `playbook`). Carries the platform host but
   # the tenant's own `app` so request/session lookups use its SESSION_CONFIG.
   def self.tenant_endpoint(app, use_localhost:)
     platform = endpoints(use_localhost: use_localhost, app_filter: "platform").first

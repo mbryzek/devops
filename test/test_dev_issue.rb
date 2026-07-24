@@ -4,19 +4,19 @@ require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 
 # Covers `dev issue {claim,status,reconcile}`: the pure plan-rendering helpers (no
-# network), the claim/status arg validation, and the clubaid credential guard.
+# network), the claim/status arg validation, and the playbook credential guard.
 # Network paths (claim/status HTTP) are not exercised here — they exit before any
 # request when args or credentials are missing.
 class TestDevIssue < Minitest::Test
   include DevTestSupport
 
-  # Run a block as if `dev login --app clubaid` had never been run. Guards the
-  # arg-validation tests: this box has a real clubaid session, so without it a
+  # Run a block as if `dev login --app playbook` had never been run. Guards the
+  # arg-validation tests: this box has a real playbook session, so without it a
   # command that gets past validation would fire a live request at production.
-  def without_clubaid_session
+  def without_playbook_session
     orig = ApiClient.method(:session_id_for)
     ApiClient.define_singleton_method(:session_id_for) do |app, use_localhost:|
-      app == "clubaid" ? nil : orig.call(app, use_localhost: use_localhost)
+      app == "playbook" ? nil : orig.call(app, use_localhost: use_localhost)
     end
     yield
   ensure
@@ -26,7 +26,7 @@ class TestDevIssue < Minitest::Test
   def graph_issue
     {
       "id" => "iss-1",
-      "tenant" => { "id" => "clubaid" },
+      "tenant" => { "id" => "playbook" },
       "number" => "034",
       "category" => "graphs",
       "status" => "claimed",
@@ -273,13 +273,13 @@ class TestDevIssue < Minitest::Test
   # ---- cmd_issue_claim arg validation (exits before any network) ----
 
   # No --category is now valid (claim across all categories). Prove it gets PAST
-  # arg validation by running with no clubaid session so it stops at the
+  # arg validation by running with no playbook session so it stops at the
   # credential guard rather than firing a live claim at production.
   def test_claim_without_category_passes_arg_validation
-    out, status = without_clubaid_session { capture_stderr_and_exit { cmd_issue_claim([]) } }
+    out, status = without_playbook_session { capture_stderr_and_exit { cmd_issue_claim([]) } }
     refute_match(/--category is required/, out)
     assert_equal 1, status
-    assert_match(/dev login --app clubaid/, out)
+    assert_match(/dev login --app playbook/, out)
   end
 
   def test_claim_rejects_invalid_category
@@ -333,17 +333,17 @@ class TestDevIssue < Minitest::Test
   end
 
   # A document fix (Google Doc, process change) carries no app/baseline — it must
-  # not be forced to invent one. Run with no clubaid session so the command stops
+  # not be forced to invent one. Run with no playbook session so the command stops
   # at the credential guard: arg validation is proven to pass without this test
   # ever reaching the network.
   def test_status_fixed_with_url_alone_passes_arg_validation
-    out, status = without_clubaid_session do
+    out, status = without_playbook_session do
       capture_stderr_and_exit { cmd_issue_status(["034", "--status", "fixed", "--url", "https://docs.google.com/d/1"]) }
     end
     refute_match(/marking fixed requires/, out)
     refute_match(/--baseline-version requires --app/, out)
     assert_equal 1, status
-    assert_match(/dev login --app clubaid/, out)
+    assert_match(/dev login --app playbook/, out)
   end
 
   def test_status_app_without_baseline_version_is_rejected
@@ -408,60 +408,60 @@ class TestDevIssue < Minitest::Test
     refute issue_released_since_fix?({ "version" => "0.1.5" }, fixed_issue(deployment: nil))
   end
 
-  # ---- clubaid tenant login wiring ----
+  # ---- playbook tenant login wiring ----
 
-  def test_issue_endpoint_is_clubaid_on_platform_host
+  def test_issue_endpoint_is_playbook_on_platform_host
     ep = issue_endpoint(false)
-    assert_equal "clubaid", ep[:app]
-    assert_equal "https://idempotent.io", ep[:active_url], "clubaid rides the platform host"
+    assert_equal "playbook", ep[:app]
+    assert_equal "https://idempotent.io", ep[:active_url], "playbook rides the platform host"
     assert_equal "http://localhost:9300", issue_endpoint(true)[:active_url]
   end
 
   def test_issues_paths_are_tenant_scoped
-    assert_equal "/clubaid/issues", issues_path
-    assert_equal "/clubaid/issues/claims", issues_path("/claims")
-    assert_equal "/clubaid/issues/034/status", issues_path("/034/status")
+    assert_equal "/playbook/issues", issues_path
+    assert_equal "/playbook/issues/claims", issues_path("/claims")
+    assert_equal "/playbook/issues/034/status", issues_path("/034/status")
   end
 
-  def test_clubaid_has_its_own_session_file
-    cfg = ApiClient::SESSION_CONFIG.fetch("clubaid")
-    assert_match(%r{/\.platform/devops_clubaid$}, cfg[:file])
+  def test_playbook_has_its_own_session_file
+    cfg = ApiClient::SESSION_CONFIG.fetch("playbook")
+    assert_match(%r{/\.platform/devops_playbook$}, cfg[:file])
     assert_equal "session_id", cfg[:header]
   end
 
-  def test_clubaid_is_not_a_deployable_endpoint
+  def test_playbook_is_not_a_deployable_endpoint
     # Must stay out of ENDPOINTS so `dev tasks`/`invariants`/`version` fanout
-    # never hits clubaid with platform-only paths.
-    refute_includes ApiClient::ENDPOINTS.map { |e| e[:app] }, "clubaid"
+    # never hits playbook with platform-only paths.
+    refute_includes ApiClient::ENDPOINTS.map { |e| e[:app] }, "playbook"
   end
 
-  def test_clubaid_is_an_opt_in_login_app
-    assert_includes LOGIN_APPS, "clubaid"
+  def test_playbook_is_an_opt_in_login_app
+    assert_includes LOGIN_APPS, "playbook"
   end
 
-  def test_login_rejects_unknown_app_and_lists_clubaid
+  def test_login_rejects_unknown_app_and_lists_playbook
     out, status = capture_stderr_and_exit { cmd_login(["--app", "bogus"]) }
     assert_equal 1, status
-    assert_match(/--app must be one of:.*clubaid/, out)
+    assert_match(/--app must be one of:.*playbook/, out)
   end
 
-  def test_require_clubaid_session_names_exact_login_command
-    out, status = without_clubaid_session { capture_stderr_and_exit { require_clubaid_session!(false) } }
+  def test_require_playbook_session_names_exact_login_command
+    out, status = without_playbook_session { capture_stderr_and_exit { require_playbook_session!(false) } }
     assert_equal 1, status
-    assert_match(/dev login --app clubaid/, out)
+    assert_match(/dev login --app playbook/, out)
   end
 
-  def test_require_clubaid_session_localhost_names_localhost_login_command
-    out, status = without_clubaid_session { capture_stderr_and_exit { require_clubaid_session!(true) } }
+  def test_require_playbook_session_localhost_names_localhost_login_command
+    out, status = without_playbook_session { capture_stderr_and_exit { require_playbook_session!(true) } }
     assert_equal 1, status
-    assert_match(/dev login --app clubaid --localhost/, out)
+    assert_match(/dev login --app playbook --localhost/, out)
   end
 
-  def test_clubaid_session_file_is_scoped_by_localhost
-    prod = ApiClient.session_file("clubaid", false)
-    local = ApiClient.session_file("clubaid", true)
+  def test_playbook_session_file_is_scoped_by_localhost
+    prod = ApiClient.session_file("playbook", false)
+    local = ApiClient.session_file("playbook", true)
     refute_equal prod, local
-    assert_match(%r{/\.platform/devops_clubaid$}, prod)
-    assert_match(%r{/\.platform/devops_clubaid_localhost$}, local)
+    assert_match(%r{/\.platform/devops_playbook$}, prod)
+    assert_match(%r{/\.platform/devops_playbook_localhost$}, local)
   end
 end
