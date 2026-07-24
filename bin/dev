@@ -441,6 +441,22 @@ def login_playbook(use_localhost, email, password)
   puts "Logged in to playbook as #{user_email}"
 end
 
+# Read a password from the terminal without echoing it, stripping surrounding
+# whitespace. Strip, not chomp: a password pasted from a manager routinely
+# carries a trailing space or tab, and the browser login forms strip before
+# sending (clubaid-admin's getRequiredString does value.trim()). Chomping only
+# the newline made the CLI send a credential the browser never would, and the
+# server reports that as a bare "Incorrect password" on the password field -
+# indistinguishable from a genuinely wrong password. Matches the `.strip` the
+# email prompt already applies.
+#
+# `io` is a seam for tests: StringIO has no #noecho, so fall back to #gets when
+# stdin is not a terminal.
+def read_password(io = STDIN)
+  raw = io.respond_to?(:noecho) ? io.noecho(&:gets) : io.gets
+  raw&.strip
+end
+
 # playbook is a tenant login, opt-in via `--app playbook` only — never part of the
 # default `dev login` fanout (which is the deployable apps in ENDPOINTS).
 LOGIN_APPS = (ApiClient::ENDPOINTS.map { |e| e[:app] } + ["playbook"]).freeze
@@ -504,7 +520,7 @@ def cmd_login(args)
     end
 
     print "  Password: "
-    password = STDIN.noecho(&:gets)&.chomp
+    password = read_password
     puts ""
     if password.nil? || password.empty?
       warn "  skipped (no password)"
