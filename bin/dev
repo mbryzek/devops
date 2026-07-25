@@ -216,10 +216,10 @@ USAGE = <<~USAGE
         pass --apply to record the transitions (e.g. from a cron).
 
     #{INVOCATIONS["changelog capture"]}
-        Record the changelog for the clubaid* apps into the `changelog` data repo
+        Record the changelog for the playbook* apps into the `changelog` data repo
         (github.com/mbryzek/changelog, cloned to ~/code/changelog). With no
         subcommand it runs `capture` then `build`. `capture` reads each tracked app's
-        git tags (clubaid-admin, clubaid-app, clubaid-www) and, for every tag missing
+        git tags (playbook-admin, playbook-app, playbook-www) and, for every tag missing
         a <version>.tag.json, writes all commits since the previous tag — idempotent,
         so it both records new releases and backfills history. Repeat --app to scope;
         default is all tracked apps. Runs automatically (best-effort) at the end of
@@ -236,11 +236,11 @@ USAGE = <<~USAGE
         recent pending versions (e.g. to seed history without evaluating every past
         release). Enrichment uses your persisted playbook session; run
         `dev login --app playbook` once first. After writing notes it regenerates
-        clubaid-admin's committed snapshot (src/lib/changelog/data.json, what
+        playbook-admin's committed snapshot (src/lib/changelog/data.json, what
         /admin/changelog actually renders) in a scratch worktree and force-pushes it
         to the long-lived `changelog-data` branch, opening the PR if none is open —
         best-effort, never fails the build. The page updates once that PR is merged
-        AND clubaid-admin is released.
+        AND playbook-admin is released.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -449,7 +449,7 @@ end
 # Read a password from the terminal without echoing it, stripping surrounding
 # whitespace. Strip, not chomp: a password pasted from a manager routinely
 # carries a trailing space or tab, and the browser login forms strip before
-# sending (clubaid-admin's getRequiredString does value.trim()). Chomping only
+# sending (playbook-admin's getRequiredString does value.trim()). Chomping only
 # the newline made the CLI send a credential the browser never would, and the
 # server reports that as a bare "Incorrect password" on the password field -
 # indistinguishable from a genuinely wrong password. Matches the `.strip` the
@@ -1259,7 +1259,7 @@ def cmd_issues_status(args)
 
   if has_app
     registry = Work::Registry.load
-    # deploy_tracked, not deployable: a fix can ship in an app (e.g. clubaid-app)
+    # deploy_tracked, not deployable: a fix can ship in an app (e.g. playbook-app)
     # that has no pingable prod URL, and reconcile reads its live version from k8s.
     app = registry.deploy_tracked.find { |a| a.name == target_app }
     unless app
@@ -1422,7 +1422,7 @@ end
 def fetch_version(url)
   uri = URI.parse("#{url}/_internal_/version")
   # Follow a few redirects: a registry-resolved domain may 301 to the
-  # canonical host (e.g. clubaid-admin) while still serving the endpoint there.
+  # canonical host (e.g. playbook-admin) while still serving the endpoint there.
   3.times do
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = (uri.scheme == "https")
@@ -1515,7 +1515,7 @@ end
 # failed or never ran" — only asking prod catches the latter. Reuses the same
 # probes as `dev deploy status` (/_internal_/version, or the live k8s image tag).
 # Items with nothing to ask — *-postgresql repos and apps with no prod probe
-# (host-derived-tenant frontends like clubaid-app) — stay git-only.
+# (host-derived-tenant frontends like playbook-app) — stay git-only.
 def prod_status(registry, app, tag)
   return {} unless registry && app
   return {} unless registry.prod_url(app) || app.docker_k8s
@@ -1533,18 +1533,38 @@ def needs_deploy?(d)
   d[:error].nil? && (d[:ahead].to_i > 0 || d[:prod_stale])
 end
 
+# The local checkout of a deployable: ~/code/<repo>, which is not always
+# ~/code/<app name> — a deployable can be rebranded ahead of its repo
+# (playbook-www is still checked out as clubaid-www).
+def app_checkout_dir(app)
+  File.expand_path("~/code/#{app.repo_name}")
+end
+
+# Same, by deploy-item name. Falls back to the name itself for items with no
+# registry entry (the derived <repo>-postgresql DB repos).
+def deploy_item_dir(name)
+  app = cached_registry.find(name)
+  app ? app_checkout_dir(app) : File.expand_path("~/code/#{name}")
+end
+
+# Loading the registry shells out to `pkl eval` per app, so share one across the
+# release fan-out. Racing threads may each build one; they are identical.
+def cached_registry
+  $cached_registry ||= Work::Registry.load
+end
+
 def deploy_items(registry = Work::Registry.load)
   # deploy_tracked (not deployable): we release every non-ignored app with a real
-  # deploy path, including host-derived-tenant apps like clubaid-app that have no
+  # deploy path, including host-derived-tenant apps like playbook-app that have no
   # single pingable prod URL and so are absent from `deployable`.
-  items = registry.deploy_tracked.map { |app| [app.name, File.expand_path("~/code/#{app.name}"), app] }
+  items = registry.deploy_tracked.map { |app| [app.name, app_checkout_dir(app), app] }
   # DB repos are derived from the apps registry, not a filesystem glob: every
   # deployable scala app declares a database in its config.pkl and ships a
-  # conventional "<app>-postgresql" repo checked out next to it. Driving
+  # conventional "<repo>-postgresql" repo checked out next to it. Driving
   # discovery from the registry keeps stray/abandoned *-postgresql checkouts
   # out of the list; scoping to deploy_tracked excludes ignored/archived apps.
   registry.deploy_tracked.select { |app| app.stack == :scala }.each do |app|
-    db = "#{app.name}-postgresql"
+    db = "#{app.repo_name}-postgresql"
     items << [db, File.expand_path("~/code/#{db}"), nil]
   end
   # Array#uniq keeps the first occurrence, so deployable-app entries win over a
@@ -2172,7 +2192,7 @@ def cmd_codegen_sync(argv)
 end
 
 def release_one(name)
-  dir = File.expand_path("~/code/#{name}")
+  dir = deploy_item_dir(name)
   return { ok: false, log: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
   branch = git_current_branch(dir)
@@ -3251,7 +3271,7 @@ end
 # semver sequence; the app name is also its GitHub repo slug (mbryzek/<app>) and
 # its local sibling checkout (~/code/<app>) we read git history from. platform is
 # intentionally excluded: its monorepo tag spans HOA/acumen/clubaid.
-CHANGELOG_APPS = %w[clubaid-admin clubaid-app clubaid-www].freeze
+CHANGELOG_APPS = %w[playbook-admin playbook-app playbook-www].freeze
 
 # Judgment + summarization quality matters here, so use a stronger model than the
 # mechanical codegen sync (haiku).
@@ -3298,7 +3318,27 @@ def changelog_repo_dir
 end
 
 def changelog_app_checkout(app)
-  File.expand_path("~/code/#{app}")
+  File.expand_path("~/code/#{changelog_app_repo(app)}")
+end
+
+# The GitHub repo backing a changelog app. Not always the app name: playbook-admin
+# and friends are branded ahead of their repos, which are still mbryzek/clubaid-*.
+# Read straight from dist/ rather than from Work::Registry — this runs at the tail of
+# every release, where a `pkl eval` per app (and the registry's tenant lookups) would
+# be pure overhead. An app with no dist entry keeps its own name, so an unconfigured
+# app degrades to the old behavior instead of raising.
+def changelog_app_repo(app)
+  @changelog_app_repos ||= {}
+  @changelog_app_repos[app] ||= begin
+    path = File.expand_path(File.join(__dir__, "..", "dist", "#{app}.config.json"))
+    if File.exist?(path)
+      App.new(JSON.parse(File.read(path)).fetch("app")).repo_name
+    else
+      app
+    end
+  rescue StandardError
+    app
+  end
 end
 
 # Array-form git so paths/refs never go through the shell.
@@ -3412,6 +3452,9 @@ def cmd_changelog_capture(args)
       released_at = changelog_git_out("-C", checkout, "log", "-1", "--format=%cI", tag).strip
       data = {
         "application" => app,
+        # The GitHub repo, recorded alongside the app because they can differ: the
+        # /admin/changelog page links PRs off this, not off the app name.
+        "repo" => changelog_app_repo(app),
         "version" => tag,
         "previous_version" => prev,
         "released_at" => released_at,
@@ -3445,6 +3488,18 @@ def changelog_pending(repo, apps)
         released_at: tag["released_at"].to_s, commit_count: (tag["commits"] || []).length }
     end
   end.sort_by { |p| p[:released_at] }.reverse
+end
+
+# Stamp the app's GitHub repo onto a notes file the Claude session just wrote. Done
+# here, not in the session's own output, so it is deterministic: the page links PRs
+# off this field, and the app name is not always the repo.
+def changelog_stamp_notes_repo!(p)
+  data = JSON.parse(File.read(p[:notes_file]))
+  repo = changelog_app_repo(p[:app])
+  return if data["repo"] == repo
+  File.write(p[:notes_file], "#{JSON.pretty_generate(data.merge('repo' => repo))}\n")
+rescue StandardError => e
+  warn "changelog: could not stamp repo on #{p[:notes_file]}: #{e.message}"
 end
 
 # Map "<repo-slug>#<pr-number>" => issue number, from clubaid issues that carry a
@@ -3519,7 +3574,9 @@ def changelog_version_input(p, iss_map)
       "subject" => c["subject"],
       "body" => c["body"],
       "pr_number" => pr,
-      "issue_number" => pr ? iss_map["#{p[:app]}##{pr}"] : nil,
+      # The map is keyed by REPO slug (it is parsed out of PR urls), which is not
+      # the app name once an app is rebranded ahead of its repo.
+      "issue_number" => pr ? iss_map["#{changelog_app_repo(p[:app])}##{pr}"] : nil,
     }
   end
   {
@@ -3533,18 +3590,24 @@ end
 
 # --- /admin/changelog snapshot -------------------------------------------------
 #
-# clubaid-admin renders the notes from a COMMITTED snapshot (its
+# playbook-admin renders the notes from a COMMITTED snapshot (its
 # src/lib/changelog/data.json, assembled from this data lake by its own
 # scripts/build-changelog.ts). Newly built notes are therefore invisible on the page
 # until that snapshot is regenerated AND merged — which nobody was doing, so the page
 # silently fell months behind the lake. After a successful build we regenerate it and
-# park it on a single long-lived bot branch + PR for Mike to merge (clubaid-admin is
+# park it on a single long-lived bot branch + PR for Mike to merge (playbook-admin is
 # PR-reviewed; only the lake itself is direct-push).
-CHANGELOG_ADMIN_APP = "clubaid-admin".freeze
+CHANGELOG_ADMIN_APP = "playbook-admin".freeze
 CHANGELOG_ADMIN_BRANCH = "changelog-data".freeze
 
+# The GitHub repo of the admin app, still mbryzek/clubaid-admin until the repo
+# rename catches up with the deployable name.
+def changelog_admin_repo
+  "mbryzek/#{changelog_app_repo(CHANGELOG_ADMIN_APP)}"
+end
+
 # A dedicated git worktree so we never touch whatever Mike has checked out (or
-# half-edited) in ~/code/clubaid-admin. Cheap: it shares the checkout's object store.
+# half-edited) in the admin checkout. Cheap: it shares the checkout's object store.
 def changelog_admin_worktree
   File.expand_path("~/.devops/worktrees/#{CHANGELOG_ADMIN_APP}-changelog")
 end
@@ -3579,7 +3642,7 @@ end
 # Open the bot PR if one is not already open. The branch is long-lived, so a later
 # refresh just force-pushes onto the SAME open PR rather than opening a second one.
 def changelog_open_admin_pr(wt)
-  open = IO.popen(["gh", "pr", "list", "--repo", "mbryzek/#{CHANGELOG_ADMIN_APP}",
+  open = IO.popen(["gh", "pr", "list", "--repo", changelog_admin_repo,
                    "--head", CHANGELOG_ADMIN_BRANCH, "--state", "open", "--json", "number"],
                   err: File::NULL, &:read).to_s
   if open.include?("number")
@@ -3594,14 +3657,14 @@ def changelog_open_admin_pr(wt)
     Opened automatically by `dev changelog build`. The branch is long-lived: later
     refreshes force-push onto this same PR until it is merged.
   BODY
-  ok = system("gh", "pr", "create", "--repo", "mbryzek/#{CHANGELOG_ADMIN_APP}",
+  ok = system("gh", "pr", "create", "--repo", changelog_admin_repo,
               "--head", CHANGELOG_ADMIN_BRANCH, "--title",
               "Refresh /admin/changelog data from the changelog data lake",
               "--body", body, chdir: wt)
   warn "changelog: `gh pr create` failed; branch #{CHANGELOG_ADMIN_BRANCH} is pushed, open the PR by hand" unless ok
 end
 
-# Regenerate clubaid-admin's committed snapshot and push it to the bot branch/PR.
+# Regenerate playbook-admin's committed snapshot and push it to the bot branch/PR.
 # Entirely best-effort: the notes are already committed to the lake by the time we
 # get here, so nothing in this path may fail the build.
 def changelog_refresh_admin_snapshot!(repo)
@@ -3671,6 +3734,7 @@ def cmd_changelog_build(args)
 
     batch.each do |p|
       if File.exist?(p[:notes_file]) && (JSON.parse(File.read(p[:notes_file])) rescue false)
+        changelog_stamp_notes_repo!(p)
         built << p
       else
         failed << p
@@ -3683,7 +3747,7 @@ def cmd_changelog_build(args)
     changelog_git_commit_push!(repo, "changelog: build notes for #{built.length} version(s)\n\n" \
                                      "#{built.map { |p| "#{p[:app]}/#{p[:version]}" }.join("\n")}")
     puts "changelog build: wrote #{built.length} notes file(s)"
-    # New notes are useless until clubaid-admin's committed snapshot catches up.
+    # New notes are useless until playbook-admin's committed snapshot catches up.
     changelog_refresh_admin_snapshot!(repo)
   end
   unless failed.empty?

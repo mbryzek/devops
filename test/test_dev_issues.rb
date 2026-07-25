@@ -65,7 +65,7 @@ class TestDevIssues < Minitest::Test
     )
   end
 
-  def fixed_issue(deployment: { "app" => "clubaid-app", "baseline_version" => "0.1.4" })
+  def fixed_issue(deployment: { "app" => "playbook-app", "baseline_version" => "0.1.4" })
     graph_issue.merge(
       "status" => "fixed",
       "fixed_at" => "2026-07-10T09:00:00Z",
@@ -348,7 +348,7 @@ class TestDevIssues < Minitest::Test
 
   def test_status_app_without_baseline_version_is_rejected
     out, status = capture_stderr_and_exit do
-      cmd_issues_status(["034", "--status", "fixed", "--url", "https://pr/1", "--app", "clubaid-app"])
+      cmd_issues_status(["034", "--status", "fixed", "--url", "https://pr/1", "--app", "playbook-app"])
     end
     assert_equal 1, status
     assert_match(/--app requires --baseline-version/, out)
@@ -375,9 +375,9 @@ class TestDevIssues < Minitest::Test
   def test_fix_deployment_reads_the_latest_fix
     issue = graph_issue.merge("fixes" => [
       { "url" => "https://pr/1", "deployment" => { "app" => "platform", "baseline_version" => "0.0.1" } },
-      { "url" => "https://pr/2", "deployment" => { "app" => "clubaid-app", "baseline_version" => "0.1.4" } },
+      { "url" => "https://pr/2", "deployment" => { "app" => "playbook-app", "baseline_version" => "0.1.4" } },
     ])
-    assert_equal({ "app" => "clubaid-app", "baseline_version" => "0.1.4" }, issue_fix_deployment(issue))
+    assert_equal({ "app" => "playbook-app", "baseline_version" => "0.1.4" }, issue_fix_deployment(issue))
   end
 
   def test_fix_deployment_nil_for_document_fix_and_no_fixes

@@ -76,10 +76,14 @@ class TestDevPending < Minitest::Test
 end
 
 # deploy_items derives DB repos from the apps registry (scala apps ship a
-# "<app>-postgresql" repo), NOT from a filesystem glob — so abandoned
+# "<repo>-postgresql" repo), NOT from a filesystem glob — so abandoned
 # *-postgresql checkouts next to the apps are never picked up.
 class TestPendingItems < Minitest::Test
-  FakeApp = Struct.new(:name, :stack, keyword_init: true)
+  FakeApp = Struct.new(:name, :stack, :repo, keyword_init: true) do
+    # Mirrors Work::Registry::App: the repo (and so the checkout dir) defaults to
+    # the app name but can differ once an app is rebranded ahead of its repo.
+    def repo_name = (repo || name).split("/").last
+  end
 
   class FakeRegistry
     def initialize(apps, deploy_tracked)
@@ -100,6 +104,27 @@ class TestPendingItems < Minitest::Test
   end
 
   def names = deploy_items.map(&:first)
+
+  def dirs = deploy_items.to_h { |name, dir, _| [name, dir] }
+
+  # A deployable can be rebranded ahead of its repo, and the checkout on disk is
+  # named for the repo — so the deploy list must follow `repo`, not `name`. Getting
+  # this wrong makes `dev deploy status` report "no checkout" for a renamed app.
+  def test_checkout_dir_follows_the_repo_not_the_app_name
+    apps = [FakeApp.new(name: "playbook-www", stack: :sveltekit, repo: "mbryzek/clubaid-www")]
+    with_registry(apps) do
+      assert_includes names, "playbook-www"
+      assert_equal File.expand_path("~/code/clubaid-www"), dirs["playbook-www"]
+    end
+  end
+
+  def test_db_repo_follows_the_repo_not_the_app_name
+    apps = [FakeApp.new(name: "playbook", stack: :scala, repo: "mbryzek/platform")]
+    with_registry(apps) do
+      assert_includes names, "platform-postgresql"
+      refute_includes names, "playbook-postgresql"
+    end
+  end
 
   def test_derives_db_repo_per_scala_app
     apps = [

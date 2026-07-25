@@ -70,7 +70,7 @@ end
 # outside world (Claude, git, ISS lookup, admin snapshot) stubbed. Asserts the thing
 # that matters: one Claude session per BATCH, not per version.
 class TestDevChangelogBuild < Minitest::Test
-  APPS = %w[clubaid-admin].freeze
+  APPS = %w[playbook-admin].freeze
 
   def setup
     @repo = Dir.mktmpdir("changelog-lake")
@@ -84,15 +84,15 @@ class TestDevChangelogBuild < Minitest::Test
   end
 
   def write_tag(version, released_at, commits)
-    dir = File.join(@repo, "clubaid-admin")
+    dir = File.join(@repo, "playbook-admin")
     FileUtils.mkdir_p(dir)
     File.write(File.join(dir, "#{version}.tag.json"),
-               JSON.generate("application" => "clubaid-admin", "version" => version,
+               JSON.generate("application" => "playbook-admin", "version" => version,
                              "released_at" => released_at, "commits" => commits))
   end
 
   def notes(version)
-    f = File.join(@repo, "clubaid-admin", "#{version}.notes.json")
+    f = File.join(@repo, "playbook-admin", "#{version}.notes.json")
     File.exist?(f) ? JSON.parse(File.read(f)) : nil
   end
 
@@ -104,7 +104,10 @@ class TestDevChangelogBuild < Minitest::Test
     inputs = @inputs
     pushed = @pushed
     Object.send(:define_method, :ensure_changelog_repo!) { repo }
+    # The ISS map is keyed by repo slug, the app is playbook-admin: the build has to
+    # bridge the two, so pin the mapping rather than depending on a generated dist/.
     Object.send(:define_method, :changelog_issue_map) { |_localhost| { "clubaid-admin#412" => "034" } }
+    Object.send(:define_method, :changelog_app_repo) { |_app| "clubaid-admin" }
     Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r| nil }
     Object.send(:define_method, :changelog_git_commit_push!) { |_dir, message| pushed << message }
     Object.send(:define_method, :changelog_run_claude) do |_r, input_path, version_count|
@@ -122,7 +125,7 @@ class TestDevChangelogBuild < Minitest::Test
   end
 
   def build(*args)
-    out, = capture_io { cmd_changelog_build(["--app", "clubaid-admin"] + args) }
+    out, = capture_io { cmd_changelog_build(["--app", "playbook-admin"] + args) }
     out
   end
 
@@ -154,15 +157,23 @@ class TestDevChangelogBuild < Minitest::Test
     assert_equal [%w[0.0.2], %w[0.0.1]], @inputs.map { |i| i["versions"].map { |v| v["version"] } }
   end
 
+  # The page links PRs off the repo, which is not the app name, so the CLI stamps it
+  # deterministically after the session rather than trusting the model to echo it.
+  def test_notes_are_stamped_with_the_repo
+    write_tag("0.3.0", "2026-07-20T14:00:00-04:00", [])
+    build
+    assert_equal "clubaid-admin", notes("0.3.0")["repo"]
+  end
+
   def test_input_payload_carries_commits_and_resolved_issue
     write_tag("0.3.0", "2026-07-20T14:00:00-04:00",
               [{ "sha" => "abc", "subject" => "Add changelog page (#412)", "body" => "b", "pr_number" => 412 },
                { "sha" => "def", "subject" => "Bump version", "body" => "", "pr_number" => nil }])
     build
     v = @inputs[0]["versions"][0]
-    assert_equal "clubaid-admin", v["application"]
+    assert_equal "playbook-admin", v["application"]
     assert_equal "0.3.0", v["version"]
-    assert_equal File.join(@repo, "clubaid-admin", "0.3.0.notes.json"), v["notes_file"]
+    assert_equal File.join(@repo, "playbook-admin", "0.3.0.notes.json"), v["notes_file"]
     assert_equal "034", v["commits"][0]["issue_number"]
     assert_nil v["commits"][1]["issue_number"]
   end
@@ -171,8 +182,8 @@ class TestDevChangelogBuild < Minitest::Test
   # partially failed batch only asks about what is still missing.
   def test_existing_notes_are_skipped
     2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
-    File.write(File.join(@repo, "clubaid-admin", "0.3.0.notes.json"),
-               JSON.generate("application" => "clubaid-admin", "version" => "0.3.0", "entries" => []))
+    File.write(File.join(@repo, "playbook-admin", "0.3.0.notes.json"),
+               JSON.generate("application" => "playbook-admin", "version" => "0.3.0", "entries" => []))
     build
     assert_equal %w[0.3.1], @inputs[0]["versions"].map { |v| v["version"] }
   end

@@ -9,7 +9,12 @@ class ReleaseHelper
     end
 
     @pwd = `pwd`.strip
-    @app = @pwd.strip.split("/").last
+    # The checkout directory names the repo, which is not always the app name (a
+    # deployable can be rebranded ahead of its repo — playbook-www lives in
+    # mbryzek/clubaid-www). Resolve the config by repo, then use its canonical app
+    # name for everything downstream (release dir, Cloudflare project, tags).
+    @config = Config.load_by_dir(@pwd.split("/").last)
+    @app = @config.name
     if app_type == "sveltekit"
       @release_dir = nil
     else
@@ -18,7 +23,6 @@ class ReleaseHelper
         Util.exit_with_error("Release directory #{@release_dir} does not exist")
       end
     end
-    @config = Config.load(@app)
     @app_config = @config.send(app_type.to_sym)
     if @app_config.nil?
       Util.exit_with_error("No #{app_type} config found for app '#{@app}'")

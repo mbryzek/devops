@@ -5,9 +5,21 @@
 
 load File.join(File.dirname(__FILE__), 'lib/common.rb')
 
+# Both the pkl sources (../env/apps) and the output (dist) are resolved relative to
+# this script, not the caller's cwd — Config.regenerate calls it from whatever app
+# checkout a release is running in.
+Dir.chdir(File.dirname(__FILE__))
+
 args = Args.parse(ARGV)
 
 args.info ""
+
+# No env checkout (a scratch clone, or a deploy box shipping a prebuilt dist): leave
+# dist alone rather than emptying it.
+if !File.directory?("../env/apps")
+    args.info "No ../env/apps checkout - leaving dist/ as is"
+    return
+end
 
 if !File.directory?("dist")
     Util.run("mkdir dist")
