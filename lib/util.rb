@@ -148,7 +148,10 @@ module Util
       end
 
       if !quiet && !(Util.quiet? && passthrough)
-          puts "==> #{cmd}"
+          # stderr, not stdout: stdout is a data channel for several devops
+          # scripts (bin/env emits shell that the caller evals, bin/db emits a
+          # URL), and a "==> ..." line mixed into it corrupts the consumer.
+          $stderr.puts "==> #{cmd}"
       end
       if !system(cmd)
         if !ignore_error
