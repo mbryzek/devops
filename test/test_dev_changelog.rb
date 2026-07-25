@@ -66,6 +66,41 @@ class TestDevChangelogTimeout < Minitest::Test
   end
 end
 
+# changelog_app_repo maps a deployable to its GitHub repo (the checkout directory).
+# It must degrade to the app name rather than raise when the app is not configured —
+# `dev changelog` is best-effort and never fails a release.
+class TestChangelogAppRepo < Minitest::Test
+  def with_apps(apps)
+    orig = Config.method(:all)
+    Config.define_singleton_method(:all) { apps }
+    yield
+  ensure
+    Config.define_singleton_method(:all, orig)
+  end
+
+  def setup
+    # changelog_app_repo memoizes per process; clear it between cases.
+    Object.send(:remove_instance_variable, :@changelog_app_repos) if Object.instance_variable_defined?(:@changelog_app_repos)
+  end
+
+  def test_resolves_an_app_to_its_repo
+    app = App.new("name" => "playbook-www", "port" => 80, "repo" => "mbryzek/clubaid-www")
+    with_apps([app]) { assert_equal "clubaid-www", changelog_app_repo("playbook-www") }
+  end
+
+  def test_unconfigured_app_keeps_its_name
+    with_apps([]) { assert_equal "rallyd", changelog_app_repo("rallyd") }
+  end
+
+  def test_a_config_failure_is_not_fatal
+    orig = Config.method(:all)
+    Config.define_singleton_method(:all) { raise "no env checkout" }
+    assert_equal "rallyd", changelog_app_repo("rallyd")
+  ensure
+    Config.define_singleton_method(:all, orig)
+  end
+end
+
 # Exercises the real cmd_changelog_build against a temp data lake, with only the
 # outside world (Claude, git, ISS lookup, admin snapshot) stubbed. Asserts the thing
 # that matters: one Claude session per BATCH, not per version.
@@ -81,6 +116,9 @@ class TestDevChangelogBuild < Minitest::Test
 
   def teardown
     FileUtils.remove_entry(@repo)
+    # Unlike the other stubs, this one shadows a method other tests assert on, so put
+    # the real implementation back rather than leaking it across the suite.
+    Object.send(:define_method, :changelog_app_repo, @real_app_repo)
   end
 
   def write_tag(version, released_at, commits)
@@ -107,6 +145,7 @@ class TestDevChangelogBuild < Minitest::Test
     # The ISS map is keyed by repo slug, the app is playbook-admin: the build has to
     # bridge the two, so pin the mapping rather than depending on a generated dist/.
     Object.send(:define_method, :changelog_issue_map) { |_localhost| { "clubaid-admin#412" => "034" } }
+    @real_app_repo = Object.instance_method(:changelog_app_repo)
     Object.send(:define_method, :changelog_app_repo) { |_app| "clubaid-admin" }
     Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r| nil }
     Object.send(:define_method, :changelog_git_commit_push!) { |_dir, message| pushed << message }
