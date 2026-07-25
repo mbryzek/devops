@@ -101,6 +101,64 @@ class TestChangelogAppRepo < Minitest::Test
   end
 end
 
+# The capture summary is the only place that reports which checkouts were read, so a
+# missing checkout or a renamed repo has to be visible in it.
+class TestChangelogCaptureScanLine < Minitest::Test
+  def test_reports_tag_counts_and_the_latest_tag
+    line = changelog_capture_scan_line(app: "playbook-www", repo: "playbook-www",
+                                       tags: 41, new: 1, latest: "0.0.41")
+    assert_equal "  playbook-www: 41 tag(s), 1 new, latest 0.0.41", line
+  end
+
+  def test_names_the_repo_when_it_differs_from_the_app
+    line = changelog_capture_scan_line(app: "playbook-www", repo: "legacy-www",
+                                       tags: 0, new: 0, latest: nil)
+    assert_equal "  playbook-www (legacy-www): 0 tag(s), 0 new, latest (none)", line
+  end
+
+  def test_a_skipped_app_says_why
+    line = changelog_capture_scan_line(app: "playbook-app", repo: "playbook-app",
+                                       skipped: "skipped, no checkout at /x")
+    assert_equal "  playbook-app: skipped, no checkout at /x", line
+  end
+end
+
+# "snapshot already current" right after a successful build looks like a bug unless the
+# build's own output explains that the new notes had nothing to show.
+class TestChangelogSnapshotUnchangedReason < Minitest::Test
+  def test_explains_a_build_of_only_empty_notes
+    assert_includes changelog_snapshot_unchanged_reason(0, 2), "all 2 new note(s) had no user-facing changes"
+  end
+
+  def test_stays_silent_when_something_was_published
+    assert_equal "", changelog_snapshot_unchanged_reason(1, 2)
+  end
+
+  def test_stays_silent_when_nothing_was_built_at_all
+    assert_equal "", changelog_snapshot_unchanged_reason(0, 0)
+  end
+end
+
+class TestChangelogNotesEntryCount < Minitest::Test
+  def with_notes(contents)
+    Dir.mktmpdir("notes") do |dir|
+      f = File.join(dir, "n.json")
+      File.write(f, contents)
+      yield f
+    end
+  end
+
+  def test_counts_entries
+    with_notes(JSON.generate("entries" => [1, 2])) { |f| assert_equal 2, changelog_notes_entry_count(f) }
+  end
+
+  # Unreadable or malformed notes must not crash the summary; they just publish nothing.
+  def test_unreadable_notes_count_as_zero
+    with_notes("not json") { |f| assert_equal 0, changelog_notes_entry_count(f) }
+    assert_equal 0, changelog_notes_entry_count("/nonexistent/n.json")
+  end
+end
+
 # Exercises the real cmd_changelog_build against a temp data lake, with only the
 # outside world (Claude, git, ISS lookup, admin snapshot) stubbed. Asserts the thing
 # that matters: one Claude session per BATCH, not per version.
@@ -111,6 +169,8 @@ class TestDevChangelogBuild < Minitest::Test
     @repo = Dir.mktmpdir("changelog-lake")
     @inputs = []
     @pushed = []
+    @snapshots = []
+    @entries_by_version = {}
     stub_world!
   end
 
@@ -147,8 +207,10 @@ class TestDevChangelogBuild < Minitest::Test
     Object.send(:define_method, :changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
     @real_app_repo = Object.instance_method(:changelog_app_repo)
     Object.send(:define_method, :changelog_app_repo) { |_app| "legacy-admin" }
-    Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r| nil }
+    snapshots = @snapshots
+    Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r, **kw| snapshots << kw }
     Object.send(:define_method, :changelog_git_commit_push!) { |_dir, message| pushed << message }
+    entries_by_version = @entries_by_version
     Object.send(:define_method, :changelog_run_claude) do |_r, input_path, version_count|
       input = JSON.parse(File.read(input_path))
       inputs << input
@@ -156,7 +218,7 @@ class TestDevChangelogBuild < Minitest::Test
       input["versions"].each do |v|
         File.write(v["notes_file"], JSON.generate(
           "application" => v["application"], "version" => v["version"],
-          "released_at" => v["released_at"], "entries" => []
+          "released_at" => v["released_at"], "entries" => entries_by_version.fetch(v["version"], [])
         ))
       end
       ""
@@ -225,6 +287,18 @@ class TestDevChangelogBuild < Minitest::Test
                JSON.generate("application" => "playbook-admin", "version" => "0.3.0", "entries" => []))
     build
     assert_equal %w[0.3.1], @inputs[0]["versions"].map { |v| v["version"] }
+  end
+
+  # A release whose commits were all judged uninteresting still gets a notes file, but
+  # /admin/changelog never shows it. The summary has to separate the two so a build that
+  # produced nothing visible does not read as a build that published something.
+  def test_summary_separates_published_notes_from_empty_ones
+    2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    @entries_by_version["0.3.1"] = [{ "title" => "Something", "description" => "d" }]
+    out = build
+    assert_includes out, "wrote 2 notes file(s): 1 with release notes, 1 with no user-facing changes"
+    assert_includes out, "no user-facing changes: playbook-admin/0.3.0"
+    assert_equal [{ published: 1, empty: 1 }], @snapshots
   end
 
   # A session that returns without writing a file must not be reported as built —

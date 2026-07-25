@@ -3425,23 +3425,41 @@ def changelog_commits(checkout, range)
   end
 end
 
+# One line per app describing what capture actually looked at. Without it the
+# common "nothing new" outcome is indistinguishable from "scanned nothing at all":
+# an app whose checkout is missing, or whose repo was renamed out from under the
+# app name, silently contributes zero tags.
+def changelog_capture_scan_line(scan)
+  label = scan[:repo] == scan[:app] ? scan[:app] : "#{scan[:app]} (#{scan[:repo]})"
+  return "  #{label}: #{scan[:skipped]}" if scan[:skipped]
+
+  "  #{label}: #{scan[:tags]} tag(s), #{scan[:new]} new, latest #{scan[:latest] || '(none)'}"
+end
+
 def cmd_changelog_capture(args)
   apps = changelog_parse_flags(args)[:apps]
   repo = ensure_changelog_repo!
   written = []
+  scans = []
   apps.each do |app|
     checkout = changelog_app_checkout(app)
+    scan = { app: app, repo: changelog_app_repo(app), tags: 0, new: 0, latest: nil }
+    scans << scan
     unless Dir.exist?(File.join(checkout, ".git"))
+      scan[:skipped] = "skipped, no checkout at #{checkout}"
       warn "changelog: skipping #{app} (no checkout at #{checkout})"
       next
     end
     tags = changelog_git_out("-C", checkout, "tag", "--list", "--sort=creatordate")
            .split("\n").map(&:strip).reject(&:empty?)
+    scan[:tags] = tags.length
+    scan[:latest] = tags.last
     out_dir = File.join(repo, app)
     FileUtils.mkdir_p(out_dir)
     tags.each_with_index do |tag, i|
       file = File.join(out_dir, "#{tag}.tag.json")
       next if File.exist?(file)
+      scan[:new] += 1
       prev = i.positive? ? tags[i - 1] : nil
       range = prev ? "#{prev}..#{tag}" : tag
       released_at = changelog_git_out("-C", checkout, "log", "-1", "--format=%cI", tag).strip
@@ -3460,11 +3478,13 @@ def cmd_changelog_capture(args)
     end
   end
   if written.empty?
-    puts "changelog capture: nothing new"
+    puts "changelog capture: no new tags in #{scans.length} app(s)"
+    scans.each { |s| puts changelog_capture_scan_line(s) }
     return
   end
   changelog_git_commit_push!(repo, "changelog: capture #{written.length} release(s)\n\n#{written.join("\n")}")
-  puts "changelog capture: wrote #{written.length} file(s)"
+  puts "changelog capture: wrote #{written.length} file(s) from #{scans.length} app(s)"
+  scans.each { |s| puts changelog_capture_scan_line(s) }
   written.each { |w| puts "  #{w}" }
 end
 
@@ -3662,7 +3682,26 @@ end
 # Regenerate playbook-admin's committed snapshot and push it to the bot branch/PR.
 # Entirely best-effort: the notes are already committed to the lake by the time we
 # get here, so nothing in this path may fail the build.
-def changelog_refresh_admin_snapshot!(repo)
+# Entries in a notes file Claude just wrote. 0 means the session judged none of the
+# release's commits worth telling a human about — a legitimate outcome (a codegen-only
+# release), but one that makes the release invisible on /admin/changelog, so it has to
+# be reported rather than counted as a published note.
+def changelog_notes_entry_count(notes_file)
+  (JSON.parse(File.read(notes_file))["entries"] || []).length
+rescue StandardError
+  0
+end
+
+# Why the regenerated snapshot came out byte-identical. build-changelog.ts drops
+# releases with no entries, so a build made entirely of those cannot move the
+# snapshot — otherwise "already current" reads as a bug.
+def changelog_snapshot_unchanged_reason(published, empty)
+  return "" unless published.zero? && empty.positive?
+
+  " (all #{empty} new note(s) had no user-facing changes, so the page is unaffected)"
+end
+
+def changelog_refresh_admin_snapshot!(repo, published: 0, empty: 0)
   checkout = changelog_app_checkout(CHANGELOG_ADMIN_APP)
   unless Dir.exist?(File.join(checkout, ".git"))
     warn "changelog: no #{CHANGELOG_ADMIN_APP} checkout at #{checkout}; skipping the /admin/changelog snapshot"
@@ -3678,7 +3717,7 @@ def changelog_refresh_admin_snapshot!(repo)
   end
 
   if IO.popen(["git", "-C", wt, "status", "--porcelain"], err: File::NULL, &:read).to_s.strip.empty?
-    puts "changelog: /admin/changelog snapshot already current"
+    puts "changelog: /admin/changelog snapshot already current#{changelog_snapshot_unchanged_reason(published, empty)}"
     return
   end
 
@@ -3741,9 +3780,12 @@ def cmd_changelog_build(args)
   unless built.empty?
     changelog_git_commit_push!(repo, "changelog: build notes for #{built.length} version(s)\n\n" \
                                      "#{built.map { |p| "#{p[:app]}/#{p[:version]}" }.join("\n")}")
-    puts "changelog build: wrote #{built.length} notes file(s)"
+    published, empty = built.partition { |p| changelog_notes_entry_count(p[:notes_file]).positive? }
+    puts "changelog build: wrote #{built.length} notes file(s): " \
+         "#{published.length} with release notes, #{empty.length} with no user-facing changes"
+    empty.each { |p| puts "  no user-facing changes: #{p[:app]}/#{p[:version]}" }
     # New notes are useless until playbook-admin's committed snapshot catches up.
-    changelog_refresh_admin_snapshot!(repo)
+    changelog_refresh_admin_snapshot!(repo, published: published.length, empty: empty.length)
   end
   unless failed.empty?
     Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry): " \
