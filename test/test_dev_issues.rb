@@ -69,7 +69,7 @@ class TestDevIssues < Minitest::Test
     graph_issue.merge(
       "status" => "fixed",
       "fixed_at" => "2026-07-10T09:00:00Z",
-      "fixes" => [{ "url" => "https://github.com/mbryzek/clubaid-app/pull/1", "deployment" => deployment }.compact],
+      "fixes" => [{ "url" => "https://github.com/mbryzek/playbook-app/pull/1", "deployment" => deployment }.compact],
     )
   end
 
@@ -182,8 +182,8 @@ class TestDevIssues < Minitest::Test
     assert_equal %w[graphs worker insights], ISSUE_CATEGORIES
   end
 
-  def test_graphs_body_orients_to_clubaid_app
-    assert_includes issue_body_text("graphs"), "mbryzek/clubaid-app"
+  def test_graphs_body_orients_to_playbook_app
+    assert_includes issue_body_text("graphs"), "mbryzek/playbook-app"
   end
 
   def test_worker_body_orients_to_the_crawl_pipeline
@@ -196,7 +196,7 @@ class TestDevIssues < Minitest::Test
   def test_insights_body_orients_to_generation_quality
     body = issue_body_text("insights")
     assert_includes body, "playbook"                  # the generation subproject
-    assert_includes body, "mbryzek/clubaid-admin"     # where insights are reviewed
+    assert_includes body, "mbryzek/playbook-admin"    # where insights are reviewed
     assert_includes body, "checklist"                 # rejected-checklist-item feedback
   end
 

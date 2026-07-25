@@ -2,7 +2,7 @@
 
 Insights are the platform's generated, reviewed recommendations for a club. An issue in this
 category is a **quality** complaint about that generation — a defect an admin found while
-reviewing an insight in clubaid-admin (wrong section content, a miscomputed metric, a rendering
+reviewing an insight in playbook-admin (wrong section content, a miscomputed metric, a rendering
 problem, or a generation bug), or the feedback an admin left when rejecting a proposed checklist
 item. The fix is almost never a one-off data patch; it is an improvement to how insights are
 generated, so this routes to the insight-generation improvement session.
@@ -20,7 +20,7 @@ generated, so this routes to the insight-generation improvement session.
   is wrong or missing on a reviewed insight is often a spec question. Insight data lives in the
   `playbook` schema (`insights`, `insight_runs`, `insight_sections`, `insight_reviews`,
   `insight_judgments`, `checklist_item_insights`, ...).
-- **Review (frontend)**: repo `mbryzek/clubaid-admin` (Elm + Tailwind) — where an admin reads an
+- **Review (frontend)**: repo `mbryzek/playbook-admin` (SvelteKit + Tailwind) — where an admin reads an
   insight, votes on sections, and accepts/rejects proposed checklist items. A "rendering" or
   "wrong section content" complaint may be the console, but is more often the generated content
   itself.
@@ -40,7 +40,7 @@ generated, so this routes to the insight-generation improvement session.
 - **Trace the defect to its stage.** Wrong section content or a bad recommendation → the
   synthesis/revision prompts and the investigate stage that fed them. A miscomputed metric →
   the aggregate/service the stage read from (fix the computation, not the rendered number). A
-  rendering bug → the clubaid-admin insight page.
+  rendering bug → the playbook-admin insight page.
 - **Club** (when present) is the club whose insight was under review — reproduce against that
   club's shape of data.
 
@@ -50,8 +50,8 @@ generated, so this routes to the insight-generation improvement session.
    (`scala.general.mdc`, `scala.daos.mdc`, `scala.test.helpers.mdc`, `database.general.mdc`,
    and `apibuilder.general.mdc` if the contract changes; `elm.*.mdc` for a console fix).
 2. Work in a feature dir under `~/code/ai/` (branch name ≤ 19 chars, e.g. `iss-insight-<date>`);
-   clone `platform` (plus `clubaid-admin` if the fix is in the console, and `platform-postgresql`
-   for any schema change). Never edit `~/code/platform` or `~/code/clubaid-admin` directly.
+   clone `platform` (plus `playbook-admin` if the fix is in the console, and `platform-postgresql`
+   for any schema change). Never edit `~/code/platform` or `~/code/playbook-admin` directly.
 3. Group related issues into one branch/PR — one root cause, one fix.
 4. Verify: a scoped `sbt` spec that FAILS without your fix, run against the isolated Docker
    session DB (`eval "$(~/code/devops/bin/claude-db start | grep '^CONF_DB_DEV_URL=' | sed

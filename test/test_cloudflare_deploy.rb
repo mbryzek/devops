@@ -17,7 +17,7 @@ class TestCloudflareDeploy < Minitest::Test
 
   # A mirror target (playbook-www -> plybk-www) deploys to a project that is not named after
   # the app; the explicit value must win over the default. The same pin is what keeps the
-  # primary target on the existing clubaid-www project now that the app is playbook-www.
+  # primary target on the pre-rename project name when an app is renamed.
   def test_explicit_pages_project_wins
     target = deploy('cloudflare_account' => 'playbook', 'pages_project' => 'plybk-www')
     assert_equal "plybk-www", target.pages_project_for("playbook-www")
@@ -28,8 +28,8 @@ class TestCloudflareDeploy < Minitest::Test
   end
 end
 
-# An app can be rebranded ahead of its GitHub repo (playbook-www still lives in
-# mbryzek/clubaid-www). Everything filesystem- or git-facing keys off the repo.
+# An app can be rebranded ahead of its GitHub repo. Everything filesystem- or
+# git-facing keys off the repo, so `repo_name` must win over `name` when they differ.
 class TestAppRepoName < Minitest::Test
   def app(json_data)
     App.new({ 'name' => 'playbook-www', 'port' => 80 }.merge(json_data))
@@ -40,7 +40,7 @@ class TestAppRepoName < Minitest::Test
   end
 
   def test_uses_the_configured_repo
-    assert_equal "clubaid-www", app('repo' => 'mbryzek/clubaid-www').repo_name
+    assert_equal "legacy-www", app('repo' => 'mbryzek/legacy-www').repo_name
   end
 
   def test_ignores_an_empty_repo

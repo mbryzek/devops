@@ -111,10 +111,10 @@ class TestPendingItems < Minitest::Test
   # named for the repo — so the deploy list must follow `repo`, not `name`. Getting
   # this wrong makes `dev deploy status` report "no checkout" for a renamed app.
   def test_checkout_dir_follows_the_repo_not_the_app_name
-    apps = [FakeApp.new(name: "playbook-www", stack: :sveltekit, repo: "mbryzek/clubaid-www")]
+    apps = [FakeApp.new(name: "playbook-www", stack: :sveltekit, repo: "mbryzek/legacy-www")]
     with_registry(apps) do
       assert_includes names, "playbook-www"
-      assert_equal File.expand_path("~/code/clubaid-www"), dirs["playbook-www"]
+      assert_equal File.expand_path("~/code/legacy-www"), dirs["playbook-www"]
     end
   end
 
@@ -517,7 +517,7 @@ class TestProdStatus < Minitest::Test
   end
 
   def test_git_only_when_no_prod_probe
-    # No prod url and no docker_k8s (e.g. clubaid-app): nothing to ask.
+    # No prod url and no docker_k8s (e.g. playbook-app): nothing to ask.
     assert_equal({}, prod_status(FakeRegistry.new(nil), app, "0.0.1"))
   end
 

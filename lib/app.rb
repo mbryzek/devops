@@ -16,9 +16,9 @@ class App
   end
 
   # The GitHub repository name, which is also the checkout directory under ~/code.
-  # A deployable can be renamed ahead of its repo (playbook-www still lives in
-  # mbryzek/clubaid-www), so anything filesystem- or git-facing keys off this, not
-  # off `name`. Defaults to the app name, which is the case for every other app.
+  # Defaults to the app name — the case for every app today — but a deployable can be
+  # renamed ahead of its repo, so anything filesystem- or git-facing keys off this
+  # rather than off `name`.
   def repo_name
     @repo.nil? || @repo.empty? ? @name : @repo.split("/").last
   end
@@ -56,7 +56,7 @@ class CloudflareDeploy
 
   # The Cloudflare Pages project this target deploys to. Defaults to the app name: every
   # Pages app names its project after itself, and only a mirror target that deviates (e.g.
-  # clubaid-www -> "plybk-www") sets pages_project explicitly. Always resolving a name keeps
+  # playbook-www -> "plybk-www") sets pages_project explicitly. Always resolving a name keeps
   # `wrangler pages deploy` non-interactive — see release-sveltekit.
   def pages_project_for(app_name)
     @pages_project || app_name

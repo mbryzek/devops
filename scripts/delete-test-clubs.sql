@@ -100,7 +100,7 @@ delete from playbook.checklist_item_comments        where checklist_item_id in (
 delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
 delete from playbook.watermarks                     where club_id in (select id from _del_clubs);
 
--- ---- playbook (former clubaid schema) --------------------------------------
+-- ---- playbook ---------------------------------------------------------------
 delete from playbook.ai_messages                     where chat_id in (select id from _del_ai_chats);
 delete from playbook.ai_chats                         where club_id in (select id from _del_clubs);
 delete from playbook.suggestion_notes                where suggestion_id in (select id from _del_suggestions);

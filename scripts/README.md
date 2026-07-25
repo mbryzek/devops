@@ -13,7 +13,7 @@ Two kinds of scripts live here:
   the utility. Example: `delete-test-clubs.sql`.
 - **Wrappers** — thin executables that invoke a script living in another repo
   (it's coupled to that repo's helpers/config, so it stays there). Example:
-  `clubaid-data-diff` wraps `platform/scripts/clubaid-data-diff.scala`. This lets
+  `rename-xlsx-period` wraps `misc/rename-xlsx-period.scala`. This lets
   `dev scripts list` index *every* utility without relocating coupled suites.
 
 Adding a script (or wrapper) = drop a file here. No `dev` CLI changes required.
@@ -52,6 +52,5 @@ the script type:
   is forwarded to the script** (an optional leading `--` separator is dropped, and
   `--env`/`--prod` belong to the inner script, not the runner). A wrapper owns its
   own environment — see its header for how it reaches prod and whether it prompts
-  first (e.g. `clubaid-credentials` confirms before a prod write; `clubaid-data-diff`
-  is a read-only prod diff and does not). Their `targets=local` just means "the
-  wrapper runs on your machine."
+  first: a wrapper that writes to prod is expected to confirm, a read-only one is
+  not. Their `targets=local` just means "the wrapper runs on your machine."

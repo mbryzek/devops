@@ -5,9 +5,9 @@ orientation (pipeline map, decoding guide, working rules) for fixing that catego
 
 | file               | category   | orients the session to                                    |
 | ------------------ | ---------- | --------------------------------------------------------- |
-| `graphs-body.md`   | `graphs`   | the native graph dashboards in clubaid-app                |
+| `graphs-body.md`   | `graphs`   | the native graph dashboards in playbook-app                |
 | `worker-body.md`   | `worker`   | the async workers — chiefly the Court Reserve pipeline    |
-| `insights-body.md` | `insights` | insight-generation quality (playbook + clubaid-admin)     |
+| `insights-body.md` | `insights` | insight-generation quality (playbook + playbook-admin)     |
 
 Each is read by **`dev issues claim --category <category>`** (`bin/dev`), which claims that
 category's open issues and appends the matching body to the plan it writes under

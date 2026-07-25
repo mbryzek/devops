@@ -993,7 +993,7 @@ end
 def issue_summary_line(issue, index)
   title = issue["title"].to_s.gsub(/\s+/, " ").strip
   title = "#{title[0, 57]}..." if title.length > 60
-  # club is clubaid-only context: absent on fleet-wide auto-filed issues.
+  # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
   "  #{index}. #{issue_label(issue)} · #{issue['category']} · #{issue['status']} · #{club}#{title}"
 end
@@ -1534,8 +1534,7 @@ def needs_deploy?(d)
 end
 
 # The local checkout of a deployable: ~/code/<repo>, which is not always
-# ~/code/<app name> — a deployable can be rebranded ahead of its repo
-# (playbook-www is still checked out as clubaid-www).
+# ~/code/<app name> — a deployable can be rebranded ahead of its repo.
 def app_checkout_dir(app)
   File.expand_path("~/code/#{app.repo_name}")
 end
@@ -3246,7 +3245,7 @@ def cmd_slow_routes(args)
 
   top = rows.first
   server_dominant = top["p75_ttfb_ms"].to_f >= 0.5 * [top["p75_load_ms"].to_f, 1.0].max
-  app_repo = top["app"] == "admin" ? "clubaid-admin" : "clubaid-app"
+  app_repo = top["app"] == "admin" ? "playbook-admin" : "playbook-app"
   puts ""
   puts Util.underline("Claude handoff - paste to investigate the worst route")
   puts <<~PROMPT
@@ -3270,7 +3269,7 @@ end
 # Apps whose releases feed the changelog. Each tags independently with its own
 # semver sequence; the app name is also its GitHub repo slug (mbryzek/<app>) and
 # its local sibling checkout (~/code/<app>) we read git history from. platform is
-# intentionally excluded: its monorepo tag spans HOA/acumen/clubaid.
+# intentionally excluded: its monorepo tag spans HOA/acumen/playbook.
 CHANGELOG_APPS = %w[playbook-admin playbook-app playbook-www].freeze
 
 # Judgment + summarization quality matters here, so use a stronger model than the
@@ -3321,8 +3320,8 @@ def changelog_app_checkout(app)
   File.expand_path("~/code/#{changelog_app_repo(app)}")
 end
 
-# The GitHub repo backing a changelog app. Not always the app name: playbook-admin
-# and friends are branded ahead of their repos, which are still mbryzek/clubaid-*.
+# The GitHub repo backing a changelog app. They match today, but a deployable can be
+# rebranded ahead of its repo, and the page links PRs off the repo.
 # Goes through Config (which rebuilds dist/ from the env pkl sources once per process)
 # rather than reading dist/ directly: dist/ is an untracked build artifact, and a stale
 # one silently resolves a renamed app back to its own name — which reads as "no
@@ -3498,7 +3497,7 @@ rescue StandardError => e
   warn "changelog: could not stamp repo on #{p[:notes_file]}: #{e.message}"
 end
 
-# Map "<repo-slug>#<pr-number>" => issue number, from clubaid issues that carry a
+# Map "<repo-slug>#<pr-number>" => issue number, from playbook issues that carry a
 # fix linked to a mbryzek PR. Best-effort: any failure yields an empty map so the
 # build still produces notes, just without ISS links.
 def changelog_issue_map(use_localhost)
@@ -3596,8 +3595,8 @@ end
 CHANGELOG_ADMIN_APP = "playbook-admin".freeze
 CHANGELOG_ADMIN_BRANCH = "changelog-data".freeze
 
-# The GitHub repo of the admin app, still mbryzek/clubaid-admin until the repo
-# rename catches up with the deployable name.
+# The GitHub repo of the admin app. Resolved rather than hardcoded: it tracks the
+# deployable's configured repo, which can differ from its name.
 def changelog_admin_repo
   "mbryzek/#{changelog_app_repo(CHANGELOG_ADMIN_APP)}"
 end

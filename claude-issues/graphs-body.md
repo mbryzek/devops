@@ -1,6 +1,6 @@
 ## How this pipeline works
 
-- **Frontend**: repo `mbryzek/clubaid-app` (SvelteKit, app.clubaid.co). Dashboard pages under
+- **Frontend**: repo `mbryzek/playbook-app` (SvelteKit, app.clubaid.co). Dashboard pages under
   `src/routes/graphs/` (member, financial, court, staff, forecasting, ...); each page's
   `+page.server.ts` fetches aggregates via the generated playbook client
   (`src/generated/com-bryzek-playbook.ts`) and streams them un-awaited (`streamAggregate`).
@@ -29,11 +29,11 @@
 
 1. Read `~/code/CLAUDE.md` and the relevant `~/code/claude/rules/*.mdc` files first.
 2. Work in a feature dir under `~/code/ai/` (branch name ≤ 19 chars, e.g. `iss-graphs-<date>`);
-   clone `clubaid-app` (and `platform` + `devops` sibling only if the fix is backend/codegen).
-   Never edit `~/code/clubaid-app` or `~/code/platform` directly.
+   clone `playbook-app` (and `platform` + `devops` sibling only if the fix is backend/codegen).
+   Never edit `~/code/playbook-app` or `~/code/platform` directly.
 3. Group related issues into one branch/PR; unrelated fixes may share the branch too —
    these are small dashboard fixes, one PR set per run is fine.
-4. Verify: `npm run check` + `npm run test:unit` (clubaid-app); scoped `sbt` specs for any
+4. Verify: `npm run check` + `npm run test:unit` (playbook-app); scoped `sbt` specs for any
    platform change; visual pass with the `browse` tool against your own dev server (never
    Mike's running servers).
 5. Commit, push, open a DRAFT PR (`gh pr create --draft`), then mark it ready
