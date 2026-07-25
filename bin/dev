@@ -56,7 +56,7 @@ INVOCATIONS = {
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "changelog capture"   => 'changelog [capture] [--app APP]...',
-  "changelog build"     => 'changelog build [--app APP]... [--limit N] [--localhost]',
+  "changelog build"     => 'changelog build [--app APP]... [--limit N] [--batch-size N] [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -230,10 +230,11 @@ USAGE = <<~USAGE
         headless Claude session that judges which commits are worth a human note,
         summarizes them, and links each to its PR and (best-effort) in-house issue
         (ISS-###). Only versions without a notes file are built (cached — never
-        re-evaluated), one bounded Claude session per version, newest first; pass
-        --limit N to build only the N most recent pending versions (e.g. to seed
-        history without evaluating every past release). Enrichment uses your
-        persisted playbook session; run
+        re-evaluated), newest first, a batch of versions per Claude session
+        (--batch-size N to change the batch; session startup, not the notes
+        themselves, dominates the cost). Pass --limit N to build only the N most
+        recent pending versions (e.g. to seed history without evaluating every past
+        release). Enrichment uses your persisted playbook session; run
         `dev login --app playbook` once first. After writing notes it regenerates
         clubaid-admin's committed snapshot (src/lib/changelog/data.json, what
         /admin/changelog actually renders) in a scratch worktree and force-pushes it
@@ -3255,7 +3256,42 @@ CHANGELOG_APPS = %w[clubaid-admin clubaid-app clubaid-www].freeze
 # Judgment + summarization quality matters here, so use a stronger model than the
 # mechanical codegen sync (haiku).
 CHANGELOG_CLAUDE_MODEL = "sonnet".freeze
-CHANGELOG_CLAUDE_TIMEOUT_SECS = 20 * 60
+
+# Versions per Claude session. Each version is a small, independent commit list, so
+# batching them amortizes the ~15-30s session startup (process spawn, skill read,
+# tool setup) that used to be paid once per version — the dominant cost on a
+# backfill. Kept bounded so one session's context stays small, a bad commit set can
+# only poison its own batch, and a killed session loses at most this many versions
+# (already-written notes files are cached, so a re-run resumes). See also
+# CHANGELOG_BUILD_BATCH_COMMITS, the other half of the bound.
+CHANGELOG_BUILD_BATCH_SIZE = 10
+
+# Version count alone is a poor proxy for batch size: a typical release carries ~2
+# commits, but the first tag of an app carries its whole history (500+). So a batch
+# also closes once it has this many commits — a huge version travels alone rather
+# than dragging nine others into a context that cannot hold them.
+CHANGELOG_BUILD_BATCH_COMMITS = 100
+
+# Group newest-first pending versions into sessions, bounded by both version count
+# and cumulative commits. A single version over the commit bound still gets its own
+# batch (never dropped).
+def changelog_batches(pending, batch_size)
+  pending.each_with_object([]) do |p, batches|
+    current = batches.last
+    if current.nil? || current.length >= batch_size ||
+       current.sum { |q| q[:commit_count].to_i } + p[:commit_count].to_i > CHANGELOG_BUILD_BATCH_COMMITS
+      batches << [p]
+    else
+      current << p
+    end
+  end
+end
+
+# A batch gets proportionally longer to finish, but never less than a single
+# version's old budget, and never more than an hour.
+def changelog_claude_timeout_secs(version_count)
+  [[20 * 60, 5 * 60 * version_count].max, 60 * 60].min
+end
 
 def changelog_repo_dir
   File.expand_path("~/code/changelog")
@@ -3294,13 +3330,15 @@ def changelog_git_commit_push!(dir, message)
   warn "changelog: push failed (committed locally at #{dir})" unless system("git", "-C", dir, "push", "-q")
 end
 
-# Repeatable --app (defaults to all tracked apps), plus --localhost and --limit.
-# Rejects an unknown app loudly rather than silently producing nothing. Returns
-# { apps:, use_localhost:, limit: } (limit nil = no cap).
+# Repeatable --app (defaults to all tracked apps), plus --localhost, --limit and
+# --batch-size. Rejects an unknown app loudly rather than silently producing nothing.
+# Returns { apps:, use_localhost:, limit:, batch_size: } (limit nil = no cap,
+# batch_size nil = CHANGELOG_BUILD_BATCH_SIZE).
 def changelog_parse_flags(args)
   apps = []
   use_localhost = false
   limit = nil
+  batch_size = nil
   i = 0
   while i < args.length
     a = args[i]
@@ -3316,6 +3354,11 @@ def changelog_parse_flags(args)
       usage_exit("--limit requires a positive integer", example: usage_for("changelog build")) if v.nil? || v !~ /\A[1-9]\d*\z/
       limit = v.to_i
       i += 2
+    when "--batch-size"
+      v = args[i + 1]
+      usage_exit("--batch-size requires a positive integer", example: usage_for("changelog build")) if v.nil? || v !~ /\A[1-9]\d*\z/
+      batch_size = v.to_i
+      i += 2
     when "--localhost"
       use_localhost = true
       i += 1
@@ -3326,7 +3369,7 @@ def changelog_parse_flags(args)
     end
   end
   apps = CHANGELOG_APPS.dup if apps.empty?
-  { apps: apps.uniq, use_localhost: use_localhost, limit: limit }
+  { apps: apps.uniq, use_localhost: use_localhost, limit: limit, batch_size: batch_size }
 end
 
 # Commits in `range`, oldest-first, no merges. Extracts the squash-merge PR number
@@ -3399,7 +3442,7 @@ def changelog_pending(repo, apps)
       next if File.exist?(notes_file)
       tag = JSON.parse(File.read(tag_file)) rescue {}
       { app: app, version: version, tag_file: tag_file, notes_file: notes_file,
-        released_at: tag["released_at"].to_s }
+        released_at: tag["released_at"].to_s, commit_count: (tag["commits"] || []).length }
     end
   end.sort_by { |p| p[:released_at] }.reverse
 end
@@ -3431,13 +3474,17 @@ end
 
 # Headless Claude session that writes the notes files. Unlike spawn_claude (which
 # expects a PR URL), this only asks Claude to write files we validate afterwards.
-def changelog_run_claude(repo, input_path)
+def changelog_run_claude(repo, input_path, version_count)
+  timeout_secs = changelog_claude_timeout_secs(version_count)
   prompt = <<~PROMPT
     Follow the process in .claude/skills/changelog-build/SKILL.md exactly.
     Input file: #{input_path}
-    For each version under "versions", decide which commits are worth telling a human
-    about, write concise plain-language release notes, and write the result as JSON to
-    that version's "notes_file" path. Do not modify any other files; do not commit or push.
+    It lists #{version_count} version(s). For each version under "versions", decide which
+    commits are worth telling a human about, write concise plain-language release notes,
+    and write the result as JSON to that version's "notes_file" path. Write each file as
+    soon as you finish that version rather than batching the writes at the end. Every
+    version must get a file, even if its "entries" is empty. Do not modify any other
+    files; do not commit or push.
   PROMPT
   stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions",
                                            "--model", CHANGELOG_CLAUDE_MODEL, prompt,
@@ -3446,11 +3493,11 @@ def changelog_run_claude(repo, input_path)
   pid = wait_thr.pid
   output =
     begin
-      Timeout.timeout(CHANGELOG_CLAUDE_TIMEOUT_SECS) { out_err.read }
+      Timeout.timeout(timeout_secs) { out_err.read }
     rescue Timeout::Error
       begin Process.kill("TERM", -pid) rescue Errno::ESRCH end
       begin Process.kill("KILL", -pid) rescue Errno::ESRCH end
-      return "claude timed out after #{CHANGELOG_CLAUDE_TIMEOUT_SECS}s"
+      return "claude timed out after #{timeout_secs}s"
     ensure
       out_err.close unless out_err.closed?
     end
@@ -3458,7 +3505,11 @@ def changelog_run_claude(repo, input_path)
   output.to_s.force_encoding(Encoding::UTF_8).scrub
 end
 
-# One version's input payload for the Claude session, with ISS numbers resolved.
+# One batch's input payload for the Claude session, with ISS numbers resolved.
+def changelog_build_input(batch, iss_map)
+  { "versions" => batch.map { |p| changelog_version_input(p, iss_map) } }
+end
+
 def changelog_version_input(p, iss_map)
   tag = JSON.parse(File.read(p[:tag_file]))
   commits = (tag["commits"] || []).map do |c|
@@ -3471,13 +3522,13 @@ def changelog_version_input(p, iss_map)
       "issue_number" => pr ? iss_map["#{p[:app]}##{pr}"] : nil,
     }
   end
-  { "versions" => [{
+  {
     "application" => p[:app],
     "version" => p[:version],
     "released_at" => tag["released_at"],
     "notes_file" => p[:notes_file],
     "commits" => commits,
-  }] }
+  }
 end
 
 # --- /admin/changelog snapshot -------------------------------------------------
@@ -3602,23 +3653,29 @@ def cmd_changelog_build(args)
 
   iss_map = changelog_issue_map(flags[:use_localhost])
 
-  # One bounded Claude session per version: keeps context small, isolates a bad
-  # commit set to a single version, and makes a large backfill resumable (each
-  # written notes file is cached, so a re-run skips what already succeeded).
+  # One bounded Claude session per BATCH of versions: session startup dominated the
+  # old one-session-per-version loop, and each version's commit list is small enough
+  # that several fit comfortably in one context. Still bounded, so a bad commit set
+  # can only poison its own batch, and a large backfill stays resumable (each written
+  # notes file is cached, so a re-run skips what already succeeded).
   built = []
   failed = []
-  pending.each_with_index do |p, idx|
-    puts "changelog build [#{idx + 1}/#{pending.length}]: #{p[:app]}/#{p[:version]} via Claude (#{CHANGELOG_CLAUDE_MODEL})..."
+  batches = changelog_batches(pending, flags[:batch_size] || CHANGELOG_BUILD_BATCH_SIZE)
+  batches.each_with_index do |batch, idx|
+    puts "changelog build [batch #{idx + 1}/#{batches.length}]: #{batch.length} version(s) " \
+         "via Claude (#{CHANGELOG_CLAUDE_MODEL}): #{batch.map { |p| "#{p[:app]}/#{p[:version]}" }.join(', ')}"
     input_path = File.join(repo, "_build_input.json")
-    File.write(input_path, "#{JSON.pretty_generate(changelog_version_input(p, iss_map))}\n")
-    output = changelog_run_claude(repo, input_path)
+    File.write(input_path, "#{JSON.pretty_generate(changelog_build_input(batch, iss_map))}\n")
+    output = changelog_run_claude(repo, input_path, batch.length)
     File.delete(input_path) if File.exist?(input_path)
 
-    if File.exist?(p[:notes_file]) && (JSON.parse(File.read(p[:notes_file])) rescue false)
-      built << p
-    else
-      failed << p
-      warn "  failed (#{p[:app]}/#{p[:version]}): #{output.to_s.lines.last}"
+    batch.each do |p|
+      if File.exist?(p[:notes_file]) && (JSON.parse(File.read(p[:notes_file])) rescue false)
+        built << p
+      else
+        failed << p
+        warn "  failed (#{p[:app]}/#{p[:version]}): #{output.to_s.lines.last}"
+      end
     end
   end
 
