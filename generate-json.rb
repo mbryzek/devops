@@ -25,7 +25,10 @@ if !File.directory?("dist")
     Util.run("mkdir dist")
 end
 
-cmd = "pkl eval %s --format json  > dist/%s.%s.json"
+# Write through Util.write_atomically: `dev deploy` releases several apps in
+# parallel and every devops script rebuilds dist/ on load, so a redirect straight
+# into dist/ would let one generator truncate a file another process is reading.
+cmd = "pkl eval %s --format json > %s"
 
 `find ../env/apps -type f -name "*.pkl"`.strip.split("\n").each do |file|
     parts = file.split("/").drop(3)
@@ -34,7 +37,9 @@ cmd = "pkl eval %s --format json  > dist/%s.%s.json"
     end
     app = parts[0]
     name = parts[1].gsub(/\.pkl$/, "")
-    Util.run(cmd % [file, app, name], :quiet => args.quiet)
+    Util.write_atomically("dist/#{app}.#{name}.json") do |tmp|
+        Util.run(cmd % [file, tmp], :quiet => args.quiet)
+    end
 end
 
 

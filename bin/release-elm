@@ -9,6 +9,10 @@ LOG = "/tmp/release-elm.log"
 dir = File.dirname(__FILE__)
 load File.join(dir, "../lib/common.rb")
 
+# Parse args BEFORE anything touches Config: ReleaseHelper's constructor loads the
+# app config, which rebuilds dist/ unless --skip-generate-json has already been seen.
+Args.parse(ARGV)
+
 helper = ReleaseHelper.new("elm")
 
 # Turn elm.js -> elm.min.js

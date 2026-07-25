@@ -89,6 +89,10 @@ def ensure_wrangler_profile(label, acct)
   end
 end
 
+# Parse args BEFORE anything touches Config: ReleaseHelper's constructor loads the
+# app config, which rebuilds dist/ unless --skip-generate-json has already been seen.
+args = Args.parse(ARGV)
+
 helper = ReleaseHelper.new("sveltekit")
 
 unless system('which wrangler > /dev/null 2>&1')
@@ -118,7 +122,7 @@ end
 # --cloudflare-account LABEL narrows the release to a single account's target(s) — useful
 # to redeploy one side (e.g. after a failed deploy) without re-releasing the other.
 # Default (no flag): deploy every target configured for the app, in order.
-if account = Args.parse(ARGV).cloudflare_account
+if account = args.cloudflare_account
   matching = targets.select { |t| t.cloudflare_account == account }
   if matching.empty?
     configured = targets.map(&:cloudflare_account).uniq.join(", ")
