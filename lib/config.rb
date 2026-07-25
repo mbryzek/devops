@@ -1,6 +1,18 @@
 require 'json'
 
 module Config
+    # Passed by a script that spawns other devops scripts to say "dist/ is already
+    # current". Accepted by every script that parses args through Args, and by `dev`.
+    SKIP_REGENERATE_FLAG = "--skip-generate-json".freeze
+
+    # Treat dist/ as already rebuilt for the rest of this process. The memo in
+    # Config.regenerate is per-process, so without this every child of a release
+    # re-runs the pkl eval the parent just ran and prints its own "==> generate-json"
+    # line. Set by the arg parsers when SKIP_REGENERATE_FLAG is present.
+    def Config.skip_regenerate!
+        @regenerated = true
+    end
+
     def Config.env_from_args(args)
         args = Args.parse(ARGV, ["app"])
         Config.load(args.app).send(args.env)

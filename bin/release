@@ -39,7 +39,9 @@ files = if config.scala
   end
 
 files.each do |file|
-  cmd = File.join(dir, file) + " --app #{args.app}"
+  # Config.load above already rebuilt dist/ — children reuse it rather than each
+  # re-running generate-json.
+  cmd = File.join(dir, file) + " --app #{args.app} #{Config::SKIP_REGENERATE_FLAG}"
   cmd += " --verbose" if args.verbose
   # Only release-sveltekit understands per-account target selection.
   if file == "release-sveltekit" && args.cloudflare_account
@@ -53,6 +55,6 @@ end
 # hiccup can never block or fail a release. Only the tracked playbook* apps feed it.
 CHANGELOG_TRACKED = %w[playbook-admin playbook-app playbook-www].freeze
 if CHANGELOG_TRACKED.include?(args.app)
-  system(File.join(dir, "dev"), "changelog", "capture", "--app", args.app) ||
+  system(File.join(dir, "dev"), "changelog", "capture", "--app", args.app, Config::SKIP_REGENERATE_FLAG) ||
     warn("changelog capture failed (ignored) — run `dev changelog capture --app #{args.app}` later")
 end
