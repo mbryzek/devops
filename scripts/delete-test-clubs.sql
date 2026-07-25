@@ -20,10 +20,18 @@
 -- To regenerate the table list, query pg_constraint for FKs whose confrelid is
 -- a table in the delete universe, starting from playbook.clubs.
 begin;
+-- A concurrent scalatest run inserting into a child table would otherwise make the
+-- final clubs delete fail on an FK it cannot see. `for update` on the root set takes
+-- the same row lock an FK insert needs (FOR KEY SHARE), so child inserts against a
+-- targeted club block until we commit; lock_timeout turns a live test run into a fast,
+-- legible failure instead of an indefinite wait.
+set local lock_timeout = '10s';
 
 -- Root set + flattened id sets for every multi-level / cross subtree.
+-- Every delete below is scoped to this snapshot: clubs created after it (by a test run
+-- racing this script) are left entirely alone and cleaned up by the next run.
 create temp table _del_clubs on commit drop as
-  select id from playbook.clubs where id like 'club-%';
+  select id from playbook.clubs where id like 'club-%' for update;
 create unique index on _del_clubs (id);
 
 create temp table _del_insights on commit drop as
@@ -59,9 +67,6 @@ create unique index on _del_invocations (id);
 create temp table _del_issues on commit drop as
   select id from issues.issues where club_id in (select id from _del_clubs);
 create unique index on _del_issues (id);
-create temp table _del_suggestions on commit drop as
-  select id from playbook.suggestions where club_id in (select id from _del_clubs);
-create unique index on _del_suggestions (id);
 create temp table _del_checklist_items on commit drop as
   select id from playbook.checklist_items where club_id in (select id from _del_clubs);
 create unique index on _del_checklist_items (id);
@@ -103,8 +108,6 @@ delete from playbook.watermarks                     where club_id in (select id 
 -- ---- playbook ---------------------------------------------------------------
 delete from playbook.ai_messages                     where chat_id in (select id from _del_ai_chats);
 delete from playbook.ai_chats                         where club_id in (select id from _del_clubs);
-delete from playbook.suggestion_notes                where suggestion_id in (select id from _del_suggestions);
-delete from playbook.suggestions                      where club_id in (select id from _del_clubs);
 delete from playbook.user_club_notification_optouts  where club_id in (select id from _del_clubs);
 delete from playbook.user_clubs                       where club_id in (select id from _del_clubs);
 delete from playbook.user_invitations                where club_id in (select id from _del_clubs);
@@ -156,7 +159,14 @@ delete from court_reserve.membership_types          where club_id in (select id 
 -- ---- playbook members (scores/transitions -> members) ----------------------
 delete from playbook.member_engagement_scores       where club_id in (select id from _del_clubs);
 delete from playbook.member_segment_transitions     where club_id in (select id from _del_clubs);
+delete from playbook.member_engagement_backfills    where club_id in (select id from _del_clubs);
+delete from playbook.member_membership_intervals    where club_id in (select id from _del_clubs);
 delete from playbook.members                        where club_id in (select id from _del_clubs);
+
+-- ---- playbook coaches ------------------------------------------------------
+-- court_reserve.reservations.coach_id references coaches, so this must run after
+-- the reservation cluster above.
+delete from playbook.coaches                        where club_id in (select id from _del_clubs);
 
 -- ---- issues (tickets/attachments/comments/fixes -> issues) -----------------
 -- log_review_tickets FK-references issues.issues, and a Court Reserve finding scoped to a
@@ -177,14 +187,15 @@ delete from playbook.courts                          where club_id in (select id
 delete from user_tracking.page_views                where club_id in (select id from _del_clubs);
 
 -- ---- finally the clubs (self-FK NO ACTION handles parent/child subset) ------
-delete from playbook.clubs where id like 'club-%';
+delete from playbook.clubs where id in (select id from _del_clubs);
 
 do $$
 declare remaining int;
 begin
-  select count(*) into remaining from playbook.clubs where id like 'club-%';
-  if remaining <> 0 then raise exception 'Expected 0 club-%% remaining, found %', remaining; end if;
-  raise notice 'All club-%% test clubs and dependent rows deleted.';
+  select count(*) into remaining from playbook.clubs c
+    where exists (select 1 from _del_clubs d where d.id = c.id);
+  if remaining <> 0 then raise exception 'Expected 0 targeted clubs remaining, found %', remaining; end if;
+  raise notice 'All targeted club-%% test clubs and dependent rows deleted.';
 end $$;
 
 commit;
