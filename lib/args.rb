@@ -185,6 +185,10 @@ class Args
                 av.add("verbose", true)
             end
 
+            opts.on(Config::SKIP_REGENERATE_FLAG, "Reuse dist/ as-is instead of rebuilding it from the env pkl sources (the parent script already did)") do
+                Config.skip_regenerate!
+            end
+
             opts.on("--no-download", "If specified, do not download files") do
                 av.add("no_download", true)
             end

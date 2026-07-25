@@ -3761,6 +3761,8 @@ end
 
 if __FILE__ == $PROGRAM_NAME
   argv = ARGV.dup
+  # Global flag, stripped before dispatch so no subcommand parser has to know it.
+  Config.skip_regenerate! if argv.delete(Config::SKIP_REGENERATE_FLAG)
   usage_exit if argv.empty?
   usage_exit if %w[-h --help help].include?(argv.first)
 
