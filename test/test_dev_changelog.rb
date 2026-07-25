@@ -1,0 +1,188 @@
+#!/usr/bin/env ruby
+require 'minitest/autorun'
+require_relative 'test_helper'
+require 'tmpdir'
+require 'fileutils'
+require 'json'
+load File.expand_path('../bin/dev', __dir__)
+
+class TestDevChangelogFlags < Minitest::Test
+  include DevTestSupport
+
+  def test_defaults
+    f = changelog_parse_flags([])
+    assert_equal CHANGELOG_APPS, f[:apps]
+    assert_nil f[:limit]
+    assert_nil f[:batch_size]
+    refute f[:use_localhost]
+  end
+
+  def test_batch_size
+    assert_equal 3, changelog_parse_flags(%w[--batch-size 3])[:batch_size]
+  end
+
+  def test_batch_size_rejects_non_positive
+    [%w[--batch-size 0], %w[--batch-size x], %w[--batch-size]].each do |args|
+      err, status = capture_stderr_and_exit { changelog_parse_flags(args) }
+      refute_nil status, "expected #{args.inspect} to exit"
+      assert_includes err, "--batch-size requires a positive integer"
+    end
+  end
+end
+
+class TestDevChangelogBatches < Minitest::Test
+  def v(version, commits) = { version: version, commit_count: commits }
+
+  def versions(batches) = batches.map { |b| b.map { |p| p[:version] } }
+
+  def test_groups_up_to_batch_size
+    assert_equal [%w[a b], %w[c]],
+                 versions(changelog_batches([v("a", 1), v("b", 1), v("c", 1)], 2))
+  end
+
+  def test_closes_a_batch_on_the_commit_bound
+    batches = changelog_batches([v("a", 60), v("b", 60), v("c", 1)], 10)
+    assert_equal [%w[a], %w[b c]], versions(batches)
+  end
+
+  # The first tag of an app carries its whole history; it must still be built, alone.
+  def test_oversized_version_travels_alone
+    batches = changelog_batches([v("big", 517), v("a", 1)], 10)
+    assert_equal [%w[big], %w[a]], versions(batches)
+  end
+
+  def test_empty
+    assert_empty changelog_batches([], 10)
+  end
+end
+
+class TestDevChangelogTimeout < Minitest::Test
+  # A single version keeps the budget it had before batching; a batch scales up but
+  # is capped so a wedged session cannot hang the CLI indefinitely.
+  def test_scales_between_floor_and_ceiling
+    assert_equal 20 * 60, changelog_claude_timeout_secs(1)
+    assert_equal 50 * 60, changelog_claude_timeout_secs(10)
+    assert_equal 60 * 60, changelog_claude_timeout_secs(100)
+  end
+end
+
+# Exercises the real cmd_changelog_build against a temp data lake, with only the
+# outside world (Claude, git, ISS lookup, admin snapshot) stubbed. Asserts the thing
+# that matters: one Claude session per BATCH, not per version.
+class TestDevChangelogBuild < Minitest::Test
+  APPS = %w[clubaid-admin].freeze
+
+  def setup
+    @repo = Dir.mktmpdir("changelog-lake")
+    @inputs = []
+    @pushed = []
+    stub_world!
+  end
+
+  def teardown
+    FileUtils.remove_entry(@repo)
+  end
+
+  def write_tag(version, released_at, commits)
+    dir = File.join(@repo, "clubaid-admin")
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, "#{version}.tag.json"),
+               JSON.generate("application" => "clubaid-admin", "version" => version,
+                             "released_at" => released_at, "commits" => commits))
+  end
+
+  def notes(version)
+    f = File.join(@repo, "clubaid-admin", "#{version}.notes.json")
+    File.exist?(f) ? JSON.parse(File.read(f)) : nil
+  end
+
+  # Replace every boundary cmd_changelog_build crosses. `changelog_run_claude`
+  # records the payload it was handed and writes the notes files a real session
+  # would, so the caller's validation still runs for real.
+  def stub_world!
+    repo = @repo
+    inputs = @inputs
+    pushed = @pushed
+    Object.send(:define_method, :ensure_changelog_repo!) { repo }
+    Object.send(:define_method, :changelog_issue_map) { |_localhost| { "clubaid-admin#412" => "034" } }
+    Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r| nil }
+    Object.send(:define_method, :changelog_git_commit_push!) { |_dir, message| pushed << message }
+    Object.send(:define_method, :changelog_run_claude) do |_r, input_path, version_count|
+      input = JSON.parse(File.read(input_path))
+      inputs << input
+      raise "version_count disagrees with the payload" unless version_count == input["versions"].length
+      input["versions"].each do |v|
+        File.write(v["notes_file"], JSON.generate(
+          "application" => v["application"], "version" => v["version"],
+          "released_at" => v["released_at"], "entries" => []
+        ))
+      end
+      ""
+    end
+  end
+
+  def build(*args)
+    out, = capture_io { cmd_changelog_build(["--app", "clubaid-admin"] + args) }
+    out
+  end
+
+  def test_all_pending_versions_go_to_one_session
+    3.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    build
+    assert_equal 1, @inputs.length
+    assert_equal %w[0.3.2 0.3.1 0.3.0], @inputs[0]["versions"].map { |v| v["version"] }
+    assert_equal 1, @pushed.length
+    3.times { |i| refute_nil notes("0.3.#{i}") }
+  end
+
+  def test_batch_size_splits_into_multiple_sessions
+    5.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    build("--batch-size", "2")
+    assert_equal [2, 2, 1], @inputs.map { |i| i["versions"].length }
+    assert_equal %w[0.3.4 0.3.3 0.3.2 0.3.1 0.3.0],
+                 @inputs.flat_map { |i| i["versions"].map { |v| v["version"] } }
+  end
+
+  # End-to-end version of the commit bound: a fat version is not batched with others.
+  def test_commit_heavy_version_gets_its_own_session
+    write_tag("0.0.1", "2026-07-01T14:00:00-04:00",
+              Array.new(CHANGELOG_BUILD_BATCH_COMMITS + 1) do |i|
+                { "sha" => "s#{i}", "subject" => "c#{i}", "body" => "", "pr_number" => nil }
+              end)
+    write_tag("0.0.2", "2026-07-02T14:00:00-04:00", [])
+    build
+    assert_equal [%w[0.0.2], %w[0.0.1]], @inputs.map { |i| i["versions"].map { |v| v["version"] } }
+  end
+
+  def test_input_payload_carries_commits_and_resolved_issue
+    write_tag("0.3.0", "2026-07-20T14:00:00-04:00",
+              [{ "sha" => "abc", "subject" => "Add changelog page (#412)", "body" => "b", "pr_number" => 412 },
+               { "sha" => "def", "subject" => "Bump version", "body" => "", "pr_number" => nil }])
+    build
+    v = @inputs[0]["versions"][0]
+    assert_equal "clubaid-admin", v["application"]
+    assert_equal "0.3.0", v["version"]
+    assert_equal File.join(@repo, "clubaid-admin", "0.3.0.notes.json"), v["notes_file"]
+    assert_equal "034", v["commits"][0]["issue_number"]
+    assert_nil v["commits"][1]["issue_number"]
+  end
+
+  # Versions already carrying notes are never re-evaluated, so a re-run after a
+  # partially failed batch only asks about what is still missing.
+  def test_existing_notes_are_skipped
+    2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    File.write(File.join(@repo, "clubaid-admin", "0.3.0.notes.json"),
+               JSON.generate("application" => "clubaid-admin", "version" => "0.3.0", "entries" => []))
+    build
+    assert_equal %w[0.3.1], @inputs[0]["versions"].map { |v| v["version"] }
+  end
+
+  # A session that returns without writing a file must not be reported as built —
+  # only the versions whose files exist are committed, the rest fail the command.
+  def test_versions_left_unwritten_fail_the_command
+    2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    Object.send(:define_method, :changelog_run_claude) { |_r, _input_path, _count| "claude timed out" }
+    assert_raises(SystemExit) { build }
+    assert_empty @pushed
+  end
+end
