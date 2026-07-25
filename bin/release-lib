@@ -20,16 +20,40 @@ def put_version_in_build_file(version)
   File.write(BUILD_FILE, new_content)
 end
 
+# The publish path lives in the library's build.sbt / project/plugins.sbt and a
+# repo can lose it silently: lib-query's sbt 2 pilot dropped sbt-pgp +
+# sbt-sonatype (no final sbt 2.x builds) and `organization`, so `publishSigned`
+# no longer existed and `+publishM2` happily published under groupId
+# `lib-query` instead of `com.bryzek`. Verify before mutating anything — the
+# old ordering committed, tagged and pushed first, so the failure left a
+# phantom tag (0.1.28) with nothing published under it.
+def assert_release_path
+  puts "Verifying publish settings..."
+  output = `sbt -batch -error "inspect publishSigned" "inspect sonatypeBundleRelease" "print organization" 2>&1`
+  if !$?.success?
+    Util.exit_with_error("This library has no publish path - check that project/plugins.sbt adds sbt-pgp and sbt-sonatype:\n#{Util.indent(output)}")
+  end
+
+  organization = output.strip.split("\n").last.to_s.strip
+  if !organization.include?(".")
+    Util.exit_with_error("organization is '#{organization}' - #{BUILD_FILE} must set 'ThisBuild / organization' (e.g. com.bryzek) or artifacts publish under the wrong groupId")
+  end
+  puts "  organization: #{organization}"
+end
+
 puts ""
 tag = Tag.next_tag
 if Ask.for_boolean("Create new release [#{tag}]?")
+  assert_release_path
   put_version_in_build_file(tag)
   Util.run("git commit --allow-empty -m 'Update version' #{BUILD_FILE}")
   Util.run("git push")
   Util.run("git tag -a -m #{tag} #{tag}")
   Util.run("git push --tags origin")
   Util.run("sbt +publishM2")
-  Util.run("sbt clean +publishSigned sonatypeBundleRelease")
+  # One quoted, semicolon-separated command: sbt 2 joins bare arguments into a
+  # single command line, where 'clean +publishSigned ...' is a parse error.
+  Util.run("sbt \"clean; +publishSigned; sonatypeBundleRelease\"")
 
   puts ""
   puts "Version #{tag} released"
