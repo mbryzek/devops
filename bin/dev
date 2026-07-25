@@ -3323,19 +3323,15 @@ end
 
 # The GitHub repo backing a changelog app. Not always the app name: playbook-admin
 # and friends are branded ahead of their repos, which are still mbryzek/clubaid-*.
-# Read straight from dist/ rather than from Work::Registry — this runs at the tail of
-# every release, where a `pkl eval` per app (and the registry's tenant lookups) would
-# be pure overhead. An app with no dist entry keeps its own name, so an unconfigured
-# app degrades to the old behavior instead of raising.
+# Goes through Config (which rebuilds dist/ from the env pkl sources once per process)
+# rather than reading dist/ directly: dist/ is an untracked build artifact, and a stale
+# one silently resolves a renamed app back to its own name — which reads as "no
+# checkout" and skips the app. Not Work::Registry, whose tenant lookups hit the network
+# for a value this path never needs. An unconfigured app keeps its own name.
 def changelog_app_repo(app)
   @changelog_app_repos ||= {}
   @changelog_app_repos[app] ||= begin
-    path = File.expand_path(File.join(__dir__, "..", "dist", "#{app}.config.json"))
-    if File.exist?(path)
-      App.new(JSON.parse(File.read(path)).fetch("app")).repo_name
-    else
-      app
-    end
+    Config.all.find { |a| a.name == app }&.repo_name || app
   rescue StandardError
     app
   end
