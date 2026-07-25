@@ -191,6 +191,24 @@ module Util
         $stderr.puts ('*') * 100
     end
 
+    # Produce `path` such that a concurrent reader never sees it half-written.
+    # Yields a scratch path for the block to fill, then renames it over the target
+    # — rename(2) is atomic within a filesystem, so a reader gets either the whole
+    # old file or the whole new one, never an empty or truncated one. A plain
+    # `cmd > path` redirect truncates the target the instant the command starts,
+    # which is how parallel `dev deploy` releases used to read a 0-byte config and
+    # die with JSON::ParserError. The scratch name carries the pid so two processes
+    # writing the same target never share it.
+    def Util.write_atomically(path)
+      tmp = "#{path}.tmp.#{Process.pid}"
+      begin
+        yield tmp
+        File.rename(tmp, path)
+      ensure
+        File.delete(tmp) if File.exist?(tmp)
+      end
+    end
+
     def Util.read_file(path)
       full_path = File.expand_path(path)
       if !File.exist?(full_path)
