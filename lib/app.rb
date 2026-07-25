@@ -3,15 +3,24 @@
 require 'json'
 
 class App
-  attr_accessor :name, :scala, :port, :elm, :sveltekit, :docker_k8s
+  attr_accessor :name, :repo, :scala, :port, :elm, :sveltekit, :docker_k8s
 
   def initialize(json_data)
     @name = json_data['name']
+    @repo = json_data['repo']
     @scala = json_data['scala'] ? ScalaConfig.new(json_data['scala']) : nil
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
     @sveltekit = json_data['sveltekit'] ? SveltekitConfig.new(json_data['sveltekit']) : nil
     @docker_k8s = json_data['docker_k8s'] ? DockerK8sConfig.new(json_data['docker_k8s']) : nil
+  end
+
+  # The GitHub repository name, which is also the checkout directory under ~/code.
+  # A deployable can be renamed ahead of its repo (playbook-www still lives in
+  # mbryzek/clubaid-www), so anything filesystem- or git-facing keys off this, not
+  # off `name`. Defaults to the app name, which is the case for every other app.
+  def repo_name
+    @repo.nil? || @repo.empty? ? @name : @repo.split("/").last
   end
 end
 

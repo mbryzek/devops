@@ -50,8 +50,8 @@ end
 
 # Pre-release hook: record this app's changelog into the `changelog` data repo now
 # that the tag exists. Best-effort via system() (never raises/exits) so a changelog
-# hiccup can never block or fail a release. Only the tracked clubaid* apps feed it.
-CHANGELOG_TRACKED = %w[clubaid-admin clubaid-app clubaid-www].freeze
+# hiccup can never block or fail a release. Only the tracked playbook* apps feed it.
+CHANGELOG_TRACKED = %w[playbook-admin playbook-app playbook-www].freeze
 if CHANGELOG_TRACKED.include?(args.app)
   system(File.join(dir, "dev"), "changelog", "capture", "--app", args.app) ||
     warn("changelog capture failed (ignored) — run `dev changelog capture --app #{args.app}` later")
