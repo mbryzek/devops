@@ -48,7 +48,7 @@ class CloudflareDeploy {
 
     /// Cloudflare Pages project name for this target (Pages apps only). Null = the app's own
     /// name, which is what every primary target uses. Set this only when the project name
-    /// deviates from the app name — e.g. clubaid-www's mirror target deploys to "plybk-www".
+    /// deviates from the app name — e.g. playbook-www's mirror target deploys to "plybk-www".
     pages_project: String?
 }
 

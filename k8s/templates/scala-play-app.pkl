@@ -85,7 +85,7 @@ local memoryDefault = read?("env:WEB_MEMORY") ?? "1500Mi"
 // 13000Mi sits comfortably under the ~14300Mi allocatable on s-4vcpu-16gb-amd
 // (leaves ~1300Mi for kube-system DaemonSets) and yields a ~9750MB JVM heap
 // at -XX:MaxRAMPercentage=75.0 — up from 8256MB at 11000Mi. Sized for the
-// clubaid generate/upload pipeline where peak inflight CSV byte arrays land in
+// playbook generate/upload pipeline where peak inflight CSV byte arrays land in
 // G1 humongous regions; the earlier 8GB heap entered a GC death spiral around
 // the same 8 GB of inflight bytea, causing 5-15 min restart loops on 2026-05-18.
 local memoryJobServer = read?("env:JOB_MEMORY") ?? "13000Mi"
@@ -119,7 +119,7 @@ local function heapMb(memory: String, ramPercent: Int): Int = parseMi(memory) * 
 local function heapDumpSizeLimit(memory: String, ramPercent: Int): String = "\(heapMb(memory, ramPercent) * 12 ~/ 10)Mi"
 
 local cpuLimit = "1800m"
-// 3500m fits under s-4vcpu-16gb-amd allocatable (~3890m). The clubaid CSV
+// 3500m fits under s-4vcpu-16gb-amd allocatable (~3890m). The playbook CSV
 // ingest path (Apache POI / scala-csv) is CPU-bound; at 1800m the JVM ran G1
 // concurrent-mark single-threaded (5-6s cycles) and throughput stalled at
 // ~1 task/min — the bounce-philadelphia onboarding queue backed up 2026-05-22.

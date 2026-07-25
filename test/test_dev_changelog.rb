@@ -84,8 +84,8 @@ class TestChangelogAppRepo < Minitest::Test
   end
 
   def test_resolves_an_app_to_its_repo
-    app = App.new("name" => "playbook-www", "port" => 80, "repo" => "mbryzek/clubaid-www")
-    with_apps([app]) { assert_equal "clubaid-www", changelog_app_repo("playbook-www") }
+    app = App.new("name" => "playbook-www", "port" => 80, "repo" => "mbryzek/legacy-www")
+    with_apps([app]) { assert_equal "legacy-www", changelog_app_repo("playbook-www") }
   end
 
   def test_unconfigured_app_keeps_its_name
@@ -144,9 +144,9 @@ class TestDevChangelogBuild < Minitest::Test
     Object.send(:define_method, :ensure_changelog_repo!) { repo }
     # The ISS map is keyed by repo slug, the app is playbook-admin: the build has to
     # bridge the two, so pin the mapping rather than depending on a generated dist/.
-    Object.send(:define_method, :changelog_issue_map) { |_localhost| { "clubaid-admin#412" => "034" } }
+    Object.send(:define_method, :changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
     @real_app_repo = Object.instance_method(:changelog_app_repo)
-    Object.send(:define_method, :changelog_app_repo) { |_app| "clubaid-admin" }
+    Object.send(:define_method, :changelog_app_repo) { |_app| "legacy-admin" }
     Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r| nil }
     Object.send(:define_method, :changelog_git_commit_push!) { |_dir, message| pushed << message }
     Object.send(:define_method, :changelog_run_claude) do |_r, input_path, version_count|
@@ -201,7 +201,7 @@ class TestDevChangelogBuild < Minitest::Test
   def test_notes_are_stamped_with_the_repo
     write_tag("0.3.0", "2026-07-20T14:00:00-04:00", [])
     build
-    assert_equal "clubaid-admin", notes("0.3.0")["repo"]
+    assert_equal "legacy-admin", notes("0.3.0")["repo"]
   end
 
   def test_input_payload_carries_commits_and_resolved_issue

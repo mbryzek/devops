@@ -42,9 +42,9 @@ module Config
     end
 
     # The app checked out at ~/code/<dir_name>. Resolves by GitHub repo rather than by
-    # app name: a deployable can be rebranded ahead of its repo (playbook-www lives in
-    # mbryzek/clubaid-www), and a release script only knows the directory it runs in.
-    # Falls back to a by-name load so an unconfigured directory still errors the old way.
+    # app name — a release script only knows the directory it runs in, and a deployable
+    # can be rebranded ahead of its repo. Falls back to a by-name load so an
+    # unconfigured directory still errors the old way.
     def Config.load_by_dir(dir_name)
         Config.all.find { |a| a.repo_name == dir_name } || Config.load(dir_name)
     end

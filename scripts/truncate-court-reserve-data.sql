@@ -1,5 +1,5 @@
 -- dev-script: targets=local,production app=platform
--- Truncate court_reserve (+ derived clubaid/playbook) data for a fresh upload.
+-- Truncate court_reserve (+ derived playbook) data for a fresh upload.
 --
 -- One-off data cleanup (human-run, NOT a SEM migration).
 --
@@ -41,7 +41,7 @@ truncate table
 
 set search_path to public;
 
-truncate table clubaid.uploads, clubaid.upload_logs, clubaid.export_watermarks;
+truncate table playbook.uploads, playbook.upload_logs, playbook.export_watermarks;
 truncate table playbook.revenue_categories, playbook.revenue_entries, playbook.transaction_types, playbook.watermarks;
 
 commit;

@@ -95,7 +95,7 @@ class Args
         valid_apps = Args.list_apps
         return dir if valid_apps.include?(dir)
         # The directory names the repo, which is not always the app name — resolve
-        # the checkout to its app (playbook-www is checked out as clubaid-www).
+        # the checkout to its app.
         Config.all.find { |a| a.repo_name == dir }&.name
     end
 
