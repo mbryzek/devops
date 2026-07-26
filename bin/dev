@@ -55,7 +55,7 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
-  "issues create"       => 'issues create [--title "TEXT"] [--category feature|bug|improvement] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
@@ -193,11 +193,15 @@ USAGE = <<~USAGE
         front door for all new work. Prompts for the category (feature, bug,
         improvement: the manually-filed categories, mirroring the changelog
         vocabulary; graphs/worker/insights are auto-filed and batch-claimed by
-        `issues claim`), then opens $EDITOR on a commit-style buffer where the
-        first line is the title and the rest is the body the Claude session works
-        from. Repeat --image PATH to attach screenshots or logs: each is uploaded
-        to the issue AND handed to the session as a local path, so it can read the
-        file directly. The issue is then created, claimed, stamped with the Claude
+        `issues claim`), then opens $EDITOR on a buffer that IS the brief the
+        Claude session works from. No title is needed: the server files the issue
+        under a placeholder ("New Bug", …) and a background task summarizes the
+        body into a real one moments later — pass --title to set it yourself.
+        A URL on its own line is recorded as the page the issue is about
+        (source_url), and any pasted or dragged-in file path is uploaded as a real
+        attachment — both are lifted out of the body. Repeat --image PATH to
+        attach files explicitly: each is uploaded to the issue AND handed to the
+        session as a local path, so it can read the file directly. The issue is then created, claimed, stamped with the Claude
         session id (an internal timeline comment), written to a plan under
         ~/code/claude/plans/, and the terminal is handed to an interactive session
         (Opus 4.8, 1M context) pinned to that session id. Reattach later with
@@ -947,27 +951,80 @@ end
 
 # Git-commit-style buffer: first line is the title, everything after it is the
 # body, and `#` lines are instructions that get stripped.
-def issue_editor_template(title: nil)
+def issue_editor_template
   <<~TEMPLATE
-    #{title}
-    # First line above is the issue TITLE. Leave a blank line, then write the
-    # body — this is the prompt the Claude session works from, so be as specific
-    # as you would be typing straight into the terminal.
+
+    # Describe the work. This whole buffer is the brief the Claude session works
+    # from, so be as specific as you would be typing straight into the terminal.
+    #
+    # You do NOT need a title: the server files the issue under a placeholder
+    # ("New Bug", …) and writes a real title from this text moments later. Pass
+    # --title to set one yourself.
+    #
+    # Paste a URL on its own line to record the page you were on, and paste a
+    # file path (or drag a file in) to attach it — both are lifted out of the text.
     #
     # Lines starting with '#' are ignored. An empty message aborts the issue.
   TEMPLATE
 end
 
-# Parse the editor buffer back into {title:, body:}. Returns nil when nothing
-# meaningful was saved, which aborts before any API call is made.
-def parse_issue_editor_text(text)
+# Parse the editor buffer into the brief. Returns nil when nothing meaningful was
+# saved, which aborts before any API call is made. There is no title line: the
+# title is generated server-side (or given with --title), so the whole buffer is
+# the body.
+def parse_issue_editor_brief(text)
   content = text.to_s.lines.reject { |l| l.start_with?("#") }.join.strip
-  return nil if content.empty?
-  title, _, body = content.partition("\n")
-  title = title.strip
-  return nil if title.empty?
-  body = body.strip
-  { title: title, body: body.empty? ? nil : body }
+  content.empty? ? nil : content
+end
+
+# A line that is nothing but a URL: the page the issue is about. Lifted out of the
+# brief and sent as source_url, which is the field for exactly that — rather than
+# left as noise in the body (and, before this, pasted into the title box).
+def issue_extract_source_url(brief)
+  lines = brief.to_s.lines
+  idx = lines.index { |l| l.strip.match?(%r{\Ahttps?://\S+\z}) }
+  return [brief.to_s.strip, nil] if idx.nil?
+  url = lines[idx].strip
+  remaining = lines.reject.with_index { |_, i| i == idx }.join.strip
+  [remaining, url]
+end
+
+# The longest EXISTING file path starting at each `/` or `~/` in `line`, as
+# [raw_text_in_line, absolute_path]. Paths are matched against the filesystem
+# rather than by shape, because a path pasted from Finder/a terminal drag carries
+# backslash-escaped spaces and no delimiter marking where it ends — so the only
+# reliable terminator is "this is a file that exists". Returns nil when the line
+# holds no such path.
+def issue_find_path_in_line(line)
+  line.enum_for(:scan, %r{~?/}).map { Regexp.last_match.begin(0) }.each do |start|
+    candidate = line[start..].to_s
+    while (raw = candidate.strip) && !raw.empty?
+      expanded = File.expand_path(raw.gsub(/\\(.)/, '\1'))
+      return [raw, expanded] if File.file?(expanded)
+      idx = raw.rindex(/\s/)
+      break if idx.nil?
+      candidate = raw[0...idx]
+    end
+  end
+  nil
+end
+
+# Pull every pasted local file path out of the brief, returning the cleaned brief
+# and the absolute paths. A path pasted into the text is an attachment the
+# submitter meant to include — before this it was left as literal text and the
+# file was silently never uploaded.
+def issue_extract_attachment_paths(brief)
+  paths = []
+  cleaned = brief.to_s.lines.map do |line|
+    current = line
+    while (found = issue_find_path_in_line(current))
+      raw, expanded = found
+      paths << expanded
+      current = current.sub(raw, "")
+    end
+    current
+  end
+  [cleaned.join.gsub(/[ \t]+$/, "").strip, paths]
 end
 
 # The internal timeline comment recording which Claude session is working an
@@ -1315,13 +1372,13 @@ end
 
 # Open $EDITOR on the commit-style template and parse the result. Falls back to
 # vi when neither VISUAL nor EDITOR is set, matching git's own behaviour.
-def issue_edit_in_editor(title: nil)
+def issue_edit_in_editor
   editor = ENV["VISUAL"] || ENV["EDITOR"] || "vi"
   Tempfile.create(["ISSUE_EDITMSG", ".md"]) do |f|
-    f.write(issue_editor_template(title: title))
+    f.write(issue_editor_template)
     f.flush
     system(editor, f.path) or Util.exit_with_error("Editor `#{editor}` exited non-zero. Nothing filed.")
-    parse_issue_editor_text(File.read(f.path))
+    parse_issue_editor_brief(File.read(f.path))
   end
 end
 
@@ -1389,8 +1446,17 @@ def cmd_issues_create(args)
 
   category ||= Ask.select_from_list("Category", ISSUE_MANUAL_CATEGORIES)
 
-  parsed = issue_edit_in_editor(title: title)
-  Util.exit_with_error("Aborting: empty issue (no title). Nothing filed.") if parsed.nil?
+  brief = issue_edit_in_editor
+  Util.exit_with_error("Aborting: empty issue. Nothing filed.") if brief.nil?
+
+  # Lift the pasted page URL and any pasted file paths out of the brief: the URL
+  # becomes source_url and the files become real attachments, instead of both
+  # sitting in the body as text that nothing acts on.
+  brief, source_url = issue_extract_source_url(brief)
+  brief, pasted = issue_extract_attachment_paths(brief)
+  bad = pasted.reject { |pth| issue_file_type(pth) }
+  Util.exit_with_error("Unsupported attachment type: #{bad.join(', ')} (allowed: #{ISSUE_FILE_TYPES.keys.sort.join(', ')})") unless bad.empty?
+  images = (images + pasted).uniq
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
@@ -1402,8 +1468,12 @@ def cmd_issues_create(args)
       { file_id: file.fetch("id"), description: File.basename(p) }
     end
 
-    form = { category: category, title: parsed[:title] }
-    form[:body] = parsed[:body] if parsed[:body]
+    # No title unless one was given: the server files a placeholder and queues a
+    # summarization of the body, so nothing is lost if that model call fails.
+    form = { category: category }
+    form[:title] = title if title && !title.empty?
+    form[:body] = brief unless brief.empty?
+    form[:source_url] = source_url if source_url
     form[:severity] = severity if severity
     form[:attachments] = attachments unless attachments.empty?
     issue = ApiClient.request(endpoint, :post, issues_path, body: form)
