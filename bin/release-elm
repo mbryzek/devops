@@ -99,11 +99,25 @@ def extract_file(l, tag)
   end
 end
 
-Util.assert_installed("elm")
+# Prefer the compiler pinned in the app's package.json over whatever global
+# `elm` happens to sit first on PATH — the global one is shared by every elm
+# app, so it can only ever match one app's elm.json at a time. Same rationale
+# as review.sh running elm-review out of node_modules.
+def elm_binary
+  local = File.join("node_modules", ".bin", "elm")
+  if File.executable?(local)
+    File.join(Dir.pwd, local)
+  else
+    Util.assert_installed("elm")
+    "elm"
+  end
+end
+
+elm = elm_binary
 ensure_elm_review
 puts "Compiling"
 a = "elm.js"
-helper.run "elm make src/Main.elm --optimize --output=#{a}"
+helper.run "#{elm} make src/Main.elm --optimize --output=#{a}"
 tag = Tag.ask
 
 b = rewrite_constants(a, helper.app_config.rewrites)
