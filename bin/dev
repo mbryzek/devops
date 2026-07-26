@@ -1018,6 +1018,37 @@ def issue_claim_prompt(plans)
   plans.length == 1 ? issue_session_prompt(plans.first[1]) : issue_fanout_prompt(plans)
 end
 
+# Terminal tab title for a session working `issues`, so a glance at the tab says
+# which issues that window is on. One issue is named ("ISS-015: Bars overflow the
+# axis"); several are just their numbers ("Issues: 015, 025 & 035") — the titles
+# would not fit and the numbers are what you grep the tracker by.
+def issue_tab_title(issues)
+  issues = Array(issues)
+  return nil if issues.empty?
+  if issues.length == 1
+    return "#{issue_label(issues.first)}: #{issue_tab_title_text(issues.first['title'])}"
+  end
+
+  numbers = issues.map { |i| i["number"].to_s }
+  "Issues: #{numbers.length == 2 ? numbers.join(' & ') : "#{numbers[0..-2].join(', ')} & #{numbers.last}"}"
+end
+
+# An issue title reduced to something a tab (and a shell argument) can hold: one
+# line, no quotes or control characters to escape, truncated.
+def issue_tab_title_text(title)
+  clean = title.to_s.gsub(/[[:cntrl:]]/, " ").tr('"\\', "'").gsub(/\s+/, " ").strip
+  clean.length > 60 ? "#{clean[0, 57]}..." : clean
+end
+
+# Prefix a spawned-session prompt with the tab title to set. Claude Code owns the
+# terminal title once it starts, so the only way to pin it is to tell the session
+# what it should be — the CLI cannot emit the escape itself and make it stick.
+def issue_prompt_with_tab_title(issues, prompt)
+  title = issue_tab_title(issues)
+  return prompt if title.nil?
+  "Set the terminal tab title to \"#{title}\" (printf '\\e]0;%s\\a' \"#{title}\"), then: #{prompt}"
+end
+
 # Pure, testable seam: the argv for the interactive session `dev issues claim`
 # launches after writing the plan(s). Mirrors the `ccd` alias
 # (`claude --dangerously-skip-permissions`) pinned to Opus 4.8 (1M context).
@@ -1391,7 +1422,7 @@ def cmd_issues_create(args)
     puts "Claimed #{issue_label(issue)} → #{path}"
     puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
 
-    prompt = issue_session_prompt(path)
+    prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(path))
     unless spawn_session
       puts ""
       puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"
@@ -1507,11 +1538,11 @@ def cmd_issues_claim(args)
     # today) and write one plan per category actually claimed. A category the
     # race just lost (nothing claimed) is dropped with no plan.
     plans = []
-    total_claimed = 0
+    claimed_issues = []
     present.each do |cat|
       claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { category: cat }) || []
       next if claimed.empty?
-      total_claimed += claimed.length
+      claimed_issues.concat(claimed)
       path = write_issue_plan(claimed, cat)
       plans << [cat, path]
       puts "Claimed #{claimed.length} #{cat} issue(s) → #{path}"
@@ -1523,11 +1554,11 @@ def cmd_issues_claim(args)
     end
 
     puts ""
-    puts "Claimed #{total_claimed} issue(s) across #{plans.length} categor#{plans.length == 1 ? 'y' : 'ies'}."
+    puts "Claimed #{claimed_issues.length} issue(s) across #{plans.length} categor#{plans.length == 1 ? 'y' : 'ies'}."
 
     unless spawn_session
       if plans.length == 1
-        puts "Hand it to a session with:  claude \"#{issue_session_prompt(plans.first[1])}\""
+        puts "Hand it to a session with:  claude \"#{issue_prompt_with_tab_title(claimed_issues, issue_claim_prompt(plans))}\""
       else
         puts "Start a session and dispatch one subagent per plan:"
         plans.each { |cat, p| puts "  #{cat}: #{p}" }
@@ -1544,13 +1575,14 @@ def cmd_issues_claim(args)
       "Starting Claude session (Opus 4.8, 1M context) to dispatch one subagent per category plan..."
     puts "  (re-run with --no-spawn to just write the plan(s))"
     puts ""
+    prompt = issue_prompt_with_tab_title(claimed_issues, issue_claim_prompt(plans))
     begin
-      exec(*issue_claude_argv(issue_claim_prompt(plans)))
+      exec(*issue_claude_argv(prompt))
     rescue SystemCallError => e
       # `claude` not on PATH (or otherwise unlaunchable). The plan(s) are already
       # written, so degrade to the manual hand-off rather than a stack trace.
       warn "Could not start Claude (#{e.message}). The plan(s) are saved — run with:"
-      warn "  claude \"#{issue_claim_prompt(plans)}\""
+      warn "  claude \"#{prompt}\""
     end
   end
 end
