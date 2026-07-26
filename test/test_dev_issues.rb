@@ -636,34 +636,70 @@ class TestDevIssues < Minitest::Test
 
   # ---- dev issues create: the $EDITOR buffer ----
 
-  def test_editor_template_prefills_the_title_and_explains_the_format
-    t = issue_editor_template(title: "Bars overflow")
-    assert_equal "Bars overflow", t.lines.first.chomp
-    assert_match(/^# First line above is the issue TITLE/, t)
+  def test_editor_template_explains_that_no_title_is_needed
+    t = issue_editor_template
+    assert_match(/do NOT need a title/, t)
+    assert_match(/--title/, t)
   end
 
-  def test_parse_editor_text_splits_title_and_body
-    parsed = parse_issue_editor_text("Bars overflow\n\nRevenue renders past the plot area.\nSecond line.\n")
-    assert_equal "Bars overflow", parsed[:title]
-    assert_equal "Revenue renders past the plot area.\nSecond line.", parsed[:body]
+  def test_parse_editor_brief_keeps_the_whole_buffer
+    brief = parse_issue_editor_brief("Export button does nothing\n\nClicking it is a no-op.\n")
+    assert_equal "Export button does nothing\n\nClicking it is a no-op.", brief
   end
 
-  def test_parse_editor_text_strips_comment_lines
-    parsed = parse_issue_editor_text("Title here\n# instructions\n#\n# more\n\nBody\n")
-    assert_equal "Title here", parsed[:title]
-    assert_equal "Body", parsed[:body]
+  def test_parse_editor_brief_strips_comment_lines
+    assert_equal "Body", parse_issue_editor_brief("# instructions\nBody\n# more\n")
   end
 
-  def test_parse_editor_text_title_only_has_no_body
-    parsed = parse_issue_editor_text("Just a title\n# instructions\n")
-    assert_equal "Just a title", parsed[:title]
-    assert_nil parsed[:body]
+  def test_parse_editor_brief_empty_is_nil
+    assert_nil parse_issue_editor_brief("")
+    assert_nil parse_issue_editor_brief("# only comments\n\n   \n")
+    assert_nil parse_issue_editor_brief(issue_editor_template)
   end
 
-  def test_parse_editor_text_empty_is_nil
-    assert_nil parse_issue_editor_text("")
-    assert_nil parse_issue_editor_text("# only comments\n\n   \n")
-    assert_nil parse_issue_editor_text(issue_editor_template(title: nil))
+  # ---- dev issues create: url + attachment extraction from the brief ----
+
+  def test_extract_source_url_lifts_a_url_only_line
+    brief, url = issue_extract_source_url("https://admin.clubaid.co/admin/issues/013?x=1\nThe box is too short.\n")
+    assert_equal "https://admin.clubaid.co/admin/issues/013?x=1", url
+    assert_equal "The box is too short.", brief
+  end
+
+  def test_extract_source_url_leaves_an_inline_url_alone
+    brief, url = issue_extract_source_url("broken link on https://clubaid.co/pricing\n")
+    assert_nil url
+    assert_equal "broken link on https://clubaid.co/pricing", brief
+  end
+
+  def test_extract_attachment_paths_pulls_an_escaped_path_jammed_onto_a_sentence
+    # The exact shape ISS-071 was filed with: a Finder-style path with escaped
+    # spaces, run straight onto the end of the sentence with no separator.
+    Tempfile.create(["Screenshot 2026-07-26 at 12.25.33 PM", ".png"]) do |f|
+      escaped = f.path.gsub(" ", "\\ ")
+      brief, paths = issue_extract_attachment_paths("The comment box is not tall enough.#{escaped}")
+      assert_equal [f.path], paths
+      assert_equal "The comment box is not tall enough.", brief
+    end
+  end
+
+  def test_extract_attachment_paths_handles_a_plain_path_on_its_own_line
+    Tempfile.create(["shot", ".png"]) do |f|
+      brief, paths = issue_extract_attachment_paths("Broken chart\n#{f.path}\n")
+      assert_equal [f.path], paths
+      assert_equal "Broken chart", brief
+    end
+  end
+
+  def test_extract_attachment_paths_ignores_text_that_only_looks_like_a_path
+    brief, paths = issue_extract_attachment_paths("the /admin/issues page is broken")
+    assert_empty paths
+    assert_equal "the /admin/issues page is broken", brief
+  end
+
+  def test_extract_attachment_paths_leaves_a_brief_with_no_paths_untouched
+    brief, paths = issue_extract_attachment_paths("Just a description")
+    assert_empty paths
+    assert_equal "Just a description", brief
   end
 
   # ---- dev issues create/resume: the session id ----
