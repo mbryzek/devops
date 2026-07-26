@@ -11,11 +11,14 @@ unless [ENV["LC_ALL"], ENV["LANG"]].any? { |v| v.to_s.match?(/utf-?8/i) }
   ENV["LC_ALL"] = "en_US.UTF-8"
 end
 
+require 'base64'
 require 'fileutils'
 require 'io/console'
 require 'json'
 require 'open3'
+require 'securerandom'
 require 'set'
+require 'tempfile'
 require 'time'
 require 'timeout'
 require 'uri'
@@ -52,6 +55,8 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
+  "issues create"       => 'issues create [--title "TEXT"] [--category feature|bug|improvement] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
@@ -183,6 +188,28 @@ USAGE = <<~USAGE
         arg forwarded to them (a leading `--` separator is dropped) — including
         their own `--env`/`--prod` flags.
 
+    #{INVOCATIONS["issues create"]}
+        File a new issue from the laptop and immediately start working it — the
+        front door for all new work. Prompts for the category (feature, bug,
+        improvement: the manually-filed categories, mirroring the changelog
+        vocabulary; graphs/worker/insights are auto-filed and batch-claimed by
+        `issues claim`), then opens $EDITOR on a commit-style buffer where the
+        first line is the title and the rest is the body the Claude session works
+        from. Repeat --image PATH to attach screenshots or logs: each is uploaded
+        to the issue AND handed to the session as a local path, so it can read the
+        file directly. The issue is then created, claimed, stamped with the Claude
+        session id (an internal timeline comment), written to a plan under
+        ~/code/claude/plans/, and the terminal is handed to an interactive session
+        (Opus 4.8, 1M context) pinned to that session id. Reattach later with
+        `dev issues resume`. Pass --no-spawn to stop after writing the plan.
+        Authenticates with your persisted playbook session — run
+        `dev login --app playbook` once first.
+
+    #{INVOCATIONS["issues resume"]}
+        Reattach to the Claude session `issues create` started on an issue. Reads
+        the issue's timeline, takes the most recently recorded session id, and runs
+        `claude --resume <id>`. Errors when the issue has no recorded session.
+
     #{INVOCATIONS["issues claim"]}
         Claim open issues into local plans for a Claude session to work on. With no
         --category (the default) it scans every category (graphs, worker, insights),
@@ -278,7 +305,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
-  "issues"       => %w[claim status reconcile],
+  "issues"       => %w[create claim status reconcile resume],
 }.freeze
 
 def levenshtein(a, b)
@@ -880,6 +907,82 @@ ISSUE_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].
 # issue_category enum in the platform `issues` spec — keep them in step.
 ISSUE_CATEGORIES = %w[graphs worker insights].freeze
 
+# Manually-filed categories: units of work filed from the laptop with `dev issues
+# create`. Deliberately DISJOINT from ISSUE_CATEGORIES (the batch-claim routing
+# list) so `dev issues claim` never sweeps hand-filed work into an automated
+# category plan — manual issues are claimed one at a time by `create`. Mirrors
+# the changelog vocabulary (a `bug` ships as changelog `fix`).
+ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
+
+ISSUE_SEVERITIES = %w[low medium high].freeze
+
+# Extensions the platform storage file_type enum accepts, mapped to the MIME type
+# the data_url upload needs. Anything not listed is rejected locally, before any
+# network call, so a bad path never leaves an orphan issue behind.
+ISSUE_FILE_TYPES = {
+  "png" => "image/png", "jpg" => "image/jpeg", "jpeg" => "image/jpeg",
+  "gif" => "image/gif", "webp" => "image/webp", "bmp" => "image/bmp",
+  "heic" => "image/heic", "tiff" => "image/tiff",
+  "pdf" => "application/pdf", "csv" => "text/csv", "json" => "application/json",
+  "md" => "text/markdown", "txt" => "text/plain", "html" => "text/html",
+  "zip" => "application/zip",
+}.freeze
+
+# The platform file_type value for a path, or nil when unsupported. `jpeg` is an
+# alias for the `jpg` enum value.
+def issue_file_type(path)
+  ext = File.extname(path).delete_prefix(".").downcase
+  return nil unless ISSUE_FILE_TYPES.key?(ext)
+  ext == "jpeg" ? "jpg" : ext
+end
+
+def issue_data_url(path)
+  ext = File.extname(path).delete_prefix(".").downcase
+  "data:#{ISSUE_FILE_TYPES.fetch(ext)};base64,#{Base64.strict_encode64(File.binread(path))}"
+end
+
+# Git-commit-style buffer: first line is the title, everything after it is the
+# body, and `#` lines are instructions that get stripped.
+def issue_editor_template(title: nil)
+  <<~TEMPLATE
+    #{title}
+    # First line above is the issue TITLE. Leave a blank line, then write the
+    # body — this is the prompt the Claude session works from, so be as specific
+    # as you would be typing straight into the terminal.
+    #
+    # Lines starting with '#' are ignored. An empty message aborts the issue.
+  TEMPLATE
+end
+
+# Parse the editor buffer back into {title:, body:}. Returns nil when nothing
+# meaningful was saved, which aborts before any API call is made.
+def parse_issue_editor_text(text)
+  content = text.to_s.lines.reject { |l| l.start_with?("#") }.join.strip
+  return nil if content.empty?
+  title, _, body = content.partition("\n")
+  title = title.strip
+  return nil if title.empty?
+  body = body.strip
+  { title: title, body: body.empty? ? nil : body }
+end
+
+# The internal timeline comment recording which Claude session is working an
+# issue. The CLI mints the uuid and passes it to `claude --session-id`, so the id
+# is durable even if the session dies on its first turn — never self-reported.
+def issue_session_comment_body(uuid)
+  "Claude session `#{uuid}` — resume with `claude --resume #{uuid}`"
+end
+
+# The uuid from the LAST session comment on a timeline (a reopened issue
+# accumulates one per session). nil when no session was ever started on it.
+def issue_session_uuid_from_comments(comments)
+  Array(comments).reverse_each do |c|
+    m = /Claude session `([^`]+)`/.match(c["body"].to_s)
+    return m[1] if m
+  end
+  nil
+end
+
 # Model the spawned session runs on: Opus 4.8 with the 1M-context window. This is
 # the interactive default (the `ccd` alias's model), NOT the headless-codegen
 # `CODEGEN_CLAUDE_MODEL` (haiku) — a human is driving this one to fix real bugs.
@@ -1082,6 +1185,227 @@ def write_issue_plan(items, category)
   end
   File.write(path, issue_plan_markdown(items: items, date: date, category: category, body: issue_body_text(category)))
   path
+end
+
+# Plan for a single hand-filed issue. Reuses issue_render_item so a manual issue
+# renders identically to a batch-claimed one, then adds the LOCAL file paths of
+# any attachments: the session reads them straight off disk, exactly like
+# dropping the images into a Claude Code terminal.
+def manual_issue_plan_markdown(issue:, date:, local_paths:, body:)
+  attachments =
+    if local_paths.empty?
+      ""
+    else
+      listed = local_paths.map { |p| "- `#{p}`" }.join("\n")
+      "\n## Attached files (read these directly)\n\n#{listed}\n"
+    end
+  <<~PLAN
+    # #{issue_label(issue)} — #{issue['title']}
+
+    Filed #{date} with `dev issues create` and already CLAIMED. Work it, open a PR,
+    then close it with `dev issues status` (below) so it does not stay `claimed`.
+
+    ## The issue
+
+    #{issue_render_item(issue, 1)}
+    #{attachments}
+    ---
+
+    #{body.strip}
+
+    ## Closing this issue (do this — it must not stay `claimed`)
+
+    - Fixed in a merged PR → `dev issues status #{issue['number']} --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
+      (--app + --baseline-version let `dev issues reconcile` flip it to `deployed` once
+      that app releases past the baseline; `dev deploy status` lists the app names and
+      their live tags — read the tag BEFORE your fix ships.)
+    - Fixed by a document (process/manual fix) →
+      `dev issues status #{issue['number']} --status fixed --url "<doc URL>"`
+    - Blocked on a human answer →
+      `dev issues status #{issue['number']} --status needs_input --comment "<question>"`
+  PLAN
+end
+
+def write_manual_issue_plan(issue, local_paths)
+  date = Time.now.strftime("%Y-%m-%d")
+  dir = File.expand_path("~/code/claude/plans")
+  FileUtils.mkdir_p(dir)
+  slug = issue["title"].to_s.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/\A-+|-+\z/, "")[0, 40]
+  base = "#{date}-issue-#{issue['number']}#{slug.empty? ? '' : "-#{slug}"}"
+  path = File.join(dir, "#{base}.md")
+  n = 2
+  while File.exist?(path)
+    path = File.join(dir, "#{base}-#{n}.md")
+    n += 1
+  end
+  body = File.read(File.expand_path("../claude-issues/manual-body.md", __dir__))
+  File.write(path, manual_issue_plan_markdown(issue: issue, date: date, local_paths: local_paths, body: body))
+  path
+end
+
+# Spawn argv for `dev issues create`: the batch-claim argv plus --session-id, so
+# the uuid recorded on the issue IS the session's id and `--resume` works later.
+def issue_create_claude_argv(prompt, uuid)
+  ["claude", "--dangerously-skip-permissions", "--model", ISSUE_CLAUDE_MODEL,
+   "--session-id", uuid, prompt]
+end
+
+def issue_resume_claude_argv(uuid)
+  ["claude", "--resume", uuid]
+end
+
+# Open $EDITOR on the commit-style template and parse the result. Falls back to
+# vi when neither VISUAL nor EDITOR is set, matching git's own behaviour.
+def issue_edit_in_editor(title: nil)
+  editor = ENV["VISUAL"] || ENV["EDITOR"] || "vi"
+  Tempfile.create(["ISSUE_EDITMSG", ".md"]) do |f|
+    f.write(issue_editor_template(title: title))
+    f.flush
+    system(editor, f.path) or Util.exit_with_error("Editor `#{editor}` exited non-zero. Nothing filed.")
+    parse_issue_editor_text(File.read(f.path))
+  end
+end
+
+# File a new issue from the laptop and hand it straight to a Claude session.
+# Ordering is load-bearing: the editor and every upload happen BEFORE the issue
+# is created, and the session comment + plan are written BEFORE the spawn — so a
+# failure leaves either nothing at all or a fully recoverable claimed issue,
+# never a half-filed one.
+def cmd_issues_create(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  title = nil
+  category = nil
+  severity = nil
+  images = []
+  spawn_session = true
+  leftover = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--title"
+      title = rest[i + 1]
+      usage_exit("--title requires a value", example: usage_for("issues create")) if title.nil?
+      i += 2
+    when "--category"
+      category = rest[i + 1]
+      usage_exit("--category requires a value", example: usage_for("issues create")) if category.nil?
+      i += 2
+    when "--severity"
+      severity = rest[i + 1]
+      usage_exit("--severity requires a value", example: usage_for("issues create")) if severity.nil?
+      i += 2
+    when "--image"
+      path = rest[i + 1]
+      usage_exit("--image requires a path", example: usage_for("issues create")) if path.nil?
+      images << path
+      i += 2
+    when "--no-spawn"
+      spawn_session = false
+      i += 1
+    else
+      leftover << a
+      i += 1
+    end
+  end
+
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  if category && !category.empty? && !ISSUE_MANUAL_CATEGORIES.include?(category)
+    problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')} " \
+                "(#{ISSUE_CATEGORIES.join('/')} are auto-filed — claim those with `dev issues claim`)"
+  end
+  problems << "--severity must be one of: #{ISSUE_SEVERITIES.join(', ')}" if severity && !ISSUE_SEVERITIES.include?(severity)
+  images.each do |p|
+    if !File.file?(p)
+      problems << "--image #{p}: no such file"
+    elsif issue_file_type(p).nil?
+      problems << "--image #{p}: unsupported file type (allowed: #{ISSUE_FILE_TYPES.keys.sort.join(', ')})"
+    end
+  end
+  report_arg_problems("issues create", problems, usage_for("issues create"))
+
+  require_playbook_session!(use_localhost)
+
+  category ||= Ask.select_from_list("Category", ISSUE_MANUAL_CATEGORIES)
+
+  parsed = issue_edit_in_editor(title: title)
+  Util.exit_with_error("Aborting: empty issue (no title). Nothing filed.") if parsed.nil?
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+
+    # Upload every attachment first: a failed upload must not leave an orphan issue.
+    attachments = images.map do |p|
+      file = ApiClient.request(endpoint, :post, "/#{ISSUE_TENANT_ID}/files/data_url", body: { data: issue_data_url(p) })
+      puts "Uploaded #{File.basename(p)}"
+      { file_id: file.fetch("id"), description: File.basename(p) }
+    end
+
+    form = { category: category, title: parsed[:title] }
+    form[:body] = parsed[:body] if parsed[:body]
+    form[:severity] = severity if severity
+    form[:attachments] = attachments unless attachments.empty?
+    issue = ApiClient.request(endpoint, :post, issues_path, body: form)
+    number = issue.fetch("number")
+    puts "Filed #{issue_label(issue)} (#{category})"
+
+    ApiClient.request(endpoint, :put, issues_path("/#{number}/status"), body: { status: "claimed" })
+
+    # Mint the session id HERE so it is recorded even if the session dies on its
+    # first turn — the model is never asked to self-report it.
+    uuid = SecureRandom.uuid
+    ApiClient.request(endpoint, :post, issues_path("/#{number}/comments"),
+                      body: { body: issue_session_comment_body(uuid), visibility: "internal" })
+
+    path = write_manual_issue_plan(issue, images.map { |p| File.expand_path(p) })
+    puts "Claimed #{issue_label(issue)} → #{path}"
+    puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
+
+    prompt = issue_session_prompt(path)
+    unless spawn_session
+      puts ""
+      puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"
+      return
+    end
+
+    puts ""
+    puts "Starting Claude session (Opus 4.8, 1M context)..."
+    puts ""
+    begin
+      exec(*issue_create_claude_argv(prompt, uuid))
+    rescue SystemCallError => e
+      warn "Could not start Claude (#{e.message}). #{issue_label(issue)} is claimed and the plan is saved — resume with:"
+      warn "  dev issues resume #{number}"
+    end
+  end
+end
+
+# Reattach to the Claude session `dev issues create` started on an issue. The
+# uuid lives on the issue's timeline, so the session survives closing the
+# terminal — that is the whole point of recording it.
+def cmd_issues_resume(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  number = rest.shift
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 041)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{rest.join(', ')}" unless rest.empty?
+  report_arg_problems("issues resume", problems, usage_for("issues resume"))
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    comments = ApiClient.request(endpoint, :get, issues_path("/#{number}/comments?limit=101&offset=0")) || []
+    uuid = issue_session_uuid_from_comments(comments)
+    Util.exit_with_error("ISS-#{number} has no recorded Claude session. File work with `dev issues create` to get one.") if uuid.nil?
+    puts "Resuming Claude session #{uuid} for ISS-#{number}..."
+    begin
+      exec(*issue_resume_claude_argv(uuid))
+    rescue SystemCallError => e
+      warn "Could not start Claude (#{e.message}). Resume by hand with:  claude --resume #{uuid}"
+    end
+  end
 end
 
 def cmd_issues_claim(args)
@@ -3883,6 +4207,8 @@ when "scripts"
 when "issues"
   sub = argv.shift
   case sub
+  when "create"    then cmd_issues_create(argv)
+  when "resume"    then cmd_issues_resume(argv)
   when "claim"     then cmd_issues_claim(argv)
   when "status"    then cmd_issues_status(argv)
   when "reconcile" then cmd_issues_reconcile(argv)
