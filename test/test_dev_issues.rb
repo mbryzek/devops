@@ -464,4 +464,216 @@ class TestDevIssues < Minitest::Test
     assert_match(%r{/\.platform/devops_playbook$}, prod)
     assert_match(%r{/\.platform/devops_playbook_localhost$}, local)
   end
+
+  # ---- dev issues create: categories ----
+
+  # The batch-claim routing list and the manually-filed list must stay disjoint,
+  # or `dev issues claim` would sweep hand-filed work into an automated plan.
+  def test_manual_categories_are_disjoint_from_batch_claim_categories
+    assert_equal %w[graphs worker insights], ISSUE_CATEGORIES
+    assert_equal %w[feature bug improvement], ISSUE_MANUAL_CATEGORIES
+    assert_empty(ISSUE_CATEGORIES & ISSUE_MANUAL_CATEGORIES)
+  end
+
+  def test_create_rejects_an_automated_category
+    out, status = capture_stderr_and_exit { cmd_issues_create(["--category", "graphs", "--title", "x"]) }
+    assert_equal 1, status
+    assert_match(/--category must be one of: feature, bug, improvement/, out)
+    assert_match(/dev issues claim/, out)
+  end
+
+  def test_claim_still_rejects_a_manual_category
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "feature"]) }
+    assert_equal 1, status
+    assert_match(/--category must be one of: graphs, worker, insights/, out)
+  end
+
+  def test_create_rejects_an_invalid_severity
+    out, status = capture_stderr_and_exit { cmd_issues_create(["--category", "bug", "--severity", "urgent"]) }
+    assert_equal 1, status
+    assert_match(/--severity must be one of: low, medium, high/, out)
+  end
+
+  def test_create_rejects_unexpected_positional
+    out, status = capture_stderr_and_exit { cmd_issues_create(["--category", "bug", "extra"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument/, out)
+  end
+
+  # ---- dev issues create: attachments (validated before any network call) ----
+
+  def test_create_rejects_a_missing_image
+    out, status = capture_stderr_and_exit { cmd_issues_create(["--category", "bug", "--image", "/nope/missing.png"]) }
+    assert_equal 1, status
+    assert_match(%r{--image /nope/missing\.png: no such file}, out)
+  end
+
+  def test_create_rejects_an_unsupported_image_type
+    Tempfile.create(["thing", ".xyz"]) do |f|
+      out, status = capture_stderr_and_exit { cmd_issues_create(["--category", "bug", "--image", f.path]) }
+      assert_equal 1, status
+      assert_match(/unsupported file type/, out)
+    end
+  end
+
+  def test_issue_file_type_maps_known_extensions
+    assert_equal "png", issue_file_type("/tmp/shot.PNG")
+    assert_equal "jpg", issue_file_type("/tmp/shot.jpeg")
+    assert_equal "jpg", issue_file_type("/tmp/shot.jpg")
+    assert_equal "csv", issue_file_type("/tmp/rows.csv")
+  end
+
+  def test_issue_file_type_rejects_unsupported
+    assert_nil issue_file_type("/tmp/thing.xyz")
+    assert_nil issue_file_type("/tmp/noext")
+  end
+
+  def test_issue_data_url_is_base64_with_mime
+    Tempfile.create(["shot", ".png"]) do |f|
+      f.binmode
+      f.write("hello")
+      f.flush
+      assert_equal "data:image/png;base64,#{Base64.strict_encode64('hello')}", issue_data_url(f.path)
+    end
+  end
+
+  # ---- dev issues create: the $EDITOR buffer ----
+
+  def test_editor_template_prefills_the_title_and_explains_the_format
+    t = issue_editor_template(title: "Bars overflow")
+    assert_equal "Bars overflow", t.lines.first.chomp
+    assert_match(/^# First line above is the issue TITLE/, t)
+  end
+
+  def test_parse_editor_text_splits_title_and_body
+    parsed = parse_issue_editor_text("Bars overflow\n\nRevenue renders past the plot area.\nSecond line.\n")
+    assert_equal "Bars overflow", parsed[:title]
+    assert_equal "Revenue renders past the plot area.\nSecond line.", parsed[:body]
+  end
+
+  def test_parse_editor_text_strips_comment_lines
+    parsed = parse_issue_editor_text("Title here\n# instructions\n#\n# more\n\nBody\n")
+    assert_equal "Title here", parsed[:title]
+    assert_equal "Body", parsed[:body]
+  end
+
+  def test_parse_editor_text_title_only_has_no_body
+    parsed = parse_issue_editor_text("Just a title\n# instructions\n")
+    assert_equal "Just a title", parsed[:title]
+    assert_nil parsed[:body]
+  end
+
+  def test_parse_editor_text_empty_is_nil
+    assert_nil parse_issue_editor_text("")
+    assert_nil parse_issue_editor_text("# only comments\n\n   \n")
+    assert_nil parse_issue_editor_text(issue_editor_template(title: nil))
+  end
+
+  # ---- dev issues create/resume: the session id ----
+
+  def test_session_comment_body_carries_the_uuid_and_the_resume_command
+    body = issue_session_comment_body("abc-123")
+    assert_match(/abc-123/, body)
+    assert_match(/claude --resume abc-123/, body)
+  end
+
+  # A reopened issue accumulates one session comment per session; resume must
+  # take the most recent, not the first.
+  def test_session_uuid_from_comments_picks_the_latest
+    comments = [
+      { "body" => issue_session_comment_body("first-uuid") },
+      { "body" => "unrelated chatter" },
+      { "body" => issue_session_comment_body("second-uuid") },
+    ]
+    assert_equal "second-uuid", issue_session_uuid_from_comments(comments)
+  end
+
+  def test_session_uuid_from_comments_nil_when_absent
+    assert_nil issue_session_uuid_from_comments([{ "body" => "no session here" }])
+    assert_nil issue_session_uuid_from_comments([{ "transition" => { "from" => "open", "to" => "claimed" } }])
+    assert_nil issue_session_uuid_from_comments([])
+    assert_nil issue_session_uuid_from_comments(nil)
+  end
+
+  def test_resume_requires_an_issue_number
+    out, status = capture_stderr_and_exit { cmd_issues_resume([]) }
+    assert_equal 1, status
+    assert_match(/missing issue number/, out)
+  end
+
+  def test_resume_rejects_extra_arguments
+    out, status = capture_stderr_and_exit { cmd_issues_resume(["041", "extra"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument/, out)
+  end
+
+  # ---- dev issues create/resume: spawn argv ----
+
+  def test_create_argv_pins_the_session_id
+    argv = issue_create_claude_argv("read the plan at /p.md and implement it", "uuid-9")
+    assert_equal "claude", argv.first
+    assert_includes argv, "--dangerously-skip-permissions"
+    assert_equal "uuid-9", argv[argv.index("--session-id") + 1]
+    assert_equal "read the plan at /p.md and implement it", argv.last
+  end
+
+  def test_resume_argv_uses_the_session_id
+    assert_equal ["claude", "--resume", "uuid-7"], issue_resume_claude_argv("uuid-7")
+  end
+
+  # ---- dev issues create: the generated plan ----
+
+  # A hand-filed issue from `dev issues create`: manual category, no club.
+  def manual_issue
+    {
+      "id" => "iss-41",
+      "number" => "041",
+      "category" => "bug",
+      "status" => "claimed",
+      "severity" => "medium",
+      "title" => "Export button does nothing",
+      "body" => "Clicking Export on the members page is a no-op.",
+      "created" => { "at" => "2026-07-26T09:00:00Z", "by" => { "name" => "Mike Bryzek" } },
+      "attachments" => [
+        { "id" => "att-1", "file" => { "id" => "f-9", "name" => "a.png", "url" => "https://img/a.png" } },
+      ],
+      "occurrence_count" => 1,
+    }
+  end
+
+  def test_manual_plan_lists_local_image_paths
+    md = manual_issue_plan_markdown(
+      issue: manual_issue,
+      date: "2026-07-26",
+      local_paths: ["/Users/mbryzek/shots/a.png"],
+      body: "PROMPT BODY",
+    )
+    assert_match(/ISS-041/, md)
+    assert_match(/Export button does nothing/, md)
+    assert_match(%r{/Users/mbryzek/shots/a\.png}, md)
+    assert_match(/PROMPT BODY/, md)
+    # The plan must always tell the session how to close the issue, with its number.
+    assert_match(/dev issues status 041 --status fixed/, md)
+  end
+
+  def test_manual_plan_omits_the_attachment_section_when_there_are_no_files
+    md = manual_issue_plan_markdown(issue: manual_issue, date: "2026-07-26", local_paths: [], body: "BODY")
+    refute_match(/Attached files/, md)
+  end
+
+  # The shared prompt body must exist on disk — write_manual_issue_plan reads it.
+  def test_manual_body_file_exists
+    assert File.file?(File.expand_path("../claude-issues/manual-body.md", __dir__))
+  end
+
+  # ---- registration ----
+
+  def test_create_and_resume_are_registered_subcommands
+    assert_includes SUBCOMMANDS["issues"], "create"
+    assert_includes SUBCOMMANDS["issues"], "resume"
+    assert INVOCATIONS.key?("issues create")
+    assert INVOCATIONS.key?("issues resume")
+    assert_match(/dev issues create/, usage_for("issues create"))
+    assert_match(/dev issues resume/, usage_for("issues resume"))
+  end
 end
