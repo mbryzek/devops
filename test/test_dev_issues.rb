@@ -274,6 +274,44 @@ class TestDevIssues < Minitest::Test
     assert_equal issue_session_prompt("/p/x.md"), cmd.last          # prompt is the final arg
   end
 
+  # ---- tab title: the spawned session names its window after the issue(s) ----
+
+  def test_tab_title_single_issue_is_labelled_and_titled
+    assert_equal "ISS-034: Bars overflow the axis", issue_tab_title([graph_issue])
+  end
+
+  def test_tab_title_two_issues_are_joined_with_an_ampersand
+    assert_equal "Issues: 034 & 035", issue_tab_title([graph_issue, crawl_issue])
+  end
+
+  def test_tab_title_three_or_more_issues_are_comma_separated
+    issues = [graph_issue, crawl_issue, crawl_issue.merge("number" => "036")]
+    assert_equal "Issues: 034, 035 & 036", issue_tab_title(issues)
+  end
+
+  def test_tab_title_is_nil_when_nothing_was_claimed
+    assert_nil issue_tab_title([])
+  end
+
+  # The title lands inside a double-quoted shell argument in the prompt, so a
+  # quote (or a newline) in the issue title must not break out of it.
+  def test_tab_title_strips_quotes_newlines_and_truncates
+    messy = graph_issue.merge("title" => "Say \"hi\"\nto  the\\ axis")
+    assert_equal "ISS-034: Say 'hi' to the' axis", issue_tab_title([messy])
+    long = graph_issue.merge("title" => "x" * 100)
+    assert_equal 60, issue_tab_title([long]).sub("ISS-034: ", "").length
+  end
+
+  def test_prompt_with_tab_title_prefixes_the_work_prompt
+    prompt = issue_prompt_with_tab_title([graph_issue], issue_session_prompt("/p/x.md"))
+    assert_includes prompt, 'tab title to "ISS-034: Bars overflow the axis"'
+    assert prompt.end_with?(issue_session_prompt("/p/x.md")), prompt
+  end
+
+  def test_prompt_with_tab_title_is_untouched_without_issues
+    assert_equal issue_session_prompt("/p/x.md"), issue_prompt_with_tab_title([], issue_session_prompt("/p/x.md"))
+  end
+
   # ---- claim prompt: one plan works directly, several fan out subagents ----
 
   def test_claim_prompt_single_plan_is_todays_direct_prompt
