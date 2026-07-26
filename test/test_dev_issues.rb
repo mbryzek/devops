@@ -170,16 +170,56 @@ class TestDevIssues < Minitest::Test
 
   # ---- per-category body files are real and reachable ----
 
-  def test_every_category_has_a_body_file
-    ISSUE_CATEGORIES.each do |category|
+  # Categories with a pipeline of their own — these keep a dedicated body file.
+  PIPELINE_CATEGORIES = %w[graphs worker insights].freeze
+
+  def test_pipeline_categories_have_their_own_body_file
+    PIPELINE_CATEGORIES.each do |category|
       body = issue_body_text(category)
       assert_includes body, "## How this pipeline works", "#{category}: missing pipeline map"
       assert_includes body, "## Working rules", "#{category}: missing working rules"
     end
   end
 
+  # Every claimable category must render a plan body. A missing <category>-body.md
+  # used to raise Errno::ENOENT mid-claim, AFTER the issues were already flipped to
+  # `claimed` server-side — leaving them claimed with no plan.
+  def test_every_category_resolves_to_a_body
+    ISSUE_CATEGORIES.each do |category|
+      refute_empty issue_body_text(category).strip, "#{category}: empty body"
+    end
+  end
+
+  def test_non_pipeline_categories_fall_back_to_the_default_body
+    (ISSUE_CATEGORIES - PIPELINE_CATEGORIES).each do |category|
+      assert_equal issue_default_body_text, issue_body_text(category), "#{category}: expected default body"
+    end
+  end
+
+  # A category added to the spec enum before anyone writes its body file still
+  # claims — it just gets the generic guide.
+  def test_unknown_category_falls_back_to_the_default_body
+    assert_equal issue_default_body_text, issue_body_text("brand-new-category")
+  end
+
+  def test_default_body_carries_the_shared_working_rules
+    body = issue_default_body_text
+    assert_includes body, "## How to work"
+    assert_includes body, "~/code/ai/"          # feature-dir rule
+    assert_includes body, "needs_input"         # what to do when a human call is needed
+  end
+
+  # The working rules live in default-body.md ONLY; the manual body is the
+  # hand-filed preamble that gets prepended to it.
+  def test_manual_body_is_composed_from_the_default_body
+    body = issue_manual_body_text
+    assert_includes body, "Working a hand-filed issue"
+    assert_includes body, issue_default_body_text.strip
+    assert_equal 1, body.scan("## How to work").length, "working rules duplicated"
+  end
+
   def test_categories_match_the_spec_enum
-    assert_equal %w[graphs worker insights], ISSUE_CATEGORIES
+    assert_equal %w[graphs worker insights suggestion feature bug improvement], ISSUE_CATEGORIES
   end
 
   def test_graphs_body_orients_to_playbook_app
@@ -257,16 +297,30 @@ class TestDevIssues < Minitest::Test
     assert_equal "do the thing", argv.last
   end
 
-  # ---- issue_categories_present: enum-ordered, known categories only ----
+  # ---- issue_categories_present: enum-ordered, nothing filtered out ----
 
-  def test_categories_present_returns_enum_order_known_only
+  def test_categories_present_returns_enum_order
     open = [crawl_issue.merge("category" => "insights"), graph_issue.merge("status" => "open"), crawl_issue]
     # graphs (from graph_issue) + worker (crawl_issue) + insights, listed in enum order.
     assert_equal %w[graphs worker insights], issue_categories_present(open)
   end
 
-  def test_categories_present_empty_when_no_known_open
-    assert_empty issue_categories_present([crawl_issue.merge("category" => "mystery")])
+  # Regression: `suggestion` (and the hand-filed feature/bug/improvement) used to
+  # be filtered out of the claim sweep, so an open suggestion reported
+  # "No open issues." and could never be claimed from the CLI.
+  def test_categories_present_includes_suggestion_and_manual_categories
+    open = %w[suggestion feature bug improvement].map { |c| crawl_issue.merge("category" => c) }
+    assert_equal %w[suggestion feature bug improvement], issue_categories_present(open)
+  end
+
+  # A category the tracker knows but this script does not (added to the spec enum
+  # since) is still claimed — listed after the known ones rather than dropped.
+  def test_categories_present_keeps_unknown_categories_last
+    open = [crawl_issue.merge("category" => "mystery"), graph_issue.merge("status" => "open")]
+    assert_equal %w[graphs mystery], issue_categories_present(open)
+  end
+
+  def test_categories_present_empty_only_when_nothing_is_open
     assert_empty issue_categories_present([])
   end
 
@@ -285,7 +339,7 @@ class TestDevIssues < Minitest::Test
   def test_claim_rejects_invalid_category
     out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "bogus"]) }
     assert_equal 1, status
-    assert_match(/--category must be one of: graphs, worker, insights/, out)
+    assert_match(/--category must be one of: graphs, worker, insights, suggestion, feature, bug, improvement/, out)
   end
 
   def test_claim_rejects_category_without_value
@@ -467,12 +521,11 @@ class TestDevIssues < Minitest::Test
 
   # ---- dev issues create: categories ----
 
-  # The batch-claim routing list and the manually-filed list must stay disjoint,
-  # or `dev issues claim` would sweep hand-filed work into an automated plan.
-  def test_manual_categories_are_disjoint_from_batch_claim_categories
-    assert_equal %w[graphs worker insights], ISSUE_CATEGORIES
+  # The hand-filing list is a SUBSET of the full category list: `create` offers
+  # only the categories that make sense to type, while `claim` covers them all.
+  def test_manual_categories_are_a_subset_of_all_categories
     assert_equal %w[feature bug improvement], ISSUE_MANUAL_CATEGORIES
-    assert_empty(ISSUE_CATEGORIES & ISSUE_MANUAL_CATEGORIES)
+    assert_empty(ISSUE_MANUAL_CATEGORIES - ISSUE_CATEGORIES)
   end
 
   def test_create_rejects_an_automated_category
@@ -482,10 +535,16 @@ class TestDevIssues < Minitest::Test
     assert_match(/dev issues claim/, out)
   end
 
-  def test_claim_still_rejects_a_manual_category
-    out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "feature"]) }
-    assert_equal 1, status
-    assert_match(/--category must be one of: graphs, worker, insights/, out)
+  # `claim` now accepts every category, including the hand-filed ones and
+  # `suggestion`. Prove each gets PAST arg validation (stopping at the credential
+  # guard) rather than being rejected as an unknown category.
+  def test_claim_accepts_every_category
+    ISSUE_CATEGORIES.each do |category|
+      out, status = without_playbook_session { capture_stderr_and_exit { cmd_issues_claim(["--category", category]) } }
+      assert_equal 1, status
+      refute_match(/--category must be one of/, out, "#{category}: rejected by claim")
+      assert_match(/dev login --app playbook/, out, "#{category}: did not reach the credential guard")
+    end
   end
 
   def test_create_rejects_an_invalid_severity

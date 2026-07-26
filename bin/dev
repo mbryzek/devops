@@ -212,8 +212,9 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["issues claim"]}
         Claim open issues into local plans for a Claude session to work on. With no
-        --category (the default) it scans every category (graphs, worker, insights),
-        lists the open issues grouped by category, and — after you confirm (or with
+        --category (the default) it scans EVERY category — graphs, worker, insights,
+        suggestion, feature, bug, improvement — so no open issue is unreachable from
+        the CLI. It lists them grouped by category and — after you confirm (or with
         --yes) — atomically claims each category and writes ONE plan per category to
         ~/code/claude/plans/<date>-issues-<category>.md. Pass --category CATEGORY to
         scope to a single one. It then hands the terminal to an interactive Claude
@@ -902,16 +903,19 @@ end
 
 ISSUE_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
 
-# Routing key for a fix session: one category per session, one durable prompt
-# body per category (devops/claude-issues/<category>-body.md). Mirrors the
-# issue_category enum in the platform `issues` spec — keep them in step.
-ISSUE_CATEGORIES = %w[graphs worker insights].freeze
+# EVERY issue_category in the platform `issues` spec, in enum order — keep them
+# in step. `dev issues claim` claims across all of them: an open issue the CLI
+# cannot see is an open issue nobody works, so there is no category the sweep
+# skips. Each is still one plan and one fix session; the durable prompt body is
+# devops/claude-issues/<category>-body.md where a category has its own pipeline,
+# and default-body.md otherwise (see issue_body_text).
+ISSUE_CATEGORIES = %w[graphs worker insights suggestion feature bug improvement].freeze
 
-# Manually-filed categories: units of work filed from the laptop with `dev issues
-# create`. Deliberately DISJOINT from ISSUE_CATEGORIES (the batch-claim routing
-# list) so `dev issues claim` never sweeps hand-filed work into an automated
-# category plan — manual issues are claimed one at a time by `create`. Mirrors
-# the changelog vocabulary (a `bug` ships as changelog `fix`).
+# The categories `dev issues create` offers when filing from the laptop, and the
+# changelog vocabulary they mirror (a `bug` ships as changelog `fix`). A SUBSET
+# of ISSUE_CATEGORIES: the rest arrive on their own (graphs/insights captured in
+# playbook-admin, worker auto-filed by the log review, suggestion submitted by a
+# member in playbook-app), so none of them is a sensible manual pick.
 ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
 
 ISSUE_SEVERITIES = %w[low medium high].freeze
@@ -1026,11 +1030,15 @@ def issue_claude_command(path)
   issue_claude_argv(issue_session_prompt(path))
 end
 
-# Known categories (in ISSUE_CATEGORIES order) that have at least one open issue
-# in `open`. Drives both the grouped preview and the per-category claim loop, so
-# an unknown/retired category in the tracker is simply never claimed here.
+# Every category that has at least one open issue in `open`: the known ones in
+# ISSUE_CATEGORIES (enum) order, then any category the tracker returned that this
+# script does not know yet — a value added to the spec enum since. Drives both
+# the grouped preview and the per-category claim loop. Nothing is filtered out on
+# purpose: a category dropped here is an open issue that silently never gets
+# claimed, and reports "No open issues." while one is sitting there.
 def issue_categories_present(open)
-  ISSUE_CATEGORIES.select { |cat| open.any? { |c| c["category"] == cat } }
+  found = open.map { |c| c["category"] }.compact.uniq
+  ISSUE_CATEGORIES.select { |cat| found.include?(cat) } + (found - ISSUE_CATEGORIES)
 end
 
 # The issue tracker is tenant-scoped (/:tenant_id/issues) and authorized for a
@@ -1133,9 +1141,29 @@ end
 # Durable per-category orientation (pipeline map, decoding guide, working rules)
 # appended to every generated plan. Read from disk rather than inlined so the
 # prose lives in one editable place, and one file per category so a session only
-# ever sees the pipeline it is working in.
+# ever sees the pipeline it is working in. Categories with no pipeline of their
+# own — and any category added to the spec enum before its body file exists —
+# fall back to the generic guide, so a claim can never die on a missing file.
 def issue_body_text(category)
-  File.read(File.expand_path("../claude-issues/#{category}-body.md", __dir__))
+  path = claude_issues_path("#{category}-body.md")
+  File.file?(path) ? File.read(path) : issue_default_body_text
+end
+
+def claude_issues_path(name)
+  File.expand_path("../claude-issues/#{name}", __dir__)
+end
+
+# The generic "how to work an issue" guide: the orientation every plan needs
+# regardless of category. Its own file so the per-category bodies, the fallback,
+# and the hand-filed plan all share ONE copy of the working rules.
+def issue_default_body_text
+  File.read(claude_issues_path("default-body.md"))
+end
+
+# Body for a plan written by `dev issues create`: what is specific to a hand-filed
+# issue, then the shared working guide.
+def issue_manual_body_text
+  "#{File.read(claude_issues_path('manual-body.md')).strip}\n\n#{issue_default_body_text.strip}\n"
 end
 
 def issue_plan_markdown(items:, date:, category:, body:)
@@ -1238,7 +1266,7 @@ def write_manual_issue_plan(issue, local_paths)
     path = File.join(dir, "#{base}-#{n}.md")
     n += 1
   end
-  body = File.read(File.expand_path("../claude-issues/manual-body.md", __dir__))
+  body = issue_manual_body_text
   File.write(path, manual_issue_plan_markdown(issue: issue, date: date, local_paths: local_paths, body: body))
   path
 end
@@ -1313,7 +1341,8 @@ def cmd_issues_create(args)
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   if category && !category.empty? && !ISSUE_MANUAL_CATEGORIES.include?(category)
     problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')} " \
-                "(#{ISSUE_CATEGORIES.join('/')} are auto-filed — claim those with `dev issues claim`)"
+                "(#{(ISSUE_CATEGORIES - ISSUE_MANUAL_CATEGORIES).join('/')} are filed automatically " \
+                "or in-app — work those with `dev issues claim`)"
   end
   problems << "--severity must be one of: #{ISSUE_SEVERITIES.join(', ')}" if severity && !ISSUE_SEVERITIES.include?(severity)
   images.each do |p|
