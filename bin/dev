@@ -1194,7 +1194,8 @@ def issue_summary_line(issue, index)
   title = "#{title[0, 57]}..." if title.length > 60
   # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
-  "  #{index}. #{issue_label(issue)} · #{issue['category']} · #{issue['status']} · #{club}#{title}"
+  # No category here: the only caller prints these under a per-category heading.
+  "  #{index}. #{issue_label(issue)} · #{issue['status']} · #{club}#{title}"
 end
 
 # One claimed issue rendered as a plan section. Kept separate (and pure) so the

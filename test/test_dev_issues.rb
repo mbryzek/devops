@@ -148,13 +148,17 @@ class TestDevIssues < Minitest::Test
 
   # ---- issue_summary_line ----
 
-  def test_summary_line_shows_number_category_status_club_and_title
-    assert_equal "  1. ISS-034 · graphs · claimed · Padel Haus · Bars overflow the axis",
+  def test_summary_line_shows_number_status_club_and_title
+    assert_equal "  1. ISS-034 · claimed · Padel Haus · Bars overflow the axis",
                  issue_summary_line(graph_issue, 1)
   end
 
+  def test_summary_line_omits_category_because_lines_print_under_a_category_heading
+    refute_includes issue_summary_line(graph_issue, 1), "graphs"
+  end
+
   def test_summary_line_omits_club_when_absent
-    assert_equal "  2. ISS-035 · worker · open · Members export empty for 3 clubs",
+    assert_equal "  2. ISS-035 · open · Members export empty for 3 clubs",
                  issue_summary_line(crawl_issue, 2)
   end
 
@@ -165,7 +169,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_summary_line_prefixes_parent_club
-    assert_includes issue_summary_line(child_club_issue, 4), "  4. ISS-036 · graphs · claimed · Bounce / Baltimore · "
+    assert_includes issue_summary_line(child_club_issue, 4), "  4. ISS-036 · claimed · Bounce / Baltimore · "
   end
 
   # ---- per-category body files are real and reachable ----
