@@ -326,9 +326,9 @@ USAGE = <<~USAGE
         `dev auth login --app playbook` once first. After writing notes it regenerates
         playbook-admin's committed snapshot (src/lib/changelog/data.json, what
         /admin/changelog actually renders) in a scratch worktree and force-pushes it
-        to the long-lived `changelog-data` branch, opening the PR if none is open —
-        best-effort, never fails the build. The page updates once that PR is merged
-        AND playbook-admin is released.
+        to the long-lived `changelog-data` branch, opening the PR if none is open and
+        squash-merging it — best-effort, never fails the build. The page updates once
+        playbook-admin is released.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -4516,9 +4516,9 @@ end
 # src/lib/changelog/data.json, assembled from this data lake by its own
 # scripts/build-changelog.ts). Newly built notes are therefore invisible on the page
 # until that snapshot is regenerated AND merged — which nobody was doing, so the page
-# silently fell months behind the lake. After a successful build we regenerate it and
-# park it on a single long-lived bot branch + PR for Mike to merge (playbook-admin is
-# PR-reviewed; only the lake itself is direct-push).
+# silently fell months behind the lake. After a successful build we regenerate it, push
+# it to a long-lived bot branch, open a PR (playbook-admin is PR-reviewed; only the lake
+# itself is direct-push) and squash-merge that PR ourselves.
 CHANGELOG_ADMIN_APP = "playbook-admin".freeze
 CHANGELOG_ADMIN_BRANCH = "changelog-data".freeze
 
@@ -4561,29 +4561,67 @@ def changelog_prepare_admin_worktree(checkout)
   wt
 end
 
-# Open the bot PR if one is not already open. The branch is long-lived, so a later
-# refresh just force-pushes onto the SAME open PR rather than opening a second one.
+# The open bot PR's number, or nil when none is open.
+def changelog_admin_open_pr_number
+  out = IO.popen(["gh", "pr", "list", "--repo", changelog_admin_repo,
+                  "--head", CHANGELOG_ADMIN_BRANCH, "--state", "open", "--json", "number"],
+                 err: File::NULL, &:read).to_s
+  (JSON.parse(out).first || {})["number"]
+rescue JSON::ParserError, TypeError
+  nil
+end
+
+# Open the bot PR if one is not already open, and return its number (nil if it could
+# not be opened). The branch is long-lived, so a refresh that lands while a previous
+# PR is still open force-pushes onto that SAME PR rather than opening a second one.
 def changelog_open_admin_pr(wt)
-  open = IO.popen(["gh", "pr", "list", "--repo", changelog_admin_repo,
-                   "--head", CHANGELOG_ADMIN_BRANCH, "--state", "open", "--json", "number"],
-                  err: File::NULL, &:read).to_s
-  if open.include?("number")
-    puts "changelog: updated the open /admin/changelog snapshot PR"
-    return
+  existing = changelog_admin_open_pr_number
+  if existing
+    puts "changelog: updated the open /admin/changelog snapshot PR ##{existing}"
+    return existing
   end
 
   body = <<~BODY
     Regenerated `src/lib/changelog/data.json` from the `changelog` data lake after
     `dev changelog build` curated new release notes. Data only — no code changes.
 
-    Opened automatically by `dev changelog build`. The branch is long-lived: later
-    refreshes force-push onto this same PR until it is merged.
+    Opened and merged automatically by `dev changelog build`.
   BODY
-  ok = system("gh", "pr", "create", "--repo", changelog_admin_repo,
-              "--head", CHANGELOG_ADMIN_BRANCH, "--title",
-              "Refresh /admin/changelog data from the changelog data lake",
-              "--body", body, chdir: wt)
-  warn "changelog: `gh pr create` failed; branch #{CHANGELOG_ADMIN_BRANCH} is pushed, open the PR by hand" unless ok
+  unless system("gh", "pr", "create", "--repo", changelog_admin_repo,
+                "--head", CHANGELOG_ADMIN_BRANCH, "--title",
+                "Refresh /admin/changelog data from the changelog data lake",
+                "--body", body, chdir: wt)
+    warn "changelog: `gh pr create` failed; branch #{CHANGELOG_ADMIN_BRANCH} is pushed, open the PR by hand"
+    return nil
+  end
+  changelog_admin_open_pr_number
+end
+
+# GitHub computes mergeability asynchronously, so a merge attempted in the same breath
+# as `gh pr create` is often rejected only because the answer is not ready yet. Retry
+# a few times before giving up.
+CHANGELOG_MERGE_ATTEMPTS = 5
+CHANGELOG_MERGE_RETRY_SECS = 3
+
+# Squash-merge the snapshot PR so the /admin/changelog page picks the new notes up on
+# the next deploy without waiting on a human. Safe to automate: the PR is data only,
+# and playbook-admin's Reviewable review auto-completes for frontend repos. Best-effort
+# like the rest of this path — a failed merge just leaves the PR open.
+def changelog_merge_admin_pr!(number)
+  return if number.nil?
+
+  last = nil
+  CHANGELOG_MERGE_ATTEMPTS.times do |attempt|
+    last, status = Open3.capture2e("gh", "pr", "merge", number.to_s,
+                                   "--repo", changelog_admin_repo, "--squash")
+    if status.success?
+      puts "changelog: merged the /admin/changelog snapshot PR ##{number}"
+      return
+    end
+    sleep CHANGELOG_MERGE_RETRY_SECS unless attempt == CHANGELOG_MERGE_ATTEMPTS - 1
+  end
+  warn "changelog: could not merge #{changelog_admin_repo}##{number} " \
+       "(#{last.to_s.lines.map(&:strip).reject(&:empty?).last}); merge it by hand"
 end
 
 # Regenerate playbook-admin's committed snapshot and push it to the bot branch/PR.
@@ -4646,7 +4684,7 @@ def changelog_refresh_admin_snapshot!(repo, published: 0, empty: 0)
     warn "changelog: could not push #{CHANGELOG_ADMIN_BRANCH} (committed locally at #{wt})"
     return
   end
-  changelog_open_admin_pr(wt)
+  changelog_merge_admin_pr!(changelog_open_admin_pr(wt))
 end
 
 def cmd_changelog_build(args)
