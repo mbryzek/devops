@@ -14,10 +14,17 @@ any code is written. Work out what the issue actually is FIRST:
 - It is buildable as described → build it.
 - It needs a human decision (product scope, a tradeoff only Mike can call, or a
   question for the submitter) → do NOT guess. Close it with
-  `--status needs_input --comment "<the question>"`; on a `suggestion` that
-  comment reaches the member when shared from playbook-admin.
+  `--status needs_input --comment "<what you need decided or asked>"`.
 - It is not actionable, or is already fixed → `--status dismissed` (or
   `needs_input`) with the reason.
+
+**Everything you write on an issue is an INTERNAL note to the team.** It is
+never a reply to the club or member who filed it, so do not address them
+("Love this idea…", "Two questions for you…") — write it to Mike. The server
+rejects a shared comment from an automated actor, and nothing internal is ever
+quoted to the submitter. When the submitter genuinely needs to be asked
+something, say plainly what should be asked; Mike writes and shares the
+customer-facing reply from playbook-admin.
 
 ## How to work
 
