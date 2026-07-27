@@ -68,7 +68,7 @@ INVOCATIONS = {
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "features list"       => 'features [list] [--localhost]',
-  "features create"     => 'features create <subproject> <feature> --app APP [--app APP]... [--localhost]',
+  "features retire"     => 'features retire <subproject> <feature> --app APP [--app APP]... [--localhost]',
   "features status"     => 'features status [--localhost]',
   "features reconcile"  => 'features reconcile [--apply] [--localhost]',
   "features cancel"     => 'features cancel <subproject> <feature> [--localhost]',
@@ -316,7 +316,7 @@ USAGE = <<~USAGE
         longer appears in the catalog (its enum value is gone), so it is listed
         separately or not at all.
 
-    #{INVOCATIONS["features create"]}
+    #{INVOCATIONS["features retire"]}
         Record a removed flag for cleanup, naming every deployable app whose release
         carries the removal. Run it after the removal PRs merge. Baselines are read
         from what production is running now, so they are never typed by hand; an app
@@ -412,7 +412,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "issues"       => %w[create claim status snooze reconcile resume],
-  "features"     => %w[list create status reconcile cancel],
+  "features"     => %w[list retire status reconcile cancel],
 }.freeze
 
 def levenshtein(a, b)
@@ -2417,17 +2417,18 @@ def feature_removal_state(registry, cache, removal)
   { ready: !results.empty? && results.all? { |r| r[:confirmed] }, pairs: results }
 end
 
-# Record a flag for cleanup. Baselines are resolved from what production is
+# Retire a flag: record that its code is gone and its row is awaiting cleanup.
+# Baselines are resolved from what production is
 # running RIGHT NOW rather than taken as arguments: the baseline is a floor
 # ("prod was here when the removal merged"), so reading it is more reliable than
 # asking a session to type it, and it is the same signal reconcile later compares
 # against. An app whose version cannot be read is a hard error — a removal
 # recorded against an unknown baseline could never be confirmed.
-# Flags for `features create`. Deliberately NOT parse_common_flags: that helper
+# Flags for `features retire`. Deliberately NOT parse_common_flags: that helper
 # treats --app as a single filter and swallows repeats, so a removal spanning two
 # apps would arrive here with an empty list and be rejected as having none.
 # `changelog` rolls its own parser for the same reason.
-def features_create_parse_flags(args)
+def features_retire_parse_flags(args)
   apps = []
   use_localhost = false
   positional = []
@@ -2437,7 +2438,7 @@ def features_create_parse_flags(args)
     case a
     when "--app"
       v = args[i + 1]
-      usage_exit("--app requires a value", example: usage_for("features create")) if v.nil?
+      usage_exit("--app requires a value", example: usage_for("features retire")) if v.nil?
       apps << v
       i += 2
     when "--localhost"
@@ -2453,27 +2454,28 @@ def features_create_parse_flags(args)
   { apps: apps, use_localhost: use_localhost, positional: positional }
 end
 
-# Record a flag for cleanup. Baselines are resolved from what production is
+# Retire a flag: record that its code is gone and its row is awaiting cleanup.
+# Baselines are resolved from what production is
 # running RIGHT NOW rather than taken as arguments: the baseline is a floor
 # ("prod was here when the removal merged"), so reading it is more reliable than
 # asking a session to type it, and it is the same signal reconcile later compares
 # against. An app whose version cannot be read is a hard error — a removal
 # recorded against an unknown baseline could never be confirmed.
-def cmd_features_create(args)
-  flags = features_create_parse_flags(args)
+def cmd_features_retire(args)
+  flags = features_retire_parse_flags(args)
   apps = flags[:apps]
   positional = flags[:positional]
   subproject = positional.shift
   feature = positional.shift
-  reject_unknown_args("features create", positional)
+  reject_unknown_args("features retire", positional)
 
   problems = []
-  problems << "features create requires <subproject> <feature>" if subproject.nil? || feature.nil?
+  problems << "features retire requires <subproject> <feature>" if subproject.nil? || feature.nil?
   # Without at least one app, "every app has released" is vacuously true and the
   # first reconcile would delete the flag row immediately.
   problems << "at least one --app is required (the deployable app(s) carrying the removal)" if apps.empty?
   problems << "each --app may be given only once" if apps.uniq.length != apps.length
-  report_arg_problems("features create", problems, usage_for("features create"))
+  report_arg_problems("features retire", problems, usage_for("features retire"))
 
   registry = Work::Registry.load
   known = registry.deploy_tracked.map(&:name)
@@ -5234,7 +5236,7 @@ when "features"
   sub = resolve_subcommand(argv, default: "list")
   case sub
   when "list"      then cmd_features_list(argv)
-  when "create"    then cmd_features_create(argv)
+  when "retire"    then cmd_features_retire(argv)
   when "status"    then cmd_features_status(argv)
   when "reconcile" then cmd_features_reconcile(argv)
   when "cancel"    then cmd_features_cancel(argv)
