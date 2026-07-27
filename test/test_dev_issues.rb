@@ -396,6 +396,65 @@ class TestDevIssues < Minitest::Test
     assert_match(/unexpected argument/, out)
   end
 
+  def test_claim_rejects_issues_without_value
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--issues"]) }
+    assert_equal 1, status
+    assert_match(/--issues requires a value/, out)
+  end
+
+  # ---- selecting which open issues to claim ----
+
+  # The preview groups by category but the numbers the operator types must be
+  # unambiguous across the whole list, so ordering is category-group order,
+  # flattened, and indexes run 1..N.
+  def open_queue
+    [
+      crawl_issue.merge("number" => "078", "category" => "worker", "status" => "open"),
+      graph_issue.merge("number" => "079", "category" => "feature", "status" => "open"),
+      graph_issue.merge("number" => "080", "category" => "improvement", "status" => "open"),
+    ]
+  end
+
+  def ordered_queue
+    present = issue_categories_present(open_queue)
+    issue_ordered_open(open_queue, present)
+  end
+
+  def test_ordered_open_flattens_category_groups_in_enum_order
+    assert_equal %w[078 079 080], ordered_queue.map { |c| c["number"] }
+  end
+
+  def test_selection_indexes_are_positions_in_the_flattened_list
+    ordered = ordered_queue
+    assert_equal %w[078 080], Ask.parse_selection("1,3", ordered).map { |c| c["number"] }
+    assert_equal %w[078 079 080], Ask.parse_selection("all", ordered).map { |c| c["number"] }
+    assert_empty Ask.parse_selection("none", ordered)
+  end
+
+  def test_requested_issues_accept_padded_unpadded_and_iss_prefixed_numbers
+    resolved, unknown = issue_resolve_requested("078, 79, ISS-080", ordered_queue)
+    assert_equal %w[078 079 080], resolved.map { |c| c["number"] }
+    assert_empty unknown
+  end
+
+  def test_requested_issues_dedupe_and_report_what_is_not_on_offer
+    resolved, unknown = issue_resolve_requested("078 078 999", ordered_queue)
+    assert_equal %w[078], resolved.map { |c| c["number"] }
+    assert_equal %w[999], unknown
+  end
+
+  # A category selected in full claims by category, so the server takes whatever
+  # is open at claim time; a partial selection claims the exact numbers picked.
+  def test_claim_scope_is_by_category_when_the_whole_category_is_selected
+    worker = open_queue.select { |c| c["category"] == "worker" }
+    assert_equal({ category: "worker" }, issue_claim_scope("worker", worker, worker))
+  end
+
+  def test_claim_scope_is_by_number_for_a_partial_selection
+    graphs = [graph_issue.merge("number" => "090"), graph_issue.merge("number" => "091")]
+    assert_equal({ numbers: %w[090] }, issue_claim_scope("graphs", [graphs.first], graphs))
+  end
+
   # ---- cmd_issues_snooze arg validation (exits before any network) ----
 
   def test_snooze_requires_number

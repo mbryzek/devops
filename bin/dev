@@ -63,7 +63,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
-  "issues claim"        => 'issues claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
+  "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
@@ -257,10 +257,17 @@ USAGE = <<~USAGE
         Claim open issues into local plans for a Claude session to work on. With no
         --category (the default) it scans EVERY category — graphs, worker, insights,
         suggestion, feature, bug, improvement — so no open issue is unreachable from
-        the CLI. It lists them grouped by category and — after you confirm (or with
-        --yes) — atomically claims each category and writes ONE plan per category to
-        ~/code/claude/plans/<date>-issues-<category>.md. Pass --category CATEGORY to
-        scope to a single one. It then hands the terminal to an interactive Claude
+        the CLI. It lists them grouped by category, numbered 1..N across the whole
+        list, and asks which to claim: numbers (`1,3`), `all` (the default — just
+        press enter), or `none`. It then atomically claims the selection and writes
+        ONE plan per category claimed to
+        ~/code/claude/plans/<date>-issues-<category>.md. Pass --issues 078,080 to
+        select by issue number without the prompt, --yes to take everything open, or
+        --category CATEGORY to scope to a single category. A category you selected in
+        full is claimed as a category (so it picks up whatever is open at claim time);
+        a partial selection is claimed by number and is all-or-nothing — if one of the
+        picked issues was just taken by another session, nothing is claimed and the
+        error says which. It then hands the terminal to an interactive Claude
         session (Opus 4.8, 1M context — the `ccd` model): one plan → it implements
         the plan directly; several → it dispatches one subagent per plan and works
         them in parallel. Pass --no-spawn to just write the plan(s) and print their
@@ -1384,6 +1391,58 @@ def issue_categories_present(open)
   ISSUE_CATEGORIES.select { |cat| found.include?(cat) } + (found - ISSUE_CATEGORIES)
 end
 
+# The open issues in the order the preview lists them (category groups in
+# ISSUE_CATEGORIES order). Selection indexes are positions in THIS list, so they
+# run 1..N across the whole preview rather than restarting per category — a
+# per-category "1" would be ambiguous the moment two categories are shown.
+def issue_ordered_open(open, present)
+  present.flat_map { |cat| open.select { |c| c["category"] == cat } }
+end
+
+# Resolves the --issues values against the open issues on offer. Accepts a number
+# as displayed or as typed ("078", "78", "ISS-078"); anything that names no open
+# issue is an error naming what IS on offer, rather than a claim that silently
+# covers less than asked for.
+def issue_resolve_requested(raw, ordered)
+  wanted = raw.to_s.split(/[\s,]+/).reject(&:empty?)
+  by_number = ordered.to_h { |c| [c["number"].to_s.sub(/\A0+/, ""), c] }
+  resolved = []
+  unknown = []
+  wanted.each do |w|
+    key = w.sub(/\Aiss-/i, "").sub(/\A0+/, "")
+    issue = by_number[key]
+    issue ? resolved << issue : unknown << w
+  end
+  [resolved.uniq, unknown]
+end
+
+# Asks which of the listed issues to claim. Reuses Ask.parse_selection (so the
+# accepted forms match the rest of the CLI) but not its prompt wrapper, which
+# would reprint the list flat and lose the category headings above.
+def issue_ask_selection(ordered)
+  loop do
+    raw = Ask.for_string("Claim which issues? Enter numbers (e.g. 1,3), `all`, or `none` [all]:", default: "all")
+    selected = Ask.parse_selection(raw, ordered)
+    return selected if selected
+    puts ""
+    puts "Invalid selection. Enter numbers between 1 and #{ordered.length} (e.g. 1,3), `all`, or `none`."
+  end
+end
+
+# The claim body for one category's selection. A whole-category selection claims
+# by category — the server takes whatever is open at claim time, so a racing
+# session simply leaves fewer issues. A partial selection claims by number, which
+# is all-or-nothing: if one of them was just taken, nothing is claimed and the
+# server says which, rather than quietly claiming a different set than the one
+# that was picked.
+def issue_claim_scope(category, selected, category_open)
+  if selected.length == category_open.length
+    { category: category }
+  else
+    { numbers: selected.map { |c| c["number"] } }
+  end
+end
+
 # The issue tracker is tenant-scoped (/:tenant_id/issues) and authorized for a
 # playbook tenant admin, not the platform tenant that `dev auth login` stores —
 # authenticate with the persisted playbook session (`dev auth login --app playbook`) on
@@ -1806,6 +1865,7 @@ def cmd_issues_claim(args)
   assume_yes = false
   spawn_session = true
   category = nil
+  requested = nil
   leftover = []
   i = 0
   while i < rest.length
@@ -1814,6 +1874,10 @@ def cmd_issues_claim(args)
     when "--category"
       category = rest[i + 1]
       usage_exit("--category requires a value", example: usage_for("issues claim")) if category.nil?
+      i += 2
+    when "--issues"
+      requested = rest[i + 1]
+      usage_exit("--issues requires a value (e.g. --issues 078,080)", example: usage_for("issues claim")) if requested.nil?
       i += 2
     when "--yes", "-y"
       assume_yes = true
@@ -1848,32 +1912,54 @@ def cmd_issues_claim(args)
       return
     end
 
-    claimable = open.count { |c| present.include?(c["category"]) }
+    # One flat, globally numbered list behind the per-category headings: the
+    # numbers the operator types are positions in it.
+    ordered = issue_ordered_open(open, present)
+    positions = ordered.each_with_index.to_h { |c, i| [c["number"], i + 1] }
     puts ""
     present.each do |cat|
       issues = open.select { |c| c["category"] == cat }
       puts Util.underline("#{cat} (#{issues.length})")
-      issues.each_with_index { |c, i| puts issue_summary_line(c, i + 1) }
+      issues.each { |c| puts issue_summary_line(c, positions[c["number"]]) }
       puts ""
     end
 
-    unless assume_yes
-      scope = present.length == 1 ? "#{present.first} issue(s)" : "issue(s) across #{present.length} categories"
-      print "Claim #{claimable} open #{scope} and write plan(s)? [y/N] "
-      answer = $stdin.gets&.strip&.downcase
-      unless %w[y yes].include?(answer)
-        puts "Aborted. Nothing claimed."
-        return
+    selected =
+      if requested
+        resolved, unknown = issue_resolve_requested(requested, ordered)
+        unless unknown.empty?
+          Util.exit_with_error(
+            "Not open (or not listed above): #{unknown.join(', ')}. On offer: #{ordered.map { |c| c['number'] }.join(', ')}"
+          )
+        end
+        resolved
+      elsif assume_yes
+        ordered
+      else
+        # Non-interactive (pipe, cron, subprocess): there is nobody to answer, and
+        # defaulting to `all` would claim the whole queue on a run that never asked
+        # to. Make the caller say which it wants.
+        unless $stdin.tty?
+          Util.exit_with_error("Nothing to read the selection from (stdin is not a terminal). Pass --issues NUMBERS or --yes.")
+        end
+        issue_ask_selection(ordered)
       end
+
+    if selected.empty?
+      puts "Aborted. Nothing claimed."
+      return
     end
 
-    # Claim each present category server-side (one atomic claim per category, as
-    # today) and write one plan per category actually claimed. A category the
-    # race just lost (nothing claimed) is dropped with no plan.
+    # Claim server-side one category at a time and write one plan per category
+    # actually claimed. A category the race just lost (nothing claimed) is
+    # dropped with no plan.
     plans = []
     claimed_issues = []
     present.each do |cat|
-      claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { category: cat }) || []
+      cat_selected = selected.select { |c| c["category"] == cat }
+      next if cat_selected.empty?
+      scope = issue_claim_scope(cat, cat_selected, open.select { |c| c["category"] == cat })
+      claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { scope: scope }) || []
       next if claimed.empty?
       claimed_issues.concat(claimed)
       path = write_issue_plan(claimed, cat)
