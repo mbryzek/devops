@@ -59,6 +59,7 @@ INVOCATIONS = {
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
+  "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "changelog capture"   => 'changelog [capture] [--app APP]...',
   "changelog build"     => 'changelog build [--app APP]... [--limit N] [--batch-size N] [--localhost]',
@@ -241,6 +242,13 @@ USAGE = <<~USAGE
         the question (needs_input) or a reason (dismissed). The generated plan tells
         the fix session to call this so no session token is written into the plan file.
 
+    #{INVOCATIONS["issues snooze"]}
+        Defer an issue for --days N: it drops out of the queue, out of
+        `issues claim`, and out of the daily nudge email until then, keeping its
+        status. Use --comment to record why you are coming back ("confirm the
+        data migration completed"). --wake clears the snooze and returns the
+        issue to the queue now.
+
     #{INVOCATIONS["issues reconcile"]}
         Flip `fixed` issues to `deployed` once their target app has released past the
         fix. Read-only against the deploy registry (same live-version signal as
@@ -310,7 +318,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
-  "issues"       => %w[create claim status reconcile resume],
+  "issues"       => %w[create claim status snooze reconcile resume],
 }.freeze
 
 def levenshtein(a, b)
@@ -1154,7 +1162,7 @@ end
 # name the parameter `statuses` so the filter applies.
 def issues_list_path(statuses:, category: nil, limit: 100)
   params = { "statuses" => Array(statuses) }
-  params["category"] = category if category
+  params["categories"] = category if category
   params["limit"] = limit
   params["offset"] = 0
   issues_path("?#{URI.encode_www_form(params)}")
@@ -1744,6 +1752,63 @@ def cmd_issues_status(args)
                             body: body)
     puts "#{issue_label(res)}: status set to #{res['status']}"
     puts "  target app: #{target_app} (baseline #{baseline_version})" if has_app
+  end
+end
+
+# Defer an issue (or wake it now). A snooze is orthogonal to status: the issue keeps
+# its place in the lifecycle and simply stays out of the queue, the per-category claim,
+# and the daily nudge until its wake time passes.
+def cmd_issues_snooze(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  days = nil
+  comment = nil
+  wake = false
+  leftover = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--days"
+      days = rest[i + 1]
+      usage_exit("--days requires a value", example: usage_for("issues snooze")) if days.nil?
+      i += 2
+    when "--comment"
+      comment = rest[i + 1]
+      usage_exit("--comment requires a value", example: usage_for("issues snooze")) if comment.nil?
+      i += 2
+    when "--wake"
+      wake = true
+      i += 1
+    else
+      leftover << a
+      i += 1
+    end
+  end
+
+  number = leftover.shift
+  days_i = days && (Integer(days) rescue nil)
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 034)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "pass --days N or --wake" if days.nil? && !wake
+  problems << "--days and --wake are opposites — pass one" if days && wake
+  problems << "--days must be an integer >= 1" if days && (days_i.nil? || days_i < 1)
+  report_arg_problems("issues snooze", problems, usage_for("issues snooze"))
+
+  require_playbook_session!(use_localhost)
+  path = issues_path("/#{URI.encode_www_form_component(number)}/snooze")
+
+  handle_errors do
+    if wake
+      res = ApiClient.request(issue_endpoint(use_localhost), :delete, path)
+      puts "#{issue_label(res)}: snooze cleared; back in the queue"
+    else
+      until_iso = (Time.now + (days_i * 24 * 60 * 60)).utc.iso8601
+      body = { snoozed_until: until_iso }
+      body[:comment] = comment if comment && !comment.empty?
+      res = ApiClient.request(issue_endpoint(use_localhost), :put, path, body: body)
+      puts "#{issue_label(res)}: snoozed until #{res['snoozed_until']} (status #{res['status']} unchanged)"
+    end
   end
 end
 
@@ -4365,6 +4430,7 @@ when "issues"
   when "resume"    then cmd_issues_resume(argv)
   when "claim"     then cmd_issues_claim(argv)
   when "status"    then cmd_issues_status(argv)
+  when "snooze"    then cmd_issues_snooze(argv)
   when "reconcile" then cmd_issues_reconcile(argv)
   when nil         then require_subcommand("issues")
   else               unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
