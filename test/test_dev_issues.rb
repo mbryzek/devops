@@ -10,7 +10,7 @@ load File.expand_path('../bin/dev', __dir__)
 class TestDevIssues < Minitest::Test
   include DevTestSupport
 
-  # Run a block as if `dev login --app playbook` had never been run. Guards the
+  # Run a block as if `dev auth login --app playbook` had never been run. Guards the
   # arg-validation tests: this box has a real playbook session, so without it a
   # command that gets past validation would fire a live request at production.
   def without_playbook_session
@@ -375,7 +375,7 @@ class TestDevIssues < Minitest::Test
     out, status = without_playbook_session { capture_stderr_and_exit { cmd_issues_claim([]) } }
     refute_match(/--category is required/, out)
     assert_equal 1, status
-    assert_match(/dev login --app playbook/, out)
+    assert_match(/dev auth login --app playbook/, out)
   end
 
   def test_claim_rejects_invalid_category
@@ -475,7 +475,7 @@ class TestDevIssues < Minitest::Test
     refute_match(/marking fixed requires/, out)
     refute_match(/--baseline-version requires --app/, out)
     assert_equal 1, status
-    assert_match(/dev login --app playbook/, out)
+    assert_match(/dev auth login --app playbook/, out)
   end
 
   def test_status_app_without_baseline_version_is_rejected
@@ -572,7 +572,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_login_rejects_unknown_app_and_lists_playbook
-    out, status = capture_stderr_and_exit { cmd_login(["--app", "bogus"]) }
+    out, status = capture_stderr_and_exit { cmd_auth_login(["--app", "bogus"]) }
     assert_equal 1, status
     assert_match(/--app must be one of:.*playbook/, out)
   end
@@ -580,13 +580,13 @@ class TestDevIssues < Minitest::Test
   def test_require_playbook_session_names_exact_login_command
     out, status = without_playbook_session { capture_stderr_and_exit { require_playbook_session!(false) } }
     assert_equal 1, status
-    assert_match(/dev login --app playbook/, out)
+    assert_match(/dev auth login --app playbook/, out)
   end
 
   def test_require_playbook_session_localhost_names_localhost_login_command
     out, status = without_playbook_session { capture_stderr_and_exit { require_playbook_session!(true) } }
     assert_equal 1, status
-    assert_match(/dev login --app playbook --localhost/, out)
+    assert_match(/dev auth login --app playbook --localhost/, out)
   end
 
   def test_playbook_session_file_is_scoped_by_localhost
@@ -621,7 +621,7 @@ class TestDevIssues < Minitest::Test
       out, status = without_playbook_session { capture_stderr_and_exit { cmd_issues_claim(["--category", category]) } }
       assert_equal 1, status
       refute_match(/--category must be one of/, out, "#{category}: rejected by claim")
-      assert_match(/dev login --app playbook/, out, "#{category}: did not reach the credential guard")
+      assert_match(/dev auth login --app playbook/, out, "#{category}: did not reach the credential guard")
     end
   end
 

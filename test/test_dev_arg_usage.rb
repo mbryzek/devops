@@ -68,7 +68,9 @@ class TestDevArgUsage < Minitest::Test
   # substring.
   def error_cases
     {
-      "login unknown arg"         => [-> { cmd_login(["--nope"]) },                    "dev login [--email EMAIL]"],
+      "auth login unknown arg"    => [-> { cmd_auth_login(["--nope"]) },               "dev auth login [--email EMAIL]"],
+      "auth ai set no token"      => [-> { cmd_auth_ai_set([]) },                      "dev auth ai set <token>"],
+      "auth status stray flag"    => [-> { cmd_auth_status(["--nope"]) },              "dev auth [status]"],
       "invariants check bad flag" => [-> { cmd_invariants_check(["--bogus"]) },        "dev invariants [check]"],
       "docker prune bad days"     => [-> { cmd_docker_prune(["--days", "abc"]) },      "dev docker prune"],
       "deploy all bad conc"       => [-> { cmd_deploy_all(["--concurrency", "0"]) }, "dev deploy all"],
