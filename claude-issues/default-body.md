@@ -35,6 +35,9 @@ Follow `~/code/CLAUDE.md`. The parts that bite most often:
   feature dir and use the same feature branch across every repo you touch.
 - Branch off the latest `origin/main` (`git fetch origin` first), never off
   another feature branch.
+- `dev issues show <number>` prints any issue with its full comment history. Use
+  it when this issue references another one — the history says what was already
+  tried, which is the part that saves you the most time.
 - Write tests. Read the existing tests in each repo first to match their shape.
 - A shared contract change (apibuilder spec, lib, DB column, config key) is a
   CROSS-REPO change: find and update every consumer on the same branch.

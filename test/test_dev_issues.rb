@@ -134,6 +134,12 @@ class TestDevIssues < Minitest::Test
     assert_includes out, "- Club: Bounce / Baltimore (`bounce-baltimore`)"
   end
 
+  # `dev issues show` renders one issue, so there is nothing to number it against.
+  def test_render_item_without_an_index_drops_the_number_prefix
+    assert_includes issue_render_item(graph_issue), "### ISS-034 — Bars overflow the axis"
+    refute_includes issue_render_item(graph_issue), "### 1."
+  end
+
   def test_render_item_lists_previous_fix_prs
     out = issue_render_item(fixed_issue, 1)
     assert_includes out, "- Previous fixes: https://github.com/mbryzek/playbook-app/pull/1 (playbook-app 0.1.4)"
@@ -573,6 +579,27 @@ class TestDevIssues < Minitest::Test
 
   def test_categories_present_empty_only_when_nothing_is_open
     assert_empty issue_categories_present([])
+  end
+
+  # ---- cmd_issues_show arg validation (exits before any network) ----
+
+  def test_show_requires_an_issue_number
+    out, status = capture_stderr_and_exit { cmd_issues_show([]) }
+    assert_equal 1, status
+    assert_match(/missing issue number/, out)
+    assert_match(/dev issues show/, out)
+  end
+
+  def test_show_rejects_extra_positionals
+    out, status = capture_stderr_and_exit { cmd_issues_show(%w[084 085]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument\(s\): 085/, out)
+  end
+
+  def test_show_is_a_registered_subcommand_with_usage
+    assert_includes SUBCOMMANDS["issues"], "show"
+    assert INVOCATIONS.key?("issues show")
+    assert_match(/dev issues show/, usage_for("issues show"))
   end
 
   # ---- cmd_issues_claim arg validation (exits before any network) ----
