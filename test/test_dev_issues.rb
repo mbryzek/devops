@@ -253,7 +253,7 @@ class TestDevIssues < Minitest::Test
     path = issues_list_path(statuses: "open", category: "graphs")
     assert_includes path, "statuses=open"
     refute_includes path, "status=open"   # the singular, server-ignored form
-    assert_includes path, "category=graphs"
+    assert_includes path, "categories=graphs"
     assert_includes path, "limit=100"
     assert_includes path, "offset=0"
   end
@@ -261,7 +261,7 @@ class TestDevIssues < Minitest::Test
   def test_issues_list_path_omits_category_when_absent
     path = issues_list_path(statuses: "fixed")
     assert_includes path, "statuses=fixed"
-    refute_includes path, "category="
+    refute_includes path, "categories="
   end
 
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
@@ -394,6 +394,42 @@ class TestDevIssues < Minitest::Test
     out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "graphs", "extra"]) }
     assert_equal 1, status
     assert_match(/unexpected argument/, out)
+  end
+
+  # ---- cmd_issues_snooze arg validation (exits before any network) ----
+
+  def test_snooze_requires_number
+    out, status = capture_stderr_and_exit { cmd_issues_snooze(["--days", "1"]) }
+    assert_equal 1, status
+    assert_match(/missing issue number/, out)
+  end
+
+  def test_snooze_requires_days_or_wake
+    out, status = capture_stderr_and_exit { cmd_issues_snooze(["034"]) }
+    assert_equal 1, status
+    assert_match(/pass --days N or --wake/, out)
+  end
+
+  def test_snooze_rejects_days_with_wake
+    out, status = capture_stderr_and_exit { cmd_issues_snooze(["034", "--days", "1", "--wake"]) }
+    assert_equal 1, status
+    assert_match(/opposites/, out)
+  end
+
+  def test_snooze_rejects_non_positive_days
+    out, status = capture_stderr_and_exit { cmd_issues_snooze(["034", "--days", "0"]) }
+    assert_equal 1, status
+    assert_match(/--days must be an integer/, out)
+  end
+
+  # Valid args reach the credential guard rather than an arg complaint — the proof
+  # that a well-formed snooze passes validation without this test hitting the network.
+  def test_snooze_with_days_passes_arg_validation
+    out, status = without_playbook_session do
+      capture_stderr_and_exit { cmd_issues_snooze(["034", "--days", "1", "--comment", "confirm the migration"]) }
+    end
+    assert_equal 1, status
+    assert_match(/No playbook session/, out)
   end
 
   # ---- cmd_issues_status arg validation (exits before any network) ----
