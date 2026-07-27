@@ -58,3 +58,28 @@ if CHANGELOG_TRACKED.include?(args.app)
   system(File.join(dir, "dev"), "changelog", "capture", "--app", args.app, Config::SKIP_REGENERATE_FLAG) ||
     warn("changelog capture failed (ignored) — run `dev changelog capture --app #{args.app}` later")
 end
+
+# Post-release hook: run the two reconcilers that gate on "what is production
+# running". A release is the only event that can change either answer, and the
+# deploy steps above already waited for the rollout, so the new version is live by
+# the time we reach here. Between releases both have nothing to do -- which is why
+# they hang off this rather than a cron nobody would remember to install.
+#
+# Deliberately NOT scoped to the app just released. A feature removal (or a fixed
+# issue) usually waits on more than one app, so releasing platform can be what
+# clears one that was also waiting on playbook-app. Both commands evaluate
+# everything outstanding, so one call per release covers all of it.
+#
+# Best-effort via system() for the same reason as the changelog hook above: a
+# reconcile hiccup must never fail a release that has already succeeded. Both are
+# fail-closed, so skipping a run only defers work -- nothing is deleted or
+# transitioned on a failure, and feature_removals_must_be_processed_within_a_week
+# catches a reconcile that has stopped running entirely.
+RECONCILERS = [
+  ["features", "feature-flag cleanup"],
+  ["issues", "fixed -> deployed transitions"],
+].freeze
+RECONCILERS.each do |command, description|
+  system(File.join(dir, "dev"), command, "reconcile", "--apply", Config::SKIP_REGENERATE_FLAG) ||
+    warn("dev #{command} reconcile --apply failed (ignored, #{description}) — run it later")
+end
