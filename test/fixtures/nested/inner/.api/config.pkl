@@ -1,0 +1,7 @@
+amends "../../../../../api/ApiConfig.pkl"
+
+org = "bryzek"
+
+applications = new Listing<AppGroup> {
+  new { names { "platform"; "playwright-vote" }; generators = module.singleGenerator("typescript", "./generated") }
+}

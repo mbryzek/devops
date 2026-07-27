@@ -8,7 +8,16 @@ class ApiConfig
   Application = Struct.new(:key, :file_path, keyword_init: true)
   Block = Struct.new(:org, :group, :generators, :attributes, :applications, keyword_init: true)
 
+  # Reserved top-level output key holding `nestedConfigs`; every other top-level
+  # key is an org. Must match `nestedConfigsKey` in devops/api/ApiConfig.pkl.
+  NESTED_CONFIGS_KEY = "$nested_configs".freeze
+
   attr_reader :blocks
+
+  # Directories (relative to this config's repo root) that hold their own
+  # `.api/config.pkl` and belong to the same `api` run. Empty for the vast
+  # majority of repos, which have exactly one config.
+  attr_reader :nested_configs
 
   # base_dir is the directory that spec_glob patterns resolve against. It
   # defaults to Dir.pwd so callers running from a repo root (the `api` command)
@@ -23,7 +32,9 @@ class ApiConfig
     if !File.exist?(path)
       Util.exit_with_error("No .api/config.pkl found at #{path}")
     end
-    @blocks = parse(path)
+    data = load_data(path)
+    @nested_configs = Array(data[NESTED_CONFIGS_KEY])
+    @blocks = parse(data)
   end
 
   # Returns all unique org names
@@ -68,17 +79,19 @@ class ApiConfig
 
   private
 
-  def parse(path)
+  def load_data(path)
     json = evaluate_pkl(path)
-    data = begin
-             JSON.parse(json)
-           rescue JSON::ParserError => e
-             Util.exit_with_error("pkl produced non-JSON output for #{path}: #{e.message}")
-           end
+    begin
+      JSON.parse(json) || {}
+    rescue JSON::ParserError => e
+      Util.exit_with_error("pkl produced non-JSON output for #{path}: #{e.message}")
+    end
+  end
 
+  def parse(data)
     blocks = []
 
-    (data || {}).each do |org, block_list|
+    data.reject { |key, _| key == NESTED_CONFIGS_KEY }.each do |org, block_list|
       (block_list || []).each do |block_data|
         generators = parse_generators(block_data["generators"] || {})
         attributes = block_data["attributes"] || {}

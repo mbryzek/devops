@@ -26,7 +26,18 @@ module Codegen
       # base_dir must be the cloned repo, not Dir.pwd: `dev codegen sync` runs
       # from wherever it was invoked, so a spec_glob (e.g. the dao group's
       # "dao/spec/*.json") would otherwise resolve against the wrong tree.
-      from_blocks(::ApiConfig.new(path, base_dir: repo_dir).blocks)
+      root = ::ApiConfig.new(path, base_dir: repo_dir)
+
+      # A repo with nested codegen roots consumes those apps too — hackathon's
+      # playwright/ root is the only reader of playwright-vote. Missing them
+      # would leave the dependency graph blind to a real consumer.
+      nested = root.nested_configs.filter_map do |rel|
+        dir = File.expand_path(rel, repo_dir)
+        nested_path = File.join(dir, ".api", "config.pkl")
+        ::ApiConfig.new(nested_path, base_dir: dir) if File.exist?(nested_path)
+      end
+
+      from_blocks(([root] + nested).flat_map(&:blocks))
     end
 
     def self.from_blocks(blocks)

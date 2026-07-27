@@ -592,7 +592,7 @@ end
 
 # --- Batch Operations ---
 
-def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
+def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion, project_root)
   blocks = config.blocks_for_org(org)
   blocks = blocks.select { |b| b.group == group_filter } if group_filter
 
@@ -616,7 +616,9 @@ def build_batch_form(config, org, operations, app_filter, group_filter, import_e
     entry = { "organization_key" => org, "application_key" => app_key }
 
     if operations.include?("upload")
-      file_path = data[:file_path]
+      # Relative to the config's own root, which is the repo root for the repo's
+      # own config and the nested directory for a nested one.
+      file_path = File.join(project_root, data[:file_path])
       if !File.exist?(file_path)
         Util.exit_with_error("Application file not found: #{file_path} (for #{app_key})")
       end
@@ -706,16 +708,20 @@ def strip_metadata(content)
   content.each_line.reject { |line| IGNORE_PATTERNS.any? { |p| p.match?(line) } }.join.rstrip
 end
 
-def validate_filters(config, app_filter, group_filter)
+# Validates --app/--group against the union of every root, so `--app <key>` that
+# lives only in a nested root is accepted; a root the filter matches nothing in
+# simply contributes no applications and is skipped.
+def validate_filters(configs, app_filter, group_filter)
+  all_blocks = Array(configs).flat_map(&:blocks)
   if group_filter
-    all_groups = config.blocks.map(&:group).compact.uniq
+    all_groups = all_blocks.map(&:group).compact.uniq
     if !all_groups.include?(group_filter)
       Util.exit_with_error("Unknown group: #{group_filter}\n  Available: #{all_groups.sort.join(', ')}")
     end
   end
 
   if app_filter
-    filtered_blocks = group_filter ? config.blocks.select { |b| b.group == group_filter } : config.blocks
+    filtered_blocks = group_filter ? all_blocks.select { |b| b.group == group_filter } : all_blocks
     all_app_keys = filtered_blocks.flat_map { |b| b.applications.map(&:key) }.uniq
     missing = app_filter.select { |a| !all_app_keys.include?(a) }
     if missing.any?
@@ -724,22 +730,50 @@ def validate_filters(config, app_filter, group_filter)
   end
 end
 
-def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag)
-  config_path = File.join(Dir.pwd, ".api", "config.pkl")
-  config = ApiConfig.new(config_path)
+# Every codegen root this invocation owns: the repo's own `.api/config.pkl`,
+# then each directory its `nestedConfigs` lists. A nested root is processed with
+# ITS config and ITS directory as the output root, exactly as running `api` there
+# would - which is the point: one command at the repo root leaves no root behind.
+# Not recursive, so the repo root remains the single place that names the roots.
+def resolve_config_roots(root_dir)
+  root_config = ApiConfig.new(File.join(root_dir, ".api", "config.pkl"), base_dir: root_dir)
+  roots = [[root_config, root_dir]]
 
+  root_config.nested_configs.each do |rel|
+    dir = File.expand_path(rel, root_dir)
+    path = File.join(dir, ".api", "config.pkl")
+    if !File.exist?(path)
+      Util.exit_with_error("nestedConfigs lists '#{rel}' but #{path} does not exist")
+    end
+    roots << [ApiConfig.new(path, base_dir: dir), dir]
+  end
+
+  roots
+end
+
+def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag)
+  roots = resolve_config_roots(Dir.pwd)
+  if roots.size > 1
+    puts "==> #{roots.size} codegen roots: #{roots.map { |_, dir| dir == Dir.pwd ? "." : Pathname.new(dir).relative_path_from(Pathname.new(Dir.pwd)).to_s }.join(', ')}"
+  end
+
+  validate_filters(roots.map { |config, _| config }, app_filter, group_filter)
+
+  roots.each do |config, project_root|
+    run_batch_for_config(profile, operations.dup, app_filter, group_filter, expand_imports_flag, config, project_root)
+  end
+end
+
+def run_batch_for_config(profile, operations, app_filter, group_filter, expand_imports_flag, config, project_root)
   if operations.empty?
     operations = ["codegen"]
-    has_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(a.file_path) } }
+    has_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(File.join(project_root, a.file_path)) } }
     operations.unshift("upload") if has_specs
     puts "==> Auto-detected operations: #{operations.join(', ')}"
   end
 
-  validate_filters(config, app_filter, group_filter)
-
   client = ApibuilderClient.new(profile)
   batch_client = ApiBatchClient.new(client)
-  project_root = Dir.pwd
 
   num_orgs = config.orgs.size
   puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
@@ -748,7 +782,7 @@ def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag
 
   config.orgs.each do |org|
     puts "==> Building batch for #{org}"
-    form = build_batch_form(config, org, operations, app_filter, group_filter, import_expansion)
+    form = build_batch_form(config, org, operations, app_filter, group_filter, import_expansion, project_root)
     next if form["applications"].empty?
 
     num_apps = form["applications"].size

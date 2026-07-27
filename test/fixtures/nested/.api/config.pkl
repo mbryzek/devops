@@ -1,0 +1,11 @@
+amends "../../../../api/ApiConfig.pkl"
+
+org = "bryzek"
+
+applications = new Listing<AppGroup> {
+  new { names { "platform" }; generators = module.singleGenerator("typescript", "./src/generated") }
+}
+
+nestedConfigs {
+  "inner"
+}
