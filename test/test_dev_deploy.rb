@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 load File.expand_path('../lib/tag.rb', __dir__)
 

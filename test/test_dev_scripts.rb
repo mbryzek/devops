@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require_relative 'test_helper'
 require 'stringio'
 require 'tmpdir'
 load File.expand_path('../bin/dev', __dir__)
