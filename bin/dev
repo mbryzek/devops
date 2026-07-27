@@ -2472,6 +2472,9 @@ def cmd_issues_reconcile(args)
       return
     end
 
+    puts ""
+    puts "Fixed issues awaiting deploy (advance to deployed once their app has released):"
+
     deployed = 0
     skipped = 0
     fixed.each do |c|
@@ -2784,6 +2787,8 @@ def cmd_features_reconcile(args)
 
   handle_errors do
     outstanding = ApiClient.request(endpoint, :get, "#{FEATURE_REMOVALS_PATH}?processed=false&limit=100") || []
+    puts ""
+    puts "Feature-flag removals awaiting cleanup (process once every app is past the flag, then purge):"
     processed_count = 0
     outstanding.each do |r|
       state = feature_removal_state(registry, cache, r)

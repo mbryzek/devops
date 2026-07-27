@@ -166,4 +166,19 @@ class TestDevFeatures < Minitest::Test
     p = feature_removal_path({ "subproject" => "playbook", "feature" => "revenue_business_line" }, "/process")
     assert_equal "/dev/feature-removals/playbook/revenue_business_line/process", p
   end
+
+  # ---------- output ----------
+
+  # `release` runs this reconciler unattended, so its lines land in the middle of
+  # release output with nothing naming them. The header is what says which sweep
+  # the "waiting"/"processed" lines belong to.
+  def test_reconcile_titles_its_output
+    out, = capture_io do
+      with_stubbed_api("GET /dev/feature-removals?processed=false&limit=100" => [],
+                       "GET /dev/feature-removals?processed=true&limit=100" => []) do
+        cmd_features_reconcile([])
+      end
+    end
+    assert_match(/^Feature-flag removals awaiting cleanup\b/, out)
+  end
 end
