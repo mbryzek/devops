@@ -4,9 +4,9 @@ The issue text above IS the brief — treat it the way you would treat the same
 text typed straight into a Claude Code terminal. Any attachments are listed with
 their URLs (or local paths); read them before you start.
 
-Not every issue is a defect with an obvious fix. A `suggestion` is a member's
-product feedback, and a `feature`/`improvement` may need a product call before
-any code is written. Work out what the issue actually is FIRST:
+Not every issue is a defect with an obvious fix. A `feature`/`improvement` may
+need a product call before any code is written. Work out what the issue
+actually is FIRST:
 
 - It is a defect in one of the pipelines with its own orientation (`graphs`,
   `worker`, `insights`) → say so in your PR, and read that pipeline's body file

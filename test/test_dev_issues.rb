@@ -195,9 +195,20 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_non_pipeline_categories_fall_back_to_the_default_body
-    (ISSUE_CATEGORIES - PIPELINE_CATEGORIES).each do |category|
+    (ISSUE_CATEGORIES - PIPELINE_CATEGORIES - %w[suggestion]).each do |category|
       assert_equal issue_default_body_text, issue_body_text(category), "#{category}: expected default body"
     end
+  end
+
+  # `suggestion` is the one category with its own body that is NOT a pipeline body:
+  # it replaces default-body.md outright (an investigation, not a fix session), so
+  # it must not equal the default body the way the other non-pipeline categories do.
+  def test_suggestion_has_its_own_investigation_body
+    body = issue_body_text("suggestion")
+    refute_equal issue_default_body_text, body
+    assert_includes body, "INVESTIGATE"
+    assert_includes body, "Do not create a branch"
+    assert_includes body, "needs_review"
   end
 
   # A category added to the spec enum before anyone writes its body file still
@@ -455,7 +466,7 @@ class TestDevIssues < Minitest::Test
     assert_equal({ numbers: %w[090] }, issue_claim_scope("graphs", [graphs.first], graphs))
   end
 
-  # ---- categories a blanket claim never sweeps up ----
+  # ---- suggestion is swept like every other category ----
 
   def suggestion_queue
     open_queue + [graph_issue.merge("number" => "081", "category" => "suggestion", "status" => "open")]
@@ -465,34 +476,24 @@ class TestDevIssues < Minitest::Test
     issue_ordered_open(suggestion_queue, issue_categories_present(suggestion_queue))
   end
 
-  def test_blanket_claim_skips_suggestions
-    assert_equal %w[078 079 080], issue_auto_claim_default(ordered_suggestion_queue, nil).map { |c| c["number"] }
+  # Regression: `suggestion` used to be excluded from a blanket claim (`all`/--yes).
+  # It is swept like every other category now — what makes it different is its body
+  # file (suggestion-body.md, which turns the session into an investigation), not
+  # whether the sweep claims it.
+  def test_prompt_all_takes_everything_including_suggestions
+    ordered = ordered_suggestion_queue
+    orig = Ask.method(:for_string)
+    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
+    # Enum order: worker (078), suggestion (081), feature (079), improvement (080).
+    assert_equal %w[078 081 079 080], issue_ask_selection(ordered, ordered).map { |c| c["number"] }
+  ensure
+    Ask.define_singleton_method(:for_string, orig)
   end
 
-  # Naming the category IS the human decision the gate exists for, so it stops
-  # filtering and `all` means all again.
-  def test_explicit_category_claims_suggestions
-    ordered = ordered_suggestion_queue.select { |c| c["category"] == "suggestion" }
-    assert_equal %w[081], issue_auto_claim_default(ordered, "suggestion").map { |c| c["number"] }
-  end
-
-  # A suggestion is still reachable by number — the gate is on the sweep, not on
-  # the issue.
   def test_suggestions_are_still_selectable_by_number
     resolved, unknown = issue_resolve_requested("081", ordered_suggestion_queue)
     assert_equal %w[081], resolved.map { |c| c["number"] }
     assert_empty unknown
-  end
-
-  # `all` at the prompt means "what a sweep takes", not "everything listed".
-  def test_prompt_all_takes_the_auto_claim_set_not_the_whole_list
-    ordered = ordered_suggestion_queue
-    auto = issue_auto_claim_default(ordered, nil)
-    orig = Ask.method(:for_string)
-    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
-    assert_equal %w[078 079 080], issue_ask_selection(ordered, auto).map { |c| c["number"] }
-  ensure
-    Ask.define_singleton_method(:for_string, orig)
   end
 
   def test_prompt_numbers_can_still_pick_a_suggestion
@@ -505,12 +506,11 @@ class TestDevIssues < Minitest::Test
     Ask.define_singleton_method(:for_string, orig)
   end
 
-  # Even a whole-category suggestion pick claims by number: claiming by category
-  # would take whatever is open server-side, pulling in a suggestion filed since
-  # the preview that nobody looked at.
-  def test_claim_scope_is_by_number_for_a_whole_suggestion_category
+  # A whole-category suggestion pick now claims by category, exactly like any other
+  # category selected in full — there is no more number-only exception for it.
+  def test_claim_scope_is_by_category_for_a_whole_suggestion_category_too
     suggestions = suggestion_queue.select { |c| c["category"] == "suggestion" }
-    assert_equal({ numbers: %w[081] }, issue_claim_scope("suggestion", suggestions, suggestions))
+    assert_equal({ category: "suggestion" }, issue_claim_scope("suggestion", suggestions, suggestions))
   end
 
   # ---- cmd_issues_snooze arg validation (exits before any network) ----
