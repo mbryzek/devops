@@ -337,3 +337,106 @@ class TestDevChangelogBuild < Minitest::Test
     assert_empty @pushed
   end
 end
+
+# The snapshot PR is merged for Mike, so the merge itself has to survive GitHub's
+# asynchronous mergeability computation without a human noticing.
+class TestChangelogMergeAdminPr < Minitest::Test
+  Status = Struct.new(:success?)
+
+  def setup
+    @calls = []
+    @slept = []
+    slept = @slept
+    Object.send(:define_method, :sleep) { |secs| slept << secs }
+  end
+
+  def teardown
+    Object.send(:remove_method, :sleep)
+    Open3.singleton_class.send(:remove_method, :capture2e)
+  end
+
+  # Each element of `results` is the success? of one `gh pr merge` attempt.
+  def stub_merge!(*results)
+    calls = @calls
+    queue = results.dup
+    Open3.define_singleton_method(:capture2e) do |*cmd|
+      calls << cmd
+      ok = queue.shift
+      [ok ? "Merged\n" : "not mergeable\n", Status.new(ok)]
+    end
+  end
+
+  def merge(number)
+    out, err = capture_io { changelog_merge_admin_pr!(number) }
+    [out, err]
+  end
+
+  def test_merges_the_pr
+    stub_merge!(true)
+    out, = merge(654)
+    assert_includes out, "merged the /admin/changelog snapshot PR #654"
+    assert_equal 1, @calls.length
+    assert_includes @calls[0], "--squash"
+    assert_includes @calls[0], "654"
+    assert_empty @slept
+  end
+
+  # GitHub reports a freshly opened PR as not mergeable until it finishes computing:
+  # retrying, not failing, is what keeps the automation hands-off.
+  def test_retries_until_github_reports_mergeable
+    stub_merge!(false, false, true)
+    out, = merge(654)
+    assert_includes out, "merged the /admin/changelog snapshot PR #654"
+    assert_equal 3, @calls.length
+    assert_equal [CHANGELOG_MERGE_RETRY_SECS] * 2, @slept
+  end
+
+  # Best-effort: a PR that will not merge is reported for a human, never raised — the
+  # notes are already committed to the lake by this point.
+  def test_gives_up_with_a_warning
+    stub_merge!(*Array.new(CHANGELOG_MERGE_ATTEMPTS, false))
+    _, err = merge(654)
+    assert_equal CHANGELOG_MERGE_ATTEMPTS, @calls.length
+    assert_equal CHANGELOG_MERGE_ATTEMPTS - 1, @slept.length
+    assert_includes err, "could not merge"
+    assert_includes err, "#654 (not mergeable)"
+  end
+
+  # Nothing to merge when the PR could not be opened.
+  def test_no_pr_number_is_a_no_op
+    stub_merge!
+    out, err = merge(nil)
+    assert_empty @calls
+    assert_equal "", out
+    assert_equal "", err
+  end
+end
+
+# The PR number is what the merge step acts on, so an empty list has to come back as
+# nil rather than as a truthy blob of JSON.
+class TestChangelogAdminOpenPrNumber < Minitest::Test
+  def stub_gh!(output)
+    IO.define_singleton_method(:popen) { |*_args, **_kw| output }
+  end
+
+  def teardown
+    IO.singleton_class.send(:remove_method, :popen)
+  end
+
+  def test_returns_the_open_pr_number
+    stub_gh!(JSON.generate([{ "number" => 654 }]))
+    assert_equal 654, changelog_admin_open_pr_number
+  end
+
+  def test_no_open_pr
+    stub_gh!("[]")
+    assert_nil changelog_admin_open_pr_number
+  end
+
+  # gh failing (not authenticated, no network) prints nothing parseable; that must
+  # read as "no PR", not crash the best-effort snapshot path.
+  def test_unparseable_gh_output
+    stub_gh!("")
+    assert_nil changelog_admin_open_pr_number
+  end
+end
