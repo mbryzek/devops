@@ -1202,6 +1202,21 @@ class TestDevIssues < Minitest::Test
     assert File.file?(File.expand_path("../claude-issues/manual-body.md", __dir__))
   end
 
+  # ---- output ----
+
+  # Same reason as the features reconciler: `release` runs this unattended, so the
+  # ISS-nnn lines need a header saying what sweep they came from.
+  def test_reconcile_titles_its_output
+    fixed = [{ "number" => "034", "status" => "fixed" }]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: 'fixed')}" => fixed) do
+        cmd_issues_reconcile([])
+      end
+    end
+    assert_match(/^Fixed issues awaiting deploy\b/, out)
+    assert_match(/skip ISS-034/, out)
+  end
+
   # ---- registration ----
 
   def test_create_and_resume_are_registered_subcommands
