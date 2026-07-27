@@ -4142,6 +4142,14 @@ end
 # release's commits worth telling a human about — a legitimate outcome (a codegen-only
 # release), but one that makes the release invisible on /admin/changelog, so it has to
 # be reported rather than counted as a published note.
+# Indented "app/version <detail>" lines under a `changelog build` header, padded to a
+# common width so a batch reads as a column instead of one comma-joined line.
+def changelog_build_lines(pending)
+  labels = pending.map { |p| "#{p[:app]}/#{p[:version]}" }
+  width = labels.map(&:length).max.to_i
+  pending.zip(labels).map { |p, label| "  #{label.ljust(width)}  #{yield(p)}" }
+end
+
 def changelog_notes_entry_count(notes_file)
   (JSON.parse(File.read(notes_file))["entries"] || []).length
 rescue StandardError
@@ -4216,7 +4224,8 @@ def cmd_changelog_build(args)
   batches = changelog_batches(pending, flags[:batch_size] || CHANGELOG_BUILD_BATCH_SIZE)
   batches.each_with_index do |batch, idx|
     puts "changelog build [batch #{idx + 1}/#{batches.length}]: #{batch.length} version(s) " \
-         "via Claude (#{CHANGELOG_CLAUDE_MODEL}): #{batch.map { |p| "#{p[:app]}/#{p[:version]}" }.join(', ')}"
+         "via Claude (#{CHANGELOG_CLAUDE_MODEL})"
+    puts changelog_build_lines(batch) { |p| "#{p[:commit_count]} commit(s)" }
     input_path = File.join(repo, "_build_input.json")
     File.write(input_path, "#{JSON.pretty_generate(changelog_build_input(batch, iss_map))}\n")
     output = changelog_run_claude(repo, input_path, batch.length)
@@ -4228,7 +4237,7 @@ def cmd_changelog_build(args)
         built << p
       else
         failed << p
-        warn "  failed (#{p[:app]}/#{p[:version]}): #{output.to_s.lines.last}"
+        warn "  #{p[:app]}/#{p[:version]}: failed: #{output.to_s.lines.last}"
       end
     end
   end
@@ -4236,16 +4245,19 @@ def cmd_changelog_build(args)
   unless built.empty?
     changelog_git_commit_push!(repo, "changelog: build notes for #{built.length} version(s)\n\n" \
                                      "#{built.map { |p| "#{p[:app]}/#{p[:version]}" }.join("\n")}")
-    published, empty = built.partition { |p| changelog_notes_entry_count(p[:notes_file]).positive? }
+    counts = built.to_h { |p| [p[:notes_file], changelog_notes_entry_count(p[:notes_file])] }
+    published, empty = built.partition { |p| counts[p[:notes_file]].positive? }
     puts "changelog build: wrote #{built.length} notes file(s): " \
          "#{published.length} with release notes, #{empty.length} with no user-facing changes"
-    empty.each { |p| puts "  no user-facing changes: #{p[:app]}/#{p[:version]}" }
+    puts changelog_build_lines(built) { |p|
+      counts[p[:notes_file]].positive? ? "#{counts[p[:notes_file]]} note(s)" : "no user-facing changes"
+    }
     # New notes are useless until playbook-admin's committed snapshot catches up.
     changelog_refresh_admin_snapshot!(repo, published: published.length, empty: empty.length)
   end
   unless failed.empty?
-    Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry): " \
-                         "#{failed.map { |p| "#{p[:app]}/#{p[:version]}" }.join(', ')}")
+    Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry):\n" \
+                         "#{failed.map { |p| "  #{p[:app]}/#{p[:version]}" }.join("\n")}")
   end
 end
 

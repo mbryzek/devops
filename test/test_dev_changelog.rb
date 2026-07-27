@@ -123,6 +123,23 @@ class TestChangelogCaptureScanLine < Minitest::Test
   end
 end
 
+# A build lists every version it touched on its own line; the labels are padded so the
+# details line up, which is the whole point of not comma-joining them.
+class TestChangelogBuildLines < Minitest::Test
+  def test_pads_labels_to_a_common_width
+    lines = changelog_build_lines([{ app: "playbook-app", version: "0.1.71", commit_count: 12 },
+                                   { app: "playbook-admin", version: "0.3.9", commit_count: 3 }]) do |p|
+      "#{p[:commit_count]} commit(s)"
+    end
+    assert_equal ["  playbook-app/0.1.71   12 commit(s)",
+                  "  playbook-admin/0.3.9  3 commit(s)"], lines
+  end
+
+  def test_empty
+    assert_empty changelog_build_lines([]) { "x" }
+  end
+end
+
 # "snapshot already current" right after a successful build looks like a bug unless the
 # build's own output explains that the new notes had nothing to show.
 class TestChangelogSnapshotUnchangedReason < Minitest::Test
@@ -239,6 +256,15 @@ class TestDevChangelogBuild < Minitest::Test
     3.times { |i| refute_nil notes("0.3.#{i}") }
   end
 
+  # The header names the batch; the versions in it are listed one per line with the
+  # commit load that made the batch that size.
+  def test_batch_header_lists_each_version_and_its_commit_count
+    write_tag("0.3.0", "2026-07-20T14:00:00-04:00", [{ "sha" => "a", "subject" => "s" }])
+    out = build
+    assert_includes out, "changelog build [batch 1/1]: 1 version(s) via Claude (#{CHANGELOG_CLAUDE_MODEL})\n"
+    assert_includes out, "  playbook-admin/0.3.0  1 commit(s)"
+  end
+
   def test_batch_size_splits_into_multiple_sessions
     5.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
     build("--batch-size", "2")
@@ -297,7 +323,8 @@ class TestDevChangelogBuild < Minitest::Test
     @entries_by_version["0.3.1"] = [{ "title" => "Something", "description" => "d" }]
     out = build
     assert_includes out, "wrote 2 notes file(s): 1 with release notes, 1 with no user-facing changes"
-    assert_includes out, "no user-facing changes: playbook-admin/0.3.0"
+    assert_includes out, "  playbook-admin/0.3.0  no user-facing changes"
+    assert_includes out, "  playbook-admin/0.3.1  1 note(s)"
     assert_equal [{ published: 1, empty: 1 }], @snapshots
   end
 
