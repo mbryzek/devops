@@ -1,6 +1,4 @@
-require 'etc'
 require 'shellwords'
-require 'socket'
 
 # Registry + container constants and helpers for the platformdb Docker workflow.
 #
@@ -41,18 +39,59 @@ module DbImages
     tag
   end
 
+  # Feature directory every Claude session works in, one subdirectory per feature.
+  AI_DIR = File.expand_path("~/code/ai")
+
   # Session identifier used to name the per-session database.
   #
-  # Prefers CLAUDE_SESSION_ID (set automatically by Claude Code) which
-  # guarantees distinct names across parallel sessions.  Falls back to a
-  # stable per-user-per-machine string for manual invocations where
-  # parallel isolation is not required.
+  # Resolution order, each step unique per session by construction:
+  #   1. CLAUDE_SESSION_ID, when the caller set it explicitly.
+  #   2. the ~/code/ai/<feature> directory the caller is working in — one feature
+  #      dir per session, and stable no matter which repo inside it is the cwd.
+  #   3. no answer: exit with instructions.
+  #
+  # There is deliberately NO per-machine fallback. It used to be
+  # "#{Etc.getlogin}_#{Socket.gethostname}", which is IDENTICAL for every session
+  # on this machine, so parallel sessions silently shared one database — the exact
+  # opposite of what this tooling exists to provide, and undetectable until one
+  # session's unreleased migration breaks another's test run (2026-07-27: a
+  # not-null playbook.clubs.days column from an in-flight branch failed 18 specs
+  # in a session that had merged nothing of the sort, making `main` look red).
+  # Worse, `Socket.gethostname` is not even stable within one session (DHCP
+  # re-registration flipped it from "Michaels-MacBook-Pro" to "Mac"), so `end` and
+  # `gc` computed a different name than `start` and silently leaked the database
+  # they were asked to reclaim. Failing loudly beats either.
   def DbImages.session_id
     sid = ENV['CLAUDE_SESSION_ID']
-    return sid if sid && !sid.strip.empty?
-    user = Etc.getlogin rescue "user"
-    host = Socket.gethostname.split('.').first rescue "local"
-    "#{user}_#{host}"
+    return sid.strip if sid && !sid.strip.empty?
+    feature = DbImages.feature_dir_name(Dir.pwd)
+    return feature if feature
+    Util.exit_with_error(
+      "Cannot derive a unique session id, and refusing to share one database across sessions.\n" \
+      "Either export CLAUDE_SESSION_ID=<feature-name> first:\n" \
+      "  export CLAUDE_SESSION_ID=my-feature\n" \
+      "or run this from inside your #{AI_DIR}/<feature> working directory, whose name is used instead."
+    )
+  end
+
+  # Session id when one can be determined, else nil — for read-only callers (see
+  # `claude-db status`) that should report "cannot tell" rather than abort. Every
+  # caller that CREATES or DROPS a database uses session_id instead, so a session
+  # that cannot name itself can never write to, or reclaim, another one's data.
+  def DbImages.session_id_or_nil
+    sid = ENV['CLAUDE_SESSION_ID']
+    return sid.strip if sid && !sid.strip.empty?
+    DbImages.feature_dir_name(Dir.pwd)
+  end
+
+  # The <feature> component of a path under AI_DIR, or nil when `path` is
+  # somewhere else. Matches the directory itself as well as any repo inside it.
+  def DbImages.feature_dir_name(path)
+    prefix = "#{AI_DIR}#{File::SEPARATOR}"
+    expanded = File.expand_path(path)
+    return nil unless expanded.start_with?(prefix)
+    name = expanded[prefix.length..].to_s.split(File::SEPARATOR).first
+    name && !name.empty? ? name : nil
   end
 
   # Postgres database name derived from a session ID.
