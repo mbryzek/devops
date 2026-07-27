@@ -396,6 +396,123 @@ class TestDevIssues < Minitest::Test
     assert_match(/unexpected argument/, out)
   end
 
+  def test_claim_rejects_issues_without_value
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--issues"]) }
+    assert_equal 1, status
+    assert_match(/--issues requires a value/, out)
+  end
+
+  # ---- selecting which open issues to claim ----
+
+  # The preview groups by category but the numbers the operator types must be
+  # unambiguous across the whole list, so ordering is category-group order,
+  # flattened, and indexes run 1..N.
+  def open_queue
+    [
+      crawl_issue.merge("number" => "078", "category" => "worker", "status" => "open"),
+      graph_issue.merge("number" => "079", "category" => "feature", "status" => "open"),
+      graph_issue.merge("number" => "080", "category" => "improvement", "status" => "open"),
+    ]
+  end
+
+  def ordered_queue
+    present = issue_categories_present(open_queue)
+    issue_ordered_open(open_queue, present)
+  end
+
+  def test_ordered_open_flattens_category_groups_in_enum_order
+    assert_equal %w[078 079 080], ordered_queue.map { |c| c["number"] }
+  end
+
+  def test_selection_indexes_are_positions_in_the_flattened_list
+    ordered = ordered_queue
+    assert_equal %w[078 080], Ask.parse_selection("1,3", ordered).map { |c| c["number"] }
+    assert_equal %w[078 079 080], Ask.parse_selection("all", ordered).map { |c| c["number"] }
+    assert_empty Ask.parse_selection("none", ordered)
+  end
+
+  def test_requested_issues_accept_padded_unpadded_and_iss_prefixed_numbers
+    resolved, unknown = issue_resolve_requested("078, 79, ISS-080", ordered_queue)
+    assert_equal %w[078 079 080], resolved.map { |c| c["number"] }
+    assert_empty unknown
+  end
+
+  def test_requested_issues_dedupe_and_report_what_is_not_on_offer
+    resolved, unknown = issue_resolve_requested("078 078 999", ordered_queue)
+    assert_equal %w[078], resolved.map { |c| c["number"] }
+    assert_equal %w[999], unknown
+  end
+
+  # A category selected in full claims by category, so the server takes whatever
+  # is open at claim time; a partial selection claims the exact numbers picked.
+  def test_claim_scope_is_by_category_when_the_whole_category_is_selected
+    worker = open_queue.select { |c| c["category"] == "worker" }
+    assert_equal({ category: "worker" }, issue_claim_scope("worker", worker, worker))
+  end
+
+  def test_claim_scope_is_by_number_for_a_partial_selection
+    graphs = [graph_issue.merge("number" => "090"), graph_issue.merge("number" => "091")]
+    assert_equal({ numbers: %w[090] }, issue_claim_scope("graphs", [graphs.first], graphs))
+  end
+
+  # ---- categories a blanket claim never sweeps up ----
+
+  def suggestion_queue
+    open_queue + [graph_issue.merge("number" => "081", "category" => "suggestion", "status" => "open")]
+  end
+
+  def ordered_suggestion_queue
+    issue_ordered_open(suggestion_queue, issue_categories_present(suggestion_queue))
+  end
+
+  def test_blanket_claim_skips_suggestions
+    assert_equal %w[078 079 080], issue_auto_claim_default(ordered_suggestion_queue, nil).map { |c| c["number"] }
+  end
+
+  # Naming the category IS the human decision the gate exists for, so it stops
+  # filtering and `all` means all again.
+  def test_explicit_category_claims_suggestions
+    ordered = ordered_suggestion_queue.select { |c| c["category"] == "suggestion" }
+    assert_equal %w[081], issue_auto_claim_default(ordered, "suggestion").map { |c| c["number"] }
+  end
+
+  # A suggestion is still reachable by number — the gate is on the sweep, not on
+  # the issue.
+  def test_suggestions_are_still_selectable_by_number
+    resolved, unknown = issue_resolve_requested("081", ordered_suggestion_queue)
+    assert_equal %w[081], resolved.map { |c| c["number"] }
+    assert_empty unknown
+  end
+
+  # `all` at the prompt means "what a sweep takes", not "everything listed".
+  def test_prompt_all_takes_the_auto_claim_set_not_the_whole_list
+    ordered = ordered_suggestion_queue
+    auto = issue_auto_claim_default(ordered, nil)
+    orig = Ask.method(:for_string)
+    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
+    assert_equal %w[078 079 080], issue_ask_selection(ordered, auto).map { |c| c["number"] }
+  ensure
+    Ask.define_singleton_method(:for_string, orig)
+  end
+
+  def test_prompt_numbers_can_still_pick_a_suggestion
+    ordered = ordered_suggestion_queue
+    orig = Ask.method(:for_string)
+    # suggestion sorts 2nd in ISSUE_CATEGORIES order: worker, suggestion, feature, improvement.
+    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "2" }
+    assert_equal %w[081], issue_ask_selection(ordered, []).map { |c| c["number"] }
+  ensure
+    Ask.define_singleton_method(:for_string, orig)
+  end
+
+  # Even a whole-category suggestion pick claims by number: claiming by category
+  # would take whatever is open server-side, pulling in a suggestion filed since
+  # the preview that nobody looked at.
+  def test_claim_scope_is_by_number_for_a_whole_suggestion_category
+    suggestions = suggestion_queue.select { |c| c["category"] == "suggestion" }
+    assert_equal({ numbers: %w[081] }, issue_claim_scope("suggestion", suggestions, suggestions))
+  end
+
   # ---- cmd_issues_snooze arg validation (exits before any network) ----
 
   def test_snooze_requires_number
