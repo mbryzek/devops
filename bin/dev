@@ -1286,6 +1286,9 @@ def issue_plan_markdown(items:, date:, category:, body:)
       (no app/baseline: nothing to detect, so `deployed` is set by hand later)
     - Needs a human decision, or not actionable / already fixed →
       `dev issues status <number> --status needs_input --comment "<question or reason>"`
+      (every comment you write is an INTERNAL note to the team — never a reply
+      addressed to the club that filed the issue. Say what needs deciding or
+      asking; Mike writes any customer-facing reply from playbook-admin.)
   PLAN
 end
 
@@ -1340,6 +1343,8 @@ def manual_issue_plan_markdown(issue:, date:, local_paths:, body:)
       `dev issues status #{issue['number']} --status fixed --url "<doc URL>"`
     - Blocked on a human answer →
       `dev issues status #{issue['number']} --status needs_input --comment "<question>"`
+      (an INTERNAL note to the team, not a reply to the club — Mike writes any
+      customer-facing reply from playbook-admin.)
   PLAN
 end
 
@@ -1709,8 +1714,13 @@ def cmd_issues_status(args)
   problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
   report_arg_problems("issues status", problems, usage_for("issues status"))
 
+  # Always internal, never settable from here. This command is how a Claude fix session talks to
+  # the tracker, and everything an automated actor writes is a note to the team — the club that
+  # filed the issue is replied to by a person, from playbook-admin. Sent explicitly rather than
+  # leaning on the server default so this stays true if that default ever changes.
   body = { status: status }
   body[:comment] = comment if comment && !comment.empty?
+  body[:visibility] = "internal" if body.key?(:comment)
   body[:url] = url if url && !url.empty?
 
   if has_app
