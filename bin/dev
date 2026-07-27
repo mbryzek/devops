@@ -15,6 +15,7 @@ require 'base64'
 require 'fileutils'
 require 'io/console'
 require 'json'
+require 'tmpdir'
 require 'open3'
 require 'securerandom'
 require 'set'
@@ -75,6 +76,8 @@ INVOCATIONS = {
   "features cancel"     => 'features cancel <subproject> <feature> [--localhost]',
   "changelog capture"   => 'changelog [capture] [--app APP]...',
   "changelog build"     => 'changelog build [--app APP]... [--limit N] [--batch-size N] [--localhost]',
+  "changelog push"      => 'changelog push [--app APP]... [--localhost]',
+  "changelog status"    => 'changelog status [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -323,6 +326,18 @@ USAGE = <<~USAGE
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
+    #{INVOCATIONS["changelog push"]}
+        One-time migration: upload the `changelog` git repo into platform. The raw
+        capture is reproducible from git, but the notes are hundreds of
+        non-deterministic model outputs that cannot be regenerated cheaply, so they are
+        moved rather than rebuilt. Idempotent -- every write is an upsert keyed on
+        application/version, so a partial run is simply re-run. Delete this command once
+        the lake is archived.
+
+    #{INVOCATIONS["changelog status"]}
+        What platform holds per app: the latest recorded version and how many are still
+        awaiting notes. The check to run after a backfill and before archiving the lake.
+
     #{INVOCATIONS["features list"]}
         Every feature flag in the code-driven catalog with its state, roles, and
         last-enabled-at, plus any flags awaiting cleanup. A flag awaiting cleanup no
@@ -360,9 +375,9 @@ USAGE = <<~USAGE
         flag's removal was undone, so the cleanup must not proceed.
 
     #{INVOCATIONS["changelog capture"]}
-        Record the changelog for the playbook* apps into the `changelog` data repo
-        (github.com/mbryzek/changelog, cloned to ~/code/changelog). With no
-        subcommand it runs `capture` then `build`. `capture` reads each tracked app's
+        Record the changelog for the playbook* apps into platform, which serves it at
+        /dev/changelog and /playbook/admin/changelog. With no subcommand it runs
+        `capture` then `build`. `capture` reads each tracked app's
         git tags (playbook-admin, playbook-app, playbook-www) and, for every tag missing
         a <version>.tag.json, writes all commits since the previous tag — idempotent,
         so it both records new releases and backfills history. Repeat --app to scope;
@@ -414,7 +429,7 @@ COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scr
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
-  "changelog"    => %w[capture build],
+  "changelog"    => %w[capture build push status],
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
   "deploy"       => %w[status all],
@@ -4891,6 +4906,69 @@ end
 
 # Commits in `range`, oldest-first, no merges. Extracts the squash-merge PR number
 # from the trailing "(#NN)" of the subject when present.
+# --- the changelog store ------------------------------------------------------
+#
+# The changelog lives in platform and is served from the API. It used to live in a
+# git repo whose contents were baked into playbook-admin as a committed data.json;
+# that snapshot was regenerated AFTER the release that would have carried it, so a
+# release could never contain its own notes and the page sat a deploy behind.
+
+CHANGELOG_PATH = "/dev/changelog".freeze
+
+# The server accepts at most this many records per call, and enforces it. Chunk to
+# match rather than discovering the limit as a 422.
+CHANGELOG_MAX_BATCH = 100
+
+# Per-app server state, keyed by app name: what it already holds, so we send only the
+# difference.
+def changelog_status(endpoint)
+  (ApiClient.request(endpoint, :get, "#{CHANGELOG_PATH}/status") || [])
+    .map { |s| [s["application"], s] }.to_h
+end
+
+# Tags in VERSION order, not creation order or lexical order. `--sort=v:refname` is
+# git's own version-aware sort: it yields 0.1.8, 0.1.9, 0.1.75, 0.1.76, where a plain
+# sort yields 0.1.75, 0.1.76, 0.1.8, 0.1.9 and would silently skip the two newest.
+# This is why nothing in this pipeline parses a version.
+def changelog_tags(checkout)
+  changelog_git_out("-C", checkout, "tag", "--list", "--sort=v:refname")
+    .split("\n").map(&:strip).reject(&:empty?)
+end
+
+# The releases in this checkout the server does not have yet: everything after
+# max_version in the ordered tag list. An unknown max_version (a deleted tag) sends
+# everything and lets the upsert dedupe -- resending is a no-op, skipping is not.
+def changelog_new_releases(app, checkout, max_version)
+  tags = changelog_tags(checkout)
+  cursor = max_version ? tags.index(max_version) : nil
+  pending = cursor ? tags[(cursor + 1)..] || [] : tags
+  pending.map do |tag|
+    i = tags.index(tag)
+    prev = i.positive? ? tags[i - 1] : nil
+    range = prev ? "#{prev}..#{tag}" : tag
+    {
+      "application" => app,
+      # Recorded alongside the app because they can differ: /admin/changelog links PRs
+      # off the repo, not the app name.
+      "repo" => changelog_app_repo(app),
+      "version" => tag,
+      "previous_version" => prev,
+      "released_at" => changelog_git_out("-C", checkout, "log", "-1", "--format=%cI", tag).strip,
+      "commits" => changelog_commits(checkout, range),
+    }.compact
+  end
+end
+
+# POST in chunks, returning the number sent. Each call is all-or-nothing server side,
+# so a failure leaves earlier chunks committed and the next run resumes from the
+# server's own cursor.
+def changelog_post_batches(endpoint, path, key, records)
+  records.each_slice(CHANGELOG_MAX_BATCH) do |chunk|
+    ApiClient.request(endpoint, :post, "#{CHANGELOG_PATH}/#{path}", body: { key => chunk })
+  end
+  records.length
+end
+
 def changelog_commits(checkout, range)
   raw = changelog_git_out("-C", checkout, "log", "--no-merges", "--reverse",
                           "--format=%H%x1f%s%x1f%b%x1e", range)
@@ -4901,9 +4979,11 @@ def changelog_commits(checkout, range)
     {
       "sha" => (sha || "").strip,
       "subject" => subject,
-      "body" => (body || "").strip,
+      # Omitted, never "": the API models body as optional, so an empty string would
+      # store a value every reader then has to treat as absent.
+      "body" => ((body || "").strip.empty? ? nil : body.strip),
       "pr_number" => (pr ? pr.to_i : nil),
-    }
+    }.compact
   end
 end
 
@@ -4919,89 +4999,76 @@ def changelog_capture_scan_line(scan)
 end
 
 def cmd_changelog_capture(args)
-  apps = changelog_parse_flags(args)[:apps]
-  repo = ensure_changelog_repo!
-  written = []
-  scans = []
-  apps.each do |app|
-    checkout = changelog_app_checkout(app)
-    scan = { app: app, repo: changelog_app_repo(app), tags: 0, new: 0, latest: nil }
-    scans << scan
-    unless Dir.exist?(File.join(checkout, ".git"))
-      scan[:skipped] = "skipped, no checkout at #{checkout}"
-      warn "changelog: skipping #{app} (no checkout at #{checkout})"
-      next
+  flags = changelog_parse_flags(args)
+  apps = flags[:apps]
+  endpoint = platform_endpoint(flags[:use_localhost])
+
+  handle_errors do
+    status = changelog_status(endpoint)
+    sent = 0
+    scans = []
+    apps.each do |app|
+      checkout = changelog_app_checkout(app)
+      scan = { app: app, repo: changelog_app_repo(app), tags: 0, new: 0, latest: nil }
+      scans << scan
+      unless Dir.exist?(File.join(checkout, ".git"))
+        scan[:skipped] = "skipped, no checkout at #{checkout}"
+        warn "changelog: skipping #{app} (no checkout at #{checkout})"
+        next
+      end
+      tags = changelog_tags(checkout)
+      scan[:tags] = tags.length
+      scan[:latest] = tags.last
+      releases = changelog_new_releases(app, checkout, status.dig(app, "max_version"))
+      scan[:new] = releases.length
+      sent += changelog_post_batches(endpoint, "releases", :releases, releases)
     end
-    tags = changelog_git_out("-C", checkout, "tag", "--list", "--sort=creatordate")
-           .split("\n").map(&:strip).reject(&:empty?)
-    scan[:tags] = tags.length
-    scan[:latest] = tags.last
-    out_dir = File.join(repo, app)
-    FileUtils.mkdir_p(out_dir)
-    tags.each_with_index do |tag, i|
-      file = File.join(out_dir, "#{tag}.tag.json")
-      next if File.exist?(file)
-      scan[:new] += 1
-      prev = i.positive? ? tags[i - 1] : nil
-      range = prev ? "#{prev}..#{tag}" : tag
-      released_at = changelog_git_out("-C", checkout, "log", "-1", "--format=%cI", tag).strip
-      data = {
-        "application" => app,
-        # The GitHub repo, recorded alongside the app because they can differ: the
-        # /admin/changelog page links PRs off this, not off the app name.
-        "repo" => changelog_app_repo(app),
-        "version" => tag,
-        "previous_version" => prev,
-        "released_at" => released_at,
-        "commits" => changelog_commits(checkout, range),
-      }
-      File.write(file, "#{JSON.pretty_generate(data)}\n")
-      written << "#{app}/#{tag}.tag.json"
-    end
-  end
-  if written.empty?
-    puts "changelog capture: no new tags in #{scans.length} app(s)"
+
+    puts "changelog capture: sent #{sent} release(s) from #{scans.length} app(s)"
     scans.each { |s| puts changelog_capture_scan_line(s) }
-    return
   end
-  changelog_git_commit_push!(repo, "changelog: capture #{written.length} release(s)\n\n#{written.join("\n")}")
-  puts "changelog capture: wrote #{written.length} file(s) from #{scans.length} app(s)"
-  scans.each { |s| puts changelog_capture_scan_line(s) }
-  written.each { |w| puts "  #{w}" }
 end
 
-# tag.json files (for the selected apps) that do not yet have a sibling notes.json,
-# newest-first (by release timestamp) so a --limit builds the most recent releases.
-def changelog_pending(repo, apps)
+# Versions the server has recorded but has no notes for, newest first so a --limit
+# builds the most recent releases. The list is the server's answer, not a filesystem
+# scan: "still needs notes" is notes_built_at being null, which is deliberately not the
+# same as having no entries -- a release whose commits were all noise gets zero entries
+# and is finished, not pending.
+#
+# Commits come from git rather than the API: they are the model's input, never rendered,
+# so the read path does not serve them.
+def changelog_pending(endpoint, apps, workdir)
+  status = changelog_status(endpoint)
   apps.flat_map do |app|
-    dir = File.join(repo, app)
-    next [] unless Dir.exist?(dir)
-    Dir.glob(File.join(dir, "*.tag.json")).filter_map do |tag_file|
-      version = File.basename(tag_file).sub(/\.tag\.json\z/, "")
-      notes_file = File.join(dir, "#{version}.notes.json")
-      next if File.exist?(notes_file)
-      tag = JSON.parse(File.read(tag_file)) rescue {}
-      { app: app, version: version, tag_file: tag_file, notes_file: notes_file,
-        released_at: tag["released_at"].to_s, commit_count: (tag["commits"] || []).length }
+    versions = status.dig(app, "versions_missing_notes") || []
+    next [] if versions.empty?
+    checkout = changelog_app_checkout(app)
+    unless Dir.exist?(File.join(checkout, ".git"))
+      warn "changelog: #{versions.length} version(s) of #{app} need notes but there is no checkout at #{checkout}"
+      next []
+    end
+    tags = changelog_tags(checkout)
+    versions.filter_map do |version|
+      i = tags.index(version)
+      if i.nil?
+        warn "changelog: #{app} #{version} is recorded but has no local tag; skipping"
+        next nil
+      end
+      prev = i.positive? ? tags[i - 1] : nil
+      range = prev ? "#{prev}..#{version}" : version
+      commits = changelog_commits(checkout, range)
+      {
+        app: app,
+        version: version,
+        notes_file: File.join(workdir, "#{app}-#{version}.notes.json"),
+        released_at: changelog_git_out("-C", checkout, "log", "-1", "--format=%cI", version).strip,
+        commits: commits,
+        commit_count: commits.length,
+      }
     end
   end.sort_by { |p| p[:released_at] }.reverse
 end
 
-# Stamp the app's GitHub repo onto a notes file the Claude session just wrote. Done
-# here, not in the session's own output, so it is deterministic: the page links PRs
-# off this field, and the app name is not always the repo.
-def changelog_stamp_notes_repo!(p)
-  data = JSON.parse(File.read(p[:notes_file]))
-  repo = changelog_app_repo(p[:app])
-  return if data["repo"] == repo
-  File.write(p[:notes_file], "#{JSON.pretty_generate(data.merge('repo' => repo))}\n")
-rescue StandardError => e
-  warn "changelog: could not stamp repo on #{p[:notes_file]}: #{e.message}"
-end
-
-# Map "<repo-slug>#<pr-number>" => issue number, from playbook issues that carry a
-# fix linked to a mbryzek PR. Best-effort: any failure yields an empty map so the
-# build still produces notes, just without ISS links.
 def changelog_issue_map(use_localhost)
   if ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
     warn "changelog: no playbook session; skipping ISS enrichment (run `dev auth login --app playbook` to enable)"
@@ -5063,8 +5130,7 @@ def changelog_build_input(batch, iss_map)
 end
 
 def changelog_version_input(p, iss_map)
-  tag = JSON.parse(File.read(p[:tag_file]))
-  commits = (tag["commits"] || []).map do |c|
+  commits = p[:commits].map do |c|
     pr = c["pr_number"]
     {
       "sha" => c["sha"],
@@ -5079,249 +5145,183 @@ def changelog_version_input(p, iss_map)
   {
     "application" => p[:app],
     "version" => p[:version],
-    "released_at" => tag["released_at"],
+    "released_at" => p[:released_at],
     "notes_file" => p[:notes_file],
     "commits" => commits,
   }
 end
 
-# --- /admin/changelog snapshot -------------------------------------------------
-#
-# playbook-admin renders the notes from a COMMITTED snapshot (its
-# src/lib/changelog/data.json, assembled from this data lake by its own
-# scripts/build-changelog.ts). Newly built notes are therefore invisible on the page
-# until that snapshot is regenerated AND merged — which nobody was doing, so the page
-# silently fell months behind the lake. After a successful build we regenerate it, push
-# it to a long-lived bot branch, open a PR (playbook-admin is PR-reviewed; only the lake
-# itself is direct-push) and squash-merge that PR ourselves.
-CHANGELOG_ADMIN_APP = "playbook-admin".freeze
-CHANGELOG_ADMIN_BRANCH = "changelog-data".freeze
-
-# The GitHub repo of the admin app. Resolved rather than hardcoded: it tracks the
-# deployable's configured repo, which can differ from its name.
-def changelog_admin_repo
-  "mbryzek/#{changelog_app_repo(CHANGELOG_ADMIN_APP)}"
-end
-
-# A dedicated git worktree so we never touch whatever Mike has checked out (or
-# half-edited) in the admin checkout. Cheap: it shares the checkout's object store.
-def changelog_admin_worktree
-  File.expand_path("~/.devops/worktrees/#{CHANGELOG_ADMIN_APP}-changelog")
-end
-
-# Point the worktree at a pristine origin/main, creating it on first use.
-# Returns the path, or nil if it could not be prepared.
-def changelog_prepare_admin_worktree(checkout)
-  wt = changelog_admin_worktree
-  FileUtils.mkdir_p(File.dirname(wt))
-  unless system("git", "-C", checkout, "fetch", "--quiet", "origin")
-    warn "changelog: could not fetch #{CHANGELOG_ADMIN_APP}; skipping the /admin/changelog snapshot"
-    return nil
-  end
-
-  if File.exist?(File.join(wt, ".git"))
-    ok = system("git", "-C", wt, "checkout", "-q", "-B", CHANGELOG_ADMIN_BRANCH, "origin/main") &&
-      system("git", "-C", wt, "reset", "-q", "--hard", "origin/main") &&
-      system("git", "-C", wt, "clean", "-qfd")
-  else
-    FileUtils.rm_rf(wt)
-    ok = system("git", "-C", checkout, "worktree", "add", "--quiet", "--force",
-                "-B", CHANGELOG_ADMIN_BRANCH, wt, "origin/main")
-  end
-
-  unless ok
-    warn "changelog: could not prepare #{wt}; skipping the /admin/changelog snapshot"
-    return nil
-  end
-  wt
-end
-
-# The open bot PR's number, or nil when none is open.
-def changelog_admin_open_pr_number
-  out = IO.popen(["gh", "pr", "list", "--repo", changelog_admin_repo,
-                  "--head", CHANGELOG_ADMIN_BRANCH, "--state", "open", "--json", "number"],
-                 err: File::NULL, &:read).to_s
-  (JSON.parse(out).first || {})["number"]
-rescue JSON::ParserError, TypeError
-  nil
-end
-
-# Open the bot PR if one is not already open, and return its number (nil if it could
-# not be opened). The branch is long-lived, so a refresh that lands while a previous
-# PR is still open force-pushes onto that SAME PR rather than opening a second one.
-def changelog_open_admin_pr(wt)
-  existing = changelog_admin_open_pr_number
-  if existing
-    puts "changelog: updated the open /admin/changelog snapshot PR ##{existing}"
-    return existing
-  end
-
-  body = <<~BODY
-    Regenerated `src/lib/changelog/data.json` from the `changelog` data lake after
-    `dev changelog build` curated new release notes. Data only — no code changes.
-
-    Opened and merged automatically by `dev changelog build`.
-  BODY
-  unless system("gh", "pr", "create", "--repo", changelog_admin_repo,
-                "--head", CHANGELOG_ADMIN_BRANCH, "--title",
-                "Refresh /admin/changelog data from the changelog data lake",
-                "--body", body, chdir: wt)
-    warn "changelog: `gh pr create` failed; branch #{CHANGELOG_ADMIN_BRANCH} is pushed, open the PR by hand"
-    return nil
-  end
-  changelog_admin_open_pr_number
-end
-
-# GitHub computes mergeability asynchronously, so a merge attempted in the same breath
-# as `gh pr create` is often rejected only because the answer is not ready yet. Retry
-# a few times before giving up.
-CHANGELOG_MERGE_ATTEMPTS = 5
-CHANGELOG_MERGE_RETRY_SECS = 3
-
-# Squash-merge the snapshot PR so the /admin/changelog page picks the new notes up on
-# the next deploy without waiting on a human. Safe to automate: the PR is data only,
-# and playbook-admin's Reviewable review auto-completes for frontend repos. Best-effort
-# like the rest of this path — a failed merge just leaves the PR open.
-def changelog_merge_admin_pr!(number)
-  return if number.nil?
-
-  last = nil
-  CHANGELOG_MERGE_ATTEMPTS.times do |attempt|
-    last, status = Open3.capture2e("gh", "pr", "merge", number.to_s,
-                                   "--repo", changelog_admin_repo, "--squash")
-    if status.success?
-      puts "changelog: merged the /admin/changelog snapshot PR ##{number}"
-      return
-    end
-    sleep CHANGELOG_MERGE_RETRY_SECS unless attempt == CHANGELOG_MERGE_ATTEMPTS - 1
-  end
-  warn "changelog: could not merge #{changelog_admin_repo}##{number} " \
-       "(#{last.to_s.lines.map(&:strip).reject(&:empty?).last}); merge it by hand"
-end
-
-# Regenerate playbook-admin's committed snapshot and push it to the bot branch/PR.
-# Entirely best-effort: the notes are already committed to the lake by the time we
-# get here, so nothing in this path may fail the build.
-# Entries in a notes file Claude just wrote. 0 means the session judged none of the
-# release's commits worth telling a human about — a legitimate outcome (a codegen-only
-# release), but one that makes the release invisible on /admin/changelog, so it has to
-# be reported rather than counted as a published note.
-# Indented "app/version <detail>" lines under a `changelog build` header, padded to a
-# common width so a batch reads as a column instead of one comma-joined line.
+# One aligned line per version in a build, so the batch header and the summary read
+# as a table rather than ragged text.
 def changelog_build_lines(pending)
   labels = pending.map { |p| "#{p[:app]}/#{p[:version]}" }
   width = labels.map(&:length).max.to_i
   pending.zip(labels).map { |p, label| "  #{label.ljust(width)}  #{yield(p)}" }
 end
 
-def changelog_notes_entry_count(notes_file)
-  (JSON.parse(File.read(notes_file))["entries"] || []).length
-rescue StandardError
-  0
-end
-
-# Why the regenerated snapshot came out byte-identical. build-changelog.ts drops
-# releases with no entries, so a build made entirely of those cannot move the
-# snapshot — otherwise "already current" reads as a bug.
-def changelog_snapshot_unchanged_reason(published, empty)
-  return "" unless published.zero? && empty.positive?
-
-  " (all #{empty} new note(s) had no user-facing changes, so the page is unaffected)"
-end
-
-def changelog_refresh_admin_snapshot!(repo, published: 0, empty: 0)
-  checkout = changelog_app_checkout(CHANGELOG_ADMIN_APP)
-  unless Dir.exist?(File.join(checkout, ".git"))
-    warn "changelog: no #{CHANGELOG_ADMIN_APP} checkout at #{checkout}; skipping the /admin/changelog snapshot"
-    return
-  end
-
-  wt = changelog_prepare_admin_worktree(checkout)
-  return if wt.nil?
-
-  unless system({ "CHANGELOG_REPO_DIR" => repo }, "node", "scripts/build-changelog.ts", chdir: wt)
-    warn "changelog: build-changelog.ts failed in #{wt}; skipping the /admin/changelog snapshot"
-    return
-  end
-
-  if IO.popen(["git", "-C", wt, "status", "--porcelain"], err: File::NULL, &:read).to_s.strip.empty?
-    puts "changelog: /admin/changelog snapshot already current#{changelog_snapshot_unchanged_reason(published, empty)}"
-    return
-  end
-
-  system("git", "-C", wt, "add", "-A")
-  unless system("git", "-C", wt, "commit", "-q", "-m",
-                "Refresh changelog data.json from the changelog data lake")
-    warn "changelog: nothing to commit for the /admin/changelog snapshot"
-    return
-  end
-  unless system("git", "-C", wt, "push", "-q", "--force-with-lease", "origin", CHANGELOG_ADMIN_BRANCH)
-    warn "changelog: could not push #{CHANGELOG_ADMIN_BRANCH} (committed locally at #{wt})"
-    return
-  end
-  changelog_merge_admin_pr!(changelog_open_admin_pr(wt))
-end
-
 def cmd_changelog_build(args)
   flags = changelog_parse_flags(args)
-  repo = ensure_changelog_repo!
-  pending = changelog_pending(repo, flags[:apps])
-  total_pending = pending.length
-  pending = pending.first(flags[:limit]) if flags[:limit]
-  if pending.empty?
-    puts "changelog build: nothing to build"
-    return
-  end
-  if flags[:limit] && total_pending > pending.length
-    puts "changelog build: #{total_pending} versions pending; building the #{pending.length} most recent (--limit)."
-  end
+  endpoint = platform_endpoint(flags[:use_localhost])
 
-  iss_map = changelog_issue_map(flags[:use_localhost])
+  handle_errors do
+    # The model writes each version's notes to a file, so it needs somewhere to write.
+    # A scratch dir rather than a repo: notes are persisted by POSTing them, and a
+    # half-written batch should leave nothing behind.
+    Dir.mktmpdir("changelog-build") do |workdir|
+      pending = changelog_pending(endpoint, flags[:apps], workdir)
+      total_pending = pending.length
+      pending = pending.first(flags[:limit]) if flags[:limit]
+      if pending.empty?
+        puts "changelog build: nothing to build"
+        next
+      end
+      if flags[:limit] && total_pending > pending.length
+        puts "changelog build: #{total_pending} versions pending; building the #{pending.length} most recent (--limit)."
+      end
 
-  # One bounded Claude session per BATCH of versions: session startup dominated the
-  # old one-session-per-version loop, and each version's commit list is small enough
-  # that several fit comfortably in one context. Still bounded, so a bad commit set
-  # can only poison its own batch, and a large backfill stays resumable (each written
-  # notes file is cached, so a re-run skips what already succeeded).
-  built = []
-  failed = []
-  batches = changelog_batches(pending, flags[:batch_size] || CHANGELOG_BUILD_BATCH_SIZE)
-  batches.each_with_index do |batch, idx|
-    puts "changelog build [batch #{idx + 1}/#{batches.length}]: #{batch.length} version(s) " \
-         "via Claude (#{CHANGELOG_CLAUDE_MODEL})"
-    puts changelog_build_lines(batch) { |p| "#{p[:commit_count]} commit(s)" }
-    input_path = File.join(repo, "_build_input.json")
-    File.write(input_path, "#{JSON.pretty_generate(changelog_build_input(batch, iss_map))}\n")
-    output = changelog_run_claude(repo, input_path, batch.length)
-    File.delete(input_path) if File.exist?(input_path)
+      iss_map = changelog_issue_map(flags[:use_localhost])
 
-    batch.each do |p|
-      if File.exist?(p[:notes_file]) && (JSON.parse(File.read(p[:notes_file])) rescue false)
-        changelog_stamp_notes_repo!(p)
-        built << p
-      else
-        failed << p
-        warn "  #{p[:app]}/#{p[:version]}: failed: #{output.to_s.lines.last}"
+      # One bounded Claude session per BATCH of versions: session startup dominated the
+      # old one-session-per-version loop, and each version's commit list is small enough
+      # that several fit comfortably in one context. Still bounded, so a bad commit set
+      # can only poison its own batch, and a large backfill stays resumable -- notes are
+      # POSTed per batch, so a re-run picks up whatever the server still lists as
+      # missing.
+      built = []
+      failed = []
+      batches = changelog_batches(pending, flags[:batch_size] || CHANGELOG_BUILD_BATCH_SIZE)
+      batches.each_with_index do |batch, idx|
+        puts "changelog build [batch #{idx + 1}/#{batches.length}]: #{batch.length} version(s) " \
+             "via Claude (#{CHANGELOG_CLAUDE_MODEL})"
+        puts changelog_build_lines(batch) { |p| "#{p[:commit_count]} commit(s)" }
+        input_path = File.join(workdir, "_build_input.json")
+        File.write(input_path, "#{JSON.pretty_generate(changelog_build_input(batch, iss_map))}\n")
+        output = changelog_run_claude(workdir, input_path, batch.length)
+        File.delete(input_path) if File.exist?(input_path)
+
+        notes = []
+        batch.each do |p|
+          parsed = (JSON.parse(File.read(p[:notes_file])) if File.exist?(p[:notes_file])) rescue nil
+          if parsed
+            notes << {
+              "application" => p[:app],
+              "version" => p[:version],
+              # Every version must get a record even with no entries: that is what marks
+              # it evaluated, and without it the release comes back as pending forever.
+              "entries" => (parsed["entries"] || []).map { |e|
+                { "summary" => e["summary"], "category" => e["category"],
+                  "pr_number" => e["pr_number"], "issue_number" => e["issue_number"] }.compact
+              },
+            }
+            built << p.merge(entry_count: (parsed["entries"] || []).length)
+          else
+            failed << p
+            warn "  #{p[:app]}/#{p[:version]}: failed: #{output.to_s.lines.last}"
+          end
+        end
+        changelog_post_batches(endpoint, "notes", :notes, notes) unless notes.empty?
+      end
+
+      unless built.empty?
+        published, empty = built.partition { |p| p[:entry_count].positive? }
+        puts "changelog build: recorded notes for #{built.length} version(s): " \
+             "#{published.length} with release notes, #{empty.length} with no user-facing changes"
+        puts changelog_build_lines(built) { |p|
+          p[:entry_count].positive? ? "#{p[:entry_count]} note(s)" : "no user-facing changes"
+        }
+      end
+      unless failed.empty?
+        Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry):\n" \
+                             "#{failed.map { |p| "  #{p[:app]}/#{p[:version]}" }.join("\n")}")
       end
     end
   end
+end
 
-  unless built.empty?
-    changelog_git_commit_push!(repo, "changelog: build notes for #{built.length} version(s)\n\n" \
-                                     "#{built.map { |p| "#{p[:app]}/#{p[:version]}" }.join("\n")}")
-    counts = built.to_h { |p| [p[:notes_file], changelog_notes_entry_count(p[:notes_file])] }
-    published, empty = built.partition { |p| counts[p[:notes_file]].positive? }
-    puts "changelog build: wrote #{built.length} notes file(s): " \
-         "#{published.length} with release notes, #{empty.length} with no user-facing changes"
-    puts changelog_build_lines(built) { |p|
-      counts[p[:notes_file]].positive? ? "#{counts[p[:notes_file]]} note(s)" : "no user-facing changes"
-    }
-    # New notes are useless until playbook-admin's committed snapshot catches up.
-    changelog_refresh_admin_snapshot!(repo, published: published.length, empty: empty.length)
+# One-time migration: upload the `changelog` git repo into platform.
+#
+# The raw capture is reproducible from git, but the notes are 581 non-deterministic
+# model outputs that cost real time and money -- rebuilding them is not an option, so
+# they are moved rather than regenerated. Idempotent (every write is an upsert keyed on
+# application/version), so a partial run is simply re-run.
+#
+# Delete this once the lake is archived; `capture` and `build` are the steady state.
+def cmd_changelog_push(args)
+  flags = changelog_parse_flags(args)
+  apps = flags[:apps]
+  endpoint = platform_endpoint(flags[:use_localhost])
+  repo = ensure_changelog_repo!
+
+  handle_errors do
+    apps.each do |app|
+      dir = File.join(repo, app)
+      unless Dir.exist?(dir)
+        puts "  #{app}: no directory in the lake, skipping"
+        next
+      end
+
+      # Releases first: notes name a release that must already exist.
+      releases = Dir.glob(File.join(dir, "*.tag.json")).sort.filter_map do |f|
+        data = (JSON.parse(File.read(f)) rescue nil)
+        next nil if data.nil?
+        {
+          "application" => app,
+          "repo" => data["repo"] || changelog_app_repo(app),
+          "version" => data["version"],
+          "previous_version" => data["previous_version"],
+          "released_at" => data["released_at"],
+          "commits" => (data["commits"] || []).map { |c|
+            {
+              "sha" => c["sha"],
+              "subject" => c["subject"],
+              # The lake stores "" for a bodyless commit; the API models it as absent.
+              "body" => (c["body"].to_s.strip.empty? ? nil : c["body"].strip),
+              "pr_number" => c["pr_number"],
+            }.compact
+          },
+        }.compact
+      end
+      sent_releases = changelog_post_batches(endpoint, "releases", :releases, releases)
+
+      notes = Dir.glob(File.join(dir, "*.notes.json")).sort.filter_map do |f|
+        data = (JSON.parse(File.read(f)) rescue nil)
+        next nil if data.nil?
+        {
+          "application" => app,
+          "version" => data["version"],
+          "entries" => (data["entries"] || []).map { |e|
+            { "summary" => e["summary"], "category" => e["category"],
+              "pr_number" => e["pr_number"], "issue_number" => e["issue_number"] }.compact
+          },
+        }
+      end
+      sent_notes = changelog_post_batches(endpoint, "notes", :notes, notes)
+
+      puts "  #{app}: #{sent_releases} release(s), #{sent_notes} notes"
+    end
+
+    puts ""
+    puts "Verify with `dev changelog status` before archiving the lake."
   end
-  unless failed.empty?
-    Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry):\n" \
-                         "#{failed.map { |p| "  #{p[:app]}/#{p[:version]}" }.join("\n")}")
+end
+
+# What the server holds, per app -- the check to run after a backfill and before
+# archiving the lake.
+def cmd_changelog_status(args)
+  flags = changelog_parse_flags(args)
+  endpoint = platform_endpoint(flags[:use_localhost])
+  handle_errors do
+    status = changelog_status(endpoint)
+    if status.empty?
+      puts "changelog: nothing recorded"
+      return
+    end
+    status.keys.sort.each do |app|
+      s = status[app]
+      missing = s["versions_missing_notes"] || []
+      puts "  #{app}: latest #{s['max_version'] || '(none)'}, #{missing.length} awaiting notes"
+      puts "    #{missing.first(10).join(', ')}#{missing.length > 10 ? ', ...' : ''}" unless missing.empty?
+    end
   end
 end
 
@@ -5454,6 +5454,8 @@ when "changelog"
   case sub
   when "capture" then cmd_changelog_capture(argv)
   when "build"   then cmd_changelog_build(argv)
+  when "push"    then cmd_changelog_push(argv)
+  when "status"  then cmd_changelog_status(argv)
   when "all"     then cmd_changelog_all(argv)
   else                unknown("changelog subcommand", sub, SUBCOMMANDS["changelog"])
   end
