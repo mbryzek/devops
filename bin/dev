@@ -67,6 +67,11 @@ INVOCATIONS = {
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
+  "features list"       => 'features [list] [--localhost]',
+  "features create"     => 'features create <subproject> <feature> --app APP [--app APP]... [--localhost]',
+  "features status"     => 'features status [--localhost]',
+  "features reconcile"  => 'features reconcile [--apply] [--localhost]',
+  "features cancel"     => 'features cancel <subproject> <feature> [--localhost]',
   "changelog capture"   => 'changelog [capture] [--app APP]...',
   "changelog build"     => 'changelog build [--app APP]... [--limit N] [--batch-size N] [--localhost]',
 }.freeze
@@ -305,6 +310,42 @@ USAGE = <<~USAGE
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
+    #{INVOCATIONS["features list"]}
+        Every feature flag in the code-driven catalog with its state, roles, and
+        last-enabled-at, plus any flags awaiting cleanup. A flag awaiting cleanup no
+        longer appears in the catalog (its enum value is gone), so it is listed
+        separately or not at all.
+
+    #{INVOCATIONS["features create"]}
+        Record a removed flag for cleanup, naming every deployable app whose release
+        carries the removal. Run it after the removal PRs merge. Baselines are read
+        from what production is running now, so they are never typed by hand; an app
+        whose live version cannot be read is a hard error rather than a removal that
+        could never be confirmed.
+
+    #{INVOCATIONS["features status"]}
+        Feature removals awaiting cleanup, with each (app, baseline version) pair
+        checked against the version production is running. READY means every pair has
+        cleared: production released past the baseline recorded when the removal
+        merged. Read-only.
+
+    #{INVOCATIONS["features reconcile"]}
+        Soft delete the tenant_features row for every READY removal, then hard delete
+        rows whose one-month rollback window has closed. Same live-version signal as
+        `dev deploy status`. Dry-run by default; pass --apply to record the changes
+        (e.g. from a cron).
+
+        Deliberately fail-closed: an app that has not released, a missing version
+        probe, or an unknown app leaves the removal pending rather than advancing it.
+        Deleting a flag row while the old code is still serving flips the behavior
+        back for real users, so silence must never be read as confirmation. Anything
+        stuck for more than a week trips the
+        feature_removals_must_be_processed_within_a_week invariant.
+
+    #{INVOCATIONS["features cancel"]}
+        Void a removal and restore its soft-deleted flag row. The revert path: the
+        flag's removal was undone, so the cleanup must not proceed.
+
     #{INVOCATIONS["changelog capture"]}
         Record the changelog for the playbook* apps into the `changelog` data repo
         (github.com/mbryzek/changelog, cloned to ~/code/changelog). With no
@@ -356,7 +397,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen issues changelog].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen issues changelog features].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -371,6 +412,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "issues"       => %w[create claim status snooze reconcile resume],
+  "features"     => %w[list create status reconcile cancel],
 }.freeze
 
 def levenshtein(a, b)
@@ -2288,6 +2330,287 @@ def issue_released_since_fix?(info, issue)
   baseline = issue_fix_deployment(issue)&.fetch("baseline_version", nil)
   live = info["version"]
   !baseline.nil? && !live.nil? && live != baseline
+end
+
+# ---------- features ----------
+#
+# Feature-flag cleanup. Removing a flag is a two-phase change: the code stops
+# reading it, then its tenant_features row goes away. Deleting the row while the
+# old code is still serving flips the behavior back for real users, so the row
+# waits here until every app carrying the removal has released past the version
+# production was running when it merged.
+#
+# The readiness decision lives in this CLI, not the backend: it needs the live
+# version signal (/_internal_/version, or the k8s image tag) that `dev deploy
+# status` reads, and the backend has no business reaching for kubectl. The API
+# only records that a cleanup is outstanding and performs the transitions asked
+# of it.
+
+FEATURE_REMOVALS_PATH = "/dev/feature-removals".freeze
+
+# A month of soft-deleted life is the rollback window; the purge sweep runs after
+# it. Matches the window the feature_removals_must_be_purged_after_the_rollback_window
+# invariant watches, which allows a grace period on top of this.
+FEATURE_PURGE_AFTER_DAYS = 30
+
+def feature_removal_path(removal, suffix = "")
+  subproject = URI.encode_www_form_component(removal["subproject"].to_s)
+  feature = URI.encode_www_form_component(removal["feature"].to_s)
+  "#{FEATURE_REMOVALS_PATH}/#{subproject}/#{feature}#{suffix}"
+end
+
+def feature_label(removal)
+  "#{removal['subproject']}/#{removal['feature']}"
+end
+
+# Live version per app, memoized for the run. Shares fetch_app_version with
+# `dev issues reconcile`, so both commands gate on exactly the same signal.
+def feature_version_info(registry, cache, app_name)
+  cache[app_name] ||= begin
+    app = registry.deploy_tracked.find { |a| a.name == app_name }
+    app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
+  end
+end
+
+# Whether one (app, baseline_version) pair has cleared. Primary signal is the
+# release timestamp: production released after the removal was recorded. Falls
+# back to "the live tag is no longer the baseline" when a timestamp is missing.
+#
+# Unconfirmable is NOT confirmed: a missing probe, an unknown app, or an app that
+# has not released leaves the pair pending. Silence must never advance a cleanup —
+# the whole point is to avoid deleting a flag row before its removal is live.
+def feature_pair_confirmed?(info, pair, created_at)
+  return false if info.nil? || info[:error]
+  live = info["version"]
+  return false if live.nil?
+
+  released_at = info["released_at"]
+  if released_at && created_at
+    begin
+      return Time.parse(released_at) > Time.parse(created_at)
+    rescue ArgumentError
+      # fall through to tag comparison
+    end
+  end
+  baseline = pair["baseline_version"]
+  !baseline.nil? && live != baseline
+end
+
+# Per-pair readiness, plus a human explanation for the ones still waiting.
+def feature_removal_state(registry, cache, removal)
+  pairs = removal["apps"] || []
+  results = pairs.map do |pair|
+    info = feature_version_info(registry, cache, pair["app"])
+    confirmed = feature_pair_confirmed?(info, pair, removal["created_at"])
+    detail =
+      if info && info[:error]
+        "#{pair['app']}: #{info[:error]}"
+      else
+        live = info && info["version"] ? info["version"] : "?"
+        "#{pair['app']}: #{pair['baseline_version']} -> #{live}"
+      end
+    { confirmed: confirmed, detail: detail }
+  end
+  # A removal with no pairs would be vacuously ready. The API rejects that at
+  # creation; treating it as not-ready here too means even a hand-inserted row
+  # cannot trip the deletion.
+  { ready: !results.empty? && results.all? { |r| r[:confirmed] }, pairs: results }
+end
+
+# Record a flag for cleanup. Baselines are resolved from what production is
+# running RIGHT NOW rather than taken as arguments: the baseline is a floor
+# ("prod was here when the removal merged"), so reading it is more reliable than
+# asking a session to type it, and it is the same signal reconcile later compares
+# against. An app whose version cannot be read is a hard error — a removal
+# recorded against an unknown baseline could never be confirmed.
+def cmd_features_create(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  apps = []
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--app"
+      apps << (rest[i + 1] || usage_exit("--app requires a value", example: usage_for("features create")))
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+  subproject = leftover.shift
+  feature = leftover.shift
+  reject_unknown_args("features create", leftover)
+
+  problems = []
+  problems << "features create requires <subproject> <feature>" if subproject.nil? || feature.nil?
+  # Without at least one app, "every app has released" is vacuously true and the
+  # first reconcile would delete the flag row immediately.
+  problems << "at least one --app is required (the deployable app(s) carrying the removal)" if apps.empty?
+  problems << "each --app may be given only once" if apps.uniq.length != apps.length
+  report_arg_problems("features create", problems, usage_for("features create"))
+
+  registry = Work::Registry.load
+  cache = {}
+  pairs = apps.map do |name|
+    info = feature_version_info(registry, cache, name)
+    if info.nil? || info[:error] || info["version"].nil?
+      reason = info && info[:error] ? info[:error] : "no live version available"
+      Util.exit_with_error("Cannot read the live version for '#{name}': #{reason}. " \
+                           "A removal needs a baseline it can later be compared against.")
+    end
+    { app: name, baseline_version: info["version"] }
+  end
+
+  endpoint = platform_endpoint(use_localhost)
+  handle_errors do
+    ApiClient.request(endpoint, :post, FEATURE_REMOVALS_PATH,
+                      body: { subproject: subproject, feature: feature, apps: pairs })
+    puts "Recorded #{subproject}/#{feature} for cleanup:"
+    pairs.each { |p| puts "  #{p[:app]} baseline #{p[:baseline_version]}" }
+    puts ""
+    puts "The flag row stays live until every app releases past its baseline."
+    puts "Check with `dev features status`; `dev features reconcile --apply` performs the cleanup."
+  end
+end
+
+def cmd_features_list(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  reject_unknown_args("features list", rest)
+
+  endpoint = platform_endpoint(use_localhost)
+  handle_errors do
+    flags = ApiClient.request(endpoint, :get, "/dev/features") || []
+    removals = ApiClient.request(endpoint, :get, "#{FEATURE_REMOVALS_PATH}?processed=false&limit=100") || []
+
+    puts ""
+    puts Util.underline("Feature Flags#{use_localhost ? ' (localhost)' : ''}")
+    puts ""
+    if flags.empty?
+      puts "No feature flags in the catalog."
+    else
+      flags.sort_by { |f| [f["subproject"].to_s, f["feature"].to_s] }.each do |f|
+        state = f["enabled"] ? "on " : "off"
+        roles = (f["roles"] || []).empty? ? "" : " roles=#{f['roles'].join(',')}"
+        last = f["last_enabled_at"] ? " last_enabled=#{f['last_enabled_at'][0, 10]}" : ""
+        puts "  [#{state}] #{f['subproject']}/#{f['feature']} (#{f['type']})#{roles}#{last}"
+      end
+    end
+
+    # Removals name features the catalog no longer declares, so they can never
+    # appear in the listing above — they are shown here or nowhere.
+    unless removals.empty?
+      puts ""
+      puts "Awaiting cleanup (#{removals.length}): run `dev features status` for readiness."
+      removals.each { |r| puts "  #{feature_label(r)} (recorded #{r['created_at'][0, 10]})" }
+    end
+  end
+end
+
+def cmd_features_status(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  reject_unknown_args("features status", rest)
+
+  endpoint = platform_endpoint(use_localhost)
+  registry = Work::Registry.load
+  cache = {}
+
+  handle_errors do
+    removals = ApiClient.request(endpoint, :get, "#{FEATURE_REMOVALS_PATH}?processed=false&limit=100") || []
+    puts ""
+    puts Util.underline("Feature Removals#{use_localhost ? ' (localhost)' : ''}")
+    puts ""
+    if removals.empty?
+      puts "No feature removals awaiting cleanup."
+      return
+    end
+
+    removals.each do |r|
+      state = feature_removal_state(registry, cache, r)
+      puts "#{state[:ready] ? 'READY  ' : 'waiting'} #{feature_label(r)} (recorded #{r['created_at'][0, 10]})"
+      state[:pairs].each { |p| puts "         #{p[:confirmed] ? 'ok      ' : 'pending '} #{p[:detail]}" }
+    end
+    puts ""
+    ready = removals.count { |r| feature_removal_state(registry, cache, r)[:ready] }
+    puts "#{ready} of #{removals.length} ready. Run `dev features reconcile --apply` to process."
+  end
+end
+
+def cmd_features_reconcile(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  apply = false
+  leftover = []
+  rest.each { |a| a == "--apply" ? (apply = true) : leftover << a }
+  reject_unknown_args("features reconcile", leftover)
+
+  endpoint = platform_endpoint(use_localhost)
+  registry = Work::Registry.load
+  cache = {}
+
+  handle_errors do
+    outstanding = ApiClient.request(endpoint, :get, "#{FEATURE_REMOVALS_PATH}?processed=false&limit=100") || []
+    processed_count = 0
+    outstanding.each do |r|
+      state = feature_removal_state(registry, cache, r)
+      unless state[:ready]
+        waiting = state[:pairs].reject { |p| p[:confirmed] }.map { |p| p[:detail] }.join("; ")
+        puts "  waiting  #{feature_label(r)} (#{waiting})"
+        next
+      end
+      if apply
+        ApiClient.request(endpoint, :post, feature_removal_path(r, "/process"))
+        puts "  processed #{feature_label(r)} (flag row soft deleted)"
+      else
+        puts "  would process #{feature_label(r)}"
+      end
+      processed_count += 1
+    end
+
+    # Purge sweep: hard delete flag rows whose rollback window has closed. Folded
+    # into reconcile so one cron entry covers the whole lifecycle.
+    purged_count = 0
+    done = ApiClient.request(endpoint, :get, "#{FEATURE_REMOVALS_PATH}?processed=true&limit=100") || []
+    cutoff = Time.now - (FEATURE_PURGE_AFTER_DAYS * 24 * 60 * 60)
+    done.each do |r|
+      next if r["purged_at"]
+      next if r["processed_at"].nil?
+      begin
+        next if Time.parse(r["processed_at"]) > cutoff
+      rescue ArgumentError
+        next
+      end
+      if apply
+        ApiClient.request(endpoint, :post, feature_removal_path(r, "/purge"))
+        puts "  purged #{feature_label(r)} (rollback window closed)"
+      else
+        puts "  would purge #{feature_label(r)}"
+      end
+      purged_count += 1
+    end
+
+    puts ""
+    verb = apply ? "processed" : "would process"
+    puts "#{processed_count} #{verb}, #{purged_count} #{apply ? 'purged' : 'would purge'}, #{outstanding.length} outstanding."
+    if !apply && (processed_count > 0 || purged_count > 0)
+      puts "Re-run with --apply to record the changes."
+    end
+  end
+end
+
+def cmd_features_cancel(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  subproject = rest.shift
+  feature = rest.shift
+  reject_unknown_args("features cancel", rest)
+  if subproject.nil? || feature.nil?
+    usage_exit("features cancel requires <subproject> <feature>", example: usage_for("features cancel"))
+  end
+
+  endpoint = platform_endpoint(use_localhost)
+  handle_errors do
+    ApiClient.request(endpoint, :delete, feature_removal_path({ "subproject" => subproject, "feature" => feature }))
+    puts "Cancelled the removal for #{subproject}/#{feature}; a soft-deleted flag row has been restored."
+  end
 end
 
 # ---------- docker prune ----------
@@ -4874,6 +5197,16 @@ when "issues"
   when "reconcile" then cmd_issues_reconcile(argv)
   when nil         then require_subcommand("issues")
   else               unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
+  end
+when "features"
+  sub = resolve_subcommand(argv, default: "list")
+  case sub
+  when "list"      then cmd_features_list(argv)
+  when "create"    then cmd_features_create(argv)
+  when "status"    then cmd_features_status(argv)
+  when "reconcile" then cmd_features_reconcile(argv)
+  when "cancel"    then cmd_features_cancel(argv)
+  else                  unknown("features subcommand", sub, SUBCOMMANDS["features"])
   end
 when "changelog"
   sub = resolve_subcommand(argv, default: "all")
