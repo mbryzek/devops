@@ -228,9 +228,15 @@ def do_status
     end
   end
 
-  current_db = DbImages.db_name(DbImages.session_id)
+  # Read-only: report that this session cannot name itself rather than aborting a
+  # command whose whole job is to show you the state.
+  sid = DbImages.session_id_or_nil
   puts ""
-  puts "Current session DB : #{current_db}"
+  if sid
+    puts "Current session DB : #{DbImages.db_name(sid)}"
+  else
+    puts "Current session DB : (none — export CLAUDE_SESSION_ID, or run from ~/code/ai/<feature>)"
+  end
   puts ""
 end
 
