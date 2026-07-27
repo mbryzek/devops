@@ -108,9 +108,11 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["auth ai provision"]}
         Mint Otto's token and store it — the whole setup in one command. Using
-        YOUR platform session it creates the token (POST /tokens), reads the
-        cleartext back (readable exactly once), writes it to ~/.platform/, and
-        verifies the stored token authenticates. Refuses to run inside a Claude
+        YOUR playbook session (Otto is a playbook-tenant user, and user lookups
+        are scoped to the caller's tenant) it creates the token (POST /tokens),
+        reads the cleartext back (readable exactly once), writes it to
+        ~/.platform/, and verifies the stored token authenticates as Otto before
+        reporting success. Refuses to run inside a Claude
         session: a human authorizes the AI's credential, never the AI itself.
         If Otto already has live tokens it stops and lists them; --rotate mints
         and stores the new one first, then revokes the old ones (which breaks
@@ -792,8 +794,16 @@ def require_human_session!(action)
   )
 end
 
-# Tokens live for the AI user, but every call here authenticates as YOU (require_human_session!
-# above means auth_header_for returns nil, so the platform session is used).
+# Otto lives in the `playbook` tenant, and user lookups are tenant-scoped: a TenantAdmin's dbAuth is
+# DbAuthorization.Tenant(their own tenant), so a platform-tenant session gets a 404 for `ai` however
+# real the row is. Authenticate this flow with the playbook session, the tenant that owns the
+# account. The /tokens endpoints themselves are not tenant-scoped, so they are happy either way.
+def auth_ai_endpoint(use_localhost)
+  ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
+end
+
+# Tokens belong to the AI user, but every call here authenticates as YOU (require_human_session!
+# above means auth_header_for returns nil, so your playbook session is used).
 def auth_ai_tokens(endpoint)
   ApiClient.request(endpoint, :get, "/tokens/users/#{AI_USER_ID}") || []
 end
@@ -805,8 +815,8 @@ def require_ai_user!(endpoint, use_localhost)
   ApiClient.request(endpoint, :get, "/users/#{AI_USER_ID}")
 rescue ApiError => e
   Util.exit_with_error(
-    "No `#{AI_USER_ID}` user on #{auth_target_label(use_localhost)} (#{e.message}). The account is created by a " \
-    "platform-postgresql migration — release the DB (or apply the script to this session DB) first."
+    "No `#{AI_USER_ID}` user visible on #{auth_target_label(use_localhost)} (#{e.message}). The account is created " \
+    "by a platform-postgresql migration — release the DB (or apply the script to this session DB) first."
   )
 end
 
@@ -817,7 +827,8 @@ end
 def cmd_auth_ai_provision(args)
   use_localhost, flags = parse_auth_flags(args, "auth ai provision", allow: ["--rotate"])
   require_human_session!("provision a token")
-  endpoint = platform_endpoint(use_localhost)
+  require_playbook_session!(use_localhost)
+  endpoint = auth_ai_endpoint(use_localhost)
   target = auth_target_label(use_localhost)
 
   handle_errors do
@@ -869,7 +880,8 @@ end
 def cmd_auth_ai_revoke(args)
   use_localhost, = parse_auth_flags(args, "auth ai revoke")
   require_human_session!("revoke a token")
-  endpoint = platform_endpoint(use_localhost)
+  require_playbook_session!(use_localhost)
+  endpoint = auth_ai_endpoint(use_localhost)
   target = auth_target_label(use_localhost)
 
   handle_errors do

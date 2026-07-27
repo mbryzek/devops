@@ -24,11 +24,12 @@ class TestDevAuth < Minitest::Test
     orig_write   = ApiClient.method(:write_ai_token)
     orig_clear   = ApiClient.method(:clear_ai_token)
     orig_session = ApiClient.method(:ai_session?)
+    orig_sid     = ApiClient.method(:session_id_for)
     requests = @requests
     test = self
 
     ApiClient.define_singleton_method(:request) do |endpoint, method, path, **opts|
-      requests << { method: method, path: path, body: opts[:body], as_token: opts[:as_token] }
+      requests << { app: endpoint[:app], method: method, path: path, body: opts[:body], as_token: opts[:as_token] }
       key = "#{method.to_s.upcase} #{path}"
       test.flunk("unstubbed request: #{key}") unless responses.key?(key)
       value = responses.fetch(key)
@@ -38,6 +39,8 @@ class TestDevAuth < Minitest::Test
     ApiClient.define_singleton_method(:write_ai_token) { |token, use_localhost:| test.instance_variable_set(:@written, token) }
     ApiClient.define_singleton_method(:clear_ai_token) { |use_localhost:| test.instance_variable_set(:@cleared, true) }
     ApiClient.define_singleton_method(:ai_session?) { ai_session }
+    # Every command here needs a human session; the box running the tests may or may not have one.
+    ApiClient.define_singleton_method(:session_id_for) { |app, use_localhost:| "sess-#{app}" }
 
     yield
   ensure
@@ -45,6 +48,7 @@ class TestDevAuth < Minitest::Test
     ApiClient.define_singleton_method(:write_ai_token, orig_write)
     ApiClient.define_singleton_method(:clear_ai_token, orig_clear)
     ApiClient.define_singleton_method(:ai_session?, orig_session)
+    ApiClient.define_singleton_method(:session_id_for, orig_sid)
   end
 
   # Run a command that both prints and exits, returning [stdout, stderr, status].
@@ -113,6 +117,16 @@ class TestDevAuth < Minitest::Test
     assert_equal "ai", @requests.find { |r| r[:method] == :post }[:body][:user_id]
   end
 
+  # Otto is a `playbook` tenant user and /users/:id is scoped to the CALLER's tenant, so a
+  # platform-tenant session 404s on a row that is really there. Every call must ride the playbook
+  # session.
+  def test_provision_authenticates_against_the_playbook_tenant
+    with_api(provision_responses) do
+      run_cmd { cmd_auth_ai_provision([]) }
+    end
+    assert_equal ["playbook"], @requests.map { |r| r[:app] }.uniq
+  end
+
   # The verification call must present the NEW token, not whatever credential the
   # process would otherwise resolve - otherwise it proves nothing about the token
   # just written to disk.
@@ -150,7 +164,7 @@ class TestDevAuth < Minitest::Test
     with_api(provision_responses.merge("GET /users/ai" => ApiError.new("HTTP 404 GET /users/ai"))) do
       _, out, status = run_cmd { cmd_auth_ai_provision([]) }
       assert_equal 1, status
-      assert_match(/No `ai` user on prod/, out)
+      assert_match(/No `ai` user visible on prod/, out)
       assert_match(/platform-postgresql migration/, out)
     end
     assert_nil @written
