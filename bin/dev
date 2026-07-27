@@ -2423,24 +2423,49 @@ end
 # asking a session to type it, and it is the same signal reconcile later compares
 # against. An app whose version cannot be read is a hard error — a removal
 # recorded against an unknown baseline could never be confirmed.
-def cmd_features_create(args)
-  rest, _app, use_localhost = parse_common_flags(args)
+# Flags for `features create`. Deliberately NOT parse_common_flags: that helper
+# treats --app as a single filter and swallows repeats, so a removal spanning two
+# apps would arrive here with an empty list and be rejected as having none.
+# `changelog` rolls its own parser for the same reason.
+def features_create_parse_flags(args)
   apps = []
-  leftover = []
+  use_localhost = false
+  positional = []
   i = 0
-  while i < rest.length
-    case rest[i]
+  while i < args.length
+    a = args[i]
+    case a
     when "--app"
-      apps << (rest[i + 1] || usage_exit("--app requires a value", example: usage_for("features create")))
+      v = args[i + 1]
+      usage_exit("--app requires a value", example: usage_for("features create")) if v.nil?
+      apps << v
       i += 2
+    when "--localhost"
+      use_localhost = true
+      i += 1
+    when "-h", "--help"
+      usage_exit
     else
-      leftover << rest[i]
+      positional << a
       i += 1
     end
   end
-  subproject = leftover.shift
-  feature = leftover.shift
-  reject_unknown_args("features create", leftover)
+  { apps: apps, use_localhost: use_localhost, positional: positional }
+end
+
+# Record a flag for cleanup. Baselines are resolved from what production is
+# running RIGHT NOW rather than taken as arguments: the baseline is a floor
+# ("prod was here when the removal merged"), so reading it is more reliable than
+# asking a session to type it, and it is the same signal reconcile later compares
+# against. An app whose version cannot be read is a hard error — a removal
+# recorded against an unknown baseline could never be confirmed.
+def cmd_features_create(args)
+  flags = features_create_parse_flags(args)
+  apps = flags[:apps]
+  positional = flags[:positional]
+  subproject = positional.shift
+  feature = positional.shift
+  reject_unknown_args("features create", positional)
 
   problems = []
   problems << "features create requires <subproject> <feature>" if subproject.nil? || feature.nil?
@@ -2451,6 +2476,13 @@ def cmd_features_create(args)
   report_arg_problems("features create", problems, usage_for("features create"))
 
   registry = Work::Registry.load
+  known = registry.deploy_tracked.map(&:name)
+  unknown_apps = apps.reject { |a| known.include?(a) }
+  unless unknown_apps.empty?
+    Util.exit_with_error("Unknown --app #{unknown_apps.map { |a| "'#{a}'" }.join(', ')}. " \
+                         "Valid apps: #{known.sort.join(', ')}")
+  end
+
   cache = {}
   pairs = apps.map do |name|
     info = feature_version_info(registry, cache, name)
@@ -2462,7 +2494,7 @@ def cmd_features_create(args)
     { app: name, baseline_version: info["version"] }
   end
 
-  endpoint = platform_endpoint(use_localhost)
+  endpoint = platform_endpoint(flags[:use_localhost])
   handle_errors do
     ApiClient.request(endpoint, :post, FEATURE_REMOVALS_PATH,
                       body: { subproject: subproject, feature: feature, apps: pairs })
