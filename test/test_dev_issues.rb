@@ -403,6 +403,16 @@ class TestDevIssues < Minitest::Test
     assert_includes body, "needs_input"         # what to do when a human call is needed
   end
 
+  # A session that never learns the command cannot read the history the CLI now
+  # exposes. suggestion-body.md is the trap: it REPLACES default-body.md rather
+  # than layering on it, so a pointer added only to the default silently misses
+  # every investigation session. Assert on both bodies a session can be handed.
+  def test_every_standalone_body_points_at_dev_issues_show
+    [issue_default_body_text, issue_body_text("suggestion")].each do |body|
+      assert_includes body, "dev issues show"
+    end
+  end
+
   # The working rules live in default-body.md ONLY; the manual body is the
   # hand-filed preamble that gets prepended to it.
   def test_manual_body_is_composed_from_the_default_body

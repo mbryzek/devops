@@ -10,8 +10,14 @@ findings and stop — the decision to build it is not yours.
 
 ## What to produce
 
-Read the issue, its attachments, and whatever code and data it concerns. Then post ONE
-comment covering:
+Read the issue, its attachments, and whatever code and data it concerns. Start with
+`dev issues show <NNN>`: it prints this issue's full comment history and any previous
+fix PRs. If it was investigated before, the earlier findings are there and a
+recommendation that repeats them is worth nothing — and a RE-OPENED banner means the
+earlier recommendation did not stand. Use the same command on any issue this one
+references.
+
+Then post ONE comment covering:
 
 - **What they are actually asking for** — in your words, separating the symptom they
   described from the change they want.
