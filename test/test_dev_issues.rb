@@ -144,6 +144,47 @@ class TestDevIssues < Minitest::Test
     assert_includes md, 'dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
     assert_includes md, 'dev issues status <number> --status fixed --url "<doc URL>"'
     assert_includes md, "--status needs_input"
+    assert_includes md, "Implement the fixes, open PRs"
+  end
+
+  # The plan WRAPPER (not just the body file) has to match the category. A
+  # `suggestion` is swept into a claim like everything else since
+  # ISSUE_NO_AUTO_CLAIM_CATEGORIES was removed, so if the wrapper still said
+  # "implement the fixes, open PRs" the session would be told to build the very
+  # thing suggestion-body.md forbids it from building.
+  def suggestion_plan_markdown
+    issue_plan_markdown(
+      items: [graph_issue.merge("category" => "suggestion")],
+      date: "2026-07-27",
+      category: "suggestion",
+      body: "BODY-ORIENTATION",
+    )
+  end
+
+  def test_suggestion_plan_wrapper_never_says_implement_or_open_a_pr
+    md = suggestion_plan_markdown
+    refute_includes md, "Implement the fixes, open PRs"
+    refute_includes md, "## Issues to fix"
+    refute_includes md, "--status fixed"
+    assert_includes md, "## Issues to investigate"
+    assert_includes md, "do not create a branch, do not write code, do not open a"
+  end
+
+  def test_suggestion_plan_offers_needs_review_as_the_closing_move
+    md = suggestion_plan_markdown
+    assert_includes md, '`dev issues status <number> --status needs_review --comment "<your findings>"`'
+    assert_includes md, "--status needs_input"
+  end
+
+  # `needs_review` is the suggestion-only door: every other category still closes
+  # on fixed/needs_input exactly as before.
+  def test_other_categories_keep_the_implementation_wrapper_unchanged
+    (ISSUE_CATEGORIES - %w[suggestion]).each do |category|
+      md = issue_plan_markdown(items: [graph_issue], date: "2026-07-27", category: category, body: "BODY")
+      assert_includes md, "Implement the fixes, open PRs", "#{category}: lost the implementation framing"
+      assert_includes md, "## Issues to fix", "#{category}: lost the fix heading"
+      refute_includes md, "--status needs_review", "#{category}: should not offer needs_review"
+    end
   end
 
   # ---- issue_summary_line ----
@@ -209,6 +250,24 @@ class TestDevIssues < Minitest::Test
     assert_includes body, "INVESTIGATE"
     assert_includes body, "Do not create a branch"
     assert_includes body, "needs_review"
+  end
+
+  # Regression: the body told every investigation session to close with
+  # `dev issues status --number <NNN> ...`, but the number is POSITIONAL — the
+  # parser has no `--number`, so it fell through to `leftover` and the command
+  # exited "unexpected argument(s)", leaving the suggestion stuck in `claimed`.
+  def test_suggestion_body_closing_command_matches_the_real_argument_parsing
+    body = issue_body_text("suggestion")
+    refute_includes body, "--number"
+    assert_includes body, 'dev issues status <NNN> --status needs_review --comment "<your findings>"'
+  end
+
+  # The same guard for every body file: no plan may hand out a flag the parser
+  # does not implement.
+  def test_no_body_file_invents_a_number_flag
+    ISSUE_CATEGORIES.each do |category|
+      refute_includes issue_body_text(category), "--number", "#{category}: invents a --number flag"
+    end
   end
 
   # A category added to the spec enum before anyone writes its body file still
@@ -337,9 +396,20 @@ class TestDevIssues < Minitest::Test
     prompt = issue_claim_prompt([["graphs", "/p/g.md"], ["worker", "/p/w.md"]])
     assert_includes prompt, "2 issue plans"
     assert_includes prompt, "ONE subagent per plan"
-    assert_includes prompt, "do NOT implement the fixes yourself"
+    assert_includes prompt, "do NOT work the plans yourself"
     assert_includes prompt, "- graphs: /p/g.md"
     assert_includes prompt, "- worker: /p/w.md"
+  end
+
+  # Regression: the fan-out prompt used to tell EVERY subagent to "implement the
+  # fixes, open PRs" — including the one handed a `suggestion` plan, whose whole
+  # point is that it never builds anything. The plan is the authority now, and a
+  # suggestion plan is labelled so the parent session cannot mis-brief it.
+  def test_claim_prompt_multi_plan_marks_a_suggestion_plan_investigate_only
+    prompt = issue_claim_prompt([["suggestion", "/p/s.md"], ["worker", "/p/w.md"]])
+    assert_includes prompt, "- suggestion: /p/s.md (INVESTIGATE ONLY — no branch, no code, no PR)"
+    refute_match(/- worker: \S+ \(INVESTIGATE/, prompt)
+    assert_includes prompt, "--status needs_review"
   end
 
   def test_claim_argv_wraps_any_prompt_as_ccd_opus
@@ -571,6 +641,17 @@ class TestDevIssues < Minitest::Test
 
   def test_status_rejects_unexpected_positional
     out, status = capture_stderr_and_exit { cmd_issues_status(["034", "extra", "--status", "dismissed"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument/, out)
+  end
+
+  # Proof of what the corrected suggestion-body.md closing command avoids: the
+  # issue number has no flag form, so `--number 081` is swallowed as two stray
+  # positionals and the command dies before it ever reaches the API.
+  def test_status_rejects_a_number_flag_because_the_number_is_positional
+    out, status = capture_stderr_and_exit do
+      cmd_issues_status(["--number", "081", "--status", "needs_review", "--comment", "findings"])
+    end
     assert_equal 1, status
     assert_match(/unexpected argument/, out)
   end

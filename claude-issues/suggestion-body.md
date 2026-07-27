@@ -26,7 +26,10 @@ comment covering:
 
 Finish with:
 
-    dev issues status --number <NNN> --status needs_review --comment "<your findings>"
+    dev issues status <NNN> --status needs_review --comment "<your findings>"
+
+The issue number is POSITIONAL. There is no flag form for it — pass it as a bare
+argument or the command exits with `unexpected argument(s)`.
 
 If the suggestion concerns a pipeline with its own orientation, read that body file
 under `~/code/devops/claude-issues/` first — `graphs-body.md`, `worker-body.md`,
