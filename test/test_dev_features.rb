@@ -123,6 +123,43 @@ class TestDevFeatures < Minitest::Test
     assert_includes state[:pairs].first[:detail], "1.0.0 -> 1.2.0"
   end
 
+  # ---------- create flag parsing ----------
+  #
+  # Regression: the first cut of `features create` used parse_common_flags, which
+  # treats --app as a SINGLE filter. Both apps were swallowed before the command
+  # saw them, so every invocation failed with "at least one --app is required" —
+  # the command could never succeed. Repeats have to survive parsing.
+
+  def test_create_collects_repeated_app_flags
+    flags = features_create_parse_flags(%w[playbook revenue_business_line --app platform --app playbook-app])
+    assert_equal %w[platform playbook-app], flags[:apps]
+    assert_equal %w[playbook revenue_business_line], flags[:positional]
+    refute flags[:use_localhost]
+  end
+
+  def test_create_collects_a_single_app_flag
+    flags = features_create_parse_flags(%w[playbook some_flag --app platform])
+    assert_equal %w[platform], flags[:apps]
+  end
+
+  def test_create_separates_localhost_from_positionals
+    flags = features_create_parse_flags(%w[playbook some_flag --app platform --localhost])
+    assert flags[:use_localhost]
+    assert_equal %w[playbook some_flag], flags[:positional]
+    assert_equal %w[platform], flags[:apps]
+  end
+
+  def test_create_handles_flags_before_positionals
+    flags = features_create_parse_flags(%w[--app platform playbook some_flag])
+    assert_equal %w[platform], flags[:apps]
+    assert_equal %w[playbook some_flag], flags[:positional]
+  end
+
+  def test_create_reports_no_apps_when_none_given
+    flags = features_create_parse_flags(%w[playbook some_flag])
+    assert_empty flags[:apps]
+  end
+
   # ---------- paths ----------
 
   def test_feature_removal_path_encodes_both_segments
