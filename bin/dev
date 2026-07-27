@@ -38,9 +38,14 @@ require 'codegen/sync'
 # inline (via usage_for) on an argument error, so help text and error hints can't
 # drift. Add a command here and reference it in both places.
 INVOCATIONS = {
-  "login"               => 'login [--email EMAIL] [--app APP] [--localhost]',
-  "logout"              => 'logout [--localhost]',
-  "ai-token"            => 'ai-token [<token> | --status | --clear] [--localhost]',
+  "auth status"         => 'auth [status] [--localhost]',
+  "auth login"          => 'auth login [--email EMAIL] [--app APP] [--localhost]',
+  "auth logout"         => 'auth logout [--localhost]',
+  "auth ai status"      => 'auth ai [status] [--localhost]',
+  "auth ai provision"   => 'auth ai provision [--rotate] [--localhost]',
+  "auth ai set"         => 'auth ai set <token> [--localhost]',
+  "auth ai clear"       => 'auth ai clear [--localhost]',
+  "auth ai revoke"      => 'auth ai revoke [--localhost]',
   "invariants check"    => 'invariants [check] [--app APP] [--localhost] [--examples N | --all-examples]',
   "invariants snoozes"  => 'invariants snoozes [--app APP] [--localhost]',
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
@@ -76,7 +81,13 @@ USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
   Commands:
-    #{INVOCATIONS["login"]}
+    #{INVOCATIONS["auth status"]}
+        Every credential `dev` holds for a target, in one view: which app
+        sessions are stored (platform, acumen, playbook), whether the AI token
+        is present, and which of the two THIS process would authenticate with.
+        `status` is the default when no subcommand is given.
+
+    #{INVOCATIONS["auth login"]}
         Log in to platform and acumen. Prompts for email + password
         separately per app (credentials differ between stacks). If
         --email is passed it is reused for both; password is always
@@ -86,15 +97,34 @@ USAGE = <<~USAGE
         `dev issues`); it is opt-in only, never part of the default
         login. Sessions are stored under ~/.platform/.
 
-    #{INVOCATIONS["logout"]}
-        Clear the cached devops sessions (platform + acumen).
+    #{INVOCATIONS["auth logout"]}
+        Clear the cached devops sessions (platform + acumen + playbook).
 
-    #{INVOCATIONS["ai-token"]}
-        Store (or inspect/clear) the API token for the AI actor, "Otto AI".
-        Inside a Claude session `dev` authenticates with this token instead of
-        your session, so work the AI does is attributed to the AI and not to
-        you. Your own runs are unaffected. --status prints it masked and says
-        whether this process would use it.
+    #{INVOCATIONS["auth ai status"]}
+        Show the API token for the AI actor, "Otto AI", masked, and say whether
+        this process would use it. Inside a Claude session `dev` authenticates
+        with this token instead of your session, so work the AI does is
+        attributed to the AI and not to you. Your own runs are unaffected.
+
+    #{INVOCATIONS["auth ai provision"]}
+        Mint Otto's token and store it — the whole setup in one command. Using
+        YOUR platform session it creates the token (POST /tokens), reads the
+        cleartext back (readable exactly once), writes it to ~/.platform/, and
+        verifies the stored token authenticates. Refuses to run inside a Claude
+        session: a human authorizes the AI's credential, never the AI itself.
+        If Otto already has live tokens it stops and lists them; --rotate mints
+        and stores the new one first, then revokes the old ones (which breaks
+        any other machine still holding them).
+
+    #{INVOCATIONS["auth ai set"]}
+        Store a token you minted elsewhere (e.g. provisioned on another machine).
+
+    #{INVOCATIONS["auth ai clear"]}
+        Forget the token locally. The token stays valid server-side.
+
+    #{INVOCATIONS["auth ai revoke"]}
+        The kill switch: revoke every live token for Otto server-side, then
+        forget the local copy. Use this if the token leaks.
 
     #{INVOCATIONS["invariants check"]}
         Check invariants across endpoints. `check` is the default when no
@@ -216,7 +246,7 @@ USAGE = <<~USAGE
         (Opus 4.8, 1M context) pinned to that session id. Reattach later with
         `dev issues resume`. Pass --no-spawn to stop after writing the plan.
         Authenticates with your persisted playbook session — run
-        `dev login --app playbook` once first.
+        `dev auth login --app playbook` once first.
 
     #{INVOCATIONS["issues resume"]}
         Reattach to the Claude session `issues create` started on an issue. Reads
@@ -235,8 +265,8 @@ USAGE = <<~USAGE
         the plan directly; several → it dispatches one subagent per plan and works
         them in parallel. Pass --no-spawn to just write the plan(s) and print their
         paths. Authenticates with your persisted playbook session — run
-        `dev login --app playbook` once first (the issues API requires a playbook
-        admin, not the platform `dev login`).
+        `dev auth login --app playbook` once first (the issues API requires a playbook
+        admin, not the platform `dev auth login`).
 
     #{INVOCATIONS["issues status"]}
         Close a claimed issue. NUMBER is the per-tenant issue number shown as
@@ -283,7 +313,7 @@ USAGE = <<~USAGE
         themselves, dominates the cost). Pass --limit N to build only the N most
         recent pending versions (e.g. to seed history without evaluating every past
         release). Enrichment uses your persisted playbook session; run
-        `dev login --app playbook` once first. After writing notes it regenerates
+        `dev auth login --app playbook` once first. After writing notes it regenerates
         playbook-admin's committed snapshot (src/lib/changelog/data.json, what
         /admin/changelog actually renders) in a scratch worktree and force-pushes it
         to the long-lived `changelog-data` branch, opening the PR if none is open —
@@ -314,8 +344,10 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[login logout invariants tasks deploy config docker aidirs browserslist scripts codegen issues changelog].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen issues changelog].freeze
 SUBCOMMANDS = {
+  "auth"         => %w[status login logout ai],
+  "auth ai"      => %w[status provision set clear revoke],
   "changelog"    => %w[capture build],
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
@@ -448,7 +480,11 @@ def platform_endpoint(use_localhost)
   ApiClient.endpoints(use_localhost: use_localhost, app_filter: "platform").first
 end
 
-# ---------- login / logout ----------
+# ---------- auth ----------
+#
+# One home for every credential `dev` holds: the per-app sessions a human logs in
+# with, and the API token the AI authenticates as. They are two answers to the
+# same question ("who is this process?"), so they live under one command.
 
 def login_platform(use_localhost, email, password)
   res = ApiClient.request(platform_endpoint(use_localhost), :post, "/tenant/platform/session/logins",
@@ -511,10 +547,10 @@ def read_password(io = STDIN)
 end
 
 # playbook is a tenant login, opt-in via `--app playbook` only — never part of the
-# default `dev login` fanout (which is the deployable apps in ENDPOINTS).
+# default `dev auth login` fanout (which is the deployable apps in ENDPOINTS).
 LOGIN_APPS = (ApiClient::ENDPOINTS.map { |e| e[:app] } + ["playbook"]).freeze
 
-def cmd_login(args)
+def cmd_auth_login(args)
   email = nil
   use_localhost = false
   app_filter = nil
@@ -524,23 +560,23 @@ def cmd_login(args)
     case a
     when "--email"
       email = args[i + 1]
-      usage_exit("--email requires a value", example: usage_for("login")) if email.nil?
+      usage_exit("--email requires a value", example: usage_for("auth login")) if email.nil?
       i += 2
     when "--app"
       app_filter = args[i + 1]
-      usage_exit("--app requires a value", example: usage_for("login")) if app_filter.nil?
+      usage_exit("--app requires a value", example: usage_for("auth login")) if app_filter.nil?
       i += 2
     when "--localhost"
       use_localhost = true
       i += 1
     else
-      usage_exit("Unknown argument: #{a}", example: usage_for("login"))
+      usage_exit("Unknown argument: #{a}", example: usage_for("auth login"))
     end
   end
 
   apps = if app_filter
            unless LOGIN_APPS.include?(app_filter)
-             usage_exit("--app must be one of: #{LOGIN_APPS.join(', ')}", example: usage_for("login"))
+             usage_exit("--app must be one of: #{LOGIN_APPS.join(', ')}", example: usage_for("auth login"))
            end
            [app_filter]
          else
@@ -598,12 +634,12 @@ def cmd_login(args)
   Util.exit_with_error("No logins succeeded") unless any_ok
 end
 
-def cmd_logout(args)
+def cmd_auth_logout(args)
   use_localhost = false
   args.each do |a|
     case a
     when "--localhost" then use_localhost = true
-    else usage_exit("Unknown argument: #{a}", example: usage_for("logout"))
+    else usage_exit("Unknown argument: #{a}", example: usage_for("auth logout"))
     end
   end
 
@@ -648,6 +684,209 @@ def cmd_logout(args)
   puts "Logged out"
 end
 
+# The AI actor. Claude sessions authenticate as "Otto AI" (user id `ai`) with an API token
+# instead of borrowing Mike's session, so anything the AI writes is attributed to the AI.
+AI_USER_ID = "ai".freeze
+AI_USER_LABEL = "Otto AI".freeze
+
+# Only these flags; anything else is a typo worth reporting rather than ignoring.
+def parse_auth_flags(args, command, allow: [])
+  use_localhost = false
+  flags = {}
+  args.each do |a|
+    case a
+    when "--localhost" then use_localhost = true
+    when *allow        then flags[a.delete_prefix("--").to_sym] = true
+    else usage_exit("Unknown argument: #{a}", example: usage_for(command))
+    end
+  end
+  [use_localhost, flags]
+end
+
+def auth_target_label(use_localhost)
+  use_localhost ? "localhost" : "prod"
+end
+
+# Never print a token in full — enough characters to tell two tokens apart, not enough to use one.
+def mask_token(token)
+  token.to_s.length > 8 ? "#{token[0, 4]}...#{token[-4, 4]}" : "****"
+end
+
+def cmd_auth_status(args)
+  use_localhost, = parse_auth_flags(args, "auth status")
+  target = auth_target_label(use_localhost)
+
+  puts ""
+  puts Util.underline("Credentials (#{target})")
+  puts ""
+
+  puts "Sessions:"
+  ApiClient::SESSION_CONFIG.keys.each do |app|
+    sid = ApiClient.session_id_for(app, use_localhost: use_localhost)
+    state = sid ? "stored (#{mask_token(sid)})" : "none"
+    puts "  #{app.ljust(9)} #{state}"
+  end
+
+  puts ""
+  puts "#{AI_USER_LABEL} token:"
+  stored = ApiClient.ai_token(use_localhost: use_localhost)
+  if stored.nil?
+    puts "  none (provision with `dev auth ai provision#{use_localhost ? ' --localhost' : ''}`)"
+  else
+    source = ENV["PLATFORM_AI_API_TOKEN"].to_s.strip.empty? ? ApiClient.ai_token_file(use_localhost) : "PLATFORM_AI_API_TOKEN"
+    puts "  #{mask_token(stored)} (from #{source})"
+  end
+
+  puts ""
+  puts "This process: #{auth_effective_identity(stored)}"
+  puts ""
+end
+
+# Which credential THIS process would present. The whole point of the separate account is that the
+# answer differs between a Claude session and a human at a keyboard, so say which one you are.
+def auth_effective_identity(stored_token)
+  if !ApiClient.ai_session?
+    "not a Claude session — `dev` authenticates as you."
+  elsif stored_token.nil?
+    "a Claude session, but with no token stored it falls back to your session."
+  else
+    "a Claude session — `dev` authenticates as #{AI_USER_LABEL}."
+  end
+end
+
+def cmd_auth_ai_status(args)
+  use_localhost, = parse_auth_flags(args, "auth ai status")
+  target = auth_target_label(use_localhost)
+  stored = ApiClient.ai_token(use_localhost: use_localhost)
+  if stored.nil?
+    puts "No #{AI_USER_LABEL} token stored for #{target}. Claude sessions fall back to your own session."
+  else
+    source = ENV["PLATFORM_AI_API_TOKEN"].to_s.strip.empty? ? ApiClient.ai_token_file(use_localhost) : "PLATFORM_AI_API_TOKEN"
+    puts "#{AI_USER_LABEL} token for #{target}: #{mask_token(stored)} (from #{source})"
+  end
+  puts "This process is #{auth_effective_identity(stored)}"
+end
+
+def cmd_auth_ai_set(args)
+  token = args.shift if args.first && !args.first.start_with?("--")
+  use_localhost, = parse_auth_flags(args, "auth ai set")
+  usage_exit("Missing token", example: usage_for("auth ai set")) if token.nil? || token.empty?
+  ApiClient.write_ai_token(token, use_localhost: use_localhost)
+  puts "Stored the #{AI_USER_LABEL} token for #{auth_target_label(use_localhost)} in #{ApiClient.ai_token_file(use_localhost)}."
+end
+
+def cmd_auth_ai_clear(args)
+  use_localhost, = parse_auth_flags(args, "auth ai clear")
+  ApiClient.clear_ai_token(use_localhost: use_localhost)
+  puts "Cleared the local #{AI_USER_LABEL} token for #{auth_target_label(use_localhost)}. It is still valid server-side — `dev auth ai revoke` kills it."
+end
+
+# A Claude session must not mint, rotate, or revoke the AI's own credential: the account exists to
+# separate the AI's writes from Mike's, and an AI that can issue itself tokens erases that boundary.
+# A human at a keyboard authorizes it.
+def require_human_session!(action)
+  return unless ApiClient.ai_session?
+  Util.exit_with_error(
+    "Refusing to #{action} inside a Claude session. #{AI_USER_LABEL}'s credential is provisioned by a human — " \
+    "run this yourself in a normal terminal."
+  )
+end
+
+# Tokens live for the AI user, but every call here authenticates as YOU (require_human_session!
+# above means auth_header_for returns nil, so the platform session is used).
+def auth_ai_tokens(endpoint)
+  ApiClient.request(endpoint, :get, "/tokens/users/#{AI_USER_ID}") || []
+end
+
+# The account has to exist before a token can point at it: `tokens.user_id` is a foreign key, so
+# minting against a target that never ran the SEM script fails deep in the DAO with an opaque 500.
+# Check first and name the fix.
+def require_ai_user!(endpoint, use_localhost)
+  ApiClient.request(endpoint, :get, "/users/#{AI_USER_ID}")
+rescue ApiError => e
+  Util.exit_with_error(
+    "No `#{AI_USER_ID}` user on #{auth_target_label(use_localhost)} (#{e.message}). The account is created by a " \
+    "platform-postgresql migration — release the DB (or apply the script to this session DB) first."
+  )
+end
+
+def auth_token_description
+  "dev CLI on #{`hostname -s`.strip}"
+end
+
+def cmd_auth_ai_provision(args)
+  use_localhost, flags = parse_auth_flags(args, "auth ai provision", allow: ["--rotate"])
+  require_human_session!("provision a token")
+  endpoint = platform_endpoint(use_localhost)
+  target = auth_target_label(use_localhost)
+
+  handle_errors do
+    require_ai_user!(endpoint, use_localhost)
+
+    existing = auth_ai_tokens(endpoint)
+    if existing.any? && !flags[:rotate]
+      warn "#{AI_USER_LABEL} already has #{existing.length} live token(s) on #{target}:"
+      existing.each { |t| warn "  #{t['id']}  #{t['masked_token']}  #{t['description'] || '(no description)'}  created #{t['created_at']}" }
+      Util.exit_with_error(
+        "Not minting another. Re-run with --rotate to mint a new token and revoke these, or " \
+        "`dev auth ai set <token>` if you already have the cleartext."
+      )
+    end
+
+    created = ApiClient.request(endpoint, :post, "/tokens",
+                                body: { user_id: AI_USER_ID, description: auth_token_description })
+    cleartext = ApiClient.request(endpoint, :get, "/tokens/#{created['id']}/cleartext")
+    token = cleartext && cleartext["token"]
+    if token.nil? || token.empty?
+      Util.exit_with_error("Minted token #{created['id']} but its cleartext was already claimed — revoke it and retry.")
+    end
+
+    # Store BEFORE revoking anything: a failure past this point leaves a working credential on disk
+    # rather than none at all.
+    ApiClient.write_ai_token(token, use_localhost: use_localhost)
+    puts "Minted #{created['masked_token']} for #{AI_USER_LABEL} and stored it in #{ApiClient.ai_token_file(use_localhost)}."
+
+    verify_ai_token!(endpoint, token)
+    puts "Verified: the stored token authenticates as #{AI_USER_ID}."
+
+    if flags[:rotate] && existing.any?
+      existing.each do |t|
+        ApiClient.request(endpoint, :delete, "/tokens/#{t['id']}")
+        puts "Revoked #{t['masked_token']} (#{t['id']})."
+      end
+    end
+  end
+end
+
+# Prove the credential we just wrote actually authenticates, rather than reporting success on a
+# token nobody has used yet. Presents it as HTTP Basic exactly as `dev` will.
+def verify_ai_token!(endpoint, token)
+  ApiClient.request(endpoint, :get, "/tokens/users/#{AI_USER_ID}", as_token: token)
+rescue SessionExpired, ApiError => e
+  Util.exit_with_error("Stored the token but it failed to authenticate: #{e.message}")
+end
+
+def cmd_auth_ai_revoke(args)
+  use_localhost, = parse_auth_flags(args, "auth ai revoke")
+  require_human_session!("revoke a token")
+  endpoint = platform_endpoint(use_localhost)
+  target = auth_target_label(use_localhost)
+
+  handle_errors do
+    existing = auth_ai_tokens(endpoint)
+    if existing.empty?
+      puts "#{AI_USER_LABEL} has no live tokens on #{target}."
+    else
+      existing.each do |t|
+        ApiClient.request(endpoint, :delete, "/tokens/#{t['id']}")
+        puts "Revoked #{t['masked_token']} (#{t['id']})."
+      end
+    end
+    ApiClient.clear_ai_token(use_localhost: use_localhost)
+    puts "Cleared the local token for #{target}."
+  end
+end
+
 # ---------- invariants ----------
 
 def print_invariant_failures(result, example_limit: 10)
@@ -668,57 +907,6 @@ def print_invariant_failures(result, example_limit: 10)
   (result["error"] || []).each do |inv|
     puts "  - #{inv['name']}"
     puts "    Error: #{inv['error'] || 'Unknown error'}"
-  end
-end
-
-# The AI actor's credential. Claude sessions authenticate as "Otto AI" (user id `ai`) with this
-# token instead of borrowing Mike's session, so anything the AI writes is attributed to the AI.
-#
-# Mint one as a platform admin: POST /tokens {"user_id": "ai"}, then read it back once via
-# GET /tokens/:id/cleartext (the cleartext is readable exactly once). Revoke with DELETE /tokens/:id,
-# which is also the kill switch if it ever leaks.
-def cmd_ai_token(args)
-  use_localhost = false
-  token = nil
-  mode = :set
-  args.each do |a|
-    case a
-    when "--localhost" then use_localhost = true
-    when "--status"    then mode = :status
-    when "--clear"     then mode = :clear
-    else
-      usage_exit("Unknown argument: #{a}", example: usage_for("ai-token")) if a.start_with?("--")
-      usage_exit("Only one token may be given", example: usage_for("ai-token")) if token
-      token = a
-    end
-  end
-
-  target = use_localhost ? "localhost" : "prod"
-
-  case mode
-  when :status
-    stored = ApiClient.ai_token(use_localhost: use_localhost)
-    if stored.nil?
-      puts "No AI token stored for #{target}. Claude sessions fall back to your own session."
-    else
-      masked = stored.length > 8 ? "#{stored[0, 4]}...#{stored[-4, 4]}" : "****"
-      source = ENV["PLATFORM_AI_API_TOKEN"].to_s.strip.empty? ? ApiClient.ai_token_file(use_localhost) : "PLATFORM_AI_API_TOKEN"
-      puts "AI token for #{target}: #{masked} (from #{source})"
-    end
-    if !ApiClient.ai_session?
-      puts "This process is NOT a Claude session, so `dev` authenticates as you."
-    elsif stored.nil?
-      puts "This process IS a Claude session, but with no token stored it falls back to your session."
-    else
-      puts "This process IS a Claude session, so `dev` authenticates as Otto AI."
-    end
-  when :clear
-    ApiClient.clear_ai_token(use_localhost: use_localhost)
-    puts "Cleared the AI token for #{target}."
-  else
-    usage_exit("Missing token", example: usage_for("ai-token")) if token.nil? || token.empty?
-    ApiClient.write_ai_token(token, use_localhost: use_localhost)
-    puts "Stored the AI token for #{target} in #{ApiClient.ai_token_file(use_localhost)}."
   end
 end
 
@@ -753,7 +941,7 @@ def cmd_invariants_check(args)
         data = ApiClient.request(endpoint, :get, "/dev/invariant/checks")
         { endpoint: endpoint, data: data, error: nil }
       rescue SessionExpired => e
-        { endpoint: endpoint, data: nil, error: "session expired - run 'dev login'" }
+        { endpoint: endpoint, data: nil, error: "session expired - run 'dev auth login'" }
       rescue ApiError => e
         { endpoint: endpoint, data: nil, error: e.message }
       rescue => e
@@ -958,7 +1146,7 @@ def cmd_tasks_requeue(args)
       count = res && res["requeued"]
       puts "  #{endpoint[:name]}: #{count} tasks requeued"
     rescue SessionExpired
-      puts "  #{endpoint[:name]}: ERROR - session expired or invalid - run 'dev login'"
+      puts "  #{endpoint[:name]}: ERROR - session expired or invalid - run 'dev auth login'"
       all_ok = false
     rescue ApiError => e
       puts "  #{endpoint[:name]}: ERROR - #{e.message}"
@@ -1197,8 +1385,8 @@ def issue_categories_present(open)
 end
 
 # The issue tracker is tenant-scoped (/:tenant_id/issues) and authorized for a
-# playbook tenant admin, not the platform tenant that `dev login` stores —
-# authenticate with the persisted playbook session (`dev login --app playbook`) on
+# playbook tenant admin, not the platform tenant that `dev auth login` stores —
+# authenticate with the persisted playbook session (`dev auth login --app playbook`) on
 # the platform host.
 def issue_endpoint(use_localhost)
   ApiClient.tenant_endpoint("playbook", use_localhost: use_localhost)
@@ -1228,12 +1416,12 @@ def issues_list_path(statuses:, category: nil, limit: 100)
 end
 
 # Fail with the exact login command when there is no credential yet, rather than the generic
-# "run 'dev login'" that handle_errors emits on a 401. A Claude session carrying the AI token has
+# "run 'dev auth login'" that handle_errors emits on a 401. A Claude session carrying the AI token has
 # its own credential and needs no login at all.
 def require_playbook_session!(use_localhost)
   return unless ApiClient.auth_header_for("playbook", use_localhost: use_localhost).nil?
   return unless ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
-  Util.exit_with_error("No playbook session#{use_localhost ? ' (localhost)' : ''}. Run `dev login --app playbook#{use_localhost ? ' --localhost' : ''}` first.")
+  Util.exit_with_error("No playbook session#{use_localhost ? ' (localhost)' : ''}. Run `dev auth login --app playbook#{use_localhost ? ' --localhost' : ''}` first.")
 end
 
 # Display identity of an issue: the per-tenant number, e.g. ISS-034.
@@ -3813,7 +4001,7 @@ def cmd_slow_routes(args)
   rows = begin
     ApiClient.request(endpoint, :get, "/admin/user/tracking/page/views/latency?#{query}")
   rescue SessionExpired
-    Util.exit_with_error("session expired - run 'dev login'")
+    Util.exit_with_error("session expired - run 'dev auth login'")
   rescue ApiError => e
     Util.exit_with_error(e.message)
   end
@@ -4114,7 +4302,7 @@ end
 # build still produces notes, just without ISS links.
 def changelog_issue_map(use_localhost)
   if ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
-    warn "changelog: no playbook session; skipping ISS enrichment (run `dev login --app playbook` to enable)"
+    warn "changelog: no playbook session; skipping ISS enrichment (run `dev auth login --app playbook` to enable)"
     return {}
   end
   map = {}
@@ -4413,12 +4601,24 @@ if __FILE__ == $PROGRAM_NAME
 
   command = argv.shift
   case command
-when "login"
-  cmd_login(argv)
-when "logout"
-  cmd_logout(argv)
-when "ai-token"
-  cmd_ai_token(argv)
+when "auth"
+  sub = resolve_subcommand(argv, default: "status")
+  case sub
+  when "status" then cmd_auth_status(argv)
+  when "login"  then cmd_auth_login(argv)
+  when "logout" then cmd_auth_logout(argv)
+  when "ai"
+    ai_sub = resolve_subcommand(argv, default: "status")
+    case ai_sub
+    when "status"    then cmd_auth_ai_status(argv)
+    when "provision" then cmd_auth_ai_provision(argv)
+    when "set"       then cmd_auth_ai_set(argv)
+    when "clear"     then cmd_auth_ai_clear(argv)
+    when "revoke"    then cmd_auth_ai_revoke(argv)
+    else                  unknown("auth ai subcommand", ai_sub, SUBCOMMANDS["auth ai"])
+    end
+  else               unknown("auth subcommand", sub, SUBCOMMANDS["auth"])
+  end
 when "invariants"
   sub = resolve_subcommand(argv, default: "check")
   case sub

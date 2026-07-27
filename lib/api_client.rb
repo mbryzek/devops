@@ -17,7 +17,7 @@ class ApiClient
   # Platform's session cookie is named `session_id`; acumen's is
   # `acumen_session_id`. `playbook` is not a deployable app (it is a tenant admin
   # surface on the platform host, so it is deliberately absent from ENDPOINTS)
-  # but gets its own persisted session via `dev login --app playbook`, on the
+  # but gets its own persisted session via `dev auth login --app playbook`, on the
   # platform `session_id` header.
   SESSION_CONFIG = {
     "platform" => { file: File.expand_path("~/.platform/devops"),         header: "session_id" },
@@ -121,7 +121,10 @@ class ApiClient
     { name: app.capitalize, app: app, active_url: platform[:active_url], use_localhost: use_localhost }
   end
 
-  def self.request(endpoint, method, path, body: nil, auth_required: true)
+  # `as_token` presents a specific API token as HTTP Basic instead of resolving a credential from
+  # disk. Provisioning uses it to prove the token it just minted actually authenticates, before
+  # reporting success.
+  def self.request(endpoint, method, path, body: nil, auth_required: true, as_token: nil)
     uri = URI.parse("#{endpoint[:active_url]}#{path}")
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = (uri.scheme == "https")
@@ -134,11 +137,13 @@ class ApiClient
     }.fetch(method.to_sym)
 
     use_localhost = endpoint.fetch(:use_localhost)
-    login_cmd = "dev login#{endpoint[:app] == 'platform' ? '' : " --app #{endpoint[:app]}"}#{use_localhost ? ' --localhost' : ''}"
+    login_cmd = "dev auth login#{endpoint[:app] == 'platform' ? '' : " --app #{endpoint[:app]}"}#{use_localhost ? ' --localhost' : ''}"
 
     req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
-    if auth_required
+    if auth_required && as_token
+      req["Authorization"] = "Basic #{Base64.strict_encode64("#{as_token}:")}"
+    elsif auth_required
       header, value = auth_header_for(endpoint[:app], use_localhost: use_localhost)
       if header
         req[header] = value
