@@ -81,6 +81,13 @@ class TestCodegenApiConfig < Minitest::Test
     cfg = Codegen::ApiConfig.load(File.expand_path('..', __dir__))
     refute_empty cfg.app_names
   end
+
+  # A nested codegen root is a real consumer: hackathon's playwright/ root is the
+  # only reader of playwright-vote, so the graph must see apps only it names.
+  def test_load_includes_apps_from_nested_configs
+    cfg = Codegen::ApiConfig.load(File.expand_path('fixtures/nested', __dir__))
+    assert_equal ["platform", "playwright-vote"], cfg.app_names.to_a.sort
+  end
 end
 
 class TestGraph < Minitest::Test

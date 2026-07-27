@@ -89,4 +89,20 @@ class TestApiConfig < Minitest::Test
   def test_find_target_does_not_fall_back_for_listed_app_missing_generator
     assert_nil @config.find_target("apibuilder-spec", "typescript")
   end
+
+  # A config that names no nested roots must not grow one, and the reserved
+  # output key must never be mistaken for an org.
+  def test_nested_configs_defaults_to_empty
+    assert_equal [], @config.nested_configs
+  end
+
+  NESTED = File.expand_path('fixtures/nested/.api/config.pkl', __dir__)
+
+  def test_nested_configs_are_read
+    config = ApiConfig.new(NESTED, base_dir: File.dirname(File.dirname(NESTED)))
+    assert_equal ["inner"], config.nested_configs
+    assert_equal ["bryzek"], config.orgs
+    assert_equal 1, config.blocks.size
+    assert_equal ["platform"], config.blocks.first.applications.map(&:key)
+  end
 end

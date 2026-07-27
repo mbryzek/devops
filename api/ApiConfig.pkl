@@ -63,6 +63,22 @@ class AppGroup {
 
 applications: Listing<AppGroup>
 
+/// Directories, relative to this config's own directory's parent (the repo root),
+/// that hold their own `.api/config.pkl` and belong to the same `api` run.
+///
+/// A repo needs this when part of it generates code that must NOT reach the
+/// shipped bundle — hackathon's `playwright/` regenerates the same clients plus a
+/// test-only one, so keeping it a separate root is what keeps the test client out
+/// of `src/`. Listing it here means one `api` at the repo root regenerates both;
+/// without it the nested config is only ever run by whoever remembers to cd into
+/// that directory, and its copy silently rots (hackathon #54).
+///
+/// Each listed directory is processed with ITS config and ITS directory as the
+/// output root, exactly as running `api` there would. Not recursive: a nested
+/// config's own `nestedConfigs` is ignored, so the repo root stays the one place
+/// that says which roots exist.
+nestedConfigs: Listing<String>?
+
 // --- Bundle factory functions ---
 // Each returns a concrete `Listing<Generator>` the caller assigns to `AppGroup.generators`.
 // Factories read `defaultTargets` from the enclosing module, so repo-level
@@ -147,12 +163,20 @@ local function renderBlock(ag: AppGroup) =
       when (ag.specGlob != null) { spec_glob = ag.specGlob }
     }
 
+/// Reserved output key carrying `nestedConfigs`. Prefixed with `$` so it cannot
+/// collide with an API Builder org key, which is a plain slug — every other
+/// top-level key in the output IS an org.
+const nestedConfigsKey = "$nested_configs"
+
 output {
   value = new Dynamic {
     [org] = new Listing {
       for (ag in applications) {
         renderBlock(ag)
       }
+    }
+    when (nestedConfigs != null) {
+      [nestedConfigsKey] = nestedConfigs
     }
   }
   // omitNullProperties = false is required: application entries with null spec paths
