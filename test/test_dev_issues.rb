@@ -73,6 +73,25 @@ class TestDevIssues < Minitest::Test
     )
   end
 
+  def comment(body: nil, transition: nil, visibility: "internal", at: "2026-07-11T09:00:00Z")
+    {
+      "id" => "cmt-#{at}",
+      "created" => { "at" => at, "by" => { "name" => "Mike Bryzek" } },
+      "visibility" => visibility,
+      "body" => body,
+      "transition" => transition,
+    }.compact
+  end
+
+  # A timeline that closed the issue and then re-opened it: the shape every
+  # re-opened issue has, and the one the plan must lead with.
+  def reopen_comments
+    [
+      comment(body: "shipped the axis clamp", transition: { "from" => "claimed", "to" => "fixed" }),
+      comment(body: "still broken on mobile", transition: { "from" => "fixed", "to" => "open" }, at: "2026-07-12T09:00:00Z"),
+    ]
+  end
+
   # ---- issue_label ----
 
   def test_issue_label_is_iss_prefixed_number
@@ -113,6 +132,101 @@ class TestDevIssues < Minitest::Test
   def test_render_item_prefixes_parent_club
     out = issue_render_item(child_club_issue, 1)
     assert_includes out, "- Club: Bounce / Baltimore (`bounce-baltimore`)"
+  end
+
+  def test_render_item_lists_previous_fix_prs
+    out = issue_render_item(fixed_issue, 1)
+    assert_includes out, "- Previous fixes: https://github.com/mbryzek/playbook-app/pull/1 (playbook-app 0.1.4)"
+  end
+
+  def test_render_item_omits_previous_fixes_when_none_recorded
+    refute_includes issue_render_item(graph_issue, 1), "- Previous fixes:"
+  end
+
+  # ---- comment history + re-open ----
+
+  def test_reopened_when_a_transition_returns_the_issue_to_open
+    assert issue_reopened?(reopen_comments)
+    refute issue_reopened?([]), "a freshly filed issue has no history"
+    refute issue_reopened?([comment(body: "just a note")]), "a plain note is not a re-open"
+  end
+
+  def test_a_first_transition_to_open_is_not_a_reopen
+    refute issue_reopened?([comment(transition: { "from" => "open", "to" => "open" })])
+  end
+
+  def test_render_item_leads_with_the_reopen_callout
+    out = issue_render_item(fixed_issue, 1, comments: reopen_comments)
+    banner = out.index("RE-OPENED")
+    assert banner, "expected the re-open banner"
+    assert banner < out.index("- Issue: `ISS-034`"), "banner must precede the issue fields"
+    assert_includes out, "**RE-OPENED — the earlier attempt did not hold.**"
+    assert_includes out, "Reason given: still broken on mobile"
+    assert_includes out, "NEW `~/code/ai/<short-name>` directory on a NEW branch"
+    assert_includes out, "never reuse"
+  end
+
+  def test_reopen_callout_counts_repeat_reopens
+    twice = reopen_comments + [comment(transition: { "from" => "fixed", "to" => "open" }, at: "2026-07-14T09:00:00Z")]
+    assert_includes issue_render_item(fixed_issue, 1, comments: twice), "**RE-OPENED 2 times — the earlier attempt did not hold.**"
+  end
+
+  # A suggestion session is told not to branch at all, so the callout must not
+  # hand it a contradictory "on a NEW branch".
+  def test_reopen_callout_omits_the_branch_for_an_investigate_only_category
+    out = issue_render_item(graph_issue.merge("category" => "suggestion"), 1, comments: reopen_comments)
+    assert_includes out, "NEW `~/code/ai/<short-name>` directory — never reuse the directory"
+    refute_includes out, "on a NEW branch"
+  end
+
+  def test_render_item_has_no_callout_without_a_reopen
+    refute_includes issue_render_item(graph_issue, 1, comments: [comment(body: "just a note")]), "RE-OPENED"
+  end
+
+  def test_render_item_includes_the_comment_history_oldest_first
+    out = issue_render_item(fixed_issue, 1, comments: reopen_comments)
+    assert_includes out, "**Comment history (2, oldest first):**"
+    assert_includes out, "- 2026-07-11T09:00:00Z · Mike Bryzek · status claimed → fixed"
+    assert_includes out, "  > shipped the axis clamp"
+    assert_includes out, "- 2026-07-12T09:00:00Z · Mike Bryzek · status fixed → open"
+    assert out.index("status claimed → fixed") < out.index("status fixed → open"), "oldest first"
+  end
+
+  def test_history_indents_multiline_comment_bodies
+    out = issue_render_item(graph_issue, 1, comments: [comment(body: "line one\nline two")])
+    assert_includes out, "  > line one\n  > line two"
+  end
+
+  def test_history_flags_a_comment_shared_with_the_submitter
+    out = issue_render_item(graph_issue, 1, comments: [comment(body: "we are on it", visibility: "shared")])
+    assert_includes out, "shared with the submitter"
+    refute_includes issue_render_item(graph_issue, 1, comments: [comment(body: "internal")]), "shared with the submitter"
+  end
+
+  # Pointing a re-opened issue at the earlier session invites resuming it — the
+  # opposite of the "new directory, new branch" instruction in the callout.
+  def test_history_drops_the_session_bookkeeping_comment
+    out = issue_render_item(graph_issue, 1, comments: [comment(body: "Claude session `abc-123` — resume with `claude --resume abc-123`")])
+    refute_includes out, "Comment history"
+    refute_includes out, "abc-123"
+  end
+
+  def test_history_keeps_a_session_comment_that_also_recorded_a_transition
+    out = issue_render_item(graph_issue, 1,
+                            comments: [comment(body: "Claude session `abc-123`", transition: { "from" => "open", "to" => "claimed" })])
+    assert_includes out, "status open → claimed"
+  end
+
+  def test_render_item_without_comments_is_unchanged
+    assert_equal issue_render_item(graph_issue, 1), issue_render_item(graph_issue, 1, comments: [])
+  end
+
+  def test_plan_markdown_renders_history_for_the_matching_issue_only
+    md = issue_plan_markdown(items: [fixed_issue, child_club_issue], date: "2026-07-10", category: "graphs",
+                             body: "BODY", comments_by_number: { "034" => reopen_comments })
+    assert_includes md, "RE-OPENED"
+    assert_includes md, "still broken on mobile"
+    assert_equal 1, md.scan("Comment history").length, "ISS-036 has no history to render"
   end
 
   # ---- issue_club_label ----

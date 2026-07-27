@@ -17,6 +17,11 @@ plan it writes under `~/code/claude/plans/<date>-issues-<category>.md`. Categori
 pipeline get their own file; every other category falls back to `default-body.md`. Edit the prose
 here — the command picks it up automatically.
 
+Per-issue context is rendered by `bin/dev`, not from these files: each claimed issue carries its
+previous fix PRs and its full comment history into the plan, and a RE-OPENED issue leads with a
+banner saying the earlier attempt did not hold and to work it in a NEW `~/code/ai/` directory and
+branch. Edit that wording in `issue_reopen_callout` / `issue_render_item`, not here.
+
 `default-body.md` holds the working rules ONCE. The pipeline bodies carry only what is specific
 to their pipeline, and `manual-body.md` is prepended to `default-body.md` for a plan written by
 `dev issues create`. `suggestion-body.md` is the one exception: it replaces `default-body.md`
