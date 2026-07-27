@@ -1,3 +1,4 @@
+require 'base64'
 require 'fileutils'
 require 'json'
 require 'net/http'
@@ -39,6 +40,58 @@ class ApiClient
     return nil unless File.exist?(file)
     id = File.read(file).strip
     id.empty? ? nil : id
+  end
+
+  # The AI actor's own API token ("Otto AI", user id `ai`). Kept beside the session files, one per
+  # target, since a prod token is meaningless against localhost.
+  AI_TOKEN_FILE = File.expand_path("~/.platform/devops_ai").freeze
+
+  def self.ai_token_file(use_localhost)
+    use_localhost ? "#{AI_TOKEN_FILE}_localhost" : AI_TOKEN_FILE
+  end
+
+  def self.write_ai_token(token, use_localhost:)
+    file = ai_token_file(use_localhost)
+    FileUtils.mkdir_p(File.dirname(file), mode: 0700)
+    tmp = "#{file}.tmp.#{Process.pid}"
+    File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0600) { |f| f.write(token) }
+    File.rename(tmp, file)
+  end
+
+  def self.clear_ai_token(use_localhost:)
+    file = ai_token_file(use_localhost)
+    File.delete(file) if File.exist?(file)
+  end
+
+  def self.ai_token(use_localhost:)
+    from_env = ENV["PLATFORM_AI_API_TOKEN"].to_s.strip
+    return from_env unless from_env.empty?
+
+    file = ai_token_file(use_localhost)
+    return nil unless File.exist?(file)
+    token = File.read(file).strip
+    token.empty? ? nil : token
+  end
+
+  # Whether this process is a Claude session rather than Mike at a keyboard. Only the AI borrows
+  # the AI's identity: a human running the same command stays themselves, which is the whole point
+  # of the separate account.
+  def self.ai_session?
+    !ENV["CLAUDECODE"].to_s.strip.empty?
+  end
+
+  # The credential this process should present for `app`: the AI's token inside a Claude session
+  # (when one has been stored), otherwise the logged-in human's session id.
+  #
+  # Only the platform host honours these tokens, and only `platform`/`playbook` ride on it; acumen
+  # keeps its own session. A Claude session with no stored token falls back to the human session —
+  # the same behaviour as before this existed, so nothing breaks before the token is provisioned.
+  def self.auth_header_for(app, use_localhost:)
+    if ai_session? && app != "acumen"
+      token = ai_token(use_localhost: use_localhost)
+      return ["Authorization", "Basic #{Base64.strict_encode64("#{token}:")}"] if token
+    end
+    nil
   end
 
   def self.write_session_id_for(app, id, use_localhost:)
@@ -86,10 +139,15 @@ class ApiClient
     req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
     if auth_required
-      cfg = SESSION_CONFIG.fetch(endpoint[:app])
-      sid = session_id_for(endpoint[:app], use_localhost: use_localhost) or
-        raise SessionExpired, "No session for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
-      req[cfg[:header]] = sid
+      header, value = auth_header_for(endpoint[:app], use_localhost: use_localhost)
+      if header
+        req[header] = value
+      else
+        cfg = SESSION_CONFIG.fetch(endpoint[:app])
+        sid = session_id_for(endpoint[:app], use_localhost: use_localhost) or
+          raise SessionExpired, "No session for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
+        req[cfg[:header]] = sid
+      end
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body
 

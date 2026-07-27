@@ -40,6 +40,7 @@ require 'codegen/sync'
 INVOCATIONS = {
   "login"               => 'login [--email EMAIL] [--app APP] [--localhost]',
   "logout"              => 'logout [--localhost]',
+  "ai-token"            => 'ai-token [<token> | --status | --clear] [--localhost]',
   "invariants check"    => 'invariants [check] [--app APP] [--localhost] [--examples N | --all-examples]',
   "invariants snoozes"  => 'invariants snoozes [--app APP] [--localhost]',
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
@@ -87,6 +88,13 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["logout"]}
         Clear the cached devops sessions (platform + acumen).
+
+    #{INVOCATIONS["ai-token"]}
+        Store (or inspect/clear) the API token for the AI actor, "Otto AI".
+        Inside a Claude session `dev` authenticates with this token instead of
+        your session, so work the AI does is attributed to the AI and not to
+        you. Your own runs are unaffected. --status prints it masked and says
+        whether this process would use it.
 
     #{INVOCATIONS["invariants check"]}
         Check invariants across endpoints. `check` is the default when no
@@ -663,6 +671,57 @@ def print_invariant_failures(result, example_limit: 10)
   end
 end
 
+# The AI actor's credential. Claude sessions authenticate as "Otto AI" (user id `ai`) with this
+# token instead of borrowing Mike's session, so anything the AI writes is attributed to the AI.
+#
+# Mint one as a platform admin: POST /tokens {"user_id": "ai"}, then read it back once via
+# GET /tokens/:id/cleartext (the cleartext is readable exactly once). Revoke with DELETE /tokens/:id,
+# which is also the kill switch if it ever leaks.
+def cmd_ai_token(args)
+  use_localhost = false
+  token = nil
+  mode = :set
+  args.each do |a|
+    case a
+    when "--localhost" then use_localhost = true
+    when "--status"    then mode = :status
+    when "--clear"     then mode = :clear
+    else
+      usage_exit("Unknown argument: #{a}", example: usage_for("ai-token")) if a.start_with?("--")
+      usage_exit("Only one token may be given", example: usage_for("ai-token")) if token
+      token = a
+    end
+  end
+
+  target = use_localhost ? "localhost" : "prod"
+
+  case mode
+  when :status
+    stored = ApiClient.ai_token(use_localhost: use_localhost)
+    if stored.nil?
+      puts "No AI token stored for #{target}. Claude sessions fall back to your own session."
+    else
+      masked = stored.length > 8 ? "#{stored[0, 4]}...#{stored[-4, 4]}" : "****"
+      source = ENV["PLATFORM_AI_API_TOKEN"].to_s.strip.empty? ? ApiClient.ai_token_file(use_localhost) : "PLATFORM_AI_API_TOKEN"
+      puts "AI token for #{target}: #{masked} (from #{source})"
+    end
+    if !ApiClient.ai_session?
+      puts "This process is NOT a Claude session, so `dev` authenticates as you."
+    elsif stored.nil?
+      puts "This process IS a Claude session, but with no token stored it falls back to your session."
+    else
+      puts "This process IS a Claude session, so `dev` authenticates as Otto AI."
+    end
+  when :clear
+    ApiClient.clear_ai_token(use_localhost: use_localhost)
+    puts "Cleared the AI token for #{target}."
+  else
+    usage_exit("Missing token", example: usage_for("ai-token")) if token.nil? || token.empty?
+    ApiClient.write_ai_token(token, use_localhost: use_localhost)
+    puts "Stored the AI token for #{target} in #{ApiClient.ai_token_file(use_localhost)}."
+  end
+end
+
 def cmd_invariants_check(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   example_limit = 10
@@ -1168,9 +1227,11 @@ def issues_list_path(statuses:, category: nil, limit: 100)
   issues_path("?#{URI.encode_www_form(params)}")
 end
 
-# Fail with the exact login command when there is no playbook session yet, rather
-# than the generic "run 'dev login'" that handle_errors emits on a 401.
+# Fail with the exact login command when there is no credential yet, rather than the generic
+# "run 'dev login'" that handle_errors emits on a 401. A Claude session carrying the AI token has
+# its own credential and needs no login at all.
 def require_playbook_session!(use_localhost)
+  return unless ApiClient.auth_header_for("playbook", use_localhost: use_localhost).nil?
   return unless ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
   Util.exit_with_error("No playbook session#{use_localhost ? ' (localhost)' : ''}. Run `dev login --app playbook#{use_localhost ? ' --localhost' : ''}` first.")
 end
@@ -4356,6 +4417,8 @@ when "login"
   cmd_login(argv)
 when "logout"
   cmd_logout(argv)
+when "ai-token"
+  cmd_ai_token(argv)
 when "invariants"
   sub = resolve_subcommand(argv, default: "check")
   case sub
