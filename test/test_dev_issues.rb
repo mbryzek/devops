@@ -6,22 +6,11 @@ load File.expand_path('../bin/dev', __dir__)
 # Covers `dev issues {claim,status,reconcile}`: the pure plan-rendering helpers (no
 # network), the claim/status arg validation, and the playbook credential guard.
 # Network paths (claim/status HTTP) are not exercised here — they exit before any
-# request when args or credentials are missing.
+# request when args or credentials are missing. `DevTestSupport::NetworkGuard`
+# (test_helper.rb) reads every credential as absent and raises on any request, so
+# these commands stop at their credential guard and cannot reach production.
 class TestDevIssues < Minitest::Test
   include DevTestSupport
-
-  # Run a block as if `dev auth login --app playbook` had never been run. Guards the
-  # arg-validation tests: this box has a real playbook session, so without it a
-  # command that gets past validation would fire a live request at production.
-  def without_playbook_session
-    orig = ApiClient.method(:session_id_for)
-    ApiClient.define_singleton_method(:session_id_for) do |app, use_localhost:|
-      app == "playbook" ? nil : orig.call(app, use_localhost: use_localhost)
-    end
-    yield
-  ensure
-    ApiClient.define_singleton_method(:session_id_for, orig)
-  end
 
   def graph_issue
     {
@@ -615,10 +604,10 @@ class TestDevIssues < Minitest::Test
   # ---- cmd_issues_claim arg validation (exits before any network) ----
 
   # No --category is now valid (claim across all categories). Prove it gets PAST
-  # arg validation by running with no playbook session so it stops at the
-  # credential guard rather than firing a live claim at production.
+  # arg validation by letting it run to the credential guard, which the network
+  # guard leaves unsatisfied — so it stops there rather than claiming for real.
   def test_claim_without_category_passes_arg_validation
-    out, status = without_playbook_session { capture_stderr_and_exit { cmd_issues_claim([]) } }
+    out, status = capture_stderr_and_exit { cmd_issues_claim([]) }
     refute_match(/--category is required/, out)
     assert_equal 1, status
     assert_match(/dev auth login --app playbook/, out)
@@ -777,9 +766,7 @@ class TestDevIssues < Minitest::Test
   # Valid args reach the credential guard rather than an arg complaint — the proof
   # that a well-formed snooze passes validation without this test hitting the network.
   def test_snooze_with_days_passes_arg_validation
-    out, status = without_playbook_session do
-      capture_stderr_and_exit { cmd_issues_snooze(["034", "--days", "1", "--comment", "confirm the migration"]) }
-    end
+    out, status = capture_stderr_and_exit { cmd_issues_snooze(["034", "--days", "1", "--comment", "confirm the migration"]) }
     assert_equal 1, status
     assert_match(/No playbook session/, out)
   end
@@ -828,13 +815,10 @@ class TestDevIssues < Minitest::Test
   end
 
   # A document fix (Google Doc, process change) carries no app/baseline — it must
-  # not be forced to invent one. Run with no playbook session so the command stops
-  # at the credential guard: arg validation is proven to pass without this test
-  # ever reaching the network.
+  # not be forced to invent one. The command stops at the credential guard, so arg
+  # validation is proven to pass without this test ever reaching the network.
   def test_status_fixed_with_url_alone_passes_arg_validation
-    out, status = without_playbook_session do
-      capture_stderr_and_exit { cmd_issues_status(["034", "--status", "fixed", "--url", "https://docs.google.com/d/1"]) }
-    end
+    out, status = capture_stderr_and_exit { cmd_issues_status(["034", "--status", "fixed", "--url", "https://docs.google.com/d/1"]) }
     refute_match(/marking fixed requires/, out)
     refute_match(/--baseline-version requires --app/, out)
     assert_equal 1, status
@@ -940,14 +924,42 @@ class TestDevIssues < Minitest::Test
     assert_match(/--app must be one of:.*playbook/, out)
   end
 
+  # Regression (2026-07-27): this file ran with a live credential in the process.
+  # Inside a Claude session `dev` presents the AI's API token, and
+  # `require_playbook_session!` accepts it, so the arg-validation tests sailed past
+  # the guard and wrote to PRODUCTION ISS-034 on every run — dozens of snooze
+  # comments, a verified→fixed regression, and 35 bogus fixes. Stubbing the session
+  # was never enough; only blocking the request is. Assert that WITH a credential.
+  def test_a_credentialed_issue_command_still_cannot_reach_production
+    with_credentials do
+      err = assert_raises(DevTestSupport::NetworkBlocked) do
+        cmd_issues_snooze(["034", "--days", "1", "--comment", "must never reach the network"])
+      end
+      assert_match(%r{PUT /playbook/issues/034/snooze}, err.message)
+    end
+  end
+
+  # The trap itself, stated as a test: the guard is satisfied by the AI's API
+  # TOKEN, not only by a human session. A test that nils the session therefore
+  # still runs the command for real — which is why the block above blocks the
+  # request rather than the credential.
+  def test_the_ai_token_alone_satisfies_the_playbook_credential_guard
+    orig = ApiClient.method(:auth_header_for)
+    ApiClient.define_singleton_method(:auth_header_for) { |_app, use_localhost:| ["Authorization", "Basic token"] }
+    _, status = capture_stderr_and_exit { require_playbook_session!(false) }
+    assert_nil status, "a token-bearing process passes the guard even with no session"
+  ensure
+    ApiClient.define_singleton_method(:auth_header_for, orig)
+  end
+
   def test_require_playbook_session_names_exact_login_command
-    out, status = without_playbook_session { capture_stderr_and_exit { require_playbook_session!(false) } }
+    out, status = capture_stderr_and_exit { require_playbook_session!(false) }
     assert_equal 1, status
     assert_match(/dev auth login --app playbook/, out)
   end
 
   def test_require_playbook_session_localhost_names_localhost_login_command
-    out, status = without_playbook_session { capture_stderr_and_exit { require_playbook_session!(true) } }
+    out, status = capture_stderr_and_exit { require_playbook_session!(true) }
     assert_equal 1, status
     assert_match(/dev auth login --app playbook --localhost/, out)
   end
@@ -981,7 +993,7 @@ class TestDevIssues < Minitest::Test
   # guard) rather than being rejected as an unknown category.
   def test_claim_accepts_every_category
     ISSUE_CATEGORIES.each do |category|
-      out, status = without_playbook_session { capture_stderr_and_exit { cmd_issues_claim(["--category", category]) } }
+      out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", category]) }
       assert_equal 1, status
       refute_match(/--category must be one of/, out, "#{category}: rejected by claim")
       assert_match(/dev auth login --app playbook/, out, "#{category}: did not reach the credential guard")

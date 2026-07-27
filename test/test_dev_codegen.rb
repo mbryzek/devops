@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require_relative 'test_helper'
 require 'codegen/api_config'
 require 'codegen/graph'
 require 'codegen/sync'
