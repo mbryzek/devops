@@ -62,6 +62,7 @@ INVOCATIONS = {
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
@@ -255,6 +256,13 @@ USAGE = <<~USAGE
         Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first.
 
+    #{INVOCATIONS["issues show"]}
+        Print one issue and its full comment history, oldest first, with the status
+        transition each comment recorded. This is the only way to READ a timeline
+        from the CLI — `issues status --comment` only writes to it. The output is
+        the same section `issues claim` puts in a plan, so a re-opened issue shows
+        its RE-OPENED banner and previous fix PRs here too.
+
     #{INVOCATIONS["issues resume"]}
         Reattach to the Claude session `issues create` started on an issue. Reads
         the issue's timeline, takes the most recently recorded session id, and runs
@@ -416,7 +424,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
-  "issues"       => %w[create claim status snooze reconcile resume],
+  "issues"       => %w[create claim show status snooze reconcile resume],
   "features"     => %w[list retire status reconcile cancel],
 }.freeze
 
@@ -1557,6 +1565,39 @@ def issues_list_path(statuses:, category: nil, limit: 100)
   issues_path("?#{URI.encode_www_form(params)}")
 end
 
+def issue_comments_path(number)
+  issues_path("/#{number}/comments?limit=101&offset=0")
+end
+
+# The ONE way anything in this CLI reads an issue's timeline: `dev issues show`,
+# the claim-time plan render, and `dev issues resume`'s session lookup all go
+# through it, so the limit and the ordering are decided in one place.
+def issue_fetch_comments(endpoint, number)
+  ApiClient.request(endpoint, :get, issue_comments_path(number)) || []
+end
+
+def issue_fetch(endpoint, number)
+  ApiClient.request(endpoint, :get, issues_path("/#{number}"))
+end
+
+# The timeline of every claimed issue, keyed by issue number, for the plan to
+# render. Best-effort per issue: by the time this runs the issues are ALREADY
+# claimed server-side, so a failed read must degrade the plan, not abort the
+# claim and strand them in `claimed` with no plan written.
+def issue_comments_by_number(endpoint, issues)
+  issues.to_h do |issue|
+    number = issue["number"]
+    comments =
+      begin
+        issue_fetch_comments(endpoint, number)
+      rescue StandardError => e
+        warn "Could not read ISS-#{number} comments (#{e.message}); its plan will omit the history."
+        []
+      end
+    [number, comments]
+  end
+end
+
 # Fail with the exact login command when there is no credential yet, rather than the generic
 # "run 'dev auth login'" that handle_errors emits on a 401. A Claude session carrying the AI token has
 # its own credential and needs no login at all.
@@ -1597,12 +1638,87 @@ def issue_summary_line(issue, index)
   "  #{index}. #{issue_label(issue)} · #{issue['status']} · #{club}#{title}"
 end
 
-# One claimed issue rendered as a plan section. Kept separate (and pure) so the
-# plan output is unit-testable without any network calls.
-def issue_render_item(issue, index)
+# A timeline comment that moved the issue BACK to `open` from anything else is a
+# re-open: the issue was closed once and the close did not hold. That is the
+# single most load-bearing fact about the issue — what was already tried failed —
+# so the plan leads with it instead of reading like a fresh report.
+def issue_reopen_transitions(comments)
+  Array(comments).select do |c|
+    t = c["transition"]
+    t && t["to"] == "open" && t["from"] != "open"
+  end
+end
+
+def issue_reopened?(comments)
+  !issue_reopen_transitions(comments).empty?
+end
+
+# The bookkeeping comment `dev issues create` writes to record a session id is
+# not history a fix session needs — and on a re-opened issue pointing at the
+# earlier session invites resuming it, which is exactly what must not happen.
+# Dropped unless it also carries a status transition.
+def issue_history_comments(comments)
+  Array(comments).reject { |c| c["transition"].nil? && /\AClaude session `/.match?(c["body"].to_s) }
+end
+
+# One timeline entry: when, who, the status transition it recorded, and the note.
+# Visibility is called out only for `shared` — that text went to the submitter,
+# so it is the one thing here a reply must stay consistent with.
+def issue_render_comment(comment)
+  t = comment["transition"]
+  meta = ["#{comment.dig('created', 'at')}", issue_author_label(comment)]
+  meta << "status #{t['from']} → #{t['to']}" if t
+  meta << "shared with the submitter" if comment["visibility"] == "shared"
+  head = "- #{meta.join(' · ')}"
+  body = comment["body"].to_s.strip
+  body.empty? ? head : "#{head}\n  > #{body.gsub("\n", "\n  > ")}"
+end
+
+# The banner a re-opened issue leads with. Names the two things that otherwise
+# get re-derived the slow way: the earlier fix did not work (so re-applying it is
+# not the answer), and the earlier working directory/branch must not be reused —
+# a second session in the same dir clobbers the first one's tree.
+def issue_reopen_callout(issue, comments)
+  reopens = issue_reopen_transitions(comments)
+  last = reopens.last
+  why = last && !last["body"].to_s.strip.empty? ? " Reason given: #{last['body'].to_s.strip.gsub("\n", ' ')}" : ""
+  times = reopens.length > 1 ? " #{reopens.length} times" : ""
+  # An investigate-only category has no branch to warn about — only the working
+  # directory — and telling it to open one would contradict the plan wrapper.
+  workspace =
+    if issue_investigate_only?(issue["category"])
+      "Work it in a NEW `~/code/ai/<short-name>` directory — never reuse the directory\n" \
+      "or session from the earlier attempt (two sessions in one working dir clobber\n" \
+      "each other)."
+    else
+      "Work it in a NEW `~/code/ai/<short-name>` directory on a NEW branch — never reuse\n" \
+      "the directory, branch, or session from the earlier attempt (two sessions in one\n" \
+      "working dir clobber each other)."
+    end
+  [
+    "**RE-OPENED#{times} — the earlier attempt did not hold.**#{why}",
+    "",
+    "Before writing anything, read this issue's previous fix PR(s) and comment history",
+    "below: what looks like the obvious answer has already been tried. Find why it did",
+    "not work rather than repeating it.",
+    "",
+    workspace,
+  ].join("\n")
+end
+
+# One issue rendered as a plan section. Kept separate (and pure) so the output is
+# unit-testable without any network calls. `comments` is the issue's timeline:
+# absent for a freshly filed issue, load-bearing for a re-opened one. `index`
+# numbers it within a plan's list; nil for `dev issues show`, which renders one
+# issue with nothing to count it against.
+def issue_render_item(issue, index = nil, comments: [])
   lines = []
-  lines << "### #{index}. #{issue_label(issue)} — #{issue['title']}"
+  lines << "### #{index ? "#{index}. " : ''}#{issue_label(issue)} — #{issue['title']}"
   lines << ""
+  if issue_reopened?(comments)
+    lines << issue_reopen_callout(issue, comments)
+    lines << ""
+  end
   lines << "- Issue: `#{issue_label(issue)}` (id `#{issue['id']}`)"
   lines << "- Category: #{issue['category']}"
   lines << "- Status: #{issue['status']}"
@@ -1618,10 +1734,26 @@ def issue_render_item(issue, index)
     desc.nil? || desc.empty? ? url : "#{url} (#{desc})"
   end.compact
   lines << "- Attachments: #{attachments.empty? ? 'none' : attachments.join(', ')}"
+  # Every fix already recorded on the issue. On a re-opened issue these are the
+  # PRs that were supposed to close it — read them before proposing anything.
+  fixes = (issue["fixes"] || []).map do |f|
+    url = f["url"].to_s
+    next if url.empty?
+    app = f.dig("deployment", "app")
+    app.nil? || app.empty? ? url : "#{url} (#{app} #{f.dig('deployment', 'baseline_version')})"
+  end.compact
+  lines << "- Previous fixes: #{fixes.join(', ')}" unless fixes.empty?
   body = issue["body"].to_s
   unless body.empty?
     lines << ""
     lines << "> #{body.gsub("\n", "\n> ")}"
+  end
+  history = issue_history_comments(comments)
+  unless history.empty?
+    lines << ""
+    lines << "**Comment history (#{history.length}, oldest first):**"
+    lines << ""
+    history.each { |c| lines << issue_render_comment(c) }
   end
   lines.join("\n")
 end
@@ -1719,8 +1851,10 @@ def issue_plan_closing(category)
   end
 end
 
-def issue_plan_markdown(items:, date:, category:, body:)
-  rendered = items.each_with_index.map { |c, i| issue_render_item(c, i + 1) }.join("\n\n")
+def issue_plan_markdown(items:, date:, category:, body:, comments_by_number: {})
+  rendered = items.each_with_index.map do |c, i|
+    issue_render_item(c, i + 1, comments: comments_by_number[c["number"]] || [])
+  end.join("\n\n")
   heading = issue_investigate_only?(category) ? "## Issues to investigate" : "## Issues to fix"
   <<~PLAN
     # #{category} issues — #{items.length} item(s) claimed #{date}
@@ -1744,7 +1878,7 @@ def issue_plan_markdown(items:, date:, category:, body:)
   PLAN
 end
 
-def write_issue_plan(items, category)
+def write_issue_plan(items, category, comments_by_number = {})
   date = Time.now.strftime("%Y-%m-%d")
   dir = File.expand_path("~/code/claude/plans")
   FileUtils.mkdir_p(dir)
@@ -1755,7 +1889,9 @@ def write_issue_plan(items, category)
     path = File.join(dir, "#{base}-#{n}.md")
     n += 1
   end
-  File.write(path, issue_plan_markdown(items: items, date: date, category: category, body: issue_body_text(category)))
+  File.write(path, issue_plan_markdown(items: items, date: date, category: category,
+                                       body: issue_body_text(category),
+                                       comments_by_number: comments_by_number))
   path
 end
 
@@ -1969,6 +2105,29 @@ def cmd_issues_create(args)
   end
 end
 
+# Read one issue and its timeline. `dev issues status --comment` has always been
+# able to WRITE a comment; until this there was no way to read one back short of
+# opening playbook-admin, and the history is the part that says what was already
+# tried. Prints the exact section `dev issues claim` puts in a plan — same
+# renderer, so a re-opened issue shows the same RE-OPENED banner and previous fix
+# PRs here as it does there.
+def cmd_issues_show(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  number = rest.shift
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 084)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{rest.join(', ')}" unless rest.empty?
+  report_arg_problems("issues show", problems, usage_for("issues show"))
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    issue = issue_fetch(endpoint, number)
+    puts issue_render_item(issue, comments: issue_fetch_comments(endpoint, number))
+  end
+end
+
 # Reattach to the Claude session `dev issues create` started on an issue. The
 # uuid lives on the issue's timeline, so the session survives closing the
 # terminal — that is the whole point of recording it.
@@ -1984,7 +2143,7 @@ def cmd_issues_resume(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
-    comments = ApiClient.request(endpoint, :get, issues_path("/#{number}/comments?limit=101&offset=0")) || []
+    comments = issue_fetch_comments(endpoint, number)
     uuid = issue_session_uuid_from_comments(comments)
     Util.exit_with_error("ISS-#{number} has no recorded Claude session. File work with `dev issues create` to get one.") if uuid.nil?
     puts "Resuming Claude session #{uuid} for ISS-#{number}..."
@@ -2099,7 +2258,7 @@ def cmd_issues_claim(args)
       claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { scope: scope }) || []
       next if claimed.empty?
       claimed_issues.concat(claimed)
-      path = write_issue_plan(claimed, cat)
+      path = write_issue_plan(claimed, cat, issue_comments_by_number(endpoint, claimed))
       plans << [cat, path]
       puts "Claimed #{claimed.length} #{cat} issue(s) → #{path}"
     end
@@ -5266,6 +5425,7 @@ when "issues"
   sub = argv.shift
   case sub
   when "create"    then cmd_issues_create(argv)
+  when "show"      then cmd_issues_show(argv)
   when "resume"    then cmd_issues_resume(argv)
   when "claim"     then cmd_issues_claim(argv)
   when "status"    then cmd_issues_status(argv)
