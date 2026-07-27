@@ -1377,9 +1377,18 @@ end
 ISSUE_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
 
 # The prompt handed to the spawned Claude session when exactly one category was
-# claimed (one plan). Unchanged: the session works the plan directly.
-def issue_session_prompt(path)
-  "read the plan at #{path} and implement it"
+# claimed (one plan): the session works the plan directly. An investigate-only
+# category (a member `suggestion`) is briefed as such — its plan writes no code,
+# so "implement it" contradicts the plan it points at. Symmetric with the
+# INVESTIGATE ONLY labelling in issue_fanout_prompt.
+def issue_session_prompt(category, path)
+  if issue_investigate_only?(category)
+    "read the plan at #{path} and follow it exactly. This is an INVESTIGATE ONLY " \
+      "session — no branch, no code, no PR. It ends with " \
+      "`dev issues status --status needs_review` and your findings."
+  else
+    "read the plan at #{path} and implement it"
+  end
 end
 
 # The prompt when several categories were claimed at once (one plan each). A
@@ -1405,7 +1414,7 @@ end
 # claimed: today's single-plan prompt for one, the subagent fan-out for several.
 # `plans` is a list of [category, plan_path].
 def issue_claim_prompt(plans)
-  plans.length == 1 ? issue_session_prompt(plans.first[1]) : issue_fanout_prompt(plans)
+  plans.length == 1 ? issue_session_prompt(plans.first[0], plans.first[1]) : issue_fanout_prompt(plans)
 end
 
 # Terminal tab title for a session working `issues`, so a glance at the tab says
@@ -1447,8 +1456,8 @@ def issue_claude_argv(prompt)
 end
 
 # Single-plan argv (kept as the one-plan spawn path and its regression test).
-def issue_claude_command(path)
-  issue_claude_argv(issue_session_prompt(path))
+def issue_claude_command(category, path)
+  issue_claude_argv(issue_session_prompt(category, path))
 end
 
 # Every category that has at least one open issue in `open`: the known ones in
@@ -1941,7 +1950,7 @@ def cmd_issues_create(args)
     puts "Claimed #{issue_label(issue)} → #{path}"
     puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
 
-    prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(path))
+    prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(category, path))
     unless spawn_session
       puts ""
       puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"

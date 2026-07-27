@@ -337,15 +337,27 @@ class TestDevIssues < Minitest::Test
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
 
   def test_issue_session_prompt_names_the_plan
-    assert_equal "read the plan at /p/x.md and implement it", issue_session_prompt("/p/x.md")
+    assert_equal "read the plan at /p/x.md and implement it", issue_session_prompt("graphs", "/p/x.md")
+  end
+
+  # Regression: the single-plan prompt used to say "implement it" for EVERY
+  # category, including `suggestion` — whose plan is investigate-only. A claim of
+  # one category is the common case (`dev issues claim --category suggestion`), so
+  # the contradiction landed on exactly the path the fan-out prompt already fixed.
+  def test_issue_session_prompt_briefs_a_suggestion_plan_investigate_only
+    prompt = issue_session_prompt("suggestion", "/p/s.md")
+    assert_includes prompt, "/p/s.md"
+    assert_includes prompt, "INVESTIGATE ONLY"
+    assert_includes prompt, "--status needs_review"
+    refute_includes prompt, "implement it"
   end
 
   def test_issue_claude_command_is_ccd_pinned_to_opus_1m
-    cmd = issue_claude_command("/p/x.md")
+    cmd = issue_claude_command("graphs", "/p/x.md")
     assert_equal "claude", cmd[0]
     assert_includes cmd, "--dangerously-skip-permissions"          # the `ccd` alias
     assert_equal "claude-opus-4-8[1m]", cmd[cmd.index("--model") + 1]
-    assert_equal issue_session_prompt("/p/x.md"), cmd.last          # prompt is the final arg
+    assert_equal issue_session_prompt("graphs", "/p/x.md"), cmd.last # prompt is the final arg
   end
 
   # ---- tab title: the spawned session names its window after the issue(s) ----
@@ -377,19 +389,21 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_prompt_with_tab_title_prefixes_the_work_prompt
-    prompt = issue_prompt_with_tab_title([graph_issue], issue_session_prompt("/p/x.md"))
+    prompt = issue_prompt_with_tab_title([graph_issue], issue_session_prompt("graphs", "/p/x.md"))
     assert_includes prompt, 'tab title to "ISS-034: Bars overflow the axis"'
-    assert prompt.end_with?(issue_session_prompt("/p/x.md")), prompt
+    assert prompt.end_with?(issue_session_prompt("graphs", "/p/x.md")), prompt
   end
 
   def test_prompt_with_tab_title_is_untouched_without_issues
-    assert_equal issue_session_prompt("/p/x.md"), issue_prompt_with_tab_title([], issue_session_prompt("/p/x.md"))
+    assert_equal issue_session_prompt("graphs", "/p/x.md"),
+                 issue_prompt_with_tab_title([], issue_session_prompt("graphs", "/p/x.md"))
   end
 
   # ---- claim prompt: one plan works directly, several fan out subagents ----
 
-  def test_claim_prompt_single_plan_is_todays_direct_prompt
-    assert_equal issue_session_prompt("/p/g.md"), issue_claim_prompt([["graphs", "/p/g.md"]])
+  def test_claim_prompt_single_plan_is_the_direct_prompt_for_its_category
+    assert_equal issue_session_prompt("graphs", "/p/g.md"), issue_claim_prompt([["graphs", "/p/g.md"]])
+    assert_equal issue_session_prompt("suggestion", "/p/s.md"), issue_claim_prompt([["suggestion", "/p/s.md"]])
   end
 
   def test_claim_prompt_multi_plan_dispatches_one_subagent_per_plan
