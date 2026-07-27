@@ -262,8 +262,11 @@ USAGE = <<~USAGE
         press enter), or `none`. It then atomically claims the selection and writes
         ONE plan per category claimed to
         ~/code/claude/plans/<date>-issues-<category>.md. Pass --issues 078,080 to
-        select by issue number without the prompt, --yes to take everything open, or
-        --category CATEGORY to scope to a single category. A category you selected in
+        select by issue number without the prompt, --yes to take everything a sweep
+        takes, or --category CATEGORY to scope to a single category. `suggestion` is
+        listed but NEVER swept up by `all`/--yes — a member's request is a product
+        call, not a defect — so claim one with --issues NUMBERS or
+        --category suggestion, each of which IS that call. A category you selected in
         full is claimed as a category (so it picks up whatever is open at claim time);
         a partial selection is claimed by number and is all-or-nothing — if one of the
         picked issues was just taken by another session, nothing is claimed and the
@@ -1170,9 +1173,10 @@ end
 ISSUE_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
 
 # EVERY issue_category in the platform `issues` spec, in enum order — keep them
-# in step. `dev issues claim` claims across all of them: an open issue the CLI
-# cannot see is an open issue nobody works, so there is no category the sweep
-# skips. Each is still one plan and one fix session; the durable prompt body is
+# in step. `dev issues claim` lists all of them: an open issue the CLI cannot see
+# is an open issue nobody works, so no category is hidden (a blanket claim does
+# skip ISSUE_NO_AUTO_CLAIM_CATEGORIES, which is a gate on the sweep, not on
+# visibility). Each is one plan and one fix session; the durable prompt body is
 # devops/claude-issues/<category>-body.md where a category has its own pipeline,
 # and default-body.md otherwise (see issue_body_text).
 ISSUE_CATEGORIES = %w[graphs worker insights suggestion feature bug improvement].freeze
@@ -1183,6 +1187,14 @@ ISSUE_CATEGORIES = %w[graphs worker insights suggestion feature bug improvement]
 # playbook-admin, worker auto-filed by the log review, suggestion submitted by a
 # member in playbook-app), so none of them is a sensible manual pick.
 ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
+
+# Categories a blanket claim never sweeps up. A `suggestion` is a member asking
+# for something in playbook-app, not a defect: whether to build it is a product
+# call, so it must not be handed to an implementation session just because it is
+# open. It is still fully claimable — by number, or with `--category suggestion`
+# — because either one IS that call. It stays in the preview: a category hidden
+# from the listing is an open issue nobody can see from the CLI.
+ISSUE_NO_AUTO_CLAIM_CATEGORIES = %w[suggestion].freeze
 
 ISSUE_SEVERITIES = %w[low medium high].freeze
 
@@ -1416,12 +1428,24 @@ def issue_resolve_requested(raw, ordered)
   [resolved.uniq, unknown]
 end
 
+# What a blanket claim — `all`, the prompt's default, or --yes — takes: every
+# listed issue except the categories that are never auto-claimed. Naming one with
+# --category is the human decision that gate exists for, so it turns the filter
+# off and `all` means all again.
+def issue_auto_claim_default(ordered, category)
+  return ordered if category
+  ordered.reject { |c| ISSUE_NO_AUTO_CLAIM_CATEGORIES.include?(c["category"]) }
+end
+
 # Asks which of the listed issues to claim. Reuses Ask.parse_selection (so the
 # accepted forms match the rest of the CLI) but not its prompt wrapper, which
-# would reprint the list flat and lose the category headings above.
-def issue_ask_selection(ordered)
+# would reprint the list flat and lose the category headings above. `all` is
+# answered with `auto` rather than the whole list: it means "the ones a sweep
+# takes", so a never-auto-claimed issue is only ever claimed by naming its number.
+def issue_ask_selection(ordered, auto)
   loop do
     raw = Ask.for_string("Claim which issues? Enter numbers (e.g. 1,3), `all`, or `none` [all]:", default: "all")
+    return auto if Ask::ALL.include?(raw.to_s.strip.downcase)
     selected = Ask.parse_selection(raw, ordered)
     return selected if selected
     puts ""
@@ -1435,8 +1459,12 @@ end
 # is all-or-nothing: if one of them was just taken, nothing is claimed and the
 # server says which, rather than quietly claiming a different set than the one
 # that was picked.
+# A never-auto-claimed category is always claimed by number, even when the whole
+# category was picked: claiming by category takes whatever is open server-side at
+# claim time, which would quietly pull in a suggestion filed since the preview —
+# exactly the un-reviewed claim the gate exists to prevent.
 def issue_claim_scope(category, selected, category_open)
-  if selected.length == category_open.length
+  if selected.length == category_open.length && !ISSUE_NO_AUTO_CLAIM_CATEGORIES.include?(category)
     { category: category }
   else
     { numbers: selected.map { |c| c["number"] } }
@@ -1915,11 +1943,15 @@ def cmd_issues_claim(args)
     # One flat, globally numbered list behind the per-category headings: the
     # numbers the operator types are positions in it.
     ordered = issue_ordered_open(open, present)
+    auto = issue_auto_claim_default(ordered, category)
     positions = ordered.each_with_index.to_h { |c, i| [c["number"], i + 1] }
     puts ""
     present.each do |cat|
       issues = open.select { |c| c["category"] == cat }
-      puts Util.underline("#{cat} (#{issues.length})")
+      # Say it on the heading, not just in --help: the numbers are right there,
+      # so the operator can pick one without hunting for why `all` skipped it.
+      skipped = !category && ISSUE_NO_AUTO_CLAIM_CATEGORIES.include?(cat)
+      puts Util.underline("#{cat} (#{issues.length})#{skipped ? ' — not auto-claimed; select by number' : ''}")
       issues.each { |c| puts issue_summary_line(c, positions[c["number"]]) }
       puts ""
     end
@@ -1934,7 +1966,7 @@ def cmd_issues_claim(args)
         end
         resolved
       elsif assume_yes
-        ordered
+        auto
       else
         # Non-interactive (pipe, cron, subprocess): there is nobody to answer, and
         # defaulting to `all` would claim the whole queue on a run that never asked
@@ -1942,11 +1974,20 @@ def cmd_issues_claim(args)
         unless $stdin.tty?
           Util.exit_with_error("Nothing to read the selection from (stdin is not a terminal). Pass --issues NUMBERS or --yes.")
         end
-        issue_ask_selection(ordered)
+        issue_ask_selection(ordered, auto)
       end
 
     if selected.empty?
-      puts "Aborted. Nothing claimed."
+      # Everything open is in a never-auto-claimed category: `all` legitimately
+      # selected nothing, which reads as a bug unless we say why and how to take
+      # them anyway.
+      if auto.empty? && !ordered.empty?
+        cats = ordered.map { |c| c["category"] }.uniq
+        puts "Nothing claimed — the only open issue(s) are #{cats.join(', ')}, which a blanket claim skips."
+        puts "Claim them explicitly with --issues #{ordered.map { |c| c['number'] }.join(',')} or --category #{cats.first}."
+      else
+        puts "Aborted. Nothing claimed."
+      end
       return
     end
 

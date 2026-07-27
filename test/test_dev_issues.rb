@@ -455,6 +455,64 @@ class TestDevIssues < Minitest::Test
     assert_equal({ numbers: %w[090] }, issue_claim_scope("graphs", [graphs.first], graphs))
   end
 
+  # ---- categories a blanket claim never sweeps up ----
+
+  def suggestion_queue
+    open_queue + [graph_issue.merge("number" => "081", "category" => "suggestion", "status" => "open")]
+  end
+
+  def ordered_suggestion_queue
+    issue_ordered_open(suggestion_queue, issue_categories_present(suggestion_queue))
+  end
+
+  def test_blanket_claim_skips_suggestions
+    assert_equal %w[078 079 080], issue_auto_claim_default(ordered_suggestion_queue, nil).map { |c| c["number"] }
+  end
+
+  # Naming the category IS the human decision the gate exists for, so it stops
+  # filtering and `all` means all again.
+  def test_explicit_category_claims_suggestions
+    ordered = ordered_suggestion_queue.select { |c| c["category"] == "suggestion" }
+    assert_equal %w[081], issue_auto_claim_default(ordered, "suggestion").map { |c| c["number"] }
+  end
+
+  # A suggestion is still reachable by number — the gate is on the sweep, not on
+  # the issue.
+  def test_suggestions_are_still_selectable_by_number
+    resolved, unknown = issue_resolve_requested("081", ordered_suggestion_queue)
+    assert_equal %w[081], resolved.map { |c| c["number"] }
+    assert_empty unknown
+  end
+
+  # `all` at the prompt means "what a sweep takes", not "everything listed".
+  def test_prompt_all_takes_the_auto_claim_set_not_the_whole_list
+    ordered = ordered_suggestion_queue
+    auto = issue_auto_claim_default(ordered, nil)
+    orig = Ask.method(:for_string)
+    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
+    assert_equal %w[078 079 080], issue_ask_selection(ordered, auto).map { |c| c["number"] }
+  ensure
+    Ask.define_singleton_method(:for_string, orig)
+  end
+
+  def test_prompt_numbers_can_still_pick_a_suggestion
+    ordered = ordered_suggestion_queue
+    orig = Ask.method(:for_string)
+    # suggestion sorts 2nd in ISSUE_CATEGORIES order: worker, suggestion, feature, improvement.
+    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "2" }
+    assert_equal %w[081], issue_ask_selection(ordered, []).map { |c| c["number"] }
+  ensure
+    Ask.define_singleton_method(:for_string, orig)
+  end
+
+  # Even a whole-category suggestion pick claims by number: claiming by category
+  # would take whatever is open server-side, pulling in a suggestion filed since
+  # the preview that nobody looked at.
+  def test_claim_scope_is_by_number_for_a_whole_suggestion_category
+    suggestions = suggestion_queue.select { |c| c["category"] == "suggestion" }
+    assert_equal({ numbers: %w[081] }, issue_claim_scope("suggestion", suggestions, suggestions))
+  end
+
   # ---- cmd_issues_snooze arg validation (exits before any network) ----
 
   def test_snooze_requires_number
