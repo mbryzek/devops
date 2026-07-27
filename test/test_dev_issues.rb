@@ -144,6 +144,47 @@ class TestDevIssues < Minitest::Test
     assert_includes md, 'dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
     assert_includes md, 'dev issues status <number> --status fixed --url "<doc URL>"'
     assert_includes md, "--status needs_input"
+    assert_includes md, "Implement the fixes, open PRs"
+  end
+
+  # The plan WRAPPER (not just the body file) has to match the category. A
+  # `suggestion` is swept into a claim like everything else since
+  # ISSUE_NO_AUTO_CLAIM_CATEGORIES was removed, so if the wrapper still said
+  # "implement the fixes, open PRs" the session would be told to build the very
+  # thing suggestion-body.md forbids it from building.
+  def suggestion_plan_markdown
+    issue_plan_markdown(
+      items: [graph_issue.merge("category" => "suggestion")],
+      date: "2026-07-27",
+      category: "suggestion",
+      body: "BODY-ORIENTATION",
+    )
+  end
+
+  def test_suggestion_plan_wrapper_never_says_implement_or_open_a_pr
+    md = suggestion_plan_markdown
+    refute_includes md, "Implement the fixes, open PRs"
+    refute_includes md, "## Issues to fix"
+    refute_includes md, "--status fixed"
+    assert_includes md, "## Issues to investigate"
+    assert_includes md, "do not create a branch, do not write code, do not open a"
+  end
+
+  def test_suggestion_plan_offers_needs_review_as_the_closing_move
+    md = suggestion_plan_markdown
+    assert_includes md, '`dev issues status <number> --status needs_review --comment "<your findings>"`'
+    assert_includes md, "--status needs_input"
+  end
+
+  # `needs_review` is the suggestion-only door: every other category still closes
+  # on fixed/needs_input exactly as before.
+  def test_other_categories_keep_the_implementation_wrapper_unchanged
+    (ISSUE_CATEGORIES - %w[suggestion]).each do |category|
+      md = issue_plan_markdown(items: [graph_issue], date: "2026-07-27", category: category, body: "BODY")
+      assert_includes md, "Implement the fixes, open PRs", "#{category}: lost the implementation framing"
+      assert_includes md, "## Issues to fix", "#{category}: lost the fix heading"
+      refute_includes md, "--status needs_review", "#{category}: should not offer needs_review"
+    end
   end
 
   # ---- issue_summary_line ----
@@ -195,8 +236,37 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_non_pipeline_categories_fall_back_to_the_default_body
-    (ISSUE_CATEGORIES - PIPELINE_CATEGORIES).each do |category|
+    (ISSUE_CATEGORIES - PIPELINE_CATEGORIES - %w[suggestion]).each do |category|
       assert_equal issue_default_body_text, issue_body_text(category), "#{category}: expected default body"
+    end
+  end
+
+  # `suggestion` is the one category with its own body that is NOT a pipeline body:
+  # it replaces default-body.md outright (an investigation, not a fix session), so
+  # it must not equal the default body the way the other non-pipeline categories do.
+  def test_suggestion_has_its_own_investigation_body
+    body = issue_body_text("suggestion")
+    refute_equal issue_default_body_text, body
+    assert_includes body, "INVESTIGATE"
+    assert_includes body, "Do not create a branch"
+    assert_includes body, "needs_review"
+  end
+
+  # Regression: the body told every investigation session to close with
+  # `dev issues status --number <NNN> ...`, but the number is POSITIONAL — the
+  # parser has no `--number`, so it fell through to `leftover` and the command
+  # exited "unexpected argument(s)", leaving the suggestion stuck in `claimed`.
+  def test_suggestion_body_closing_command_matches_the_real_argument_parsing
+    body = issue_body_text("suggestion")
+    refute_includes body, "--number"
+    assert_includes body, 'dev issues status <NNN> --status needs_review --comment "<your findings>"'
+  end
+
+  # The same guard for every body file: no plan may hand out a flag the parser
+  # does not implement.
+  def test_no_body_file_invents_a_number_flag
+    ISSUE_CATEGORIES.each do |category|
+      refute_includes issue_body_text(category), "--number", "#{category}: invents a --number flag"
     end
   end
 
@@ -267,15 +337,27 @@ class TestDevIssues < Minitest::Test
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
 
   def test_issue_session_prompt_names_the_plan
-    assert_equal "read the plan at /p/x.md and implement it", issue_session_prompt("/p/x.md")
+    assert_equal "read the plan at /p/x.md and implement it", issue_session_prompt("graphs", "/p/x.md")
+  end
+
+  # Regression: the single-plan prompt used to say "implement it" for EVERY
+  # category, including `suggestion` — whose plan is investigate-only. A claim of
+  # one category is the common case (`dev issues claim --category suggestion`), so
+  # the contradiction landed on exactly the path the fan-out prompt already fixed.
+  def test_issue_session_prompt_briefs_a_suggestion_plan_investigate_only
+    prompt = issue_session_prompt("suggestion", "/p/s.md")
+    assert_includes prompt, "/p/s.md"
+    assert_includes prompt, "INVESTIGATE ONLY"
+    assert_includes prompt, "--status needs_review"
+    refute_includes prompt, "implement it"
   end
 
   def test_issue_claude_command_is_ccd_pinned_to_opus_1m
-    cmd = issue_claude_command("/p/x.md")
+    cmd = issue_claude_command("graphs", "/p/x.md")
     assert_equal "claude", cmd[0]
     assert_includes cmd, "--dangerously-skip-permissions"          # the `ccd` alias
     assert_equal "claude-opus-4-8[1m]", cmd[cmd.index("--model") + 1]
-    assert_equal issue_session_prompt("/p/x.md"), cmd.last          # prompt is the final arg
+    assert_equal issue_session_prompt("graphs", "/p/x.md"), cmd.last # prompt is the final arg
   end
 
   # ---- tab title: the spawned session names its window after the issue(s) ----
@@ -307,28 +389,41 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_prompt_with_tab_title_prefixes_the_work_prompt
-    prompt = issue_prompt_with_tab_title([graph_issue], issue_session_prompt("/p/x.md"))
+    prompt = issue_prompt_with_tab_title([graph_issue], issue_session_prompt("graphs", "/p/x.md"))
     assert_includes prompt, 'tab title to "ISS-034: Bars overflow the axis"'
-    assert prompt.end_with?(issue_session_prompt("/p/x.md")), prompt
+    assert prompt.end_with?(issue_session_prompt("graphs", "/p/x.md")), prompt
   end
 
   def test_prompt_with_tab_title_is_untouched_without_issues
-    assert_equal issue_session_prompt("/p/x.md"), issue_prompt_with_tab_title([], issue_session_prompt("/p/x.md"))
+    assert_equal issue_session_prompt("graphs", "/p/x.md"),
+                 issue_prompt_with_tab_title([], issue_session_prompt("graphs", "/p/x.md"))
   end
 
   # ---- claim prompt: one plan works directly, several fan out subagents ----
 
-  def test_claim_prompt_single_plan_is_todays_direct_prompt
-    assert_equal issue_session_prompt("/p/g.md"), issue_claim_prompt([["graphs", "/p/g.md"]])
+  def test_claim_prompt_single_plan_is_the_direct_prompt_for_its_category
+    assert_equal issue_session_prompt("graphs", "/p/g.md"), issue_claim_prompt([["graphs", "/p/g.md"]])
+    assert_equal issue_session_prompt("suggestion", "/p/s.md"), issue_claim_prompt([["suggestion", "/p/s.md"]])
   end
 
   def test_claim_prompt_multi_plan_dispatches_one_subagent_per_plan
     prompt = issue_claim_prompt([["graphs", "/p/g.md"], ["worker", "/p/w.md"]])
     assert_includes prompt, "2 issue plans"
     assert_includes prompt, "ONE subagent per plan"
-    assert_includes prompt, "do NOT implement the fixes yourself"
+    assert_includes prompt, "do NOT work the plans yourself"
     assert_includes prompt, "- graphs: /p/g.md"
     assert_includes prompt, "- worker: /p/w.md"
+  end
+
+  # Regression: the fan-out prompt used to tell EVERY subagent to "implement the
+  # fixes, open PRs" — including the one handed a `suggestion` plan, whose whole
+  # point is that it never builds anything. The plan is the authority now, and a
+  # suggestion plan is labelled so the parent session cannot mis-brief it.
+  def test_claim_prompt_multi_plan_marks_a_suggestion_plan_investigate_only
+    prompt = issue_claim_prompt([["suggestion", "/p/s.md"], ["worker", "/p/w.md"]])
+    assert_includes prompt, "- suggestion: /p/s.md (INVESTIGATE ONLY — no branch, no code, no PR)"
+    refute_match(/- worker: \S+ \(INVESTIGATE/, prompt)
+    assert_includes prompt, "--status needs_review"
   end
 
   def test_claim_argv_wraps_any_prompt_as_ccd_opus
@@ -455,7 +550,7 @@ class TestDevIssues < Minitest::Test
     assert_equal({ numbers: %w[090] }, issue_claim_scope("graphs", [graphs.first], graphs))
   end
 
-  # ---- categories a blanket claim never sweeps up ----
+  # ---- suggestion is swept like every other category ----
 
   def suggestion_queue
     open_queue + [graph_issue.merge("number" => "081", "category" => "suggestion", "status" => "open")]
@@ -465,34 +560,24 @@ class TestDevIssues < Minitest::Test
     issue_ordered_open(suggestion_queue, issue_categories_present(suggestion_queue))
   end
 
-  def test_blanket_claim_skips_suggestions
-    assert_equal %w[078 079 080], issue_auto_claim_default(ordered_suggestion_queue, nil).map { |c| c["number"] }
+  # Regression: `suggestion` used to be excluded from a blanket claim (`all`/--yes).
+  # It is swept like every other category now — what makes it different is its body
+  # file (suggestion-body.md, which turns the session into an investigation), not
+  # whether the sweep claims it.
+  def test_prompt_all_takes_everything_including_suggestions
+    ordered = ordered_suggestion_queue
+    orig = Ask.method(:for_string)
+    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
+    # Enum order: worker (078), suggestion (081), feature (079), improvement (080).
+    assert_equal %w[078 081 079 080], issue_ask_selection(ordered, ordered).map { |c| c["number"] }
+  ensure
+    Ask.define_singleton_method(:for_string, orig)
   end
 
-  # Naming the category IS the human decision the gate exists for, so it stops
-  # filtering and `all` means all again.
-  def test_explicit_category_claims_suggestions
-    ordered = ordered_suggestion_queue.select { |c| c["category"] == "suggestion" }
-    assert_equal %w[081], issue_auto_claim_default(ordered, "suggestion").map { |c| c["number"] }
-  end
-
-  # A suggestion is still reachable by number — the gate is on the sweep, not on
-  # the issue.
   def test_suggestions_are_still_selectable_by_number
     resolved, unknown = issue_resolve_requested("081", ordered_suggestion_queue)
     assert_equal %w[081], resolved.map { |c| c["number"] }
     assert_empty unknown
-  end
-
-  # `all` at the prompt means "what a sweep takes", not "everything listed".
-  def test_prompt_all_takes_the_auto_claim_set_not_the_whole_list
-    ordered = ordered_suggestion_queue
-    auto = issue_auto_claim_default(ordered, nil)
-    orig = Ask.method(:for_string)
-    Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
-    assert_equal %w[078 079 080], issue_ask_selection(ordered, auto).map { |c| c["number"] }
-  ensure
-    Ask.define_singleton_method(:for_string, orig)
   end
 
   def test_prompt_numbers_can_still_pick_a_suggestion
@@ -505,12 +590,11 @@ class TestDevIssues < Minitest::Test
     Ask.define_singleton_method(:for_string, orig)
   end
 
-  # Even a whole-category suggestion pick claims by number: claiming by category
-  # would take whatever is open server-side, pulling in a suggestion filed since
-  # the preview that nobody looked at.
-  def test_claim_scope_is_by_number_for_a_whole_suggestion_category
+  # A whole-category suggestion pick now claims by category, exactly like any other
+  # category selected in full — there is no more number-only exception for it.
+  def test_claim_scope_is_by_category_for_a_whole_suggestion_category_too
     suggestions = suggestion_queue.select { |c| c["category"] == "suggestion" }
-    assert_equal({ numbers: %w[081] }, issue_claim_scope("suggestion", suggestions, suggestions))
+    assert_equal({ category: "suggestion" }, issue_claim_scope("suggestion", suggestions, suggestions))
   end
 
   # ---- cmd_issues_snooze arg validation (exits before any network) ----
@@ -571,6 +655,17 @@ class TestDevIssues < Minitest::Test
 
   def test_status_rejects_unexpected_positional
     out, status = capture_stderr_and_exit { cmd_issues_status(["034", "extra", "--status", "dismissed"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument/, out)
+  end
+
+  # Proof of what the corrected suggestion-body.md closing command avoids: the
+  # issue number has no flag form, so `--number 081` is swallowed as two stray
+  # positionals and the command dies before it ever reaches the API.
+  def test_status_rejects_a_number_flag_because_the_number_is_positional
+    out, status = capture_stderr_and_exit do
+      cmd_issues_status(["--number", "081", "--status", "needs_review", "--comment", "findings"])
+    end
     assert_equal 1, status
     assert_match(/unexpected argument/, out)
   end

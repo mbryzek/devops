@@ -271,10 +271,12 @@ USAGE = <<~USAGE
         ~/code/claude/plans/<date>-issues-<category>.md. Pass --issues 078,080 to
         select by issue number without the prompt, --yes to take everything a sweep
         takes, or --category CATEGORY to scope to a single category. `suggestion` is
-        listed but NEVER swept up by `all`/--yes — a member's request is a product
-        call, not a defect — so claim one with --issues NUMBERS or
-        --category suggestion, each of which IS that call. A category you selected in
-        full is claimed as a category (so it picks up whatever is open at claim time);
+        swept like every other category, but its plan runs as an INVESTIGATION, not
+        a fix session — a member's request is a product call, not a defect, so the
+        session reads the code and the issue and hands back a recommendation via
+        `dev issues status --status needs_review` instead of opening a PR. A
+        category you selected in full is claimed as a category (so it picks up
+        whatever is open at claim time);
         a partial selection is claimed by number and is all-or-nothing — if one of the
         picked issues was just taken by another session, nothing is claimed and the
         error says which. It then hands the terminal to an interactive Claude
@@ -287,8 +289,11 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["issues status"]}
         Close a claimed issue. NUMBER is the per-tenant issue number shown as
-        ISS-<number> (034, or unpadded 34). STATUS is one of open, claimed, fixed,
-        deployed, verified, dismissed, needs_input. Marking `fixed` requires --url:
+        ISS-<number> (034, or unpadded 34). STATUS is one of open, claimed,
+        needs_review, fixed, deployed, verified, dismissed, needs_input.
+        `needs_review` is how a `suggestion` investigation hands back its findings
+        (see suggestion-body.md) — pass --comment with the recommendation. Marking
+        `fixed` requires --url:
         the merged PR, or a document describing a manual/process fix. Pass --app
         <deployable-app> and --baseline-version <live release tag> TOGETHER (both or
         neither) for a code fix: they are what let `dev issues reconcile` flip the
@@ -1224,15 +1229,17 @@ end
 
 # ---------- issues ----------
 
-ISSUE_STATUSES = %w[open claimed fixed deployed verified dismissed needs_input].freeze
+ISSUE_STATUSES = %w[open claimed needs_review fixed deployed verified dismissed needs_input].freeze
 
 # EVERY issue_category in the platform `issues` spec, in enum order — keep them
-# in step. `dev issues claim` lists all of them: an open issue the CLI cannot see
-# is an open issue nobody works, so no category is hidden (a blanket claim does
-# skip ISSUE_NO_AUTO_CLAIM_CATEGORIES, which is a gate on the sweep, not on
-# visibility). Each is one plan and one fix session; the durable prompt body is
-# devops/claude-issues/<category>-body.md where a category has its own pipeline,
-# and default-body.md otherwise (see issue_body_text).
+# in step. `dev issues claim` sweeps all of them, `suggestion` included: an open
+# issue the CLI cannot see is an open issue nobody works, so no category is
+# hidden or held back from a blanket claim. What makes `suggestion` different is
+# its body file, not the sweep — it turns the claimed session into an
+# investigation (see suggestion-body.md), not a fix, so it lands on
+# `needs_review` rather than a PR. Each is one plan and one session; the durable
+# prompt body is devops/claude-issues/<category>-body.md where a category has
+# its own pipeline, and default-body.md otherwise (see issue_body_text).
 ISSUE_CATEGORIES = %w[graphs worker insights suggestion feature bug improvement].freeze
 
 # The categories `dev issues create` offers when filing from the laptop, and the
@@ -1241,14 +1248,6 @@ ISSUE_CATEGORIES = %w[graphs worker insights suggestion feature bug improvement]
 # playbook-admin, worker auto-filed by the log review, suggestion submitted by a
 # member in playbook-app), so none of them is a sensible manual pick.
 ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
-
-# Categories a blanket claim never sweeps up. A `suggestion` is a member asking
-# for something in playbook-app, not a defect: whether to build it is a product
-# call, so it must not be handed to an implementation session just because it is
-# open. It is still fully claimable — by number, or with `--category suggestion`
-# — because either one IS that call. It stays in the preview: a category hidden
-# from the listing is an open issue nobody can see from the CLI.
-ISSUE_NO_AUTO_CLAIM_CATEGORIES = %w[suggestion].freeze
 
 ISSUE_SEVERITIES = %w[low medium high].freeze
 
@@ -1378,9 +1377,18 @@ end
 ISSUE_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
 
 # The prompt handed to the spawned Claude session when exactly one category was
-# claimed (one plan). Unchanged: the session works the plan directly.
-def issue_session_prompt(path)
-  "read the plan at #{path} and implement it"
+# claimed (one plan): the session works the plan directly. An investigate-only
+# category (a member `suggestion`) is briefed as such — its plan writes no code,
+# so "implement it" contradicts the plan it points at. Symmetric with the
+# INVESTIGATE ONLY labelling in issue_fanout_prompt.
+def issue_session_prompt(category, path)
+  if issue_investigate_only?(category)
+    "read the plan at #{path} and follow it exactly. This is an INVESTIGATE ONLY " \
+      "session — no branch, no code, no PR. It ends with " \
+      "`dev issues status --status needs_review` and your findings."
+  else
+    "read the plan at #{path} and implement it"
+  end
 end
 
 # The prompt when several categories were claimed at once (one plan each). A
@@ -1388,19 +1396,25 @@ end
 # INSIDE it: the session fans out one subagent per plan. Categories are
 # independent pipelines/repos, so the subagents share no state.
 def issue_fanout_prompt(plans)
-  listed = plans.map { |category, path| "- #{category}: #{path}" }.join("\n")
+  listed = plans.map { |category, path|
+    suffix = issue_investigate_only?(category) ? " (INVESTIGATE ONLY — no branch, no code, no PR)" : ""
+    "- #{category}: #{path}#{suffix}"
+  }.join("\n")
   "#{plans.length} issue plans have been claimed, one per category. Dispatch ONE " \
-    "subagent per plan and work them in parallel — do NOT implement the fixes " \
+    "subagent per plan and work them in parallel — do NOT work the plans " \
     "yourself in this session. Give each subagent its plan path and tell it to read " \
-    "the plan, implement the fixes, open PRs, and close each issue with " \
-    "`dev issues status`. Plans:\n#{listed}"
+    "the plan and follow it exactly, including the plan's own closing instructions: " \
+    "an implementation plan ends in merged PRs and `dev issues status --status fixed`, " \
+    "while an INVESTIGATE ONLY plan writes no code and ends in " \
+    "`dev issues status --status needs_review` with its findings. Every issue must be " \
+    "closed with `dev issues status`. Plans:\n#{listed}"
 end
 
 # The prompt for the spawned session, keyed on how many category plans were
 # claimed: today's single-plan prompt for one, the subagent fan-out for several.
 # `plans` is a list of [category, plan_path].
 def issue_claim_prompt(plans)
-  plans.length == 1 ? issue_session_prompt(plans.first[1]) : issue_fanout_prompt(plans)
+  plans.length == 1 ? issue_session_prompt(plans.first[0], plans.first[1]) : issue_fanout_prompt(plans)
 end
 
 # Terminal tab title for a session working `issues`, so a glance at the tab says
@@ -1442,8 +1456,8 @@ def issue_claude_argv(prompt)
 end
 
 # Single-plan argv (kept as the one-plan spawn path and its regression test).
-def issue_claude_command(path)
-  issue_claude_argv(issue_session_prompt(path))
+def issue_claude_command(category, path)
+  issue_claude_argv(issue_session_prompt(category, path))
 end
 
 # Every category that has at least one open issue in `open`: the known ones in
@@ -1482,20 +1496,11 @@ def issue_resolve_requested(raw, ordered)
   [resolved.uniq, unknown]
 end
 
-# What a blanket claim — `all`, the prompt's default, or --yes — takes: every
-# listed issue except the categories that are never auto-claimed. Naming one with
-# --category is the human decision that gate exists for, so it turns the filter
-# off and `all` means all again.
-def issue_auto_claim_default(ordered, category)
-  return ordered if category
-  ordered.reject { |c| ISSUE_NO_AUTO_CLAIM_CATEGORIES.include?(c["category"]) }
-end
-
 # Asks which of the listed issues to claim. Reuses Ask.parse_selection (so the
 # accepted forms match the rest of the CLI) but not its prompt wrapper, which
 # would reprint the list flat and lose the category headings above. `all` is
-# answered with `auto` rather than the whole list: it means "the ones a sweep
-# takes", so a never-auto-claimed issue is only ever claimed by naming its number.
+# answered with `auto` rather than the whole list, which is just `ordered`: a
+# blanket claim takes everything a sweep sees, `suggestion` included.
 def issue_ask_selection(ordered, auto)
   loop do
     raw = Ask.for_string("Claim which issues? Enter numbers (e.g. 1,3), `all`, or `none` [all]:", default: "all")
@@ -1513,12 +1518,8 @@ end
 # is all-or-nothing: if one of them was just taken, nothing is claimed and the
 # server says which, rather than quietly claiming a different set than the one
 # that was picked.
-# A never-auto-claimed category is always claimed by number, even when the whole
-# category was picked: claiming by category takes whatever is open server-side at
-# claim time, which would quietly pull in a suggestion filed since the preview —
-# exactly the un-reviewed claim the gate exists to prevent.
 def issue_claim_scope(category, selected, category_open)
-  if selected.length == category_open.length && !ISSUE_NO_AUTO_CLAIM_CATEGORIES.include?(category)
+  if selected.length == category_open.length
     { category: category }
   else
     { numbers: selected.map { |c| c["number"] } }
@@ -1653,16 +1654,80 @@ def issue_manual_body_text
   "#{File.read(claude_issues_path('manual-body.md')).strip}\n\n#{issue_default_body_text.strip}\n"
 end
 
+# Categories whose claimed session must NOT build anything. A `suggestion` is a
+# member's product request, not an approved piece of work: the session reads the
+# code and hands back a recommendation on `needs_review`, and a human decides
+# whether it becomes a feature/bug/improvement. The plan WRAPPER has to say that
+# too — suggestion-body.md alone is not enough, because the wrapper's own prose
+# ("implement the fixes, open PRs") would contradict it.
+ISSUE_INVESTIGATE_ONLY_CATEGORIES = %w[suggestion].freeze
+
+def issue_investigate_only?(category)
+  ISSUE_INVESTIGATE_ONLY_CATEGORIES.include?(category)
+end
+
+# The wrapper prose above the issue list: what this session is FOR.
+def issue_plan_intro(category)
+  if issue_investigate_only?(category)
+    <<~INTRO.strip
+      Generated by `dev issues claim --category #{category}`. These issues are CLAIMED
+      (status `claimed`) and waiting for you. This is an INVESTIGATION, not an
+      implementation session: do not create a branch, do not write code, do not open a
+      PR. Hand back findings with `dev issues status` (below) so nothing stays stuck in
+      `claimed`.
+    INTRO
+  else
+    <<~INTRO.strip
+      Generated by `dev issues claim --category #{category}`. These issues are CLAIMED
+      (status `claimed`) and waiting for you. Implement the fixes, open PRs, and close
+      each issue with `dev issues status` (below) so nothing stays stuck in `claimed`.
+    INTRO
+  end
+end
+
+# The closing menu: the statuses this session is allowed to end on. An
+# investigate-only session has no `fixed` to offer — its move is `needs_review`.
+def issue_plan_closing(category)
+  if issue_investigate_only?(category)
+    <<~CLOSING.strip
+      - Findings ready for a human to decide on →
+        `dev issues status <number> --status needs_review --comment "<your findings>"`
+        (the recommendation itself goes in --comment; a human reclassifies it into
+        feature/bug/improvement, or dismisses it, from playbook-admin)
+      - Blocked on something only a human can answer →
+        `dev issues status <number> --status needs_input --comment "<question>"`
+
+      Every comment you write is an INTERNAL note to the team — never a reply
+      addressed to the member who filed the suggestion. Say what needs deciding or
+      asking; Mike writes any customer-facing reply from playbook-admin.
+    CLOSING
+  else
+    <<~CLOSING.strip
+      - Fixed in a merged PR → `dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
+        (--app + --baseline-version let `dev issues reconcile` flip the issue to `deployed`
+        once that app releases past the baseline. `dev deploy status` lists the deployable
+        app names and their live release tags — read the tag BEFORE your fix ships.)
+      - Fixed by a document (process/manual fix, e.g. a Google Doc) →
+        `dev issues status <number> --status fixed --url "<doc URL>"`
+        (no app/baseline: nothing to detect, so `deployed` is set by hand later)
+      - Needs a human decision, or not actionable / already fixed →
+        `dev issues status <number> --status needs_input --comment "<question or reason>"`
+        (every comment you write is an INTERNAL note to the team — never a reply
+        addressed to the club that filed the issue. Say what needs deciding or
+        asking; Mike writes any customer-facing reply from playbook-admin.)
+    CLOSING
+  end
+end
+
 def issue_plan_markdown(items:, date:, category:, body:)
   rendered = items.each_with_index.map { |c, i| issue_render_item(c, i + 1) }.join("\n\n")
+  heading = issue_investigate_only?(category) ? "## Issues to investigate" : "## Issues to fix"
   <<~PLAN
     # #{category} issues — #{items.length} item(s) claimed #{date}
 
-    Generated by `dev issues claim --category #{category}`. These issues are CLAIMED
-    (status `claimed`) and waiting for you. Implement the fixes, open PRs, and close
-    each issue with `dev issues status` (below) so nothing stays stuck in `claimed`.
+    #{issue_plan_intro(category)}
 
-    ## Issues to fix
+    #{heading}
 
     #{rendered}
 
@@ -1675,18 +1740,7 @@ def issue_plan_markdown(items:, date:, category:, body:)
     Run from anywhere (re-authenticates from ~/code/env each call). `<number>` is the
     issue number shown above (e.g. `034`; unpadded `34` works too):
 
-    - Fixed in a merged PR → `dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
-      (--app + --baseline-version let `dev issues reconcile` flip the issue to `deployed`
-      once that app releases past the baseline. `dev deploy status` lists the deployable
-      app names and their live release tags — read the tag BEFORE your fix ships.)
-    - Fixed by a document (process/manual fix, e.g. a Google Doc) →
-      `dev issues status <number> --status fixed --url "<doc URL>"`
-      (no app/baseline: nothing to detect, so `deployed` is set by hand later)
-    - Needs a human decision, or not actionable / already fixed →
-      `dev issues status <number> --status needs_input --comment "<question or reason>"`
-      (every comment you write is an INTERNAL note to the team — never a reply
-      addressed to the club that filed the issue. Say what needs deciding or
-      asking; Mike writes any customer-facing reply from playbook-admin.)
+    #{issue_plan_closing(category)}
   PLAN
 end
 
@@ -1896,7 +1950,7 @@ def cmd_issues_create(args)
     puts "Claimed #{issue_label(issue)} → #{path}"
     puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
 
-    prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(path))
+    prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(category, path))
     unless spawn_session
       puts ""
       puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"
@@ -1997,15 +2051,12 @@ def cmd_issues_claim(args)
     # One flat, globally numbered list behind the per-category headings: the
     # numbers the operator types are positions in it.
     ordered = issue_ordered_open(open, present)
-    auto = issue_auto_claim_default(ordered, category)
+    auto = ordered
     positions = ordered.each_with_index.to_h { |c, i| [c["number"], i + 1] }
     puts ""
     present.each do |cat|
       issues = open.select { |c| c["category"] == cat }
-      # Say it on the heading, not just in --help: the numbers are right there,
-      # so the operator can pick one without hunting for why `all` skipped it.
-      skipped = !category && ISSUE_NO_AUTO_CLAIM_CATEGORIES.include?(cat)
-      puts Util.underline("#{cat} (#{issues.length})#{skipped ? ' — not auto-claimed; select by number' : ''}")
+      puts Util.underline("#{cat} (#{issues.length})")
       issues.each { |c| puts issue_summary_line(c, positions[c["number"]]) }
       puts ""
     end
@@ -2032,16 +2083,7 @@ def cmd_issues_claim(args)
       end
 
     if selected.empty?
-      # Everything open is in a never-auto-claimed category: `all` legitimately
-      # selected nothing, which reads as a bug unless we say why and how to take
-      # them anyway.
-      if auto.empty? && !ordered.empty?
-        cats = ordered.map { |c| c["category"] }.uniq
-        puts "Nothing claimed — the only open issue(s) are #{cats.join(', ')}, which a blanket claim skips."
-        puts "Claim them explicitly with --issues #{ordered.map { |c| c['number'] }.join(',')} or --category #{cats.first}."
-      else
-        puts "Aborted. Nothing claimed."
-      end
+      puts "Aborted. Nothing claimed."
       return
     end
 
