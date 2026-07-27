@@ -142,93 +142,74 @@ end
 
 # "snapshot already current" right after a successful build looks like a bug unless the
 # build's own output explains that the new notes had nothing to show.
-class TestChangelogSnapshotUnchangedReason < Minitest::Test
-  def test_explains_a_build_of_only_empty_notes
-    assert_includes changelog_snapshot_unchanged_reason(0, 2), "all 2 new note(s) had no user-facing changes"
-  end
-
-  def test_stays_silent_when_something_was_published
-    assert_equal "", changelog_snapshot_unchanged_reason(1, 2)
-  end
-
-  def test_stays_silent_when_nothing_was_built_at_all
-    assert_equal "", changelog_snapshot_unchanged_reason(0, 0)
-  end
-end
-
-class TestChangelogNotesEntryCount < Minitest::Test
-  def with_notes(contents)
-    Dir.mktmpdir("notes") do |dir|
-      f = File.join(dir, "n.json")
-      File.write(f, contents)
-      yield f
-    end
-  end
-
-  def test_counts_entries
-    with_notes(JSON.generate("entries" => [1, 2])) { |f| assert_equal 2, changelog_notes_entry_count(f) }
-  end
-
-  # Unreadable or malformed notes must not crash the summary; they just publish nothing.
-  def test_unreadable_notes_count_as_zero
-    with_notes("not json") { |f| assert_equal 0, changelog_notes_entry_count(f) }
-    assert_equal 0, changelog_notes_entry_count("/nonexistent/n.json")
-  end
-end
-
-# Exercises the real cmd_changelog_build against a temp data lake, with only the
-# outside world (Claude, git, ISS lookup, admin snapshot) stubbed. Asserts the thing
-# that matters: one Claude session per BATCH, not per version.
+# Exercises the real cmd_changelog_build with only the outside world stubbed -- the
+# API, Claude, git and the ISS lookup. Asserts the things that matter: one Claude
+# session per BATCH rather than per version, and that every evaluated version is
+# reported to the API including the ones the model found nothing to say about.
 class TestDevChangelogBuild < Minitest::Test
-  APPS = %w[playbook-admin].freeze
-
   def setup
-    @repo = Dir.mktmpdir("changelog-lake")
+    # changelog_pending skips an app with no checkout, so the fake one has to look
+    # like a git repo even though every git read below is stubbed.
+    @checkout = Dir.mktmpdir("changelog-checkout")
+    FileUtils.mkdir_p(File.join(@checkout, ".git"))
     @inputs = []
-    @pushed = []
-    @snapshots = []
+    @posted = []
+    @missing = %w[]
     @entries_by_version = {}
+    @commits_by_version = Hash.new { [] }
     stub_world!
   end
 
   def teardown
-    FileUtils.remove_entry(@repo)
-    # Unlike the other stubs, this one shadows a method other tests assert on, so put
-    # the real implementation back rather than leaking it across the suite.
+    FileUtils.remove_entry(@checkout)
     Object.send(:define_method, :changelog_app_repo, @real_app_repo)
   end
 
-  def write_tag(version, released_at, commits)
-    dir = File.join(@repo, "playbook-admin")
-    FileUtils.mkdir_p(dir)
-    File.write(File.join(dir, "#{version}.tag.json"),
-               JSON.generate("application" => "playbook-admin", "version" => version,
-                             "released_at" => released_at, "commits" => commits))
+  def pending_version(version, released_at, commits = [])
+    @missing << version
+    @commits_by_version[version] = commits
+    @released_at ||= {}
+    @released_at[version] = released_at
   end
 
-  def notes(version)
-    f = File.join(@repo, "playbook-admin", "#{version}.notes.json")
-    File.exist?(f) ? JSON.parse(File.read(f)) : nil
-  end
-
-  # Replace every boundary cmd_changelog_build crosses. `changelog_run_claude`
-  # records the payload it was handed and writes the notes files a real session
-  # would, so the caller's validation still runs for real.
+  # Replace every boundary cmd_changelog_build crosses. `changelog_run_claude` records
+  # the payload it was handed and writes the notes files a real session would, so the
+  # caller's validation still runs for real.
   def stub_world!
-    repo = @repo
     inputs = @inputs
-    pushed = @pushed
-    Object.send(:define_method, :ensure_changelog_repo!) { repo }
+    posted = @posted
+    missing = @missing
+    commits_by_version = @commits_by_version
+    entries_by_version = @entries_by_version
+
+    Object.send(:define_method, :platform_endpoint) { |_localhost| { name: "test" } }
     # The ISS map is keyed by repo slug, the app is playbook-admin: the build has to
     # bridge the two, so pin the mapping rather than depending on a generated dist/.
     Object.send(:define_method, :changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
     @real_app_repo = Object.instance_method(:changelog_app_repo)
     Object.send(:define_method, :changelog_app_repo) { |_app| "legacy-admin" }
-    snapshots = @snapshots
-    Object.send(:define_method, :changelog_refresh_admin_snapshot!) { |_r, **kw| snapshots << kw }
-    Object.send(:define_method, :changelog_git_commit_push!) { |_dir, message| pushed << message }
-    entries_by_version = @entries_by_version
-    Object.send(:define_method, :changelog_run_claude) do |_r, input_path, version_count|
+
+    # The server's answer to "what still needs notes", plus the git reads the build
+    # makes to rebuild each pending version's commit list.
+    released_at = -> (v) { (@released_at || {}).fetch(v, "2026-07-20T14:00:00-04:00") }
+    Object.send(:define_method, :changelog_status) do |_endpoint|
+      { "playbook-admin" => { "application" => "playbook-admin", "max_version" => missing.last,
+                              "versions_missing_notes" => missing.dup } }
+    end
+    Object.send(:define_method, :changelog_tags) { |_checkout| missing.dup }
+    Object.send(:define_method, :changelog_commits) { |_checkout, range| commits_by_version[range.split("..").last] }
+    Object.send(:define_method, :changelog_git_out) do |*cmd|
+      cmd.include?("--format=%cI") ? released_at.call(cmd.last) : ""
+    end
+    checkout = @checkout
+    Object.send(:define_method, :changelog_app_checkout) { |_app| checkout }
+
+    Object.send(:define_method, :changelog_post_batches) do |_endpoint, path, _key, records|
+      posted << [path, records]
+      records.length
+    end
+
+    Object.send(:define_method, :changelog_run_claude) do |_workdir, input_path, version_count|
       input = JSON.parse(File.read(input_path))
       inputs << input
       raise "version_count disagrees with the payload" unless version_count == input["versions"].length
@@ -247,196 +228,69 @@ class TestDevChangelogBuild < Minitest::Test
     out
   end
 
+  def posted_notes
+    @posted.select { |path, _| path == "notes" }.flat_map { |_, records| records }
+  end
+
   def test_all_pending_versions_go_to_one_session
-    3.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    3.times { |i| pending_version("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00") }
     build
     assert_equal 1, @inputs.length
     assert_equal %w[0.3.2 0.3.1 0.3.0], @inputs[0]["versions"].map { |v| v["version"] }
-    assert_equal 1, @pushed.length
-    3.times { |i| refute_nil notes("0.3.#{i}") }
+    assert_equal %w[0.3.2 0.3.1 0.3.0], posted_notes.map { |n| n["version"] }
   end
 
-  # The header names the batch; the versions in it are listed one per line with the
-  # commit load that made the batch that size.
   def test_batch_header_lists_each_version_and_its_commit_count
-    write_tag("0.3.0", "2026-07-20T14:00:00-04:00", [{ "sha" => "a", "subject" => "s" }])
+    pending_version("0.3.0", "2026-07-20T14:00:00-04:00", [{ "sha" => "a", "subject" => "s" }])
     out = build
     assert_includes out, "changelog build [batch 1/1]: 1 version(s) via Claude (#{CHANGELOG_CLAUDE_MODEL})\n"
     assert_includes out, "  playbook-admin/0.3.0  1 commit(s)"
   end
 
   def test_batch_size_splits_into_multiple_sessions
-    5.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
+    5.times { |i| pending_version("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00") }
     build("--batch-size", "2")
     assert_equal [2, 2, 1], @inputs.map { |i| i["versions"].length }
     assert_equal %w[0.3.4 0.3.3 0.3.2 0.3.1 0.3.0],
                  @inputs.flat_map { |i| i["versions"].map { |v| v["version"] } }
   end
 
-  # End-to-end version of the commit bound: a fat version is not batched with others.
-  def test_commit_heavy_version_gets_its_own_session
-    write_tag("0.0.1", "2026-07-01T14:00:00-04:00",
-              Array.new(CHANGELOG_BUILD_BATCH_COMMITS + 1) do |i|
-                { "sha" => "s#{i}", "subject" => "c#{i}", "body" => "", "pr_number" => nil }
-              end)
-    write_tag("0.0.2", "2026-07-02T14:00:00-04:00", [])
-    build
-    assert_equal [%w[0.0.2], %w[0.0.1]], @inputs.map { |i| i["versions"].map { |v| v["version"] } }
-  end
-
-  # The page links PRs off the repo, which is not the app name, so the CLI stamps it
-  # deterministically after the session rather than trusting the model to echo it.
-  def test_notes_are_stamped_with_the_repo
-    write_tag("0.3.0", "2026-07-20T14:00:00-04:00", [])
-    build
-    assert_equal "legacy-admin", notes("0.3.0")["repo"]
-  end
-
   def test_input_payload_carries_commits_and_resolved_issue
-    write_tag("0.3.0", "2026-07-20T14:00:00-04:00",
-              [{ "sha" => "abc", "subject" => "Add changelog page (#412)", "body" => "b", "pr_number" => 412 },
-               { "sha" => "def", "subject" => "Bump version", "body" => "", "pr_number" => nil }])
+    pending_version("0.3.0", "2026-07-20T14:00:00-04:00",
+                    [{ "sha" => "abc", "subject" => "Add changelog page (#412)", "body" => "b", "pr_number" => 412 },
+                     { "sha" => "def", "subject" => "Bump version", "pr_number" => nil }])
     build
     v = @inputs[0]["versions"][0]
     assert_equal "playbook-admin", v["application"]
     assert_equal "0.3.0", v["version"]
-    assert_equal File.join(@repo, "playbook-admin", "0.3.0.notes.json"), v["notes_file"]
     assert_equal "034", v["commits"][0]["issue_number"]
     assert_nil v["commits"][1]["issue_number"]
   end
 
-  # Versions already carrying notes are never re-evaluated, so a re-run after a
-  # partially failed batch only asks about what is still missing.
-  def test_existing_notes_are_skipped
-    2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
-    File.write(File.join(@repo, "playbook-admin", "0.3.0.notes.json"),
-               JSON.generate("application" => "playbook-admin", "version" => "0.3.0", "entries" => []))
-    build
-    assert_equal %w[0.3.1], @inputs[0]["versions"].map { |v| v["version"] }
-  end
-
-  # A release whose commits were all judged uninteresting still gets a notes file, but
-  # /admin/changelog never shows it. The summary has to separate the two so a build that
-  # produced nothing visible does not read as a build that published something.
-  def test_summary_separates_published_notes_from_empty_ones
-    2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
-    @entries_by_version["0.3.1"] = [{ "title" => "Something", "description" => "d" }]
+  # The property notes_built_at exists for. A release the model found nothing to say
+  # about still has to be REPORTED, with an empty entries list -- that is what marks it
+  # evaluated. Reporting only the ones with entries would leave it pending forever, and
+  # it would be sent back to the model on every build.
+  def test_a_version_with_no_entries_is_still_reported
+    2.times { |i| pending_version("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00") }
+    @entries_by_version["0.3.1"] = [{ "summary" => "Something", "category" => "fix" }]
     out = build
-    assert_includes out, "wrote 2 notes file(s): 1 with release notes, 1 with no user-facing changes"
-    assert_includes out, "  playbook-admin/0.3.0  no user-facing changes"
-    assert_includes out, "  playbook-admin/0.3.1  1 note(s)"
-    assert_equal [{ published: 1, empty: 1 }], @snapshots
+    assert_equal %w[0.3.1 0.3.0], posted_notes.map { |n| n["version"] }.sort.reverse
+    assert_empty posted_notes.find { |n| n["version"] == "0.3.0" }["entries"]
+    assert_includes out, "recorded notes for 2 version(s): 1 with release notes, 1 with no user-facing changes"
   end
 
-  # A session that returns without writing a file must not be reported as built —
-  # only the versions whose files exist are committed, the rest fail the command.
+  # A session that returns without writing a file must not be reported as built.
   def test_versions_left_unwritten_fail_the_command
-    2.times { |i| write_tag("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00", []) }
-    Object.send(:define_method, :changelog_run_claude) { |_r, _input_path, _count| "claude timed out" }
+    2.times { |i| pending_version("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00") }
+    Object.send(:define_method, :changelog_run_claude) { |_w, _input_path, _count| "claude timed out" }
     assert_raises(SystemExit) { build }
-    assert_empty @pushed
-  end
-end
-
-# The snapshot PR is merged for Mike, so the merge itself has to survive GitHub's
-# asynchronous mergeability computation without a human noticing.
-class TestChangelogMergeAdminPr < Minitest::Test
-  Status = Struct.new(:success?)
-
-  def setup
-    @calls = []
-    @slept = []
-    slept = @slept
-    Object.send(:define_method, :sleep) { |secs| slept << secs }
+    assert_empty posted_notes
   end
 
-  def teardown
-    Object.send(:remove_method, :sleep)
-    Open3.singleton_class.send(:remove_method, :capture2e)
-  end
-
-  # Each element of `results` is the success? of one `gh pr merge` attempt.
-  def stub_merge!(*results)
-    calls = @calls
-    queue = results.dup
-    Open3.define_singleton_method(:capture2e) do |*cmd|
-      calls << cmd
-      ok = queue.shift
-      [ok ? "Merged\n" : "not mergeable\n", Status.new(ok)]
-    end
-  end
-
-  def merge(number)
-    out, err = capture_io { changelog_merge_admin_pr!(number) }
-    [out, err]
-  end
-
-  def test_merges_the_pr
-    stub_merge!(true)
-    out, = merge(654)
-    assert_includes out, "merged the /admin/changelog snapshot PR #654"
-    assert_equal 1, @calls.length
-    assert_includes @calls[0], "--squash"
-    assert_includes @calls[0], "654"
-    assert_empty @slept
-  end
-
-  # GitHub reports a freshly opened PR as not mergeable until it finishes computing:
-  # retrying, not failing, is what keeps the automation hands-off.
-  def test_retries_until_github_reports_mergeable
-    stub_merge!(false, false, true)
-    out, = merge(654)
-    assert_includes out, "merged the /admin/changelog snapshot PR #654"
-    assert_equal 3, @calls.length
-    assert_equal [CHANGELOG_MERGE_RETRY_SECS] * 2, @slept
-  end
-
-  # Best-effort: a PR that will not merge is reported for a human, never raised — the
-  # notes are already committed to the lake by this point.
-  def test_gives_up_with_a_warning
-    stub_merge!(*Array.new(CHANGELOG_MERGE_ATTEMPTS, false))
-    _, err = merge(654)
-    assert_equal CHANGELOG_MERGE_ATTEMPTS, @calls.length
-    assert_equal CHANGELOG_MERGE_ATTEMPTS - 1, @slept.length
-    assert_includes err, "could not merge"
-    assert_includes err, "#654 (not mergeable)"
-  end
-
-  # Nothing to merge when the PR could not be opened.
-  def test_no_pr_number_is_a_no_op
-    stub_merge!
-    out, err = merge(nil)
-    assert_empty @calls
-    assert_equal "", out
-    assert_equal "", err
-  end
-end
-
-# The PR number is what the merge step acts on, so an empty list has to come back as
-# nil rather than as a truthy blob of JSON.
-class TestChangelogAdminOpenPrNumber < Minitest::Test
-  def stub_gh!(output)
-    IO.define_singleton_method(:popen) { |*_args, **_kw| output }
-  end
-
-  def teardown
-    IO.singleton_class.send(:remove_method, :popen)
-  end
-
-  def test_returns_the_open_pr_number
-    stub_gh!(JSON.generate([{ "number" => 654 }]))
-    assert_equal 654, changelog_admin_open_pr_number
-  end
-
-  def test_no_open_pr
-    stub_gh!("[]")
-    assert_nil changelog_admin_open_pr_number
-  end
-
-  # gh failing (not authenticated, no network) prints nothing parseable; that must
-  # read as "no PR", not crash the best-effort snapshot path.
-  def test_unparseable_gh_output
-    stub_gh!("")
-    assert_nil changelog_admin_open_pr_number
+  def test_nothing_pending_is_a_no_op
+    out = build
+    assert_includes out, "nothing to build"
+    assert_empty @posted
   end
 end

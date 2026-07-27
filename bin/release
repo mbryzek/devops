@@ -50,13 +50,17 @@ files.each do |file|
   Util.run cmd, quiet: true
 end
 
-# Pre-release hook: record this app's changelog into the `changelog` data repo now
-# that the tag exists. Best-effort via system() (never raises/exits) so a changelog
-# hiccup can never block or fail a release. Only the tracked playbook* apps feed it.
+# Post-release hook: record this app's changelog in platform now that the tag exists.
+# Runs the whole pipeline (capture then build), not just capture: the notes are served
+# from the API, so nothing is baked into a build and there is no longer any reason to
+# defer the model step to a manual run. Only the tracked playbook* apps feed it.
+#
+# Best-effort via system() (never raises/exits) so a changelog hiccup can never block or
+# fail a release that has already succeeded.
 CHANGELOG_TRACKED = %w[playbook-admin playbook-app playbook-www].freeze
 if CHANGELOG_TRACKED.include?(args.app)
-  system(File.join(dir, "dev"), "changelog", "capture", "--app", args.app, Config::SKIP_REGENERATE_FLAG) ||
-    warn("changelog capture failed (ignored) — run `dev changelog capture --app #{args.app}` later")
+  system(File.join(dir, "dev"), "changelog", "--app", args.app, Config::SKIP_REGENERATE_FLAG) ||
+    warn("changelog failed (ignored) — run `dev changelog --app #{args.app}` later")
 end
 
 # Post-release hook: run the two reconcilers that gate on "what is production
