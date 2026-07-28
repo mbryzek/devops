@@ -46,10 +46,6 @@ USAGE = <<~TEXT
     --profile PROFILE  Use a named profile from ~/.apibuilder/config
     --app APP          Process only the specified application(s). Can be repeated.
     --group GROUP      Process only blocks with the specified group.
-    --expand-imports   Force the server to walk transitive imports and auto-include
-                       them with type-scoped filters. On by default when no --app
-                       filter is used; otherwise off (subset uploads should not
-                       wipe types from imported apps' generated files).
 
   Examples:
     api init                                        # create anonymous org + token
@@ -133,7 +129,6 @@ def parse_batch_args(remaining)
   operations = []
   apps = []
   group = nil
-  expand_imports_flag = false
 
   args = remaining.dup
   while arg = args.shift
@@ -143,8 +138,6 @@ def parse_batch_args(remaining)
       apps << app unless apps.include?(app)
     when "--group"
       group = parse_option_value(args, "--group")
-    when "--expand-imports"
-      expand_imports_flag = true
     else
       if VALID_OPERATIONS.include?(arg)
         operations << arg unless operations.include?(arg)
@@ -154,17 +147,7 @@ def parse_batch_args(remaining)
     end
   end
 
-  { operations: operations, apps: apps.empty? ? nil : apps, group: group, expand_imports_flag: expand_imports_flag }
-end
-
-# Resolve the effective import_expansion mode for a batch.
-# Auto-enable on full uploads (no --app filter) so transitive third-party imports
-# like apibuilder-spec / platform-error still get codegen'd. Stay disabled on
-# subset uploads to avoid the server wiping types from sibling apps' files.
-def resolve_import_expansion(app_filter, expand_imports_flag)
-  return "enabled" if expand_imports_flag
-  return "enabled" if app_filter.nil?
-  "disabled"
+  { operations: operations, apps: apps.empty? ? nil : apps, group: group }
 end
 
 def parse_init_args(remaining)
@@ -592,7 +575,7 @@ end
 
 # --- Batch Operations ---
 
-def build_batch_form(config, org, operations, app_filter, group_filter, import_expansion, project_root)
+def build_batch_form(config, org, operations, app_filter, group_filter, project_root)
   blocks = config.blocks_for_org(org)
   blocks = blocks.select { |b| b.group == group_filter } if group_filter
 
@@ -637,7 +620,6 @@ def build_batch_form(config, org, operations, app_filter, group_filter, import_e
   {
     "operations" => operations,
     "applications" => applications,
-    "import_expansion" => import_expansion,
   }
 end
 
@@ -751,7 +733,7 @@ def resolve_config_roots(root_dir)
   roots
 end
 
-def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag)
+def run_batch(profile, operations, app_filter, group_filter)
   roots = resolve_config_roots(Dir.pwd)
   if roots.size > 1
     puts "==> #{roots.size} codegen roots: #{roots.map { |_, dir| dir == Dir.pwd ? "." : Pathname.new(dir).relative_path_from(Pathname.new(Dir.pwd)).to_s }.join(', ')}"
@@ -760,11 +742,11 @@ def run_batch(profile, operations, app_filter, group_filter, expand_imports_flag
   validate_filters(roots.map { |config, _| config }, app_filter, group_filter)
 
   roots.each do |config, project_root|
-    run_batch_for_config(profile, operations.dup, app_filter, group_filter, expand_imports_flag, config, project_root)
+    run_batch_for_config(profile, operations.dup, app_filter, group_filter, config, project_root)
   end
 end
 
-def run_batch_for_config(profile, operations, app_filter, group_filter, expand_imports_flag, config, project_root)
+def run_batch_for_config(profile, operations, app_filter, group_filter, config, project_root)
   if operations.empty?
     operations = ["codegen"]
     has_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(File.join(project_root, a.file_path)) } }
@@ -778,15 +760,13 @@ def run_batch_for_config(profile, operations, app_filter, group_filter, expand_i
   num_orgs = config.orgs.size
   puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
 
-  import_expansion = resolve_import_expansion(app_filter, expand_imports_flag)
-
   config.orgs.each do |org|
     puts "==> Building batch for #{org}"
-    form = build_batch_form(config, org, operations, app_filter, group_filter, import_expansion, project_root)
+    form = build_batch_form(config, org, operations, app_filter, group_filter, project_root)
     next if form["applications"].empty?
 
     num_apps = form["applications"].size
-    puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')}, import_expansion: #{import_expansion})"
+    puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
     batch = batch_client.create_batch(org, form)
     batch_id = batch["id"]
     puts "==> Batch #{batch_id} created, polling for processing to begin..."
@@ -852,7 +832,7 @@ if __FILE__ == $PROGRAM_NAME
       run_result(profile, parsed[:dry_run])
     else
       parsed = parse_batch_args(remaining)
-      run_batch(profile, parsed[:operations], parsed[:apps], parsed[:group], parsed[:expand_imports_flag])
+      run_batch(profile, parsed[:operations], parsed[:apps], parsed[:group])
     end
   end
 
