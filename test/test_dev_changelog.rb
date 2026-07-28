@@ -66,6 +66,45 @@ class TestDevChangelogTimeout < Minitest::Test
   end
 end
 
+# The build session runs in a scratch dir, so it can only reach the skill by absolute
+# path. When the prompt named it relatively the model found nothing at the cwd and fell
+# back to scanning the filesystem for it on every batch.
+class TestDevChangelogSkillPath < Minitest::Test
+  # Run changelog_run_claude with the subprocess replaced, and return what it would
+  # have handed `claude`: [prompt, spawn options].
+  def spawn_args(workdir: "/tmp/scratch")
+    captured = nil
+    done = Object.new
+    def done.pid = 4242
+    def done.value = nil
+    Open3.stub(:popen2e, lambda { |*args, **opts|
+      captured = [args.last, opts]
+      [StringIO.new, StringIO.new("done"), done]
+    }) do
+      changelog_run_claude(workdir, "/tmp/scratch/_build_input.json", 3)
+    end
+    captured
+  end
+
+  def test_prompt_names_the_skill_by_absolute_path
+    prompt, = spawn_args
+    assert_includes prompt, CHANGELOG_SKILL_PATH
+    refute_match %r{(?<!/)\.claude/skills}, prompt,
+                 "the skill must be named by absolute path, never relative to the cwd"
+  end
+
+  # The path is only useful if something is actually there — this is what breaks if the
+  # skill is moved or dropped from the repo again.
+  def test_the_skill_ships_with_the_cli
+    assert File.exist?(CHANGELOG_SKILL_PATH), "no changelog-build skill at #{CHANGELOG_SKILL_PATH}"
+  end
+
+  def test_session_runs_in_the_scratch_dir
+    _, opts = spawn_args(workdir: "/tmp/some-scratch")
+    assert_equal "/tmp/some-scratch", opts[:chdir]
+  end
+end
+
 # changelog_app_repo maps a deployable to its GitHub repo (the checkout directory).
 # It must degrade to the app name rather than raise when the app is not configured —
 # `dev changelog` is best-effort and never fails a release.
@@ -157,12 +196,26 @@ class TestDevChangelogBuild < Minitest::Test
     @missing = %w[]
     @entries_by_version = {}
     @commits_by_version = Hash.new { [] }
+    @real_methods = {}
     stub_world!
   end
 
   def teardown
     FileUtils.remove_entry(@checkout)
-    Object.send(:define_method, :changelog_app_repo, @real_app_repo)
+    # Every stub lands on Object, so one left behind is visible to every later test in
+    # the process, not just this class — restore them all.
+    @real_methods.each { |name, m| Object.send(:define_method, name, m) }
+  end
+
+  # Replace a global for the duration of one test, remembering the real one so teardown
+  # can put it back.
+  def stub_global(name, &body)
+    @real_methods[name] ||= begin
+      Object.instance_method(name)
+    rescue NameError
+      nil
+    end
+    Object.send(:define_method, name, body)
   end
 
   def pending_version(version, released_at, commits = [])
@@ -182,34 +235,33 @@ class TestDevChangelogBuild < Minitest::Test
     commits_by_version = @commits_by_version
     entries_by_version = @entries_by_version
 
-    Object.send(:define_method, :platform_endpoint) { |_localhost| { name: "test" } }
+    stub_global(:platform_endpoint) { |_localhost| { name: "test" } }
     # The ISS map is keyed by repo slug, the app is playbook-admin: the build has to
     # bridge the two, so pin the mapping rather than depending on a generated dist/.
-    Object.send(:define_method, :changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
-    @real_app_repo = Object.instance_method(:changelog_app_repo)
-    Object.send(:define_method, :changelog_app_repo) { |_app| "legacy-admin" }
+    stub_global(:changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
+    stub_global(:changelog_app_repo) { |_app| "legacy-admin" }
 
     # The server's answer to "what still needs notes", plus the git reads the build
     # makes to rebuild each pending version's commit list.
     released_at = -> (v) { (@released_at || {}).fetch(v, "2026-07-20T14:00:00-04:00") }
-    Object.send(:define_method, :changelog_status) do |_endpoint|
+    stub_global(:changelog_status) do |_endpoint|
       { "playbook-admin" => { "application" => "playbook-admin", "max_version" => missing.last,
                               "versions_missing_notes" => missing.dup } }
     end
-    Object.send(:define_method, :changelog_tags) { |_checkout| missing.dup }
-    Object.send(:define_method, :changelog_commits) { |_checkout, range| commits_by_version[range.split("..").last] }
-    Object.send(:define_method, :changelog_git_out) do |*cmd|
+    stub_global(:changelog_tags) { |_checkout| missing.dup }
+    stub_global(:changelog_commits) { |_checkout, range| commits_by_version[range.split("..").last] }
+    stub_global(:changelog_git_out) do |*cmd|
       cmd.include?("--format=%cI") ? released_at.call(cmd.last) : ""
     end
     checkout = @checkout
-    Object.send(:define_method, :changelog_app_checkout) { |_app| checkout }
+    stub_global(:changelog_app_checkout) { |_app| checkout }
 
-    Object.send(:define_method, :changelog_post_batches) do |_endpoint, path, _key, records|
+    stub_global(:changelog_post_batches) do |_endpoint, path, _key, records|
       posted << [path, records]
       records.length
     end
 
-    Object.send(:define_method, :changelog_run_claude) do |_workdir, input_path, version_count|
+    stub_global(:changelog_run_claude) do |_workdir, input_path, version_count|
       input = JSON.parse(File.read(input_path))
       inputs << input
       raise "version_count disagrees with the payload" unless version_count == input["versions"].length
@@ -283,7 +335,7 @@ class TestDevChangelogBuild < Minitest::Test
   # A session that returns without writing a file must not be reported as built.
   def test_versions_left_unwritten_fail_the_command
     2.times { |i| pending_version("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00") }
-    Object.send(:define_method, :changelog_run_claude) { |_w, _input_path, _count| "claude timed out" }
+    stub_global(:changelog_run_claude) { |_w, _input_path, _count| "claude timed out" }
     assert_raises(SystemExit) { build }
     assert_empty posted_notes
   end
