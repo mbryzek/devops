@@ -4773,6 +4773,11 @@ CHANGELOG_APPS = %w[playbook-admin playbook-app playbook-www].freeze
 # mechanical codegen sync (haiku).
 CHANGELOG_CLAUDE_MODEL = "sonnet".freeze
 
+# The build skill ships with this CLI rather than with the data it produces: it used to
+# live in the `changelog` data repo, which is being archived, and a session run from a
+# scratch dir can only reach it by absolute path anyway.
+CHANGELOG_SKILL_PATH = File.expand_path("../.claude/skills/changelog-build/SKILL.md", __dir__).freeze
+
 # Versions per Claude session. Each version is a small, independent commit list, so
 # batching them amortizes the ~15-30s session startup (process spawn, skill read,
 # tool setup) that used to be paid once per version — the dominant cost on a
@@ -5093,10 +5098,15 @@ end
 
 # Headless Claude session that writes the notes files. Unlike spawn_claude (which
 # expects a PR URL), this only asks Claude to write files we validate afterwards.
-def changelog_run_claude(repo, input_path, version_count)
+#
+# The session runs in a scratch dir, so the skill is named by ABSOLUTE path: a relative
+# `.claude/skills/...` resolves against the cwd, and when that stopped being a repo
+# checkout the model fell back to searching the filesystem (`find / -maxdepth 8`) for
+# the skill on every batch -- minutes of disk scan per batch before any work started.
+def changelog_run_claude(workdir, input_path, version_count)
   timeout_secs = changelog_claude_timeout_secs(version_count)
   prompt = <<~PROMPT
-    Follow the process in .claude/skills/changelog-build/SKILL.md exactly.
+    Follow the process in #{CHANGELOG_SKILL_PATH} exactly.
     Input file: #{input_path}
     It lists #{version_count} version(s). For each version under "versions", decide which
     commits are worth telling a human about, write concise plain-language release notes,
@@ -5107,7 +5117,7 @@ def changelog_run_claude(repo, input_path, version_count)
   PROMPT
   stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions",
                                            "--model", CHANGELOG_CLAUDE_MODEL, prompt,
-                                           chdir: repo, pgroup: true)
+                                           chdir: workdir, pgroup: true)
   stdin.close
   pid = wait_thr.pid
   output =
