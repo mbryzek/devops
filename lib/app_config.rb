@@ -3,12 +3,16 @@ class AppConfig
   # App-specific configuration
   APPS = {
     'platform' => { artifact: 'api', port: 9300, run_script: 'api' },
+    # Same codebase as platform, deployed to the playbook DO account.
+    'playbook-api' => { artifact: 'api', port: 9300, run_script: 'api' },
     'acumen' => { artifact: 'api', port: 9200, run_script: 'acumen-acumen-api' }
   }.freeze
 
-  # Source directory by convention: ~/code/<app_name>
+  # Source checkout: ~/code/<repo>. Resolved through the app's configured repo
+  # rather than its name — a deployable (e.g. playbook-api) can be built from
+  # another repo's checkout (platform).
   def self.source_dir(app_name)
-    File.expand_path("~/code/#{app_name}")
+    File.expand_path("~/code/#{Config.load(app_name).repo_name}")
   end
 
   # SBT artifact/subproject name

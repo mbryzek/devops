@@ -11,6 +11,7 @@
 ///
 /// Optional environment variables:
 ///   - K8S_NAMESPACE: Kubernetes namespace (default: "bryzek-production")
+///   - REGISTRY: Container registry (default: "registry.digitalocean.com/bryzek")
 ///   - WEB_REPLICAS: Number of web replicas (default: 2)
 ///   - JOB_REPLICAS: Number of job replicas (default: 1)
 ///   - JAVA_AGENT: Path to Java agent JAR (e.g., /opt/newrelic/newrelic.jar)
@@ -29,7 +30,9 @@ local appPort = (read?("env:PORT") ?? throw("PORT environment variable is requir
 
 // Optional configuration with defaults
 local k8sNamespace = read?("env:K8S_NAMESPACE") ?? "bryzek-production"
-local registry = "registry.digitalocean.com/bryzek"
+// Account-scoped: k8s-deploy passes the app's DigitalOcean account registry
+// (env/digital-ocean-accounts.pkl).
+local registry = read?("env:REGISTRY") ?? "registry.digitalocean.com/bryzek"
 local version = read?("env:VERSION") ?? throw("VERSION environment variable is required")
 local webReplicas = (read?("env:WEB_REPLICAS") ?? "2").toInt()
 local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()

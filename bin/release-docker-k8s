@@ -26,6 +26,10 @@ if dk.nil?
   Util.exit_with_error("App #{app} has no docker_k8s config")
 end
 
+# Pin doctl + kubectl to the app's DO account (registry login, manifest apply,
+# rollout wait). The namespace stays explicit in DockerK8sConfig.
+DigitalOceanAccounts.activate_for_app!(config)
+
 source_dir = AppConfig.source_dir(app)
 unless File.directory?(source_dir)
   Util.exit_with_error("Source directory not found: #{source_dir}")

@@ -5,11 +5,15 @@
 #
 # This script automates the full deployment:
 #   1. Prompts to create a new tag if needed
-#   2. Looks up node IP from config
-#   3. Copies tarball to node via scp
-#   4. SSHs to node, extracts, and runs sem-apply
+#   2. Resolves every deployable built from the schema repo — platform-postgresql
+#      applies to BOTH platform (personal DO account) and playbook-api (playbook
+#      DO account) — so one release keeps every copy of the schema in sync
+#   3. For each target: copies the tarball to that account's bastion, SSHs in,
+#      extracts, and runs sem-apply against that target's database
 #
-# Replaces manual: sem-dist && scp && ssh && tar && sem-apply
+# A target whose account has no bastion, or whose app has no env files /
+# CONF_DB_PROD_URL yet, is skipped with a loud warning (the playbook side stays
+# in this state until WS2/WS3 of the account split provision it).
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'securerandom'
@@ -37,56 +41,26 @@ if !File.directory?(repo_dir)
     Util.exit_with_error("Repository directory not found: #{repo_dir}")
 end
 
-app_name = db_name.sub(/-postgresql$/, '')
-config = Config.load(app_name)
-scala_config = config.scala
-if scala_config.nil?
-    Util.exit_with_error("App #{app_name} does not have a scala config which is needed to find database configuration")
-end
+base_app = db_name.sub(/-postgresql$/, '')
 
-scala_env = scala_config.send(args.env)
-db = scala_env.database
-
-# Load global nodes and pick the first one for running migrations
-bastion_path = File.join(File.dirname(__FILE__), "../../env/bastion.txt")
-if !File.exist?(bastion_path)
-    Util.exit_with_error("Bastion config not found at #{bastion_path}")
+# Every deployable built from this repo with a database config gets the
+# migrations. Applying to a subset silently strands the other databases on an
+# old schema, so target selection is config-driven, never a flag.
+targets = Config.all.select { |a| a.scala && a.built_from?(base_app) }
+if targets.empty?
+    Util.exit_with_error("No app with a scala config is built from ~/code/#{base_app} — nothing to apply #{db_name} to")
 end
-node_ip = IO.read(bastion_path).strip
-if node_ip.empty?
-    Util.exit_with_error("No bastion node configured in #{bastion_path}")
-end
-
-# Get database password from environment variables
-env_vars = EnvironmentVariables.load(app_name, args.env)
-db_url = env_vars['CONF_DB_PROD_URL']
-if db_url.nil?
-    Util.exit_with_error("CONF_DB_PROD_URL not found in environment variables for #{app_name}")
-end
-
-# Extract password from URL (format: ?user=x&password=y&)
-password = nil
-if i = db_url.index("?")
-    params = db_url.slice(i+1, db_url.length)
-    params.split("&").each { |p|
-        k, v = p.split("=", 2)
-        if k == "password"
-            password = v
-            break
-        end
-    }
-end
-
-if password.nil?
-    Util.exit_with_error("Could not extract password from CONF_DB_PROD_URL")
-end
+# Primary (the app named after the repo) first, then the rest by name.
+targets = targets.sort_by { |a| [a.name == base_app ? 0 : 1, a.name] }
 
 puts ""
 puts Util.underline("Database Migration Deployment")
-puts "  DB:   #{db_name}"
-puts "  Env:  #{args.env}"
-puts "  Node: #{node_ip}"
-puts "  Host: #{db.name}@#{db.host}:#{db.port}"
+puts "  DB:     #{db_name}"
+puts "  Env:    #{args.env}"
+targets.each do |t|
+    db = t.scala.send(args.env).database
+    puts "  Target: #{t.name} (account #{t.digital_ocean_account}) -> #{db.name}@#{db.host}:#{db.port}"
+end
 puts ""
 
 tarball = nil
@@ -121,62 +95,96 @@ Dir.chdir(repo_dir) do
     end
 end
 
-# Step 2: Copy tarball to node
-puts "Copying #{tarball} to #{node_ip}"
-puts ""
-Util.run("scp #{tarball} root@#{node_ip}:~/")
-
-# Step 3: Create pgpass file locally and copy to node
-# Format: hostname:port:database:username:password
-pgpass_content = "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}"
-pgpass_remote = "/tmp/.pgpass-#{SecureRandom.hex(8)}"
-
-# Write pgpass to temp file and copy
-local_pgpass = "/tmp/.pgpass-local-#{$$}"
-File.write(local_pgpass, pgpass_content)
-File.chmod(0600, local_pgpass)
-
-puts "Copying credentials to #{node_ip}"
-Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
-File.delete(local_pgpass)
-
-# Step 4: Extract and apply on node
 tarball_name = File.basename(tarball)
 dir_name = tarball_name.sub('.tar.gz', '')
 
-deployed = false
+applied = []
+skipped = []
 
-begin
-  puts ""
-  puts "Ready to apply migrations on #{node_ip}"
-  proceed = auto_confirm?
-  puts "#{AUTO_CONFIRM_ENV}=1: proceeding with apply" if proceed
-  if proceed || Ask.for_boolean("Continue?")
+targets.each do |target|
+    account = DigitalOceanAccounts.for_label(target.digital_ocean_account)
+    db = target.scala.send(args.env).database
+
+    node_ip = account['bastion'].to_s.strip
+    if node_ip.empty?
+        Util.warning("Skipping #{target.name}: DO account '#{target.digital_ocean_account}' has no bastion configured in digital-ocean-accounts.pkl")
+        skipped << target.name
+        next
+    end
+
+    if !EnvironmentVariables.configured?(target.name, args.env)
+        Util.warning("Skipping #{target.name}: no env files under env/apps/#{target.name}/env")
+        skipped << target.name
+        next
+    end
+
+    password = EnvironmentVariables.db_password(target.name, args.env)
+    if password.nil?
+        Util.warning("Skipping #{target.name}: CONF_DB_PROD_URL not found in environment variables")
+        skipped << target.name
+        next
+    end
+
     puts ""
-    remote_cmd = [
-        "cd ~",
-        "tar --warning=no-unknown-keyword -xzf #{tarball_name}",
-        "cd #{dir_name}",
-        "chmod 600 #{pgpass_remote}",
-        "PGPASSFILE=#{pgpass_remote} sem-apply --set sslmode=require --host #{db.host} --port #{db.port} --user #{db.user} --name #{db.name}",
-        "rm -f #{pgpass_remote}"
-    ].join(" && ")
+    puts Util.underline("#{target.name}: #{db.name}@#{db.host}:#{db.port} via #{node_ip}")
 
-    Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+    # Copy tarball to this account's bastion
+    puts "Copying #{tarball} to #{node_ip}"
+    puts ""
+    Util.run("scp #{tarball} root@#{node_ip}:~/")
 
-    deployed = true
-  end
-ensure
-  puts ""
-  puts "Deleteing credentials file"
-  Util.run("ssh root@#{node_ip} 'rm -f #{pgpass_remote}'")
+    # Create pgpass file locally and copy to node
+    # Format: hostname:port:database:username:password
+    pgpass_content = "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}"
+    pgpass_remote = "/tmp/.pgpass-#{SecureRandom.hex(8)}"
+
+    local_pgpass = "/tmp/.pgpass-local-#{$$}"
+    File.write(local_pgpass, pgpass_content)
+    File.chmod(0600, local_pgpass)
+
+    puts "Copying credentials to #{node_ip}"
+    Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
+    File.delete(local_pgpass)
+
+    begin
+      puts ""
+      puts "Ready to apply migrations on #{node_ip} for #{target.name}"
+      proceed = auto_confirm?
+      puts "#{AUTO_CONFIRM_ENV}=1: proceeding with apply" if proceed
+      if proceed || Ask.for_boolean("Continue?")
+        puts ""
+        remote_cmd = [
+            "cd ~",
+            "tar --warning=no-unknown-keyword -xzf #{tarball_name}",
+            "cd #{dir_name}",
+            "chmod 600 #{pgpass_remote}",
+            "PGPASSFILE=#{pgpass_remote} sem-apply --set sslmode=require --host #{db.host} --port #{db.port} --user #{db.user} --name #{db.name}",
+            "rm -f #{pgpass_remote}"
+        ].join(" && ")
+
+        Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+
+        applied << target.name
+      else
+        skipped << target.name
+      end
+    ensure
+      puts ""
+      puts "Deleting credentials file"
+      Util.run("ssh root@#{node_ip} 'rm -f #{pgpass_remote}'")
+    end
 end
 
-if deployed
-  puts ""
-  puts "Migration deployment complete!"
-  puts ""
+puts ""
+if !applied.empty?
+  puts "Migration deployment complete: #{applied.join(", ")}"
+end
+if !skipped.empty?
+  Util.warning("Migrations NOT applied to: #{skipped.join(", ")} — those databases are behind until a later release applies them")
+end
+puts ""
 
+if applied.include?(base_app)
   # Build and push a fresh platformdb Docker image for the just-released schema,
   # then purge old registry images.  Best-effort only: the schema is already
   # deployed at this point, so any failure in the image build or purge must NOT
@@ -186,6 +194,9 @@ if deployed
   # `rescue => e` only catches StandardError and would let that SystemExit
   # propagate, killing release-db after a successful migration.
   if db_name == "platform-postgresql"
+    # The dev-template image lives in the primary target's account registry.
+    primary = targets.find { |t| t.name == base_app }
+    ENV['DIGITALOCEAN_CONTEXT'] = DigitalOceanAccounts.for_label(primary.digital_ocean_account)['doctl_context']
     tag = nil
     build_log = nil
     build_failed = false

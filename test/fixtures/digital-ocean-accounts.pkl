@@ -1,0 +1,31 @@
+/// Test fixture mirroring env/do-accounts.pkl — fake values, real shape.
+accounts = new Mapping<String, Account> {
+    ["personal"] = new Account {
+        email = "mbryzek@gmail.com"
+        doctl_context = "default"
+        kube_context = "do-nyc3-bryzek-cluster"
+        registry = "registry.digitalocean.com/bryzek"
+        namespace = "bryzek-production"
+        region = "nyc3"
+        bastion = "192.0.2.10"
+    }
+    ["playbook"] = new Account {
+        email = "mike@clubaid.ai"
+        doctl_context = "playbook"
+        kube_context = null
+        registry = "registry.digitalocean.com/playbook"
+        namespace = "playbook-production"
+        region = "nyc3"
+        bastion = null
+    }
+}
+
+class Account {
+    email: String(!isEmpty)
+    doctl_context: String(!isEmpty)
+    kube_context: String?
+    registry: String(!isEmpty)
+    namespace: String(!isEmpty)
+    region: String(!isEmpty)
+    bastion: String?
+}
