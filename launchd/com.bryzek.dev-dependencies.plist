@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly dependency upgrades: runs `dev dependencies upgrade` at 3:00 AM so
+  verified upgrade PRs are waiting in the morning.
+
+  Install:   cp launchd/com.bryzek.dev-dependencies.plist ~/Library/LaunchAgents/
+             launchctl load ~/Library/LaunchAgents/com.bryzek.dev-dependencies.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.bryzek.dev-dependencies.plist
+
+  Runs through a zsh login shell so PATH (homebrew, nvm's node for `claude`,
+  sbt, gh) matches an interactive terminal — launchd's own environment is
+  nearly empty. Logs to ~/Library/Logs/dev-dependencies/<date>.log.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bryzek.dev-dependencies</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>mkdir -p ~/Library/Logs/dev-dependencies &amp;&amp; ~/code/devops/bin/dev dependencies upgrade >> ~/Library/Logs/dev-dependencies/$(date +%Y%m%d).log 2>&amp;1</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

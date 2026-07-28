@@ -33,6 +33,7 @@ $LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
 require 'codegen/api_config'
 require 'codegen/graph'
 require 'codegen/sync'
+require 'dependencies/updates'
 
 # Single source of truth for each command's invocation line, keyed by the command
 # path. The same string is interpolated into the USAGE block below and shown
@@ -62,6 +63,8 @@ INVOCATIONS = {
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
+  "dependencies check"   => 'dependencies [check] [--app APP]...',
+  "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
@@ -224,6 +227,28 @@ USAGE = <<~USAGE
         --dry-run reports diffs without spawning Claude or opening PRs;
         --regen-only opens draft PRs but skips the review-completion workflow;
         --full-tests runs the full Scala suite instead of Test/compile.
+
+    #{INVOCATIONS["dependencies check"]}
+        Report outdated library dependencies for the scala repos (platform,
+        acumen, lib-util, lib-query, lib-cipher, lib-ai) without changing
+        anything. Clones each repo, runs sbt-updates (injected via
+        --addPluginSbtFile — nothing is committed to the repo), and prints the
+        allowed bumps plus anything held back by the denylist
+        (devops/lib/dependencies/denylist.yml) or skipped by the version
+        policy (stable, plain-numeric targets only; scalaVersion / sbt / plugin
+        versions are never touched). `check` is the default subcommand.
+
+    #{INVOCATIONS["dependencies upgrade"]}
+        The nightly upgrade pipeline (also fine to run by hand): detect as in
+        `check`, then for each repo with allowed bumps spawn a Claude session
+        that applies them, compiles, runs the repo's test suite (platform
+        against an isolated claude-db session DB), fixes any breakage, reverts
+        bumps it cannot make green (listed as "Deferred upgrades" in the PR
+        body with a paste-ready denylist entry), and opens a draft PR then
+        marks it ready. One PR per repo. Skips a repo that already has an open
+        dep-upgrade PR. Lib repo PRs bump the lib's own dependencies only —
+        releasing the lib stays manual (release-lib). Scheduled nightly via
+        launchd/com.bryzek.dev-dependencies.plist (see that file to install).
 
     scripts [list]
         List utility scripts in devops/scripts/ with their allowed targets and
@@ -425,7 +450,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen issues changelog features].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues changelog features].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -439,6 +464,7 @@ SUBCOMMANDS = {
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
+  "dependencies" => %w[check upgrade],
   "issues"       => %w[create claim show status snooze reconcile resume],
   "features"     => %w[list retire status reconcile cancel],
 }.freeze
@@ -3371,9 +3397,13 @@ end
 # URL of an already-open PR from a prior codegen sweep for this repo (its head
 # branch starts with the codegen-sync prefix), or nil. `gh` infers the repo
 # from the clone's origin.
-def open_codegen_pr(clone)
+def open_pr_with_prefix(clone, branch_prefix)
   _, out = run_step(["gh", "pr", "list", "--state", "open", "--limit", "200", "--json", "url,headRefName"], clone, false, +"")
-  Codegen::Sync.open_codegen_pr_url(out, CODEGEN_BRANCH_PREFIX)
+  Codegen::Sync.open_codegen_pr_url(out, branch_prefix)
+end
+
+def open_codegen_pr(clone)
+  open_pr_with_prefix(clone, CODEGEN_BRANCH_PREFIX)
 end
 
 # Deterministic, mechanical pass for one repo: branch, wipe generated files,
@@ -3510,7 +3540,7 @@ end
 # in the background, free to push/open a PR after we've already recorded
 # :needs_attention. Instead we open the pipes ourselves, capture the pid before
 # the blocking read, and on timeout kill the process directly.
-def spawn_claude(clone, prompt)
+def spawn_claude(clone, prompt, model: CODEGEN_CLAUDE_MODEL, timeout_secs: CODEGEN_CLAUDE_TIMEOUT_SECS)
   # pgroup: true makes the spawned `claude` process its own process group
   # leader (its pid == its pgid), so killing -pid on timeout signals the whole
   # group — including grandchildren like `gh pr create`/`git push` that could
@@ -3521,13 +3551,13 @@ def spawn_claude(clone, prompt)
   # blocked and the session does nothing (no commit, no push, no PR). It runs in
   # a throwaway clone and only ever pushes the codegen-sync branch, so the blast
   # radius is bounded.
-  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions", "--model", CODEGEN_CLAUDE_MODEL, prompt, chdir: clone, pgroup: true)
+  stdin, out_err, wait_thr = Open3.popen2e("claude", "--print", "--dangerously-skip-permissions", "--model", model, prompt, chdir: clone, pgroup: true)
   stdin.close
   pid = wait_thr.pid
 
   output =
     begin
-      Timeout.timeout(CODEGEN_CLAUDE_TIMEOUT_SECS) { out_err.read }
+      Timeout.timeout(timeout_secs) { out_err.read }
     rescue Timeout::Error
       begin
         Process.kill("TERM", -pid)
@@ -3537,7 +3567,7 @@ def spawn_claude(clone, prompt)
         Process.kill("KILL", -pid)
       rescue Errno::ESRCH
       end
-      return { status: :needs_attention, error: "claude --print timed out after #{CODEGEN_CLAUDE_TIMEOUT_SECS}s (clone left at #{clone}); process killed" }
+      return { status: :needs_attention, error: "claude --print timed out after #{timeout_secs}s (clone left at #{clone}); process killed" }
     ensure
       out_err.close unless out_err.closed?
     end
@@ -3685,6 +3715,191 @@ def cmd_codegen_sync(argv)
 
   print_codegen_summary(results)
   write_codegen_status_json(workdir, results)
+end
+
+# ---------- dependencies check / upgrade ----------
+#
+# Nightly (or manual) library-dependency freshness for the scala repos.
+# Detection is deterministic and token-free: sbt-updates injected via
+# --addPluginSbtFile (nothing committed to any repo) asks sbt's own resolvers
+# what versions exist. Upgrades are one Claude session per repo that must end
+# in a verified, review-ready PR. Design: ~/code/claude/plans/2026-07-28-dep-nightly-design.md
+
+DEPS_BRANCH_PREFIX = "dep-upgrade".freeze
+DEPS_CLAUDE_TIMEOUT_SECS = 90 * 60
+# Upgrades can require real code fixes (deprecations, API changes), unlike
+# codegen's mechanical work — use a stronger model than codegen's haiku.
+DEPS_CLAUDE_MODEL = "sonnet".freeze
+DEPS_DENYLIST_PATH = File.expand_path("../lib/dependencies/denylist.yml", __dir__)
+
+# Returns the app names to process: every `--app` given (validated, deduped),
+# or all known apps when none was passed.
+def parse_dependencies_args(argv, command_key)
+  apps = []
+  args = argv.dup
+  until args.empty?
+    case (a = args.shift)
+    when "--app"
+      v = args.shift or usage_exit("--app requires a value", example: usage_for(command_key))
+      unless Dependencies::Updates::APPS.key?(v)
+        usage_exit("unknown app '#{v}' (known: #{Dependencies::Updates::APPS.keys.join(', ')})", example: usage_for(command_key))
+      end
+      apps << v
+    else
+      usage_exit("unknown option #{a}", example: usage_for(command_key))
+    end
+  end
+  apps.empty? ? Dependencies::Updates::APPS.keys : apps.uniq
+end
+
+# Scratch workdir for this run. Deliberately SHORT (~/code/dep-up.<MMDD-HHMM>)
+# because sbt runs inside <workdir>/<repo> and macOS caps unix-socket paths
+# (sbt's boot server socket) at 104 bytes. Also writes the sbt-updates plugin
+# file the detection step injects. Returns [workdir, plugin_file].
+def dependencies_workdir
+  workdir = File.expand_path("~/code/dep-up.#{Time.now.strftime('%m%d-%H%M')}")
+  FileUtils.mkdir_p(workdir)
+  plugin_file = File.join(workdir, "sbt-updates.sbt")
+  File.write(plugin_file, Dependencies::Updates::SBT_UPDATES_PLUGIN + "\n")
+  [workdir, plugin_file]
+end
+
+# lib-util is on sbt 2, which cannot load the sbt-1 sbt-updates plugin; sbt 2
+# bundles a dependencyUpdates task itself, so run it bare there.
+def dependencies_sbt_cmd(clone, plugin_file)
+  props = File.join(clone, "project", "build.properties")
+  sbt_version = File.exist?(props) ? File.read(props)[/sbt\.version\s*=\s*(\S+)/, 1].to_s : ""
+  return ["sbt", "dependencyUpdates"] if sbt_version.start_with?("2")
+  ["sbt", "--addPluginSbtFile=#{plugin_file}", "dependencyUpdates"]
+end
+
+# Runs detection in an existing clone and applies policy + denylist. Requires
+# a POSITIVE success signal ([success] in sbt output), not just exit status —
+# an sbt run that dies early would otherwise read as "everything in sync".
+def dependencies_detect(app, clone, plugin_file, denylist)
+  ok, out = run_step(dependencies_sbt_cmd(clone, plugin_file), clone, false, +"")
+  unless ok && out.to_s.include?("[success]")
+    tail = out.to_s.split("\n").last(15).join("\n")
+    return { status: :error, error: "sbt dependencyUpdates failed:\n#{tail}" }
+  end
+  updates = Dependencies::Updates.parse_report(out)
+  Dependencies::Updates.apply_policy(updates, denylist, app).merge(status: :ok)
+end
+
+def cmd_dependencies_check(argv)
+  apps = parse_dependencies_args(argv, "dependencies check")
+  denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
+  workdir, plugin_file = dependencies_workdir
+  puts "Working in #{workdir}"
+  results = {}
+  apps.each do |app|
+    puts "  #{app}: cloning + running sbt dependencyUpdates…"
+    clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
+    results[app] =
+      if clone
+        dependencies_detect(app, clone, plugin_file, denylist)
+      else
+        { status: :error, error: "clone failed" }
+      end
+  end
+  puts ""
+  puts Util.underline("dependencies check")
+  results.each do |app, r|
+    puts "  #{app}:"
+    if r[:status] == :error
+      puts "    ERROR: #{r[:error]}"
+      next
+    end
+    if r[:bumps].empty? && r[:held].empty? && r[:skipped].empty?
+      puts "    up to date"
+      next
+    end
+    r[:bumps].each { |b| puts "    #{b[:group]}:#{b[:artifact]}  #{b[:current]} -> #{b[:target]}" }
+    r[:held].each { |h| puts "    held back: #{h[:group]}:#{h[:artifact]} #{h[:current]} -> #{h[:target]} (#{h[:reason]})" }
+    r[:skipped].each { |s| puts "    no stable target: #{s[:group]}:#{s[:artifact]} #{s[:current]} (candidates: #{s[:candidates].join(', ')})" }
+  end
+end
+
+# One repo, end to end: clone, gate on an already-open dep-upgrade PR, branch
+# off freshly-fetched origin/main, detect, and hand allowed bumps to a Claude
+# session that must end with a review-ready PR. Mirrors codegen's run_repo.
+def dependencies_upgrade_one(app, workdir, plugin_file, branch, denylist, &announce)
+  note = ->(msg) { announce&.call(msg) }
+  clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
+  return { status: :error, error: "clone failed" } unless clone
+
+  if (pr = open_pr_with_prefix(clone, DEPS_BRANCH_PREFIX))
+    return { status: :skipped, error: "an open dep-upgrade PR already exists (#{pr}) — merge or close it first" }
+  end
+
+  fetch_ok, fetch_out = run_step(["git", "fetch", "--depth=1", "origin", "main"], clone, false, +"")
+  return { status: :error, error: "fetch origin main failed: #{fetch_out}" } unless fetch_ok
+  branch_ok, branch_out = run_step(["git", "checkout", "-B", branch, "FETCH_HEAD"], clone, false, +"")
+  return { status: :error, error: "branch checkout failed: #{branch_out}" } unless branch_ok
+
+  note.call("running sbt dependencyUpdates…")
+  det = dependencies_detect(app, clone, plugin_file, denylist)
+  return det if det[:status] == :error
+  det[:held].each { |h| note.call("held back: #{h[:group]}:#{h[:artifact]} -> #{h[:target]} (#{h[:reason]})") }
+  if det[:bumps].empty?
+    return { status: :in_sync, held: det[:held] }
+  end
+
+  note.call("#{det[:bumps].length} bump(s) — handing to Claude (#{DEPS_CLAUDE_MODEL}, #{DEPS_CLAUDE_TIMEOUT_SECS / 60}m timeout)")
+  prompt = Dependencies::Updates.upgrade_prompt(app: app, branch: branch, bumps: det[:bumps])
+  spawn_claude(clone, prompt, model: DEPS_CLAUDE_MODEL, timeout_secs: DEPS_CLAUDE_TIMEOUT_SECS)
+    .merge(held: det[:held], bumps: det[:bumps])
+rescue => e
+  { status: :error, error: "dependencies_upgrade_one crashed: #{e.class}: #{e.message}" }
+end
+
+def cmd_dependencies_upgrade(argv)
+  apps = parse_dependencies_args(argv, "dependencies upgrade")
+  denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
+  run_id = Time.now.strftime("%Y%m%d-%H%M%S")
+  branch = "#{DEPS_BRANCH_PREFIX}-#{run_id}"
+  workdir, plugin_file = dependencies_workdir
+  puts "Working in #{workdir}"
+
+  # Serial on purpose: platform's suite is heavy, and parallel claude-db
+  # session DBs from sibling headless sessions have collided before.
+  results = {}
+  apps.each do |app|
+    puts "  #{app}:"
+    r = dependencies_upgrade_one(app, workdir, plugin_file, branch, denylist) { |msg| puts "    #{msg}" }
+    results[app] = r
+    report_repo_line(app, r[:status], r[:error] || r[:note], false)
+  end
+
+  puts ""
+  puts Util.underline("dependencies upgrade summary")
+  results.keys.sort.each do |app|
+    r = results[app]
+    line = +"  #{app} [#{r[:status]}]"
+    line << " #{r[:pr_url]}" if r[:pr_url]
+    line << " - #{r[:error]}" if r[:error]
+    held = r[:held] || []
+    line << " (held back: #{held.map { |h| "#{h[:group]}:#{h[:artifact]}" }.join(', ')})" unless held.empty?
+    puts line
+  end
+  write_dependencies_status_json(workdir, results)
+end
+
+# dependencies-status.json in workdir, same idea as codegen-sync-status.json:
+# machine-readable per-repo outcome for openclaw's morning briefing.
+def write_dependencies_status_json(workdir, results)
+  data = results.keys.sort.map do |app|
+    r = results[app]
+    {
+      repo: app,
+      status: r[:status].to_s,
+      pr_url: r[:pr_url],
+      error: r[:error],
+      bumps: (r[:bumps] || []).map { |b| "#{b[:group]}:#{b[:artifact]} #{b[:current]} -> #{b[:target]}" },
+      held: (r[:held] || []).map { |h| "#{h[:group]}:#{h[:artifact]} (#{h[:reason]})" },
+    }
+  end
+  File.write(File.join(workdir, "dependencies-status.json"), JSON.pretty_generate(data))
 end
 
 def release_one(name)
@@ -5428,6 +5643,13 @@ when "codegen"
   case sub
   when "sync" then cmd_codegen_sync(argv)
   else             unknown("codegen subcommand", sub, SUBCOMMANDS["codegen"])
+  end
+when "dependencies"
+  sub = resolve_subcommand(argv, default: "check")
+  case sub
+  when "check"   then cmd_dependencies_check(argv)
+  when "upgrade" then cmd_dependencies_upgrade(argv)
+  else                unknown("dependencies subcommand", sub, SUBCOMMANDS["dependencies"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")

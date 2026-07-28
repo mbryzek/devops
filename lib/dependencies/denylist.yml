@@ -1,0 +1,12 @@
+# Dependencies that `dev dependencies` must NOT auto-upgrade.
+#
+# Entry shape (artifact + reason required):
+#   - artifact: com.google.inject:guice   # group:artifact
+#     reason: "6.x breaks Play DI, 2026-03"
+#     versions: ">= 6.0.0"                # optional: ">= X", "> X", "= X", or an exact version; omit = all versions
+#     apps: [platform]                    # optional: limit to specific repos; omit = all repos
+#
+# Held-back bumps are reported by `dev dependencies check` and in the nightly
+# summary, so nothing pinned here silently disappears. When an upgrade session
+# defers a bump, its PR body includes a ready-to-paste entry for this file.
+deny: []
