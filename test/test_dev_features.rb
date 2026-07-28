@@ -174,11 +174,44 @@ class TestDevFeatures < Minitest::Test
   # the "waiting"/"processed" lines belong to.
   def test_reconcile_titles_its_output
     out, = capture_io do
-      with_stubbed_api("GET /dev/feature-removals?processed=false&limit=100" => [],
+      with_stubbed_api("GET /dev/feature-removals?processed=false&limit=100" => [removal(apps: [])],
                        "GET /dev/feature-removals?processed=true&limit=100" => []) do
         cmd_features_reconcile([])
       end
     end
     assert_match(/^Feature-flag removals awaiting cleanup\b/, out)
+    assert_match(/^  waiting  playbook\/revenue_business_line/, out)
+  end
+
+  # Nothing outstanding is the normal state between releases. A header plus
+  # "0 processed, 0 purged, 0 outstanding" is a whole section saying nothing, in
+  # the middle of release output — so the sweep stays silent instead.
+  def test_reconcile_prints_nothing_when_there_is_nothing_to_do
+    out, = capture_io do
+      with_stubbed_api("GET /dev/feature-removals?processed=false&limit=100" => [],
+                       "GET /dev/feature-removals?processed=true&limit=100" => []) do
+        cmd_features_reconcile([])
+      end
+    end
+    assert_equal "", out
+  end
+
+  # ---------- features_reconcile_summary ----------
+
+  def test_summary_is_omitted_when_nothing_moved
+    assert_nil features_reconcile_summary(processed: 0, purged: 0, outstanding: 0, apply: true)
+    # Still nil with removals outstanding: the per-removal "waiting" lines above
+    # already say which ones and what they are waiting on.
+    assert_nil features_reconcile_summary(processed: 0, purged: 0, outstanding: 3, apply: true)
+  end
+
+  def test_summary_counts_when_something_moved
+    assert_equal "2 processed, 1 purged, 5 outstanding.",
+                 features_reconcile_summary(processed: 2, purged: 1, outstanding: 5, apply: true)
+  end
+
+  def test_summary_is_conditional_in_dry_run
+    assert_equal "2 would process, 0 would purge, 5 outstanding.",
+                 features_reconcile_summary(processed: 2, purged: 0, outstanding: 5, apply: false)
   end
 end

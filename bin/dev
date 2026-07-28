@@ -1648,9 +1648,25 @@ def require_playbook_session!(use_localhost)
   Util.exit_with_error("No playbook session#{use_localhost ? ' (localhost)' : ''}. Run `dev auth login --app playbook#{use_localhost ? ' --localhost' : ''}` first.")
 end
 
-# Display identity of an issue: the per-tenant number, e.g. ISS-034.
+# Display identity of an issue: the per-tenant number, e.g. ISS-034. Plain text —
+# it also lands in tab titles and in the markdown prompt bodies, which must never
+# carry terminal escapes. Use issue_link for output a human reads in a terminal.
 def issue_label(issue)
   "ISS-#{issue['number']}"
+end
+
+# Where an issue lives in the admin console. admin.clubaid.co is the canonical
+# route; admin.plybk.us is a mirror of the same app during the rebrand.
+ISSUE_ADMIN_BASE_URL = "https://admin.clubaid.co".freeze
+
+def issue_url(issue)
+  "#{ISSUE_ADMIN_BASE_URL}/admin/issues/#{issue['number']}"
+end
+
+# issue_label as a clickable link to the admin console. Degrades to the plain
+# label when stdout is not a terminal.
+def issue_link(issue)
+  Util.hyperlink(issue_label(issue), issue_url(issue))
 end
 
 # Human label for the club an issue belongs to. Child clubs are named bare
@@ -2490,6 +2506,15 @@ def issue_fix_deployment(issue)
   (issue["fixes"] || []).last&.fetch("deployment", nil)
 end
 
+# Tail line for `dev issues reconcile`, or nil when there is nothing worth
+# summarizing. Counts are only news when something actually moved: with no
+# transitions the per-issue lines above already say everything, and a
+# "0 deployed, N skipped" line just pads the release output.
+def issues_reconcile_summary(deployed:, skipped:, total:, apply:)
+  return nil if deployed.zero?
+  "#{deployed} #{apply ? 'deployed' : 'would deploy'}, #{skipped} skipped, #{total} fixed total."
+end
+
 # Flip `fixed` issues to `deployed` once their target app has released past the fix.
 # Read-only against the deploy registry (the same live-version signal `dev deploy status`
 # uses) — the release pipeline is never touched. Dry-run by default; --apply records
@@ -2508,10 +2533,10 @@ def cmd_issues_reconcile(args)
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
     fixed = ApiClient.request(endpoint, :get, issues_list_path(statuses: "fixed")) || []
-    if fixed.empty?
-      puts "No fixed issues awaiting deploy."
-      return
-    end
+    # Silent on the zero state. This runs after every release, where "nothing to
+    # do" is the common case and a "nothing to do" line is pure noise. `dev issues
+    # list --status fixed` is the human-facing view.
+    return if fixed.empty?
 
     puts ""
     puts "Fixed issues awaiting deploy (advance to deployed once their app has released):"
@@ -2521,7 +2546,7 @@ def cmd_issues_reconcile(args)
     fixed.each do |c|
       deployment = issue_fix_deployment(c)
       if deployment.nil?
-        puts "  skip #{issue_label(c)}: no deploy info (document fix — advance manually)"
+        puts "  skip #{issue_link(c)}: no deploy info (document fix — advance manually)"
         skipped += 1
         next
       end
@@ -2531,7 +2556,7 @@ def cmd_issues_reconcile(args)
         app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
       end
       if info[:error]
-        puts "  skip #{issue_label(c)} (#{app_name}): #{info[:error]}"
+        puts "  skip #{issue_link(c)} (#{app_name}): #{info[:error]}"
         skipped += 1
         next
       end
@@ -2542,18 +2567,21 @@ def cmd_issues_reconcile(args)
           ApiClient.request(endpoint, :put,
                             issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
                             body: { status: "deployed", comment: "Deployed in #{app_name} #{live}" })
-          puts "  deployed #{issue_label(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
+          puts "  deployed #{issue_link(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
         else
-          puts "  would deploy #{issue_label(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
+          puts "  would deploy #{issue_link(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
         end
         deployed += 1
       else
-        puts "  waiting  #{issue_label(c)} (#{app_name}: still #{live})"
+        puts "  waiting  #{issue_link(c)} (#{app_name}: still #{live})"
       end
     end
 
-    puts ""
-    puts "#{deployed} #{apply ? 'deployed' : 'would deploy'}, #{skipped} skipped, #{fixed.length} fixed total."
+    summary = issues_reconcile_summary(deployed: deployed, skipped: skipped, total: fixed.length, apply: apply)
+    if summary
+      puts ""
+      puts summary
+    end
     puts "Re-run with --apply to record the transitions." if !apply && deployed > 0
   end
 end
@@ -2815,6 +2843,15 @@ def cmd_features_status(args)
   end
 end
 
+# Tail line for `dev features reconcile`, or nil when nothing moved. Same rule as
+# issues_reconcile_summary: with no processing and no purging the per-removal
+# "waiting" lines already carry the state, so the counts are noise.
+def features_reconcile_summary(processed:, purged:, outstanding:, apply:)
+  return nil if processed.zero? && purged.zero?
+  verb = apply ? "processed" : "would process"
+  "#{processed} #{verb}, #{purged} #{apply ? 'purged' : 'would purge'}, #{outstanding} outstanding."
+end
+
 def cmd_features_reconcile(args)
   rest, _app, use_localhost = parse_common_flags(args)
   apply = false
@@ -2828,21 +2865,23 @@ def cmd_features_reconcile(args)
 
   handle_errors do
     outstanding = ApiClient.request(endpoint, :get, "#{FEATURE_REMOVALS_PATH}?processed=false&limit=100") || []
-    puts ""
-    puts "Feature-flag removals awaiting cleanup (process once every app is past the flag, then purge):"
+    # Buffered so the section header is only printed when there is something under
+    # it. Between releases there usually is not, and a header over a "0 processed,
+    # 0 purged, 0 outstanding" line is the whole section saying nothing.
+    lines = []
     processed_count = 0
     outstanding.each do |r|
       state = feature_removal_state(registry, cache, r)
       unless state[:ready]
         waiting = state[:pairs].reject { |p| p[:confirmed] }.map { |p| p[:detail] }.join("; ")
-        puts "  waiting  #{feature_label(r)} (#{waiting})"
+        lines << "  waiting  #{feature_label(r)} (#{waiting})"
         next
       end
       if apply
         ApiClient.request(endpoint, :post, feature_removal_path(r, "/process"))
-        puts "  processed #{feature_label(r)} (flag row soft deleted)"
+        lines << "  processed #{feature_label(r)} (flag row soft deleted)"
       else
-        puts "  would process #{feature_label(r)}"
+        lines << "  would process #{feature_label(r)}"
       end
       processed_count += 1
     end
@@ -2862,16 +2901,24 @@ def cmd_features_reconcile(args)
       end
       if apply
         ApiClient.request(endpoint, :post, feature_removal_path(r, "/purge"))
-        puts "  purged #{feature_label(r)} (rollback window closed)"
+        lines << "  purged #{feature_label(r)} (rollback window closed)"
       else
-        puts "  would purge #{feature_label(r)}"
+        lines << "  would purge #{feature_label(r)}"
       end
       purged_count += 1
     end
 
+    return if lines.empty?
+
     puts ""
-    verb = apply ? "processed" : "would process"
-    puts "#{processed_count} #{verb}, #{purged_count} #{apply ? 'purged' : 'would purge'}, #{outstanding.length} outstanding."
+    puts "Feature-flag removals awaiting cleanup (process once every app is past the flag, then purge):"
+    lines.each { |l| puts l }
+    summary = features_reconcile_summary(processed: processed_count, purged: purged_count,
+                                         outstanding: outstanding.length, apply: apply)
+    if summary
+      puts ""
+      puts summary
+    end
     if !apply && (processed_count > 0 || purged_count > 0)
       puts "Re-run with --apply to record the changes."
     end

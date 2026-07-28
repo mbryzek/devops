@@ -87,6 +87,27 @@ class TestDevIssues < Minitest::Test
     assert_equal "ISS-034", issue_label(graph_issue)
   end
 
+  # ---- issue_url / issue_link ----
+
+  def test_issue_url_points_at_the_admin_console
+    assert_equal "https://admin.clubaid.co/admin/issues/034", issue_url(graph_issue)
+  end
+
+  # capture_io redirects $stdout to a StringIO, which is not a tty — the same as
+  # a release log or a pipe. The label must come through with no escape bytes.
+  def test_issue_link_is_plain_text_when_stdout_is_not_a_terminal
+    link = nil
+    capture_io { link = issue_link(graph_issue) }
+    assert_equal "ISS-034", link
+  end
+
+  def test_hyperlink_wraps_the_text_in_osc8_on_a_terminal
+    # Util.hyperlink is what makes the label clickable; drive it directly rather
+    # than faking a tty, since $stdout.tty? is the only thing issue_link adds.
+    out = with_tty_stdout { Util.hyperlink("ISS-034", "https://example.com/x") }
+    assert_equal "\e]8;;https://example.com/x\e\\ISS-034\e]8;;\e\\", out
+  end
+
   # ---- issue_render_item ----
 
   def test_render_item_with_club_and_attachment
@@ -1227,6 +1248,32 @@ class TestDevIssues < Minitest::Test
     end
     assert_match(/^Fixed issues awaiting deploy\b/, out)
     assert_match(/skip ISS-034/, out)
+    # Nothing transitioned, so the counts add nothing the skip line did not say.
+    refute_match(/fixed total/, out)
+  end
+
+  # Nothing fixed is the normal state between releases; the sweep says nothing
+  # rather than printing a "nothing to do" line into every release.
+  def test_reconcile_prints_nothing_when_no_issues_are_awaiting_deploy
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: 'fixed')}" => []) do
+        cmd_issues_reconcile([])
+      end
+    end
+    assert_equal "", out
+  end
+
+  # ---- issues_reconcile_summary ----
+
+  def test_issues_summary_is_omitted_when_nothing_was_advanced
+    assert_nil issues_reconcile_summary(deployed: 0, skipped: 2, total: 2, apply: true)
+  end
+
+  def test_issues_summary_counts_when_something_advanced
+    assert_equal "1 deployed, 2 skipped, 3 fixed total.",
+                 issues_reconcile_summary(deployed: 1, skipped: 2, total: 3, apply: true)
+    assert_equal "1 would deploy, 2 skipped, 3 fixed total.",
+                 issues_reconcile_summary(deployed: 1, skipped: 2, total: 3, apply: false)
   end
 
   # ---- registration ----

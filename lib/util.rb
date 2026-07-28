@@ -176,6 +176,15 @@ module Util
         "#{text}\n#{'=' * text.length}"
     end
 
+    # Clickable terminal hyperlink (OSC 8): the text renders normally and opens
+    # the url on click in terminals that support it. Returns the bare text when
+    # stdout is not a terminal, so piped output and release logs stay free of
+    # escape sequences.
+    def Util.hyperlink(text, url)
+      return text unless $stdout.tty?
+      "\e]8;;#{url}\e\\#{text}\e]8;;\e\\"
+    end
+
     def Util.installed?(cmd)
       system("which #{cmd} > /dev/null 2>&1") ? true : false
     end
