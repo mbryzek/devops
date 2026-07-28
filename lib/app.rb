@@ -3,11 +3,14 @@
 require 'json'
 
 class App
-  attr_accessor :name, :repo, :scala, :port, :elm, :sveltekit, :docker_k8s
+  attr_accessor :name, :repo, :scala, :port, :elm, :sveltekit, :docker_k8s, :digital_ocean_account
 
   def initialize(json_data)
     @name = json_data['name']
     @repo = json_data['repo']
+    # Default matches the pkl schema; the fallback covers dist json generated
+    # before the field existed.
+    @digital_ocean_account = json_data['digital_ocean_account'] || 'personal'
     @scala = json_data['scala'] ? ScalaConfig.new(json_data['scala']) : nil
     @port = json_data['port']
     @elm = json_data['elm'] ? ElmConfig.new(json_data['elm']) : nil
@@ -21,6 +24,14 @@ class App
   # rather than off `name`.
   def repo_name
     @repo.nil? || @repo.empty? ? @name : @repo.split("/").last
+  end
+
+  # True when this deployable is built from the ~/code/<repo_base> checkout.
+  # More than one deployable can share a repo — platform and playbook-api are
+  # the same codebase deployed to different DO accounts — and release-db uses
+  # this to find every database a schema repo must be applied to.
+  def built_from?(repo_base)
+    repo_name == repo_base
   end
 end
 

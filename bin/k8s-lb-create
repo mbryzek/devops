@@ -13,11 +13,9 @@
 #   k8s-lb-create --app platform --cert-id <cert-id>
 #   k8s-lb-create --app acumen --cert-id <cert-id> --lb-name custom-lb-name
 
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'json'
 require 'optparse'
-
-NAMESPACE = ENV['K8S_NAMESPACE'] || 'bryzek-production'
-REGION = ENV['DO_REGION'] || 'nyc3'
 
 options = {}
 OptionParser.new do |opts|
@@ -32,9 +30,15 @@ raise "--app is required" unless options[:app]
 raise "--cert-id is required" unless options[:cert_id]
 
 app = options[:app]
+
+# Pin doctl + kubectl to the app's DO account; namespace and region are
+# account-scoped defaults (digital-ocean-accounts.pkl).
+account = DigitalOceanAccounts.activate_for_app!(Config.load(app))
+NAMESPACE = ENV['K8S_NAMESPACE'] || account['namespace']
+
 cert_id = options[:cert_id]
 lb_name = options[:lb_name] || "#{app}-lb"
-region = options[:region] || REGION
+region = options[:region] || ENV['DO_REGION'] || account['region']
 svc_name = "#{app}-web"
 
 puts "Creating load balancer '#{lb_name}' for #{app}..."

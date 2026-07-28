@@ -1,0 +1,17 @@
+/// playbook-api application configuration — the platform codebase deployed to
+/// the Playbook Systems DO account (digital_ocean_account = "playbook" in
+/// env/apps/playbook-api/config.pkl), serving only the playbook tenant.
+///
+/// Load balancer managed via doctl (create at WS2 of the account split):
+///   Name: playbook-api-lb
+///   Hostname: api.plybk.us
+///   Certificate: TBD — uploaded to the playbook DO account when provisioned
+///
+/// No javaAgent yet: the New Relic account decision for Playbook Systems is
+/// pending (WS3 of the account split).
+
+module playbookApi
+
+appName = "playbook-api"
+appPort = 9300
+webMemory = "4400Mi"

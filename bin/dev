@@ -4130,7 +4130,11 @@ end
 
 # ---------- config drift ----------
 
-K8S_NAMESPACE = 'bryzek-production'
+# Namespace + kube context are account-scoped: resolve (and pin kubectl to)
+# the app's DO account, returning that account's namespace.
+def k8s_namespace_for(app)
+  DigitalOceanAccounts.activate_for_app!(Config.load(app))['namespace']
+end
 
 def k8s_apps(app_filter)
   registry = Work::Registry.load
@@ -4148,7 +4152,7 @@ end
 
 def live_config_vars(app)
   out, status = Open3.capture2("kubectl", "get", "configmap", "#{app}-config",
-                                "-n", K8S_NAMESPACE, "-o", "json")
+                                "-n", k8s_namespace_for(app), "-o", "json")
   return nil unless status.success?
   JSON.parse(out)["data"] || {}
 end
@@ -4209,8 +4213,9 @@ def cmd_config_rollout(args)
 
     puts ""
     puts Util.underline("#{app}: rollout restart")
-    Util.run("kubectl rollout restart statefulset,deployment -l app=#{app} -n #{K8S_NAMESPACE}")
-    Util.run("kubectl rollout status statefulset,deployment -l app=#{app} -n #{K8S_NAMESPACE} --timeout=5m")
+    ns = k8s_namespace_for(app)
+    Util.run("kubectl rollout restart statefulset,deployment -l app=#{app} -n #{ns}")
+    Util.run("kubectl rollout status statefulset,deployment -l app=#{app} -n #{ns} --timeout=5m")
   end
 end
 

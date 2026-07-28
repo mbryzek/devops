@@ -18,6 +18,12 @@ class Application {
     /// GitHub repository in "owner/name" form. Null = derive from `name`.
     repo: String?
 
+    /// DigitalOcean account label (a stable identifier like "personal" or
+    /// "playbook", NOT a login email). Resolved to doctl context, kube context,
+    /// registry, namespace, region, and bastion via the env repo's
+    /// digital-ocean-accounts.pkl — the same label pattern as CloudflareDeploy.
+    digital_ocean_account: String(!isEmpty) = "personal"
+
     /// Mark a project as ignored — excluded from version checks and deploy
     /// tracking even if it has a tenant id or prod_domain set. Use for archived
     /// or non-HTTP-deployable apps.

@@ -21,7 +21,6 @@ require 'fileutils'
 
 DEVOPS_DIR = File.expand_path(File.join(File.dirname(__FILE__), '..'))
 TEMPLATE_PATH = File.join(DEVOPS_DIR, 'templates/Dockerfile.scala-play')
-REGISTRY = "registry.digitalocean.com/bryzek"
 TMP_DIR = "/tmp/k8s-build"
 
 class K8sBuild
@@ -38,6 +37,10 @@ class K8sBuild
     if @config.scala.nil?
       Util.exit_with_error("App #{@app} does not have a scala config")
     end
+
+    # Registry + doctl context come from the app's DO account. No kubectl here:
+    # an image can be built and pushed before the account's cluster exists.
+    @account = DigitalOceanAccounts.activate_for_app!(@config, require_kube: false)
   end
 
   def run
@@ -162,7 +165,7 @@ class K8sBuild
   end
 
   def image_name
-    "#{REGISTRY}/#{@app}:#{@tag}"
+    "#{@account['registry']}/#{@app}:#{@tag}"
   end
 end
 

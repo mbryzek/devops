@@ -4,10 +4,9 @@
 #
 # Usage: k8s-lb-configure --app platform --cert-id <cert-id>
 
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'json'
 require 'optparse'
-
-NAMESPACE = ENV['K8S_NAMESPACE'] || 'bryzek-production'
 
 options = {}
 OptionParser.new do |opts|
@@ -21,6 +20,11 @@ raise "--app is required" unless options[:app]
 raise "--cert-id is required" unless options[:cert_id]
 
 app = options[:app]
+
+# Pin doctl + kubectl to the app's DO account; namespace is the account default.
+account = DigitalOceanAccounts.activate_for_app!(Config.load(app))
+NAMESPACE = ENV['K8S_NAMESPACE'] || account['namespace']
+
 cert_id = options[:cert_id]
 wait_time = options[:wait] || 90
 lb_name = "#{app}-lb"
@@ -83,7 +87,7 @@ health_check = "protocol:http,port:#{http_nodeport},path:/_internal_/healthcheck
 cmd = [
   "doctl compute load-balancer update #{lb_id}",
   "--name #{lb_name}",
-  "--region nyc3",
+  "--region #{account['region']}",
   "--droplet-ids #{droplet_ids}",
   "--forwarding-rules \"#{forwarding_rules}\"",
   "--health-check \"#{health_check}\"",
