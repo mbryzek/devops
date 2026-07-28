@@ -15,6 +15,18 @@ if pwd.end_with?("-postgresql")
   return
 end
 
+# Libraries (lib-util, lib-query, lib-cipher, lib-ai) have no app in the devops
+# config — the `lib-` directory prefix is the tell, same one release-lib itself
+# uses. Without this, `release` from a library checkout died in generate-json
+# with "Missing required argument(s): app".
+#
+# passthrough: release-lib prompts for confirmation and shells out to GPG, so it
+# must keep the terminal even if a parent enabled quiet mode.
+if File.basename(pwd).start_with?("lib-")
+  Util.run File.join(dir, "release-lib"), passthrough: true
+  return
+end
+
 args = Args.parse(ARGV, ["app"])
 config = Config.load(args.app)
 
