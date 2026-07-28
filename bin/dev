@@ -53,6 +53,7 @@ INVOCATIONS = {
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
+  "queries top"         => 'queries [top] [--days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "deploy status"       => 'deploy [status] [--app APP]',
   "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
@@ -144,6 +145,13 @@ USAGE = <<~USAGE
         Check invariants across endpoints. `check` is the default when no
         subcommand is given. Shows up to N examples per failure (default 10),
         or all with --all-examples.
+
+    #{INVOCATIONS["queries top"]}
+        Rank the queries the platform ran, with the code that issued each, from
+        the samples the platform records every flush window. `top` is the default
+        when no subcommand is given. Sorted by TOTAL database time, which is what
+        surfaces a query whose modest mean is multiplied by a large call count;
+        --by-mean sorts by average for the opposite shape.
 
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
@@ -4943,21 +4951,21 @@ end
 # ---------- queries ----------
 
 # Rank the queries the platform ran, from the samples core.actors.QueryStatsActor
-# writes every flush window into query_stats.query_samples.
+# writes every flush window.
 #
 # Sorts by TOTAL time by default, not mean. That ordering is the whole point: the
 # incremental sales_details sync that turned out to be the largest consumer on the
 # database had an unremarkable 698ms mean and only stood out once multiplied by
-# 25,368 calls. `--by-waste` sorts by ms per call instead, which surfaces the
-# opposite shape -- a query that is individually slow but rarely run.
+# 25,368 calls. --by-mean sorts by average instead, which surfaces the opposite
+# shape -- a query that is individually slow but rarely run.
 #
-# Reads through the same `db exec` path as `dev scripts run`, so production keeps
-# its interactive confirmation and nothing here talks to a database directly.
+# Reads through /dev/query/stats like `dev invariants check` does, so nothing here
+# talks to a database directly and the endpoint applies its own platform-admin auth.
 def cmd_queries_top(args)
   limit = 25
   days = 7
-  order = "total_ms desc"
-  env = "local"
+  sort = "total_ms"
+  use_localhost = false
   i = 0
   while i < args.length
     case args[i]
@@ -4967,40 +4975,39 @@ def cmd_queries_top(args)
     when "--days"
       days = Integer(args[i + 1] || usage_exit("--days requires a value", example: usage_for("queries top")))
       i += 1
-    when "--by-waste" then order = "(total_ms / greatest(calls, 1)) desc"
-    when "--by-calls" then order = "calls desc"
-    when "--prod", "--production" then env = "production"
-    when "--dev", "--development" then env = "development"
-    when "--localhost", "--local" then env = "local"
+    when "--by-mean"  then sort = "mean_ms"
+    when "--by-calls" then sort = "calls"
+    when "--localhost", "--local" then use_localhost = true
     else usage_exit("Unknown flag: #{args[i]}", example: usage_for("queries top"))
     end
     i += 1
   end
 
-  # Samples are per node per window, so a query's real cost is the sum across both.
-  # Grouping here rather than reporting rows keeps one query as one line.
-  sql = <<~SQL
-    select sum(calls) as calls,
-           sum(total_ms) as total_ms,
-           max(max_ms) as max_ms,
-           sum(total_ms) / greatest(sum(calls), 1) as mean_ms,
-           coalesce(max(call_site), '(never got hot)') as call_site,
-           left(sql, 120) as sql
-      from query_stats.query_samples
-     where captured_at > now() - interval '#{days} days'
-     group by left(sql, 120)
-     order by #{order}
-     limit #{limit};
-  SQL
+  endpoint = platform_endpoint(use_localhost)
+  handle_errors do
+    stats = ApiClient.request(
+      endpoint, :get,
+      "/dev/query/stats?days=#{days}&sort=#{sort}&limit=#{limit}&offset=0"
+    )
 
-  Dir.mktmpdir("dev-queries") do |dir|
-    path = File.join(dir, "query-stats-top.sql")
-    File.write(path, sql)
-    if env == "local"
-      run_local_sql(path)
-    else
-      run_remote_sql(path, env, { "app" => "platform" })
+    if stats.nil? || stats.empty?
+      puts "No query samples in the last #{days} day(s)."
+      next
     end
+
+    puts ""
+    puts Util.underline("Top #{stats.length} queries by #{sort} (last #{days} day(s))")
+    puts ""
+    printf("%12s  %10s  %9s  %9s  %s\n", "TOTAL MS", "CALLS", "MEAN MS", "MAX MS", "CALL SITE")
+    stats.each do |s|
+      printf(
+        "%12d  %10d  %9d  %9d  %s\n",
+        s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
+        s["call_site"] || "(never got hot)"
+      )
+      puts "              #{slow_routes_truncate(s['sql'].to_s.gsub(/\s+/, ' '), 110)}"
+    end
+    puts ""
   end
 end
 
