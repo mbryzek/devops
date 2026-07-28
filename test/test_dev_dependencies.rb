@@ -167,8 +167,8 @@ class TestDependenciesPrompt < Minitest::Test
     assert_includes p, "worktree"
   end
 
-  def test_lib_util_prompt_uses_testquick
-    p = Dependencies::Updates.upgrade_prompt(app: "lib-util", branch: "b", bumps: [])
+  def test_lib_cipher_prompt_uses_testquick
+    p = Dependencies::Updates.upgrade_prompt(app: "lib-cipher", branch: "b", bumps: [])
     assert_includes p, "sbt testQuick"
   end
 end
@@ -202,27 +202,30 @@ class TestDependenciesArgs < Minitest::Test
 end
 
 class TestDependenciesSbtCmd < Minitest::Test
-  def test_sbt1_injects_plugin_file
+  def test_sbt1_injects_sbt1_plugin_file
     Dir.mktmpdir do |clone|
       FileUtils.mkdir_p(File.join(clone, "project"))
-      File.write(File.join(clone, "project", "build.properties"), "sbt.version=1.9.9\n")
-      cmd = dependencies_sbt_cmd(clone, "/tmp/p.sbt")
-      assert_includes cmd, "--addPluginSbtFile=/tmp/p.sbt"
+      File.write(File.join(clone, "project", "build.properties"), "sbt.version=1.12.11\n")
+      cmd = dependencies_sbt_cmd(clone, "/wd")
+      assert_includes cmd, "--addPluginSbtFile=/wd/sbt-updates.sbt"
     end
   end
 
-  def test_sbt2_runs_bare
+  # sbt 2 (lib-cipher) has no built-in dependencyUpdates and needs the
+  # sbt-updates_sbt2_3 release — a different plugin file, still injected.
+  def test_sbt2_injects_sbt2_plugin_file
     Dir.mktmpdir do |clone|
       FileUtils.mkdir_p(File.join(clone, "project"))
-      File.write(File.join(clone, "project", "build.properties"), "sbt.version=2.0.0-RC4\n")
-      assert_equal %w[sbt dependencyUpdates], dependencies_sbt_cmd(clone, "/tmp/p.sbt")
+      File.write(File.join(clone, "project", "build.properties"), "sbt.version=2.0.1\n")
+      cmd = dependencies_sbt_cmd(clone, "/wd")
+      assert_includes cmd, "--addPluginSbtFile=/wd/sbt-updates-sbt2.sbt"
     end
   end
 
   def test_missing_build_properties_defaults_to_sbt1
     Dir.mktmpdir do |clone|
-      cmd = dependencies_sbt_cmd(clone, "/tmp/p.sbt")
-      assert_includes cmd, "--addPluginSbtFile=/tmp/p.sbt"
+      cmd = dependencies_sbt_cmd(clone, "/wd")
+      assert_includes cmd, "--addPluginSbtFile=/wd/sbt-updates.sbt"
     end
   end
 end

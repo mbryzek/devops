@@ -44,7 +44,7 @@ night). If you'd rather get one clean message with your coffee:
 ```bash
 openclaw cron add "dep-upgrade-briefing" \
   --cron "30 7 * * *" --tz America/New_York \
-  --message 'Read the newest ~/code/dep-up.*/dependencies-status.json (mtime, today only — say "no run happened" if none is from today). Summarize per repo: PR opened (give the GitHub URL and the matching https://reviewable.io/reviews/mbryzek/<repo>/<pr> link), in sync, held back (with denylist reason), skipped, or error. Lead with the PRs that need my review. Keep it short.' \
+  --message 'Read the newest ~/code/ai/dep-up.*/dependencies-status.json (mtime, today only — say "no run happened" if none is from today). Summarize per repo: PR opened (give the GitHub URL and the matching https://reviewable.io/reviews/mbryzek/<repo>/<pr> link), in sync, held back (with denylist reason), skipped, or error. Lead with the PRs that need my review. Keep it short.' \
   --tools exec,read \
   --announce --best-effort-deliver \
   --description "Morning summary of last night's dependency-upgrade run"
@@ -63,5 +63,5 @@ Notes:
 - The pipeline is self-gating: a repo with an open `dep-upgrade-*` PR is
   skipped, so an extra manual `cron run` can't stack duplicate PRs.
 - Machine-readable results: `dependencies-status.json` in that run's
-  `~/code/dep-up.<MMDD-HHMM>/` workdir.
+  `~/code/ai/dep-up.<MMDD-HHMM>/` workdir (auto-purged by `dev aidirs prune`).
 - Denylist for known-bad upgrades: `lib/dependencies/denylist.yml`.

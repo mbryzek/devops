@@ -3752,32 +3752,35 @@ def parse_dependencies_args(argv, command_key)
   apps.empty? ? Dependencies::Updates::APPS.keys : apps.uniq
 end
 
-# Scratch workdir for this run. Deliberately SHORT (~/code/dep-up.<MMDD-HHMM>)
-# because sbt runs inside <workdir>/<repo> and macOS caps unix-socket paths
-# (sbt's boot server socket) at 104 bytes. Also writes the sbt-updates plugin
-# file the detection step injects. Returns [workdir, plugin_file].
+# Scratch workdir for this run, under ~/code/ai so `dev aidirs prune` purges
+# it automatically. Deliberately SHORT (dep-up.<MMDD-HHMM>, 16 chars — within
+# the ≤19-char feature-dir budget) because sbt runs inside <workdir>/<repo>
+# and macOS caps unix-socket paths (sbt's boot server socket) at 104 bytes.
+# Also writes the sbt-updates plugin files (one per sbt major — the plugin
+# needs a different release on sbt 2) the detection step injects. Returns
+# workdir.
 def dependencies_workdir
-  workdir = File.expand_path("~/code/dep-up.#{Time.now.strftime('%m%d-%H%M')}")
+  workdir = File.expand_path("~/code/ai/dep-up.#{Time.now.strftime('%m%d-%H%M')}")
   FileUtils.mkdir_p(workdir)
-  plugin_file = File.join(workdir, "sbt-updates.sbt")
-  File.write(plugin_file, Dependencies::Updates::SBT_UPDATES_PLUGIN + "\n")
-  [workdir, plugin_file]
+  File.write(File.join(workdir, "sbt-updates.sbt"), Dependencies::Updates::SBT_UPDATES_PLUGIN + "\n")
+  File.write(File.join(workdir, "sbt-updates-sbt2.sbt"), Dependencies::Updates::SBT_UPDATES_PLUGIN_SBT2 + "\n")
+  workdir
 end
 
-# lib-util is on sbt 2, which cannot load the sbt-1 sbt-updates plugin; sbt 2
-# bundles a dependencyUpdates task itself, so run it bare there.
-def dependencies_sbt_cmd(clone, plugin_file)
+# sbt 2 repos (lib-cipher) have no built-in dependencyUpdates and cannot load
+# the sbt-1 plugin build — inject the sbt2 release (0.7.0) there instead.
+def dependencies_sbt_cmd(clone, workdir)
   props = File.join(clone, "project", "build.properties")
   sbt_version = File.exist?(props) ? File.read(props)[/sbt\.version\s*=\s*(\S+)/, 1].to_s : ""
-  return ["sbt", "dependencyUpdates"] if sbt_version.start_with?("2")
-  ["sbt", "--addPluginSbtFile=#{plugin_file}", "dependencyUpdates"]
+  file = sbt_version.start_with?("2") ? "sbt-updates-sbt2.sbt" : "sbt-updates.sbt"
+  ["sbt", "--addPluginSbtFile=#{File.join(workdir, file)}", "dependencyUpdates"]
 end
 
 # Runs detection in an existing clone and applies policy + denylist. Requires
 # a POSITIVE success signal ([success] in sbt output), not just exit status —
 # an sbt run that dies early would otherwise read as "everything in sync".
-def dependencies_detect(app, clone, plugin_file, denylist)
-  ok, out = run_step(dependencies_sbt_cmd(clone, plugin_file), clone, false, +"")
+def dependencies_detect(app, clone, workdir, denylist)
+  ok, out = run_step(dependencies_sbt_cmd(clone, workdir), clone, false, +"")
   unless ok && out.to_s.include?("[success]")
     tail = out.to_s.split("\n").last(15).join("\n")
     return { status: :error, error: "sbt dependencyUpdates failed:\n#{tail}" }
@@ -3789,7 +3792,7 @@ end
 def cmd_dependencies_check(argv)
   apps = parse_dependencies_args(argv, "dependencies check")
   denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
-  workdir, plugin_file = dependencies_workdir
+  workdir = dependencies_workdir
   puts "Working in #{workdir}"
   results = {}
   apps.each do |app|
@@ -3797,7 +3800,7 @@ def cmd_dependencies_check(argv)
     clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
     results[app] =
       if clone
-        dependencies_detect(app, clone, plugin_file, denylist)
+        dependencies_detect(app, clone, workdir, denylist)
       else
         { status: :error, error: "clone failed" }
       end
@@ -3823,7 +3826,7 @@ end
 # One repo, end to end: clone, gate on an already-open dep-upgrade PR, branch
 # off freshly-fetched origin/main, detect, and hand allowed bumps to a Claude
 # session that must end with a review-ready PR. Mirrors codegen's run_repo.
-def dependencies_upgrade_one(app, workdir, plugin_file, branch, denylist, &announce)
+def dependencies_upgrade_one(app, workdir, branch, denylist, &announce)
   note = ->(msg) { announce&.call(msg) }
   clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
   return { status: :error, error: "clone failed" } unless clone
@@ -3838,7 +3841,7 @@ def dependencies_upgrade_one(app, workdir, plugin_file, branch, denylist, &annou
   return { status: :error, error: "branch checkout failed: #{branch_out}" } unless branch_ok
 
   note.call("running sbt dependencyUpdates…")
-  det = dependencies_detect(app, clone, plugin_file, denylist)
+  det = dependencies_detect(app, clone, workdir, denylist)
   return det if det[:status] == :error
   det[:held].each { |h| note.call("held back: #{h[:group]}:#{h[:artifact]} -> #{h[:target]} (#{h[:reason]})") }
   if det[:bumps].empty?
@@ -3858,7 +3861,7 @@ def cmd_dependencies_upgrade(argv)
   denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
   run_id = Time.now.strftime("%Y%m%d-%H%M%S")
   branch = "#{DEPS_BRANCH_PREFIX}-#{run_id}"
-  workdir, plugin_file = dependencies_workdir
+  workdir = dependencies_workdir
   puts "Working in #{workdir}"
 
   # Serial on purpose: platform's suite is heavy, and parallel claude-db
@@ -3866,7 +3869,7 @@ def cmd_dependencies_upgrade(argv)
   results = {}
   apps.each do |app|
     puts "  #{app}:"
-    r = dependencies_upgrade_one(app, workdir, plugin_file, branch, denylist) { |msg| puts "    #{msg}" }
+    r = dependencies_upgrade_one(app, workdir, branch, denylist) { |msg| puts "    #{msg}" }
     results[app] = r
     report_repo_line(app, r[:status], r[:error] || r[:note], false)
   end
