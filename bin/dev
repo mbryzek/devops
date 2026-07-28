@@ -153,6 +153,11 @@ USAGE = <<~USAGE
         surfaces a query whose modest mean is multiplied by a large call count;
         --by-mean sorts by average for the opposite shape.
 
+        Rows are numbered: at the prompt, pick any of them to file an
+        `improvement` issue holding those queries and hand it straight to a
+        Claude session, the way `dev issues create` does. Blank input files
+        nothing, and nothing is offered when output is piped.
+
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
 
@@ -2136,39 +2141,55 @@ def cmd_issues_create(args)
     form[:source_url] = source_url if source_url
     form[:severity] = severity if severity
     form[:attachments] = attachments unless attachments.empty?
-    issue = ApiClient.request(endpoint, :post, issues_path, body: form)
-    number = issue.fetch("number")
-    puts "Filed #{issue_label(issue)} (#{category})"
 
-    ApiClient.request(endpoint, :put, issues_path("/#{number}/status"), body: { status: "claimed" })
-
-    # Mint the session id HERE so it is recorded even if the session dies on its
-    # first turn — the model is never asked to self-report it.
-    uuid = SecureRandom.uuid
-    ApiClient.request(endpoint, :post, issues_path("/#{number}/comments"),
-                      body: { body: issue_session_comment_body(uuid), visibility: "internal" })
-
-    path = write_manual_issue_plan(issue, images.map { |p| File.expand_path(p) })
-    puts "Claimed #{issue_label(issue)} → #{path}"
-    puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
-
-    prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(category, path))
-    unless spawn_session
-      puts ""
-      puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"
-      return
-    end
-
-    puts ""
-    puts "Starting Claude session (Opus 4.8, 1M context)..."
-    puts ""
-    begin
-      exec(*issue_create_claude_argv(prompt, uuid))
-    rescue SystemCallError => e
-      warn "Could not start Claude (#{e.message}). #{issue_label(issue)} is claimed and the plan is saved — resume with:"
-      warn "  dev issues resume #{number}"
-    end
+    issue_file_claim_and_start(
+      endpoint: endpoint, form: form, category: category,
+      local_paths: images.map { |p| File.expand_path(p) }, spawn_session: spawn_session
+    )
   end
+end
+
+# Files `form`, claims it, writes its plan, and hands it to a Claude session.
+#
+# Every caller that files an issue FROM the laptop shares this tail, so a filed
+# issue is always in the same state whatever produced it: claimed, with a session
+# id recorded and a plan on disk. The ordering is load-bearing — the session
+# comment and the plan are both written BEFORE the spawn, so a failure leaves a
+# fully recoverable claimed issue rather than a half-filed one.
+def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spawn_session: true)
+  issue = ApiClient.request(endpoint, :post, issues_path, body: form)
+  number = issue.fetch("number")
+  puts "Filed #{issue_label(issue)} (#{category})"
+
+  ApiClient.request(endpoint, :put, issues_path("/#{number}/status"), body: { status: "claimed" })
+
+  # Mint the session id HERE so it is recorded even if the session dies on its
+  # first turn — the model is never asked to self-report it.
+  uuid = SecureRandom.uuid
+  ApiClient.request(endpoint, :post, issues_path("/#{number}/comments"),
+                    body: { body: issue_session_comment_body(uuid), visibility: "internal" })
+
+  path = write_manual_issue_plan(issue, local_paths)
+  puts "Claimed #{issue_label(issue)} → #{path}"
+  puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
+
+  prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(category, path))
+  unless spawn_session
+    puts ""
+    puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"
+    return issue
+  end
+
+  puts ""
+  puts "Starting Claude session (Opus 4.8, 1M context)..."
+  puts ""
+  begin
+    exec(*issue_create_claude_argv(prompt, uuid))
+  rescue SystemCallError => e
+    warn "Could not start Claude (#{e.message}). #{issue_label(issue)} is claimed and the plan is saved — resume with:"
+    warn "  dev issues resume #{number}"
+  end
+  issue
 end
 
 # Read one issue and its timeline. `dev issues status --comment` has always been
@@ -4998,17 +5019,192 @@ def cmd_queries_top(args)
     puts ""
     puts Util.underline("Top #{stats.length} queries by #{sort} (last #{days} day(s))")
     puts ""
-    printf("%12s  %10s  %9s  %9s  %s\n", "TOTAL MS", "CALLS", "MEAN MS", "MAX MS", "CALL SITE")
-    stats.each do |s|
+    printf("%4s  %12s  %10s  %9s  %9s  %s\n", "#", "TOTAL MS", "CALLS", "MEAN MS", "MAX MS", "CALL SITE")
+    stats.each_with_index do |s, idx|
       printf(
-        "%12d  %10d  %9d  %9d  %s\n",
-        s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
+        "%4d  %12d  %10d  %9d  %9d  %s\n",
+        idx + 1, s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
         s["call_site"] || "(never got hot)"
       )
       queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
     end
     puts ""
+
+    queries_offer_investigation(stats, days: days, sort: sort, use_localhost: use_localhost)
   end
+end
+
+# Offer to hand the selected queries to a Claude session, via an issue.
+#
+# The ranking answers "what is expensive"; the next question is always "why, and
+# can it be cheaper", and that is an investigation with a real code change behind
+# it. Routing it through `issues` rather than spawning Claude directly is what
+# makes it trackable: the issue is the record that the question was asked, it
+# closes with the PR that answered it, and `dev issues resume` reattaches to the
+# session — none of which a bare `claude` invocation gives you.
+#
+# One issue for the whole selection, not one per query: queries picked off the
+# same ranking usually share a cause (a missing index, one hot code path, one
+# oversized result set), and a session that can see all of them together finds
+# that faster than N sessions each holding one.
+#
+# Skipped entirely when stdin is not a tty — piping this command must print the
+# table and exit, never block on a prompt nobody can answer.
+def queries_offer_investigation(stats, days:, sort:, use_localhost:)
+  return unless $stdin.tty?
+
+  answer = Ask.for_string(
+    "Investigate any of these? Enter numbers (e.g. 1,3), `all`, or `none` [none]:",
+    default: "none",
+  )
+  selected = Ask.parse_selection(answer, stats)
+  if selected.nil?
+    puts "Invalid selection — nothing filed. Re-run to pick again."
+    return
+  end
+  return if selected.empty?
+
+  require_playbook_session!(use_localhost)
+  form = {
+    category: QUERIES_ISSUE_CATEGORY,
+    title: queries_issue_title(selected),
+    body: queries_issue_body(selected, days: days, sort: sort),
+  }
+  issue_file_claim_and_start(
+    endpoint: issue_endpoint(use_localhost), form: form, category: QUERIES_ISSUE_CATEGORY
+  )
+end
+
+# Query cost is an improvement, not a bug: nothing is broken, it costs more than
+# it should. `improvement` is also one of the manual categories, so these issues
+# land in the same queue `dev issues claim` already works.
+QUERIES_ISSUE_CATEGORY = "improvement".freeze
+
+# A title that says which query without the session having to open the issue.
+# The call site is the identifying half when there is one; the statement's head
+# is the fallback for a query that never got hot enough to be attributed.
+def queries_issue_title(selected)
+  return "Expensive queries: #{selected.length} from the query-stats ranking" if selected.length > 1
+
+  s = selected.first
+  site = s["call_site"].to_s
+  subject = site.empty? ? slow_routes_truncate(s["sql"].to_s.gsub(/\s+/, " ").strip, 60) : queries_call_site_short(site)
+  "Expensive query: #{subject}"
+end
+
+# The class and method out of a call site, dropping the package and the
+# file:line — "BaseMemberEngagementScoresDao.findAll" out of
+# "generated.db.playbook.BaseMemberEngagementScoresDao.findAll(MemberEngagementScoresDao.scala:242)".
+def queries_call_site_short(site)
+  head = site.to_s.sub(/\(.*\z/, "")
+  head.split(".").last(2).join(".")
+end
+
+# The issue body handed to the investigating session.
+#
+# The durable half — how the numbers are produced, where the code is, and how to
+# read them — is baked in here rather than re-derived by every session that picks
+# one of these up (rules/llm.ticket.prompts.mdc). The measurement has three
+# behaviours that make a naive reading wrong, and all three are stated: the
+# duration is charged to the FIRST statement of its block, the SQL is normalized,
+# and rows are summed across nodes and 6-hour windows. A session that does not
+# know the first one will chase an `insert` that is really a whole transaction.
+#
+# The per-instance data (the selected queries and their numbers) goes last.
+def queries_issue_body(selected, days:, sort:)
+  <<~BODY
+    #{selected.length} #{selected.length == 1 ? 'query' : 'queries'} selected from `dev queries top` (ranked by #{sort}, last #{days} day(s)).
+    Work out why #{selected.length == 1 ? 'it costs' : 'they cost'} what #{selected.length == 1 ? 'it does' : 'they do'} and make #{selected.length == 1 ? 'it' : 'them'} cheaper — or establish that the
+    cost is justified and say why. Either outcome closes this issue; a query that is
+    correctly expensive is a real finding, not a failure.
+
+    ## How these numbers are produced
+
+    Every `withConnection` / `withTransaction` block on the platform is wrapped by a
+    timing decorator. It measures the block, then charges that duration to the SQL of
+    the statement prepared inside it, keyed on the statement rather than the caller —
+    which is what catches the fast-but-frequent shape a duration threshold never sees
+    (63ms x 26,758 calls). Counters accumulate in memory per node; an actor drains them
+    every 6 hours into `query_stats.query_samples`, one row per query per node per
+    window. `dev queries top` reads those rows back through `GET /dev/query/stats`,
+    grouped by statement and summed across every node and window in the period.
+
+    The call site is resolved by walking the stack ONCE, the first time a query crosses
+    100 calls on a node — far too expensive per call, free amortized over a hot query.
+
+    ## Where the code lives
+
+    - `~/code/platform/generated/app/util/QueryStats.scala` — the counters, the hot threshold, the 5,000-query tracking cap
+    - `~/code/platform/generated/app/util/PlatformDatabase.scala` — the timing decorator that records each block
+    - `~/code/platform/generated/app/util/TimingConnection.scala` — which statement in a block the duration is charged to
+    - `~/code/platform/generated/app/util/QuerySqlNormalizer.scala` — how bind lists are collapsed
+    - `~/code/platform/generated/app/util/QueryCallSite.scala` — the stack walk, and the frames it treats as infrastructure
+    - `~/code/platform/core/app/core/actors/QueryStatsActor.scala` — the 6-hour flush and what it persists
+    - `~/code/platform/core/app/core/db/InternalQueryStatsDao.scala` — the aggregation behind the ranking
+    - `~/code/platform/dao/spec/db-query-stats.json` — the DAO spec for the samples table
+
+    ## Decoding what you are looking at
+
+    - **The duration is charged to the FIRST statement prepared in its block, and covers
+      the WHOLE block.** A `withTransaction` that inserts, then updates, then selects
+      charges all three to the insert. Before optimizing the statement shown, read its
+      call site and check whether it is the only statement in that block — if it is not,
+      the cost you are chasing may belong to a sibling statement.
+    - **The SQL is normalized**: runs of bind placeholders are collapsed to a single `?`,
+      so `in (?)` may have been two binds or two thousand. The number of binds is a
+      prime suspect and is NOT visible here — find it at the call site.
+    - **`(never got hot)` means no call site, not no caller**: the query never reached
+      100 calls in a window on any single node, so the stack walk never ran. Find the
+      caller by grepping the statement's head (a distinctive column list or table name)
+      under `~/code/platform`.
+    - **`calls` and `total_ms` are sums across nodes and windows.** Per-node cost is
+      roughly this divided by the number of pods serving; `max_ms` is a true single-call
+      worst case, not an average of maxima.
+    - A generated `Base*Dao.findAll` call site names the DAO, not the interesting code.
+      The question there is which caller asks for it, how often, and with what filters.
+
+    ## Suggested investigation
+
+    1. Read the call site and the code around it. Establish the shape first: is this one
+       query per request, a loop issuing one per row, or a batch job? An N+1 answers
+       itself and needs no plan.
+    2. Get an execution plan. Use the session Postgres, never production:
+       `export CLAUDE_SESSION_ID=<feature>` then
+       `eval "$(~/code/devops/bin/claude-db start | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')"`,
+       then `EXPLAIN (ANALYZE, BUFFERS)` the statement. A sequential scan on a large
+       table, or an estimate far from the actual row count, is the usual answer.
+    3. Check the indexes that exist, in the table's DAO spec under
+       `~/code/platform/dao/spec/`, in its model's `psql.indexes` block. **Never
+       hand-write DDL** — an index is added to the DAO spec and regenerated with
+       `api --group dao` (see `~/code/claude/rules/database.general.mdc`). A hand-rolled
+       `CREATE INDEX` skips the generated schema and is lost on the next regen.
+    4. Consider the caller, not only the query: fetching columns nobody reads, paging
+       through rows that could be filtered in SQL, or re-running per row what could run
+       once are all cheaper to fix than the statement itself.
+    5. Confirm the win. Re-run `dev queries top --days 1` after the fix is deployed and
+       compare `total_ms` — the ranking is the same instrument that found it. Note that
+       a 6-hour flush window means the effect is not visible immediately.
+
+    ## The #{selected.length == 1 ? 'query' : 'queries'}
+
+    #{selected.each_with_index.map { |s, i| queries_issue_body_entry(s, i + 1) }.join("\n\n")}
+  BODY
+end
+
+# One selected query as it appears at the bottom of the issue body. The statement
+# is fenced and NOT truncated — the display cap in the terminal exists so a wide
+# select does not bury the ranking, but the session needs the whole thing.
+def queries_issue_body_entry(s, position)
+  <<~ENTRY.strip
+    ### #{position}. #{s['call_site'].to_s.empty? ? '(never got hot — no call site resolved)' : "`#{s['call_site']}`"}
+
+    - total: #{s['total_ms']} ms across #{s['calls']} calls
+    - mean: #{s['mean_ms']} ms, max: #{s['max_ms']} ms
+
+    ```sql
+    #{s['sql'].to_s.gsub(/\s+/, ' ').strip}
+    ```
+  ENTRY
 end
 
 # How much of the statement is worth reading. One line of head was enough to tell two
