@@ -72,6 +72,19 @@ module DevTestSupport
     ApiClient.define_singleton_method(:session_id_for, orig)
   end
 
+  # Run a block with $stdout claiming to be a terminal. Output that adapts to a
+  # tty (Util.hyperlink) is otherwise untestable: a StringIO reports tty? false,
+  # which is exactly the non-terminal branch. Returns the block's value.
+  def with_tty_stdout
+    buf = StringIO.new
+    buf.define_singleton_method(:tty?) { true }
+    old = $stdout
+    $stdout = buf
+    yield
+  ensure
+    $stdout = old
+  end
+
   def capture_stderr_and_exit
     buf = StringIO.new
     old = $stderr
