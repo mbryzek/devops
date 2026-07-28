@@ -38,7 +38,6 @@ module Dependencies
         "on an unmodified checkout of origin/main (use `git worktree add`, not stash/checkout) " \
         "and if so do NOT defer the bump for it.",
       "acumen" => "Run the suite with `./run.sh test` (uses the local acumendb).",
-      "lib-cipher" => "Run the suite with `sbt testQuick` (this repo is on sbt 2, where bare `test` misbehaves).",
     }.freeze
     DEFAULT_TEST_INSTRUCTION = "Run the suite with `sbt test`.".freeze
 

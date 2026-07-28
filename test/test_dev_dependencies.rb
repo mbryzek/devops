@@ -167,9 +167,9 @@ class TestDependenciesPrompt < Minitest::Test
     assert_includes p, "worktree"
   end
 
-  def test_lib_cipher_prompt_uses_testquick
+  def test_lib_prompt_uses_default_sbt_test
     p = Dependencies::Updates.upgrade_prompt(app: "lib-cipher", branch: "b", bumps: [])
-    assert_includes p, "sbt testQuick"
+    assert_includes p, "sbt test"
   end
 end
 
