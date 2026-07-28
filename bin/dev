@@ -450,7 +450,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues changelog features].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues changelog features queries].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -467,6 +467,7 @@ SUBCOMMANDS = {
   "dependencies" => %w[check upgrade],
   "issues"       => %w[create claim show status snooze reconcile resume],
   "features"     => %w[list retire status reconcile cancel],
+  "queries"      => %w[top],
 }.freeze
 
 def levenshtein(a, b)
@@ -4939,6 +4940,70 @@ def run_sql_script(path, name, args)
   end
 end
 
+# ---------- queries ----------
+
+# Rank the queries the platform ran, from the samples core.actors.QueryStatsActor
+# writes every flush window into query_stats.query_samples.
+#
+# Sorts by TOTAL time by default, not mean. That ordering is the whole point: the
+# incremental sales_details sync that turned out to be the largest consumer on the
+# database had an unremarkable 698ms mean and only stood out once multiplied by
+# 25,368 calls. `--by-waste` sorts by ms per call instead, which surfaces the
+# opposite shape -- a query that is individually slow but rarely run.
+#
+# Reads through the same `db exec` path as `dev scripts run`, so production keeps
+# its interactive confirmation and nothing here talks to a database directly.
+def cmd_queries_top(args)
+  limit = 25
+  days = 7
+  order = "total_ms desc"
+  env = "local"
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--limit"
+      limit = Integer(args[i + 1] || usage_exit("--limit requires a value", example: usage_for("queries top")))
+      i += 1
+    when "--days"
+      days = Integer(args[i + 1] || usage_exit("--days requires a value", example: usage_for("queries top")))
+      i += 1
+    when "--by-waste" then order = "(total_ms / greatest(calls, 1)) desc"
+    when "--by-calls" then order = "calls desc"
+    when "--prod", "--production" then env = "production"
+    when "--dev", "--development" then env = "development"
+    when "--localhost", "--local" then env = "local"
+    else usage_exit("Unknown flag: #{args[i]}", example: usage_for("queries top"))
+    end
+    i += 1
+  end
+
+  # Samples are per node per window, so a query's real cost is the sum across both.
+  # Grouping here rather than reporting rows keeps one query as one line.
+  sql = <<~SQL
+    select sum(calls) as calls,
+           sum(total_ms) as total_ms,
+           max(max_ms) as max_ms,
+           sum(total_ms) / greatest(sum(calls), 1) as mean_ms,
+           coalesce(max(call_site), '(never got hot)') as call_site,
+           left(sql, 120) as sql
+      from query_stats.query_samples
+     where captured_at > now() - interval '#{days} days'
+     group by left(sql, 120)
+     order by #{order}
+     limit #{limit};
+  SQL
+
+  Dir.mktmpdir("dev-queries") do |dir|
+    path = File.join(dir, "query-stats-top.sql")
+    File.write(path, sql)
+    if env == "local"
+      run_local_sql(path)
+    else
+      run_remote_sql(path, env, { "app" => "platform" })
+    end
+  end
+end
+
 # ---------- slow-routes ----------
 
 def slow_routes_truncate(str, width)
@@ -5705,6 +5770,12 @@ when "dependencies"
   when "check"   then cmd_dependencies_check(argv)
   when "upgrade" then cmd_dependencies_upgrade(argv)
   else                unknown("dependencies subcommand", sub, SUBCOMMANDS["dependencies"])
+  end
+when "queries"
+  sub = resolve_subcommand(argv, default: "top")
+  case sub
+  when "top" then cmd_queries_top(argv)
+  else            unknown("queries subcommand", sub, SUBCOMMANDS["queries"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")
