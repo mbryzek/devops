@@ -5005,10 +5005,53 @@ def cmd_queries_top(args)
         s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
         s["call_site"] || "(never got hot)"
       )
-      puts "              #{slow_routes_truncate(s['sql'].to_s.gsub(/\s+/, ' '), 110)}"
+      queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
     end
     puts ""
   end
+end
+
+# How much of the statement is worth reading. One line of head was enough to tell two
+# queries apart but not enough to see WHICH columns, joins, or where-clause the cost is
+# in -- which is the question the ranking exists to answer. Bounded rather than unbounded
+# because a few statements run to thousands of characters and would bury the ranking.
+QUERIES_SQL_CHARS = 440
+
+QUERIES_SQL_INDENT = "              ".freeze
+
+# The statement, whitespace-collapsed, capped at QUERIES_SQL_CHARS and wrapped to the
+# terminal so the extra length reads as text instead of one line the terminal folds
+# mid-token. Wrapping is on word boundaries, falling back to a hard split for a single
+# token longer than the available width.
+def queries_sql_lines(sql, indent:)
+  text = slow_routes_truncate(sql.gsub(/\s+/, " ").strip, QUERIES_SQL_CHARS)
+  width = [terminal_width - indent.length, 40].max
+  lines = []
+  current = +""
+  text.split(" ").each do |word|
+    # A token wider than the line can never fit; emit it in hard chunks rather than
+    # looping forever trying to place it.
+    word.scan(/.{1,#{width}}/).each do |chunk|
+      if current.empty?
+        current = +chunk
+      elsif current.length + 1 + chunk.length <= width
+        current << " " << chunk
+      else
+        lines << current
+        current = +chunk
+      end
+    end
+  end
+  lines << current unless current.empty?
+  lines.map { |line| "#{indent}#{line}" }
+end
+
+# Columns available for output. Falls back to a conventional 80 when stdout is not a tty
+# (piped, redirected, CI), where there is no width to ask for.
+def terminal_width
+  IO.console&.winsize&.last || 80
+rescue StandardError
+  80
 end
 
 # ---------- slow-routes ----------
