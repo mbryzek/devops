@@ -20,8 +20,11 @@ module Dependencies
     }.freeze
 
     # Injected via `sbt --addPluginSbtFile=<file>` so no repo ever has to
-    # commit the plugin. Pinned; bump deliberately.
+    # commit the plugin. Pinned; bump deliberately. sbt 1 and sbt 2 need
+    # different releases: 0.6.4 is sbt1-only, 0.7.0 publishes the
+    # sbt-updates_sbt2_3 axis (sbt 2 has no built-in dependencyUpdates).
     SBT_UPDATES_PLUGIN = %q{addSbtPlugin("com.timushev.sbt" % "sbt-updates" % "0.6.4")}.freeze
+    SBT_UPDATES_PLUGIN_SBT2 = %q{addSbtPlugin("com.timushev.sbt" % "sbt-updates" % "0.7.0")}.freeze
 
     # How each repo proves a bump is green. platform's suite needs an isolated
     # session DB (never Mike's :5432), and the export must happen in the SAME
@@ -35,7 +38,7 @@ module Dependencies
         "on an unmodified checkout of origin/main (use `git worktree add`, not stash/checkout) " \
         "and if so do NOT defer the bump for it.",
       "acumen" => "Run the suite with `./run.sh test` (uses the local acumendb).",
-      "lib-util" => "Run the suite with `sbt testQuick` (this repo is on sbt 2, where bare `test` misbehaves).",
+      "lib-cipher" => "Run the suite with `sbt testQuick` (this repo is on sbt 2, where bare `test` misbehaves).",
     }.freeze
     DEFAULT_TEST_INSTRUCTION = "Run the suite with `sbt test`.".freeze
 
