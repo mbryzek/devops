@@ -1,4 +1,5 @@
 require 'net/http'
+require 'openssl'
 require 'uri'
 require 'json'
 require 'base64'
@@ -10,6 +11,32 @@ class ApibuilderClient
   DEFAULT_API_URI = "https://api.apibuilder.io"
   GLOBAL_CONFIG_DIR = File.join(Dir.home, ".apibuilder")
   CONFIG_PATH = File.join(GLOBAL_CONFIG_DIR, "config")
+
+  # Transport failures that are worth another attempt: a TLS connection dropped
+  # mid-response, a reset, a backend that went away while we were talking to it.
+  # These say nothing about whether the request was valid - only that this
+  # particular connection did not survive.
+  RETRYABLE_ERRORS = [
+    OpenSSL::SSL::SSLError,
+    IOError, # includes EOFError
+    Errno::ECONNRESET,
+    Errno::ECONNREFUSED,
+    Errno::EPIPE,
+    Errno::ETIMEDOUT,
+    Errno::EHOSTUNREACH,
+    Errno::ENETUNREACH,
+    Net::OpenTimeout,
+    Net::ReadTimeout,
+    SocketError,
+  ].freeze
+
+  # Gateway statuses: the load balancer answered because a backend was rolling
+  # or unreachable, so the app never saw the request. Same class of problem as a
+  # dropped connection, same response.
+  RETRYABLE_STATUSES = [502, 503, 504].freeze
+
+  MAX_ATTEMPTS = 3
+  RETRY_BACKOFF_SECONDS = [1, 3].freeze
 
   attr_reader :base_uri, :token
 
@@ -29,16 +56,12 @@ class ApibuilderClient
   # Performs an authenticated HTTP request and returns the raw Net::HTTP response.
   def raw_request(method, path, body = nil)
     uri = URI.parse("#{@base_uri}#{path}")
-    http = build_http(uri)
 
-    req = build_request(method, uri)
-    req.body = JSON.generate(body) if body
-
-    http.request(req)
-  rescue Errno::ECONNREFUSED
-    Util.exit_with_error("Cannot connect to #{@base_uri}. Is the server running?")
-  rescue SocketError => e
-    Util.exit_with_error("Cannot connect to #{@base_uri}: #{e.message}")
+    execute("#{method.to_s.upcase} #{path}") do
+      req = build_request(method, uri)
+      req.body = JSON.generate(body) if body
+      build_http(uri).request(req)
+    end
   end
 
   # Downloads a file from an absolute URL (no auth) and returns the raw body.
@@ -50,8 +73,7 @@ class ApibuilderClient
     original_url = url
     5.times do
       uri = URI.parse(url)
-      http = build_http(uri)
-      response = http.request(Net::HTTP::Get.new(uri.request_uri))
+      response = execute("GET #{url}") { build_http(uri).request(Net::HTTP::Get.new(uri.request_uri)) }
       code = response.code.to_i
       case code
       when 200
@@ -73,10 +95,11 @@ class ApibuilderClient
   # POST /apibuilder/anonymous
   def anonymous_init
     uri = URI.parse("#{@base_uri}/apibuilder/anonymous")
-    http = build_http(uri)
-    req = Net::HTTP::Post.new(uri.request_uri)
-    req["Content-Type"] = "application/json"
-    response = http.request(req)
+    response = execute("POST /apibuilder/anonymous") do
+      req = Net::HTTP::Post.new(uri.request_uri)
+      req["Content-Type"] = "application/json"
+      build_http(uri).request(req)
+    end
     handle_response(response, "POST /apibuilder/anonymous")
   end
 
@@ -165,6 +188,62 @@ class ApibuilderClient
     put: Net::HTTP::Put,
     delete: Net::HTTP::Delete,
   }.freeze
+
+  # Runs one HTTP call, retrying transient transport failures and gateway
+  # statuses with backoff, and returns the final response. Anything the app
+  # itself answered (including 4xx/5xx that are not RETRYABLE_STATUSES) is
+  # returned untouched for handle_response to interpret.
+  #
+  # Why retry rather than fail: the batch endpoints are slow enough (a ~150KB
+  # spec payload, seconds on the wire) to be a real target for a dropped
+  # connection, and by the time the connection dies the server has usually
+  # already accepted the request. Aborting there discarded work the server had
+  # done and dumped a Ruby backtrace on the user, whose only recourse was to
+  # re-run the identical command by hand - which is exactly what this does,
+  # only faster and without the stack trace.
+  def execute(description)
+    attempt = 0
+    response = nil
+    error = nil
+
+    while attempt < MAX_ATTEMPTS
+      attempt += 1
+      error = nil
+
+      begin
+        response = yield
+      rescue *RETRYABLE_ERRORS => e
+        error = e
+      end
+
+      return response if error.nil? && !RETRYABLE_STATUSES.include?(response.code.to_i)
+      break if attempt == MAX_ATTEMPTS
+
+      delay = RETRY_BACKOFF_SECONDS[attempt - 1] || RETRY_BACKOFF_SECONDS.last
+      reason = error ? "#{error.class}: #{error.message}" : "HTTP #{response.code}"
+      $stderr.puts "==> WARNING: #{description} failed (#{reason}); retrying in #{delay}s (attempt #{attempt + 1} of #{MAX_ATTEMPTS})"
+      sleep_for(delay)
+    end
+
+    return response if error.nil?
+
+    Util.exit_with_error(connection_failure_message(description, error, attempt))
+  end
+
+  def connection_failure_message(description, error, attempts)
+    case error
+    when Errno::ECONNREFUSED, SocketError
+      "Cannot connect to #{@base_uri} after #{attempts} attempts (#{error.message}). Is the server running?"
+    else
+      "#{description} failed after #{attempts} attempts: #{error.class}: #{error.message}\n" \
+        "The connection to #{@base_uri} dropped mid-request. The server may still have accepted it - re-run the command to continue."
+    end
+  end
+
+  # Seam for tests: they assert on the backoff schedule without waiting for it.
+  def sleep_for(seconds)
+    sleep(seconds)
+  end
 
   def build_http(uri)
     http = Net::HTTP.new(uri.host, uri.port)
