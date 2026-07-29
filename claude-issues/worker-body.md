@@ -63,7 +63,7 @@ always "the data is wrong/missing/stale", and the bug lives at one of these stag
    root cause and get one fix.
 4. Verify: a scoped `sbt` spec that FAILS without your fix (parser bugs get a fixture built
    from the issue's evidence snippet); `npm run build` + the task's own tests in `workers`.
-   Use the Docker session DB (`~/code/devops/bin/claude-db start`), never Mike's `:5432` and
+   Use the Docker session DB (`~/code/devops/bin/claude-db start --app platform`), never Mike's `:5432` and
    never production.
 5. Commit, push, open a DRAFT PR (`gh pr create --draft`), then mark it ready
    (`gh pr ready`), then rebase onto latest origin/main + rerun codegen per the standard
