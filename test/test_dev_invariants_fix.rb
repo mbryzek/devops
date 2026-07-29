@@ -4,9 +4,11 @@ require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 
 # Covers the investigation hand-off on `dev invariants check`: which failures are
-# worth a session, what the prompt handed to that session contains, and the
-# shape of the multi-app fan-out. The launch itself execs, so everything here
-# exercises the pure seams that build what it would exec.
+# worth a session, what the prompt handed to that session contains, the shape of
+# the multi-app fan-out, and which of the two launch paths (interactive exec vs
+# headless unattended dispatch) a given tty/--fix combination takes. Launching
+# either for real would replace or fork the test process, so everything here
+# exercises the pure seams that build what would be launched.
 class TestDevInvariantsFix < Minitest::Test
   include DevTestSupport
 
@@ -164,37 +166,149 @@ class TestDevInvariantsFix < Minitest::Test
     assert_nil launched
   end
 
-  # --fix is the explicit opt-in, so it launches without a tty to ask on.
+  # --fix at a terminal skips the question but still hands the terminal over.
   def test_auto_fix_launches_without_asking
-    launched = with_stubbed_launch(tty: false) do
+    launched = with_stubbed_launch(tty: true) do
       invariants_offer_investigation([endpoint_result("Platform", data: failing_data)], true)
     end
     assert_includes launched, "failing for Platform"
   end
 
   def test_auto_fix_does_not_launch_when_nothing_has_data
-    launched = with_stubbed_launch(tty: false) do
+    launched = with_stubbed_launch(tty: true) do
       invariants_offer_investigation([endpoint_result("Platform", error: "unreachable")], true)
     end
     assert_nil launched
   end
 
+  # ---- unattended dispatch (the cron path) ----
+
+  def test_no_tty_without_fix_does_not_dispatch
+    dispatched = with_stubbed_dispatch(tty: false) do
+      invariants_offer_investigation([endpoint_result("Platform", data: failing_data)], false)
+    end
+    assert_nil dispatched
+  end
+
+  def test_no_tty_with_fix_dispatches_headless
+    dispatched = with_stubbed_dispatch(tty: false) do
+      invariants_offer_investigation([endpoint_result("Platform", data: failing_data)], true)
+    end
+    assert_equal ["Platform"], dispatched.map { |endpoint, _| endpoint[:name] }
+  end
+
+  # A tty means a human is here, so even --fix takes the interactive path — the
+  # terminal hand-off, not a detached session writing to a log nobody opens.
+  def test_tty_with_fix_execs_instead_of_dispatching
+    dispatched = with_stubbed_dispatch(tty: true) do
+      invariants_offer_investigation([endpoint_result("Platform", data: failing_data)], true)
+    end
+    assert_nil dispatched
+  end
+
+  # ---- headless argv + prompt ----
+
+  def test_headless_argv_is_print_mode_on_opus_5
+    argv = headless_claude_argv("do the thing")
+    assert_equal "claude", argv[0]
+    assert_includes argv, "--print"                             # no terminal to attach to
+    assert_includes argv, "--dangerously-skip-permissions"      # nobody to answer prompts
+    assert_equal "claude-opus-5[1m]", argv[argv.index("--model") + 1]
+    assert_equal "do the thing", argv.last
+  end
+
+  def test_unattended_suffix_demands_a_durable_artifact_and_an_announcement
+    suffix = invariants_unattended_suffix
+    assert_includes suffix, "~/code/claude/plans/"
+    assert_includes suffix, "openclaw system event"
+    assert_includes suffix, "dev invariants snooze"
+  end
+
+  # ---- dedupe: the same failures must not spawn a session every night ----
+
+  def test_same_failures_within_the_window_are_deduped
+    now = Time.parse("2026-07-29T06:14:00Z")
+    state = { "platform" => { "invariants" => %w[a b], "at" => (now - 24 * 60 * 60).iso8601 } }
+    assert invariants_recently_dispatched?(state, "platform", %w[a b], now)
+  end
+
+  def test_same_failures_past_the_window_are_dispatched_again
+    now = Time.parse("2026-07-29T06:14:00Z")
+    old = (now - (INVARIANTS_REDISPATCH_DAYS + 1) * 24 * 60 * 60).iso8601
+    state = { "platform" => { "invariants" => %w[a b], "at" => old } }
+    refute invariants_recently_dispatched?(state, "platform", %w[a b], now)
+  end
+
+  # A changed set of failures is new information, whatever is already in flight.
+  def test_a_different_failure_set_is_not_deduped
+    now = Time.parse("2026-07-29T06:14:00Z")
+    state = { "platform" => { "invariants" => %w[a b], "at" => now.iso8601 } }
+    refute invariants_recently_dispatched?(state, "platform", %w[a b c], now)
+    refute invariants_recently_dispatched?(state, "platform", %w[a], now)
+  end
+
+  def test_a_different_app_is_not_deduped
+    now = Time.parse("2026-07-29T06:14:00Z")
+    state = { "platform" => { "invariants" => %w[a], "at" => now.iso8601 } }
+    refute invariants_recently_dispatched?(state, "acumen", %w[a], now)
+  end
+
+  # Never let a bad marker file suppress a dispatch: one duplicate session is a
+  # far cheaper failure than silence on a real invariant.
+  def test_unknown_app_and_unparseable_timestamp_dispatch
+    now = Time.parse("2026-07-29T06:14:00Z")
+    refute invariants_recently_dispatched?({}, "platform", %w[a], now)
+    state = { "platform" => { "invariants" => %w[a], "at" => "not a date" } }
+    refute invariants_recently_dispatched?(state, "platform", %w[a], now)
+  end
+
+  def test_invariant_names_are_sorted_and_span_both_failure_kinds
+    data = {
+      "success" => [],
+      "non_zero" => [{ "name" => "zebra" }],
+      "error" => [{ "name" => "apple", "error" => "boom" }],
+    }
+    assert_equal %w[apple zebra], invariant_names(data)
+  end
+
+  # Captures what `invariants_dispatch_unattended` was called with instead of
+  # spawning real sessions. Returns nil when the unattended path was not taken.
+  def with_stubbed_dispatch(tty:)
+    captured = nil
+    orig_dispatch = Object.instance_method(:invariants_dispatch_unattended)
+    orig_exec = Object.instance_method(:exec_claude)
+    orig_tty = Object.instance_method(:interactive_terminal?)
+    Object.send(:define_method, :invariants_dispatch_unattended) { |failing, **_kwargs| captured = failing }
+    Object.send(:define_method, :exec_claude) { |_prompt, **_kwargs| nil }
+    Object.send(:define_method, :interactive_terminal?) { tty }
+    capture_io { yield }
+    captured
+  ensure
+    Object.send(:define_method, :invariants_dispatch_unattended, orig_dispatch)
+    Object.send(:define_method, :exec_claude, orig_exec)
+    Object.send(:define_method, :interactive_terminal?, orig_tty)
+  end
+
   # Returns the prompt `exec_claude` would have run, or nil if it was never
-  # reached. Both the tty check and the confirmation are stubbed so the test does
-  # not depend on how the suite itself was invoked, and `exec_claude` is replaced
-  # so a launch cannot replace the test process.
+  # reached. The tty check and the confirmation are stubbed so the test does not
+  # depend on how the suite itself was invoked, and BOTH launch paths are
+  # replaced: `exec_claude` so a launch cannot replace the test process, and the
+  # unattended dispatch so no test can ever spawn a real `claude --print`.
   def with_stubbed_launch(tty:, answer: nil)
     captured = nil
     orig_exec = Object.instance_method(:exec_claude)
+    orig_dispatch = Object.instance_method(:invariants_dispatch_unattended)
     orig_tty = Object.instance_method(:interactive_terminal?)
     orig_ask = Ask.method(:for_boolean)
     Object.send(:define_method, :exec_claude) { |prompt, **_kwargs| captured = prompt }
+    Object.send(:define_method, :invariants_dispatch_unattended) { |_failing, **_kwargs| [] }
     Object.send(:define_method, :interactive_terminal?) { tty }
     Ask.define_singleton_method(:for_boolean) { |_msg| answer }
     capture_io { yield }
     captured
   ensure
     Object.send(:define_method, :exec_claude, orig_exec)
+    Object.send(:define_method, :invariants_dispatch_unattended, orig_dispatch)
     Object.send(:define_method, :interactive_terminal?, orig_tty)
     Ask.define_singleton_method(:for_boolean, orig_ask)
   end
