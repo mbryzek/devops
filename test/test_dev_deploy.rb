@@ -830,3 +830,55 @@ class TestDeployStatusPrompt < Minitest::Test
       deploy_phase2_message(%w[a b c d e], 2)
   end
 end
+
+# Uses a real (throwaway) app name under the real ~/Library/Logs/dev-deploy
+# directory rather than stubbing File.expand_path — deploy_log_path's whole
+# point is that it's a stable, predictable filesystem path, so the test
+# exercises the actual path.
+class TestDevDeployLog < Minitest::Test
+  APP = "test-dev-deploy-log-fixture"
+
+  def setup
+    @path = deploy_log_path(APP)
+  end
+
+  def teardown
+    File.delete(@path) if File.exist?(@path)
+  end
+
+  def test_deploy_log_path_is_stable_across_calls
+    assert_equal deploy_log_path(APP), deploy_log_path(APP)
+  end
+
+  def test_deploy_log_suffix_points_at_the_log_path
+    assert_equal " -> #{@path}", deploy_log_suffix(APP)
+  end
+
+  def test_deploy_log_suffix_empty_for_libraries
+    assert_equal "", deploy_log_suffix("lib-util")
+  end
+
+  def test_run_release_capturing_deletes_stale_file_before_writing
+    File.write(@path, "stale output from a previous run\n")
+
+    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd)
+
+    assert result[:ok]
+    refute_match(/stale output/, File.read(@path))
+  end
+
+  def test_run_release_capturing_streams_output_to_the_log_file
+    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd)
+
+    expected = "--app #{APP}\n"
+    assert result[:ok]
+    assert_equal expected, File.read(@path)
+    assert_equal expected, result[:log]
+  end
+
+  def test_run_release_capturing_reports_failure_status
+    result = run_release_capturing({}, "/usr/bin/false", APP, Dir.pwd)
+
+    refute result[:ok]
+  end
+end
