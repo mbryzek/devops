@@ -176,17 +176,19 @@ USAGE = <<~USAGE
         --limit (default 10), filter with --app member|admin.
 
     #{INVOCATIONS["deploy status"]}
-        Print every tracked app and DB repo with its latest tag, the version
-        production is running, and a status — the full fleet picture even
-        when everything is up to date. `status` is the default when no
-        subcommand is given.
+        Print every tracked app, DB repo, and scala library (lib-*) with its
+        latest tag, the version production is running, and a status — the
+        full fleet picture even when everything is up to date. `status` is
+        the default when no subcommand is given.
 
         An item needs a release when origin/main is ahead of the latest tag,
         OR production is running a version other than the latest tag (tagged
         but never deployed). The prod version comes from /_internal_/version
-        or the live k8s image tag; *-postgresql repos and apps with no prod
-        probe are checked on git state only. --app APP matches an app or DB
-        name exactly (e.g. `platform` vs `platform-postgresql`).
+        or the live k8s image tag; *-postgresql repos, libraries (which
+        publish to Maven Central, so their prod column is always `-`), and
+        apps with no prod probe are checked on git state only. --app APP
+        matches an app, DB, or library name exactly (e.g. `platform` vs
+        `platform-postgresql` vs `lib-util`).
 
         If anything is pending, you are prompted to pick which items to
         release — numbers (e.g. 1,3), `all` (the default), or `none` — and
@@ -194,11 +196,17 @@ USAGE = <<~USAGE
         skipped when stdin is not a terminal (pipes, cron), so scripted
         callers just get the table.
     #{INVOCATIONS["deploy all"]}
-        Release every pending item without prompting. Two phases:
+        Release every pending item without prompting. Three phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
           2. Apps release in parallel (concurrency defaults to 10) via
              `release` with RELEASE_AUTO_TAG=1.
+          3. Libraries (lib-*) release serially via `release`, which
+             dispatches a lib- checkout to `release-lib`. That stays
+             interactive — it confirms the tag and GPG asks for the
+             signing passphrase — so its output is not captured. Without a
+             terminal (pipe, cron) pending libraries are skipped, named in
+             the summary, and the command exits non-zero.
         If a DB release fails, the matching app (foo for foo-postgresql)
         is skipped to avoid deploying an app against an unmigrated schema.
         Skips repos not on `main` or with a dirty tree.
@@ -3092,6 +3100,17 @@ def db_repo?(name)
   name.end_with?("-postgresql")
 end
 
+def lib_repo?(name)
+  name.start_with?("lib-")
+end
+
+# The scala libraries, which release with `release-lib` to Maven Central rather
+# than to a cluster. They are not in the apps registry, so the canonical list is
+# the same one `dev dependencies` watches — one definition of "our libs".
+def lib_repos
+  Dependencies::Updates::APPS.keys.select { |n| lib_repo?(n) }
+end
+
 def deploy_state_for(name, dir, app: nil, registry: nil)
   return { error: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
@@ -3167,6 +3186,11 @@ def deploy_items(registry = Work::Registry.load)
     db = "#{app.repo_name}-postgresql"
     items << [db, File.expand_path("~/code/#{db}"), nil]
   end
+  # Libraries publish to Maven Central, not to a cluster, so there is no prod
+  # version to probe: they are pending purely on unreleased commits on main.
+  # Without them a lib change can sit unreleased indefinitely — nothing else
+  # reports it.
+  lib_repos.each { |lib| items << [lib, File.expand_path("~/code/#{lib}"), nil] }
   # Array#uniq keeps the first occurrence, so deployable-app entries win over a
   # DB entry if a name collides. Don't reorder.
   items.uniq { |name, _| name }.sort_by { |name, _| name }
@@ -3246,7 +3270,7 @@ def cmd_deploy_status(args)
   pending = rows.select { |_, d| needs_deploy?(d) }.map(&:first)
   if pending.empty?
     puts ""
-    puts "All production apps are running the latest versions."
+    puts "Everything tracked is up to date (apps, databases, and libraries)."
     return
   end
 
@@ -3997,6 +4021,8 @@ def release_one(name)
   pull_out = `git -C #{dir} pull --ff-only origin main 2>&1`
   return { ok: false, log: "pull --ff-only failed: #{pull_out.strip}" } unless $?.success?
 
+  return release_lib(dir) if lib_repo?(name)
+
   if db_repo?(name)
     release_bin = File.expand_path(File.join(__dir__, "release-db"))
     env = { "RELEASE_AUTO_TAG" => "1", "RELEASE_DB_AUTO_CONFIRM" => "1" }
@@ -4010,6 +4036,19 @@ def release_one(name)
   { ok: status.success?, log: out }
 rescue => e
   { ok: false, log: "release_one raised: #{e.class}: #{e.message}" }
+end
+
+# Libraries release through the same `bin/release` entry point as everything
+# else — it already dispatches a `lib-` checkout to release-lib — but with the
+# terminal INHERITED rather than captured. release-lib is interactive all the
+# way down (it confirms the tag, then GPG asks for the signing passphrase), and
+# Open3.capture2e closes the child's stdin, so the first prompt would die on
+# EOF. The tradeoff: output streams to the console instead of being buffered
+# into the failure log, so on failure we point at what was already printed.
+def release_lib(dir)
+  release_bin = File.expand_path(File.join(__dir__, "release"))
+  ok = system(release_bin, chdir: dir)
+  { ok: !!ok, log: ok ? "" : "release failed (its output is above, not captured)" }
 end
 
 def release_serial(names, results, results_mutex)
@@ -4086,7 +4125,8 @@ end
 # already displayed them pass none. Exits non-zero if any release fails.
 def run_deploys(pending, concurrency:, errors: [])
   db_pending  = pending.select { |n| db_repo?(n) }
-  app_pending = pending.reject { |n| db_repo?(n) }
+  lib_pending = pending.select { |n| lib_repo?(n) }
+  app_pending = pending - db_pending - lib_pending
 
   results_mutex = Mutex.new
   results = {}
@@ -4121,6 +4161,23 @@ def run_deploys(pending, concurrency:, errors: [])
     release_concurrent(to_run, concurrency, results, results_mutex)
   end
 
+  # Libraries go last and one at a time: `release-lib` owns the terminal while
+  # it prompts, so it must not compete with the parallel app phase for stdin.
+  # Nothing depends on the ordering — consumers pin a released version, so a
+  # lib release never affects an app deploy in the same run.
+  unless lib_pending.empty?
+    if interactive_terminal?
+      puts ""
+      puts "Phase 3: releasing #{lib_pending.length} librar#{lib_pending.length == 1 ? 'y' : 'ies'} serially (interactive): #{lib_pending.join(', ')}"
+      puts ""
+      release_serial(lib_pending, results, results_mutex)
+    else
+      lib_pending.each do |n|
+        skipped[n] = "library release is interactive - run `release-lib` in #{deploy_item_dir(n)}"
+      end
+    end
+  end
+
   pending.each do |n|
     next if skipped.key?(n)
     results[n] ||= { ok: false, log: "no result recorded (worker died?)" }
@@ -4153,9 +4210,9 @@ def run_deploys(pending, concurrency:, errors: [])
     exit 1
   end
 
-  # Defensive: today every skip implies a failed DB (which already triggers
-  # exit 1 above). Future skip paths that don't correspond to a failure must
-  # still surface a non-zero exit.
+  # A skip means pending work was not released — a failed DB (which already
+  # exits 1 above), or a library skipped for want of a terminal. Either way the
+  # fleet is still behind, so the exit code has to say so.
   exit 1 unless skipped.empty?
 end
 
