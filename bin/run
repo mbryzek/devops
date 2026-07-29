@@ -10,6 +10,13 @@
 #   ./run.sh test
 #   ./run.sh test --fix     # on failures/errors, launch claude to investigate
 #                           # (without --fix, you're prompted before exiting)
+#   ./run.sh test --make-faster
+#                           # on a GREEN run, launch claude to speed the suite up
+#
+# Every `test` run prints a timing summary (see bin/test-timings) and appends a
+# row to ~/.cache/devops-test-timings/<project>.tsv, so a slowdown shows up as a
+# trend rather than a hunch. When the summary finds something worth speeding up
+# it says so and points at --make-faster.
 
 PROJECT=$(basename "$PWD")
 
@@ -34,19 +41,60 @@ Investigate and fix the errors:
 - Work on a feature branch and directory per CLAUDE.md; do not commit to main."
 }
 
+# Launch a claude session to make the suite faster. Only ever called on a GREEN
+# run: speeding up a suite while it is red means optimizing against unknown
+# behavior, and the timing numbers from a failed run are not trustworthy anyway.
+launch_make_faster() {
+  echo "Launching claude to make the test suite faster..."
+  claude --dangerously-skip-permissions "The $PROJECT test suite was just run and passed, in ${WALL_SECONDS:-unknown} seconds of wall clock. The full sbt/ScalaTest output is in $LOG. Make the suite faster without weakening it.
+
+Start by reading the timing summary, which is printed at the end of $LOG and can be regenerated at any time:
+  ~/code/devops/bin/test-timings $LOG --project $PROJECT --top 30 --no-history
+Run history (one row per run: timestamp, wall ms, test-body ms, tests, suites) is at ~/.cache/devops-test-timings/$PROJECT.tsv — check whether this is a recent regression before assuming it was always slow.
+
+How to read the numbers:
+- 'time in test bodies' is the sum of ScalaTest's per-test durations (the '-oD' flag, already set via testOptions in build.sbt). It counts ONLY the test body.
+- It excludes suite construction, beforeAll/afterAll, Play application and HTTP server boot, and compile. So if body time is a small share of wall clock, the cost is fixtures/boot and making individual tests do less work is the WRONG lever.
+- If summed body time is close to the 'longest test run' critical path, the suites are barely overlapping and parallelism is the lever.
+
+The per-test durations do NOT attribute fixture/boot cost to a specific suite. To get true per-SUITE wall time (which DOES include beforeAll/afterAll and suite construction), re-run one subproject with ScalaTest's JUnit XML reporter. It must be scoped to a specific PROJECT — a ThisBuild-scoped or 'every'-scoped setting does NOT work here, because each subproject sets its own 'testOptions += Tests.Argument(\"-oDF\")' which shadows ThisBuild, and 'set every' fails outright with 'Reference to undefined setting':
+  ./run.sh 'set <subproject> / Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, \"-u\", \"/tmp/$PROJECT-test-reports\")' <subproject>/test
+Then compare each <testsuite time=...> against the sum of its <testcase time=...> values; the gap is that suite's fixture and boot overhead.
+
+Things worth checking in this codebase specifically:
+- Specs extending DefaultServerSpec use GuiceOneServerPerSuite, which boots a full Play app AND binds an HTTP server per suite. Specs extending DefaultAppSpec share one application per JVM via core/test/core/helpers/SharedPlayApp.scala. A spec that does not actually exercise HTTP should be on DefaultAppSpec — check before moving one, and move it only if it genuinely makes no HTTP calls.
+- Class-level vals in a spec run at suite construction and are invisible to per-test durations. Creating orgs/users/clubs there is a common hidden cost.
+- Test / parallelExecution and Test / fork are set per subproject in build.sbt.
+- DB-heavy DAO specs often do redundant per-test setup that could be built once per suite.
+
+Rules:
+- Do NOT delete tests, weaken assertions, add Thread.sleep, or mark tests ignored/pending to make numbers go down. Coverage must not regress.
+- Do NOT change production behavior to speed up a test.
+- Measure before and after with the same command and report the real delta; do not claim an improvement you have not measured.
+- Read the relevant ~/code/claude/rules/*.mdc files before writing code.
+- Confirm the suite is still green before declaring done.
+- Work on a feature branch and directory per CLAUDE.md; do not commit to main."
+}
+
 if [ "$1" = "test" ]; then
   rm -f "/tmp/$PROJECT-test-"*.log
 
   # --fix: after the run, parse the log and, if there are any failures/errors,
   # launch a claude session (ccd == claude --dangerously-skip-permissions) to
   # investigate and fix them. The flag is stripped before passing args to sbt.
+  #
+  # --make-faster: on a green run, launch claude to speed the suite up instead.
+  # Both flags are stripped before the remaining args are passed to sbt.
   AUTOFIX=0
+  MAKE_FASTER=0
   argc=$#
   while [ "$argc" -gt 0 ]; do
     arg="$1"
     shift
     if [ "$arg" = "--fix" ]; then
       AUTOFIX=1
+    elif [ "$arg" = "--make-faster" ]; then
+      MAKE_FASTER=1
     else
       set -- "$@" "$arg"
     fi
@@ -120,6 +168,23 @@ if [ "$1" = "test" ]; then
   fi
   echo "============================================="
 
+  # Timing summary. Always runs, so every green run leaves a trend datapoint.
+  # Guarded: this is reporting only, and must never turn a green run red or
+  # mask the pass/fail result decided above.
+  WALL_SECONDS=$(grep -oE '^\[success\] Total time: [0-9]+ s' "$LOG" | tail -1 | grep -oE '[0-9]+')
+  # Resolve the sibling script via this script's own path, so a checkout under
+  # ~/code/ai/<feature>/devops exercises its own copy rather than the one in
+  # ~/code/devops.
+  TIMINGS="$(dirname "$0")/test-timings"
+  if [ -x "$TIMINGS" ]; then
+    # Only a green run goes into the trend: a run that aborted on failures has
+    # a wall clock that is not comparable to a full one.
+    HISTORY_FLAG=""
+    [ "$PROBLEMS" -gt 0 ] && HISTORY_FLAG="--no-history"
+    # shellcheck disable=SC2086
+    "$TIMINGS" "$LOG" --project "$PROJECT" $HISTORY_FLAG 2>&1 | tee -a "$LOG" || true
+  fi
+
   if [ "$SBT_STATUS" -ne 0 ]; then
     # The list sbt prints is reliable even when the ScalaTest summary is not.
     echo "sbt reported failure. Failed suites:"
@@ -128,6 +193,11 @@ if [ "$1" = "test" ]; then
   fi
 
   if [ "$PROBLEMS" -gt 0 ]; then
+    if [ "$MAKE_FASTER" -eq 1 ]; then
+      # Perf work on a red suite optimizes against unknown behavior. Get it
+      # green first; --fix (if also given) still runs below.
+      echo "Skipping --make-faster: the suite is not green. Fix the failures first."
+    fi
     if [ "$AUTOFIX" -eq 1 ]; then
       echo "Found $PROBLEMS problem(s)."
       launch_fix
@@ -148,6 +218,9 @@ if [ "$1" = "test" ]; then
     exit 1
   else
     echo "All green — no failures or errors."
+    if [ "$MAKE_FASTER" -eq 1 ]; then
+      launch_make_faster
+    fi
   fi
   exit 0
 else
