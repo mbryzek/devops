@@ -21,8 +21,10 @@ apps in parallel; stay in your repo(s) and do not "helpfully" fix theirs.
   1-row failure and a 400-row failure usually have different causes.
 - Read production state through the app's API and the read-only `dev` commands.
   NEVER connect to the production database, and never write to production.
-- Anything you run locally goes against the session DB on `localhost:5433` (see
-  the `session-db` skill). Never `localhost:5432` — that is Mike's dev DB.
+- Anything you run locally goes against this session's DB, whose host port is
+  per container — use the `CONF_DB_DEV_URL` that `claude-db start` printed
+  (`claude-db status` shows it again). See the `session-db` skill. Never
+  `localhost:5432` — that is Mike's dev DB.
 - Durable records first. Prod pod logs do not survive the pod, so pull
   invocations, tasks, watermarks, and audit columns before you go looking for log
   lines that are probably already gone.

@@ -10,8 +10,7 @@
 #   verify-db-images             Audit latest schema tag; build if missing.
 #   verify-db-images --tag TAG   Audit a specific SCHEMA tag (useful for testing
 #                                the missing-image path without touching latest).
-#                                The image tag audited is derived from it —
-#                                schema tag + image recipe hash.
+#                                The image tag IS the schema tag.
 #   verify-db-images --dry-run   Check only; never invoke build-and-push.sh.
 #
 # Exit codes:
@@ -32,8 +31,8 @@ puts "          purges images older than 3 days; backfill would be wasteful)"
 puts ""
 
 # Resolve the SCHEMA tag to check. --tag takes a schema (git) tag, the same
-# thing build-and-push.sh takes; the image tag is derived from it and carries
-# the image recipe hash on top (see platform-postgresql docker/image-tag.sh).
+# thing build-and-push.sh takes, and the image tag is that tag verbatim (see
+# DbImages.image_tag for the recipe-change regression that accepts).
 if args.tag && !args.tag.empty?
   schema_tag = args.tag
   puts "Tag source : explicit --tag argument"

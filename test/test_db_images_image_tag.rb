@@ -1,86 +1,57 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
-require 'tmpdir'
-require 'fileutils'
 require_relative '../lib/common'
 require_relative 'test_helper'
 
-# The image tag is what decides whether a session runs the current platformdb
-# image or a stale cached one. It is deliberately NOT the schema tag: the image
-# also bakes seed data and the init script, so a seed-only change has to move
-# the tag or every local Docker cache keeps serving the old image under the
-# unchanged schema tag (that is exactly how a null contact_email survived in
-# the template long after the seed was written to fix it).
+# The image tag IS the schema tag, and it is also what names the per-tag
+# container — so these two must not drift apart. There used to be a recipe hash
+# suffix (platform-postgresql's docker/image-tag.sh, now deleted); it is gone
+# because a tag that moved without a schema release meant tearing down the one
+# shared container, which destroyed every other session's database.
 #
-# lib/db_images.rb does not compute the tag — platform-postgresql's
-# docker/image-tag.sh does, so there is one definition. These tests pin the
-# contract of that shell-out: pass the schema tag through, return the script's
-# answer, and fail LOUDLY (never fall back to the bare schema tag) when the
-# checkout cannot answer.
+# The accepted regression: a recipe-only change (seed.sql, initdb, Dockerfile)
+# does NOT move the tag, so it reaches nobody until the next schema tag bump.
+# Mitigation is discipline, not code — nothing here should reintroduce a
+# derived tag.
 class TestDbImagesImageTag < Minitest::Test
   include DevTestSupport
 
-  # A fake platform-postgresql checkout whose docker/image-tag.sh behaves as
-  # `body` dictates.
-  def with_fake_checkout(body, executable: true)
-    Dir.mktmpdir do |dir|
-      script = File.join(dir, "docker", "image-tag.sh")
-      FileUtils.mkdir_p(File.dirname(script))
-      File.write(script, "#!/usr/bin/env bash\n#{body}\n")
-      FileUtils.chmod(executable ? 0o755 : 0o644, script)
-      yield dir
+  def test_image_tag_is_the_schema_tag_unchanged
+    assert_equal "0.5.18", DbImages.image_tag("0.5.18")
+  end
+
+  def test_image_tag_does_not_shell_out
+    # A shell-out is what made this fail whenever a checkout was stale. Prove it
+    # is pure: no checkout on disk is consulted, so no checkout can break it.
+    Dir.chdir("/") do
+      assert_equal "0.9.99", DbImages.image_tag("0.9.99")
     end
   end
 
-  def test_returns_the_scripts_answer
-    with_fake_checkout('echo "$1-rdeadbeef"') do |dir|
-      assert_equal "0.5.18-rdeadbeef", DbImages.image_tag("0.5.18", :dir => dir)
-    end
+  def test_image_ref_is_registry_plus_schema_tag
+    assert_equal(
+      "registry.digitalocean.com/bryzek/platformdb:0.5.22",
+      DbImages.image_ref(DbImages.image_tag("0.5.22"))
+    )
   end
 
-  def test_answer_is_stripped
-    with_fake_checkout('printf "  0.5.18-rdeadbeef \n"') do |dir|
-      assert_equal "0.5.18-rdeadbeef", DbImages.image_tag("0.5.18", :dir => dir)
-    end
+  # ── container naming ──────────────────────────────────────────────────────
+
+  def test_container_name_is_prefix_plus_schema_tag
+    assert_equal "platformdb-claude-0.5.22", DbImages.container_name("0.5.22")
   end
 
-  def test_schema_tag_is_passed_through_unmangled
-    with_fake_checkout('echo "got:$1"') do |dir|
-      assert_equal "got:0.5.18", DbImages.image_tag("0.5.18", :dir => dir)
-    end
+  def test_container_schema_tag_round_trips
+    assert_equal "0.5.22", DbImages.container_schema_tag(DbImages.container_name("0.5.22"))
   end
 
-  # ── loud failures ─────────────────────────────────────────────────────────
-
-  def test_missing_script_exits_with_error
-    Dir.mktmpdir do |dir|
-      err, status = capture_stderr_and_exit { DbImages.image_tag("0.5.18", :dir => dir) }
-      assert_equal 1, status
-      assert_match(/image-tag\.sh/, err)
-    end
+  # The pre-split container carries no tag. It may still hold other sessions'
+  # databases, so it has to be recognisable rather than mistaken for a tagged one.
+  def test_legacy_container_has_no_schema_tag
+    assert_nil DbImages.container_schema_tag(DbImages::LEGACY_CONTAINER)
   end
 
-  def test_non_executable_script_exits_with_error
-    with_fake_checkout('echo "0.5.18-rdeadbeef"', :executable => false) do |dir|
-      err, status = capture_stderr_and_exit { DbImages.image_tag("0.5.18", :dir => dir) }
-      assert_equal 1, status
-      assert_match(/image-tag\.sh/, err)
-    end
-  end
-
-  def test_failing_script_exits_with_error_including_its_output
-    with_fake_checkout('echo "recipe file not found" >&2; exit 1') do |dir|
-      err, status = capture_stderr_and_exit { DbImages.image_tag("0.5.18", :dir => dir) }
-      assert_equal 1, status
-      assert_match(/recipe file not found/, err)
-    end
-  end
-
-  def test_silent_empty_answer_exits_with_error
-    with_fake_checkout('exit 0') do |dir|
-      err, status = capture_stderr_and_exit { DbImages.image_tag("0.5.18", :dir => dir) }
-      assert_equal 1, status
-      assert_match(/0\.5\.18/, err)
-    end
+  def test_unrelated_container_has_no_schema_tag
+    assert_nil DbImages.container_schema_tag("some-other-postgres")
   end
 end

@@ -36,7 +36,7 @@ Investigate and fix the errors:
 - Trust sbt's exit code and the '[error] Failed tests:' list over ScalaTest's 'Tests: succeeded N, failed N' summary lines. If the ScalaTest reporter died mid-run ('Reporter completed abruptly'), those summary lines UNDERCOUNT and can read 'failed 0' on a run that failed.
 - Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
 - Do NOT change production behavior unless you first prove it is in fact a production bug. Starting assumption is the tests need to be updated.
-- Check CONF_DB_DEV_URL is set to the :5433 session DB first: a suite that silently ran against the :5432 dev DB produces mass stale-data failures that are environmental, not code bugs.
+- Check CONF_DB_DEV_URL is set to this session's DB first (the port is per container — use the URL 'claude-db start' handed you, shown again by 'claude-db status'). A suite that silently ran against the :5432 dev DB produces mass stale-data failures that are environmental, not code bugs.
 - After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
 - Work on a feature branch and directory per CLAUDE.md; do not commit to main."
 }
