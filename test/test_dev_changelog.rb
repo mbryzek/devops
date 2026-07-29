@@ -160,6 +160,47 @@ class TestChangelogCaptureScanLine < Minitest::Test
                                        skipped: "skipped, no checkout at /x")
     assert_equal "  playbook-app: skipped, no checkout at /x", line
   end
+
+  def test_a_gap_is_shouted_on_the_scan_line
+    line = changelog_capture_scan_line(app: "playbook-app", repo: "playbook-app",
+                                       tags: 188, new: 0, latest: "0.1.88",
+                                       gap: "is missing 6 release(s)")
+    assert_equal "  playbook-app: 188 tag(s), 0 new, latest 0.1.88 -- SERVER IS MISSING 6 RELEASE(S)", line
+  end
+end
+
+# "0 new" says the newest tag is recorded. It does NOT say every tag is recorded -- capture
+# only ever looks past the cursor, so a hole below the watermark is invisible to it. This is
+# the check that tells those two apart.
+class TestChangelogCaptureGap < Minitest::Test
+  def scan(tags: 375, **rest) = { app: "playbook-admin", tags: tags, **rest }
+
+  def test_no_gap_when_the_counts_agree
+    assert_nil changelog_capture_gap(scan, 375)
+  end
+
+  def test_reports_releases_the_server_is_missing
+    assert_equal "is missing 4 release(s)", changelog_capture_gap(scan, 371)
+  end
+
+  # The other direction is real too: a tag deleted locally, or a lake version whose tag is gone.
+  def test_reports_releases_git_does_not_have
+    assert_equal "has 2 release(s) not in git", changelog_capture_gap(scan, 377)
+  end
+
+  # A platform that predates release_count returns nothing here. Reading that as zero would
+  # report every tag as missing on every run -- a false alarm is worse than no check.
+  def test_an_absent_count_is_not_zero
+    assert_nil changelog_capture_gap(scan, nil)
+  end
+
+  def test_an_app_with_no_tags_is_not_compared
+    assert_nil changelog_capture_gap(scan(tags: 0), 5)
+  end
+
+  def test_a_skipped_app_is_not_compared
+    assert_nil changelog_capture_gap(scan(skipped: "no checkout"), 0)
+  end
 end
 
 # A build lists every version it touched on its own line; the labels are padded so the
@@ -580,5 +621,106 @@ class TestDevChangelogPush < Minitest::Test
     stub_global(:changelog_status) { |_e| raise ApiError, "HTTP 500" }
     _, err = capture_io { cmd_changelog_push(["--app", "playbook-admin"], pipeline: true) }
     assert_includes err, "changelog push: HTTP 500 (ignored)"
+  end
+end
+
+# The wiring around changelog_capture_gap: capture has to re-read the count AFTER sending,
+# and a gap has to reach the user on stderr rather than only in the scan line.
+class TestDevChangelogCapture < Minitest::Test
+  def setup
+    @checkout = Dir.mktmpdir("changelog-checkout")
+    FileUtils.mkdir_p(File.join(@checkout, ".git"))
+    @posted = []
+    @status_reads = 0
+    @tags = %w[0.3.0 0.3.1 0.3.2]
+    @max_version = nil
+    @release_count = 0
+    @real_methods = {}
+    stub_world!
+  end
+
+  def teardown
+    FileUtils.remove_entry(@checkout)
+    @real_methods.each { |name, m| Object.send(:define_method, name, m) }
+  end
+
+  def stub_global(name, &body)
+    @real_methods[name] ||= begin
+      Object.instance_method(name)
+    rescue NameError
+      nil
+    end
+    Object.send(:define_method, name, body)
+  end
+
+  attr_reader :tags, :max_version, :release_count
+
+  def record_status_read = @status_reads += 1
+
+  def stub_world!
+    test = self
+    posted = @posted
+    checkout = @checkout
+    stub_global(:platform_endpoint) { |_localhost| { name: "test" } }
+    stub_global(:changelog_app_repo) { |_app| "playbook-admin" }
+    stub_global(:changelog_app_checkout) { |_app| checkout }
+    stub_global(:changelog_tags) { |_checkout| test.tags.dup }
+    stub_global(:changelog_commits) { |_checkout, _range| [] }
+    stub_global(:changelog_git_out) { |*_cmd| "2026-07-20T14:00:00-04:00" }
+    stub_global(:changelog_status) do |_endpoint|
+      test.record_status_read
+      { "playbook-admin" => { "application" => "playbook-admin",
+                              "max_version" => test.max_version,
+                              "release_count" => test.release_count,
+                              "versions_missing_notes" => [] } }
+    end
+    stub_global(:changelog_post_batches) do |_endpoint, path, _key, records|
+      posted << [path, records]
+      records.length
+    end
+  end
+
+  def capture
+    capture_io { cmd_changelog_capture(["--app", "playbook-admin"]) }
+  end
+
+  # Without the re-read the count would be short by exactly what this run just sent, and a
+  # perfectly clean capture would report a gap every time.
+  def test_rereads_the_count_after_sending
+    @release_count = 0
+    out, err = capture
+    assert_equal 2, @status_reads
+    assert_includes out, "sent 3 release(s)"
+    # The stub reports the same count on the second read, so the gap is genuine and reported.
+    assert_includes err, "playbook-admin is missing 3 release(s)"
+  end
+
+  def test_a_caught_up_server_reports_no_gap
+    @max_version = "0.3.2"
+    @release_count = 3
+    out, err = capture
+    assert_equal 1, @status_reads, "nothing was sent, so there is nothing to re-read"
+    assert_includes out, "  playbook-admin: 3 tag(s), 0 new, latest 0.3.2"
+    refute_includes out, "SERVER"
+    assert_empty err
+  end
+
+  # The whole point: the cursor is current, so capture sends nothing and would have said
+  # "0 new" -- but the server is short a release below the watermark.
+  def test_a_hole_below_the_cursor_is_caught
+    @max_version = "0.3.2"
+    @release_count = 2
+    out, err = capture
+    assert_includes out, "0 new, latest 0.3.2 -- SERVER IS MISSING 1 RELEASE(S)"
+    assert_includes err, "run `dev changelog push`"
+  end
+
+  # A platform that predates release_count must not trigger a false alarm on every run.
+  def test_a_server_without_the_field_is_silent
+    @max_version = "0.3.2"
+    @release_count = nil
+    out, err = capture
+    refute_includes out, "SERVER"
+    assert_empty err
   end
 end
