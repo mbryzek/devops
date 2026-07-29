@@ -343,6 +343,11 @@ def do_build(app, tag: nil, push: false)
   tag ||= app.current_schema_tag
   image = app.image_ref(DbImages.image_tag(tag))
 
+  # Before the scratch Postgres, the schema replay and the multi-arch build: a
+  # push that has to create a new repository in a full registry is denied at
+  # token time, i.e. after all of it has already run.
+  DbImages.assert_registry_has_room!(app) if push
+
   puts ""
   puts Util.underline("db-image build  [app: #{app.name}  db: #{app.database}  tag: #{tag}]")
   puts ""

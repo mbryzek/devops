@@ -148,6 +148,63 @@ module DbImages
     Util.exit_with_error("Could not parse doctl registry output: #{e.message}")
   end
 
+  # Names of every repository in the registry (e.g. "platformdb"), or nil when
+  # the listing could not be read.
+  #
+  # nil rather than [] on failure: an empty registry and an unreachable one look
+  # identical on stdout, and the pre-flight below must never read a doctl outage
+  # as "plenty of room".
+  def DbImages.repository_names
+    require 'json'
+    out = `doctl registry repository list-v2 --output json 2>&1`
+    return nil unless $?.success?
+    (JSON.parse(out) || []).map { |entry| entry["name"] }.compact
+  rescue JSON::ParserError
+    nil
+  end
+
+  # Repositories included in the registry's subscription tier — Basic, $5/mo.
+  #
+  # A constant because doctl exposes no way to read the ACTIVE tier: `registry
+  # get` omits it, and `registry options subscription-tiers` lists only the tiers
+  # one could switch TO. Naming it in the error below makes an upgrade a one-line
+  # edit instead of a mystery.
+  REPOSITORY_LIMIT = 5
+
+  # Exit BEFORE any expensive work when pushing `app`'s image would have to
+  # create a new repository in a registry that has no slot left.
+  #
+  # DigitalOcean enforces the cap when it issues the push token, which is the
+  # last step of `docker buildx build --push`: the scratch Postgres runs, the
+  # schema is replayed, both architectures build and export their layers, and
+  # only then does it die with "denied: registry contains 5 repositories, limit
+  # is 5". Hit 2026-07-29 adding acumendb as the 6th repository — twice, because
+  # verify-db-images self-heals by rebuilding.
+  #
+  # Fails OPEN, deliberately: an app whose repository already exists consumes no
+  # new slot, and an unreadable listing is not evidence of a full registry. The
+  # check may only ever turn a guaranteed failure into a fast one.
+  def DbImages.assert_registry_has_room!(app, names: DbImages.repository_names)
+    return if names.nil?
+    return if names.include?(app.image_name)
+    return if names.length < REPOSITORY_LIMIT
+
+    Util.exit_with_error(
+      "Registry is full: #{names.length} repositories, limit is #{REPOSITORY_LIMIT}.\n" \
+      "Pushing #{app.image_name} would create a new one, and DigitalOcean denies the push\n" \
+      "token only AFTER the whole multi-arch build has run.\n" \
+      "\n" \
+      "  In use: #{names.sort.join(", ")}\n" \
+      "\n" \
+      "Free a slot with `doctl registry repository delete <name>` (destructive — every tag\n" \
+      "in that repository goes with it), or upgrade the registry's subscription tier and\n" \
+      "raise REPOSITORY_LIMIT in lib/db_images.rb.\n" \
+      "\n" \
+      "To build without the registry at all, drop --push: `claude-db start` prefers a\n" \
+      "locally cached image and never pulls when one exists."
+    )
+  end
+
   # True if the image exists in the local Docker image cache.
   def DbImages.image_available_locally?(image)
     system("docker image inspect #{Shellwords.shellescape(image)} > /dev/null 2>&1")
