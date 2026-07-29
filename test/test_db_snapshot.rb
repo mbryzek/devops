@@ -90,3 +90,23 @@ class TestDbSnapshot < Minitest::Test
     assert_nil DbSnapshot.copy_target("  COPY public.users FROM stdin;\n")
   end
 end
+
+# A registry repository that has never been pushed to does not exist at all, and
+# doctl reports that as a 404. Treating it as a hard failure meant a brand-new
+# app could never be healed by verify-db-images — the one situation it exists
+# for. Treating EVERY doctl failure as "absent" would be worse: a network outage
+# would read as an empty registry and trigger a rebuild.
+class TestDbImagesRepositoryMissing < Minitest::Test
+  include DevTestSupport
+
+  def test_404_repository_not_found_is_absent_not_an_error
+    out = '{"errors":[{"detail":"GET https://api.digitalocean.com/v2/registry/bryzek/repositories/acumendb/tags: 404 repository not found"}]}'
+    assert DbImages.repository_missing?(out)
+  end
+
+  def test_other_failures_are_not_treated_as_absent
+    refute DbImages.repository_missing?('Error: unable to connect to the API')
+    refute DbImages.repository_missing?('Error: 401 Unauthorized')
+    refute DbImages.repository_missing?('')
+  end
+end

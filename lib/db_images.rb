@@ -119,6 +119,18 @@ module DbImages
        .sub(/_+$/, '')
   end
 
+  # A repository that has never been pushed to does not exist in the registry at
+  # all, and doctl reports that as a 404 rather than an empty list. For an app
+  # whose first image has not been built yet that is "no tags", not a failure —
+  # the whole point of verify-db-images is to notice and heal exactly that.
+  #
+  # Matched on the message because doctl exits 1 for every error alike; the
+  # alternative is treating a network outage as an empty registry, which is the
+  # mistake this deliberately avoids.
+  def DbImages.repository_missing?(doctl_output)
+    doctl_output =~ /repository not found/i ? true : false
+  end
+
   # True if the given schema tag has a pushed image in `app`'s registry repo.
   #
   # Requires doctl to be authenticated.  Exits with an error on unexpected
@@ -128,6 +140,7 @@ module DbImages
     require 'json'
     out = `doctl registry repository list-tags #{app.image_name} --output json 2>&1`
     unless $?.success?
+      return false if DbImages.repository_missing?(out)
       Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
     end
     (JSON.parse(out) || []).any? { |entry| entry["tag"] == tag }
@@ -229,6 +242,10 @@ module DbImages
     require 'time'
     out = `doctl registry repository list-tags #{app.image_name} --output json 2>&1`
     unless $?.success?
+      if DbImages.repository_missing?(out)
+        puts "purge_old: #{app.image_name} has no registry repository yet — nothing to do"
+        return
+      end
       Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
     end
 
