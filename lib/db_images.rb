@@ -3,13 +3,29 @@ require 'shellwords'
 # Registry + container constants and helpers for the platformdb Docker workflow.
 #
 # Used by bin/claude-db (per-session DB lifecycle) and any other tooling that
-# needs to know where images live or how to talk to the local container.
+# needs to know where images live or how to talk to a local container.
+#
+# ONE CONTAINER PER SCHEMA TAG. There is no single container and no fixed port:
+# the container is "platformdb-claude-<schema-tag>" and its host port is
+# allocated per container (see lib/db_ports.rb). Every helper that talks to
+# Postgres therefore takes the port of the container it is addressing.
+#
+# Why: a single shared container on a single port meant that adopting a new
+# image forced `docker rm -f` on it, which destroyed EVERY session's database
+# rather than just the caller's (measured: one `claude-db start` wiped four
+# other sessions' databases).
 module DbImages
   REGISTRY      = "registry.digitalocean.com/bryzek"
   IMAGE_NAME    = "platformdb"
-  CONTAINER     = "platformdb-claude"
+
+  # Container names are "<CONTAINER_PREFIX>-<schema-tag>". The bare prefix is
+  # also the name of the LEGACY pre-split container, which may still be running
+  # with other sessions' data in it — it is listed and (once empty) reaped, but
+  # never removed by force. No flag day.
+  CONTAINER_PREFIX = "platformdb-claude"
+  LEGACY_CONTAINER = CONTAINER_PREFIX
+
   HOST          = "localhost"
-  PORT          = 5433
   TEMPLATE_DB   = "platformdb_template"
   SESS_PREFIX   = "platformdb_sess_"
 
@@ -39,28 +55,27 @@ module DbImages
     tag
   end
 
-  # Docker image tag for a schema tag: "<schema-tag>-r<recipe-hash>".
+  # Docker image tag for a schema tag: the schema tag itself, unmodified.
+  # The image ref is "registry.digitalocean.com/bryzek/platformdb:<schema-tag>".
   #
-  # The image is schema PLUS recipe (seed rows, init script, Dockerfile), so a
-  # recipe-only change has to produce a different image tag — otherwise the
-  # registry and every local Docker cache keep serving the old image under the
-  # unchanged schema tag and the change reaches nobody until the next schema
-  # release. platform-postgresql's docker/image-tag.sh is the single definition
-  # of that tag; shelling out to it keeps this from drifting into a second one.
-  def DbImages.image_tag(schema_tag, dir: PLATFORM_POSTGRESQL_DIR)
-    script = File.join(dir, "docker", "image-tag.sh")
-    unless File.executable?(script)
-      Util.exit_with_error(
-        "Image tag script not found or not executable: #{script}\n" \
-        "Update the platform-postgresql checkout at #{dir} (this devops " \
-        "version requires docker/image-tag.sh)."
-      )
-    end
-    out = `#{Shellwords.shellescape(script)} #{Shellwords.shellescape(schema_tag)} 2>&1`.strip
-    unless $?.success? && !out.empty?
-      Util.exit_with_error("Could not compute image tag for #{schema_tag}: #{out}")
-    end
-    out
+  # KNOWN REGRESSION, accepted deliberately — do NOT "fix" it by reintroducing a
+  # derived tag. The image is schema PLUS recipe (docker/seed.sql,
+  # docker/initdb/*, the Dockerfile), and the recipe changes WITHOUT a schema
+  # release. A bare tag therefore lets a stale image keep serving under an
+  # unchanged tag: the registry and every local Docker cache already hold an
+  # image for that tag, so a recipe-only change reaches NOBODY until the next
+  # schema tag bump.
+  #
+  # This used to be solved by hashing the recipe into the tag
+  # (<schema-tag>-r<hash>, via platform-postgresql's docker/image-tag.sh, now
+  # deleted). That hash is gone because the tag is now what names the container:
+  # a tag that moved without a schema release meant tearing down the shared
+  # container, which destroyed every other session's database. Per-tag
+  # containers are worth the trade.
+  #
+  # Mitigation is discipline: BUMP THE SCHEMA TAG WHEN YOU CHANGE THE RECIPE.
+  def DbImages.image_tag(schema_tag)
+    schema_tag
   end
 
   # Image tag for the current schema tag — what every session should be on.
@@ -165,24 +180,75 @@ module DbImages
     system("docker image inspect #{Shellwords.shellescape(image)} > /dev/null 2>&1")
   end
 
-  # True when the platformdb-claude container is up and running.
-  def DbImages.container_running?
-    out = `docker inspect #{CONTAINER} --format='{{.State.Running}}' 2>/dev/null`.strip
+  # ── containers ────────────────────────────────────────────────────────────
+
+  # Container name for a schema tag.
+  def DbImages.container_name(schema_tag)
+    "#{CONTAINER_PREFIX}-#{schema_tag}"
+  end
+
+  # Schema tag a container name encodes, or nil for the legacy untagged one.
+  def DbImages.container_schema_tag(name)
+    return nil if name == LEGACY_CONTAINER
+    prefix = "#{CONTAINER_PREFIX}-"
+    return nil unless name.start_with?(prefix)
+    tag = name[prefix.length..]
+    tag && !tag.empty? ? tag : nil
+  end
+
+  # Every platformdb-claude* container on this box, running or not, sorted by
+  # name. Includes the legacy untagged container when it is still around.
+  # `docker ps --filter name=` is a substring match, so the result is filtered
+  # against the prefix to keep an unrelated container from being adopted.
+  def DbImages.claude_containers
+    out = `docker ps -a --filter name=#{CONTAINER_PREFIX} --format '{{.Names}}' 2>/dev/null`
+    out.split("\n").map(&:strip).reject(&:empty?)
+       .select { |n| n == LEGACY_CONTAINER || n.start_with?("#{CONTAINER_PREFIX}-") }
+       .sort
+  end
+
+  # True when the named container exists at all (running or stopped).
+  def DbImages.container_exists?(name)
+    system("docker inspect #{Shellwords.shellescape(name)} > /dev/null 2>&1")
+  end
+
+  # True when the named container is up and running.
+  def DbImages.container_running?(name)
+    out = `docker inspect #{Shellwords.shellescape(name)} --format='{{.State.Running}}' 2>/dev/null`.strip
     out == "true"
   end
 
-  # Image the running container was started from (e.g. "registry.…/platformdb:0.3.44").
-  def DbImages.container_image
-    `docker inspect #{CONTAINER} --format='{{.Config.Image}}' 2>/dev/null`.strip
+  # Image the named container was created from (e.g. "registry.…/platformdb:0.3.44").
+  def DbImages.container_image(name)
+    `docker inspect #{Shellwords.shellescape(name)} --format='{{.Config.Image}}' 2>/dev/null`.strip
   end
 
-  # Block until the container's Postgres accepts connections, or raise an error.
-  def DbImages.wait_for_postgres(timeout: 30)
+  # Host port the named container publishes Postgres on, or nil.
+  #
+  # Read from HostConfig.PortBindings rather than NetworkSettings.Ports so a
+  # STOPPED container still answers — that is what lets `start` recreate a dead
+  # container for the same tag on its original port without being handed one.
+  def DbImages.container_port(name)
+    out = `docker inspect #{Shellwords.shellescape(name)} \
+--format='{{with index .HostConfig.PortBindings "5432/tcp"}}{{(index . 0).HostPort}}{{end}}' 2>/dev/null`.strip
+    return nil if out.empty?
+    port = out.to_i
+    port > 0 ? port : nil
+  end
+
+  # ── postgres ──────────────────────────────────────────────────────────────
+  #
+  # Every one of these takes the port of the container being addressed. There is
+  # no default: a constant here is exactly how one session ends up talking to
+  # another session's container.
+
+  # Block until Postgres on `port` accepts connections, or exit with an error.
+  def DbImages.wait_for_postgres(port, timeout: 30)
     deadline = Time.now + timeout
     loop do
-      system("pg_isready -h #{HOST} -p #{PORT} -q > /dev/null 2>&1")
+      system("pg_isready -h #{HOST} -p #{port} -q > /dev/null 2>&1")
       return if $?.success?
-      Util.exit_with_error("Timed out waiting for Postgres on :#{PORT} after #{timeout}s") if Time.now > deadline
+      Util.exit_with_error("Timed out waiting for Postgres on :#{port} after #{timeout}s") if Time.now > deadline
       sleep 0.5
     end
   end
@@ -190,23 +256,23 @@ module DbImages
   # Run a SELECT and return rows as an array of strings.
   # Uses -At (unaligned, tuples-only) for clean programmatic output.
   # Errors are silently discarded; callers interpret an empty result.
-  def DbImages.psql_query(sql, database: "postgres")
-    cmd = "psql -h #{HOST} -p #{PORT} -U postgres -At " \
+  def DbImages.psql_query(port, sql, database: "postgres")
+    cmd = "psql -h #{HOST} -p #{port} -U postgres -At " \
           "-c #{Shellwords.shellescape(sql)} #{database} 2>/dev/null"
     `#{cmd}`.strip.split("\n").map(&:strip).reject(&:empty?)
   end
 
   # Execute a DDL statement via Util.run (echoes the command, exits on failure).
-  def DbImages.psql_exec(sql, database: "postgres")
+  def DbImages.psql_exec(port, sql, database: "postgres")
     Util.run(
-      "psql -h #{HOST} -p #{PORT} -U postgres " \
+      "psql -h #{HOST} -p #{port} -U postgres " \
       "-c #{Shellwords.shellescape(sql)} #{database}"
     )
   end
 
   # Execute a DDL statement silently; returns true on success, false otherwise.
-  def DbImages.psql_exec_quiet(sql, database: "postgres")
-    cmd = "psql -h #{HOST} -p #{PORT} -U postgres " \
+  def DbImages.psql_exec_quiet(port, sql, database: "postgres")
+    cmd = "psql -h #{HOST} -p #{port} -U postgres " \
           "-c #{Shellwords.shellescape(sql)} #{database} > /dev/null 2>&1"
     system(cmd)
   end
@@ -283,17 +349,39 @@ module DbImages
     end
   end
 
-  # List all platformdb_sess_* database names.
-  def DbImages.list_session_dbs
+  # List all platformdb_sess_* database names in the container on `port`.
+  def DbImages.list_session_dbs(port)
     psql_query(
+      port,
       "SELECT datname FROM pg_database WHERE datname LIKE '#{SESS_PREFIX}%' ORDER BY datname"
     )
   end
 
-  # Return the set of session DB names that have at least one active backend.
-  def DbImages.active_session_dbs
+  # Session DB names in the container on `port` with at least one active backend.
+  def DbImages.active_session_dbs(port)
     psql_query(
+      port,
       "SELECT DISTINCT datname FROM pg_stat_activity WHERE datname LIKE '#{SESS_PREFIX}%'"
     ).to_set
+  end
+
+  # True when `db` exists in the container on `port`.
+  def DbImages.database_exists?(port, db)
+    psql_query(port, "SELECT 1 FROM pg_database WHERE datname = '#{db}'") == ["1"]
+  end
+
+  # Every running claude container paired with its port, as [name, port].
+  # Containers whose port cannot be determined are skipped — there is no way to
+  # talk to them and guessing a port would mean talking to somebody else's.
+  def DbImages.running_containers_with_ports
+    claude_containers.select { |n| container_running?(n) }.map { |n|
+      port = container_port(n)
+      port ? [n, port] : nil
+    }.compact
+  end
+
+  # The [container, port] holding `db`, or nil when no running container has it.
+  def DbImages.find_container_with_db(db)
+    running_containers_with_ports.find { |(_name, port)| database_exists?(port, db) }
   end
 end

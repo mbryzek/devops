@@ -5,23 +5,45 @@
 # allowing parallel sessions to develop against the same schema without
 # interfering with each other.
 #
+# ONE CONTAINER PER SCHEMA TAG, ONE PORT PER CONTAINER. The container is
+# platformdb-claude-<schema-tag> and its host port is allocated from the history
+# file at ~/code/ai/.claude-db-ports.json — there is no fixed :5433 any more.
+# Never hardcode a port: use the CONF_DB_DEV_URL `start` handed you.
+#
+# `start` NEVER removes a container it did not just decide to create. Adopting a
+# new schema tag creates a NEW container beside the existing ones. The old
+# behaviour — one shared container, torn down and recreated whenever the image
+# moved — destroyed every other session's database, not just the caller's (one
+# `claude-db start` was measured wiping four other sessions' databases).
+#
 # Usage:
-#   claude-db start    Boot the container if needed and create this session's DB.
-#                      Prints: CONF_DB_DEV_URL=jdbc:postgresql://localhost:5433/<db>
+#   claude-db next-port    Print a free host port to pass to `start`.
 #
-#   claude-db end      Drop this session's database.
+#   claude-db start [--port N]
+#                      Boot the container for the current schema tag if needed
+#                      and create this session's DB. --port is REQUIRED only
+#                      when that container does not exist yet; when it does, its
+#                      port is reused and re-running with no arguments works.
+#                      Prints: CONF_DB_DEV_URL=jdbc:postgresql://localhost:<port>/<db>
 #
-#   claude-db status   Show container state and list all platformdb_sess_* databases.
+#   claude-db end      Drop this session's database, from whichever container
+#                      holds it.
+#
+#   claude-db status   Show every platformdb-claude* container — schema tag,
+#                      port, and the platformdb_sess_* databases inside it.
 #
 #   claude-db gc       Drop session databases with no active backend (dead-session
-#                      orphans).  Always preserves the current session's database.
+#                      orphans), then remove containers left holding none and
+#                      release their ports.  Always preserves the current
+#                      session's database.
 #
 # Environment:
 #   CLAUDE_SESSION_ID  Session identifier set automatically by Claude Code.
 #                      Two concurrent sessions must have different values —
 #                      this is what gives each session a distinct database name.
-#                      Falls back to a stable per-user-per-machine string when
-#                      not set (manual use, single session only).
+#                      When unset, the ~/code/ai/<feature> directory name is
+#                      used; when neither can be determined, claude-db fails
+#                      loudly rather than sharing one database across sessions.
 
 DIR = File.dirname(__FILE__)
 load File.join(DIR, '../lib/common.rb')
@@ -34,60 +56,65 @@ def show_usage
     Usage: claude-db <command>
 
     Commands:
-      start    Ensure the #{DbImages::CONTAINER} container is running and create a
-               per-session database cloned from #{DbImages::TEMPLATE_DB}.
-               Prints CONF_DB_DEV_URL for the caller to export.
+      next-port          Print a free host port (#{DbPorts::RANGE_MIN}-#{DbPorts::RANGE_MAX}) for `start --port`.
 
-      end      Drop this session's database.
+      start [--port N]   Ensure the #{DbImages::CONTAINER_PREFIX}-<schema-tag> container is
+                         running and create a per-session database cloned from
+                         #{DbImages::TEMPLATE_DB}.  --port is required only when
+                         that container does not exist yet.
+                         Prints CONF_DB_DEV_URL for the caller to export.
 
-      status   Show container state and list all session databases.
+      end                Drop this session's database.
 
-      gc       Drop orphaned session databases (no active backend connections).
-               Always preserves the current session's database.
+      status             Show every claude container and its session databases.
+
+      gc                 Drop orphaned session databases (no active backend), then
+                         remove containers holding none.  Always preserves the
+                         current session's database.
 
     Environment:
       CLAUDE_SESSION_ID   Session identifier (auto-set by Claude Code).
-                          Omit for manual single-session use.
+                          Falls back to the ~/code/ai/<feature> directory name.
 
   USAGE
   exit 1
 end
 
+# ── next-port ──────────────────────────────────────────────────────────────
+
+def do_next_port
+  port = DbPorts.allocate!
+  if port.nil?
+    Util.exit_with_error(
+      "No free port in #{DbPorts::RANGE_MIN}-#{DbPorts::RANGE_MAX}.\n" \
+      "Every port in the range is either reserved by a container that still " \
+      "exists or bound on this host.\n" \
+      "Run `claude-db gc` to reap containers holding no session databases, " \
+      "which releases their ports."
+    )
+  end
+  # Stdout is exactly the port and nothing else — this is meant to be used as
+  # `claude-db start --port "$(claude-db next-port)"`.
+  puts port
+end
+
 # ── start ──────────────────────────────────────────────────────────────────
 
-def do_start
-  # Two tags, deliberately: the schema tag is the platform-postgresql git tag
-  # (what a build replays), the image tag is that plus the image recipe hash
-  # (what a container runs). A seed-data change moves the second and not the
-  # first — which is the whole point: it restarts the container onto the new
-  # image instead of silently reusing the cached one.
+def do_start(requested_port)
+  # The image tag IS the schema tag now (the recipe hash is gone — see
+  # DbImages.image_tag for the regression that accepts and why). It is also what
+  # names the container, which is the whole point: a new tag gets a NEW
+  # container instead of evicting everyone from the shared one.
   schema_tag = DbImages.current_schema_tag
   image_tag  = DbImages.image_tag(schema_tag)
+  container  = DbImages.container_name(schema_tag)
+
   puts ""
-  puts Util.underline("claude-db start  [schema tag: #{schema_tag}  image: #{image_tag}]")
+  puts Util.underline("claude-db start  [schema tag: #{schema_tag}  container: #{container}]")
   puts ""
 
   desired_image = DbImages.image_ref(image_tag)
-
-  # 1. Ensure the container is running with the correct schema image.
-  if DbImages.container_running?
-    current_image = DbImages.container_image
-    if current_image == desired_image
-      puts "Container #{DbImages::CONTAINER} already running (#{image_tag}). No restart needed."
-    else
-      old_tag = current_image.split(':').last
-      puts "Container running with image #{old_tag} — upgrading to #{image_tag}."
-      puts "(Existing session databases in the old container will be gone after restart.)"
-      Util.run("docker rm -f #{DbImages::CONTAINER}")
-      start_container(desired_image, schema_tag)
-    end
-  else
-    # Remove stale (stopped) container record if one exists.
-    if system("docker inspect #{DbImages::CONTAINER} > /dev/null 2>&1")
-      Util.run("docker rm -f #{DbImages::CONTAINER}")
-    end
-    start_container(desired_image, schema_tag)
-  end
+  port = ensure_container(container, desired_image, schema_tag, requested_port)
 
   # 2. Create this session's database (idempotent).
   sid = DbImages.session_id
@@ -96,16 +123,13 @@ def do_start
   puts "Session ID : #{sid}"
   puts "Session DB : #{db}"
 
-  existing = DbImages.psql_query(
-    "SELECT 1 FROM pg_database WHERE datname = '#{db}'"
-  )
-
-  if existing == ["1"]
+  if DbImages.database_exists?(port, db)
     puts "Database #{db} already exists — reusing."
   else
     puts ""
     puts "Creating #{db} from template #{DbImages::TEMPLATE_DB}..."
     DbImages.psql_exec(
+      port,
       "CREATE DATABASE #{db} TEMPLATE #{DbImages::TEMPLATE_DB} OWNER api"
     )
   end
@@ -114,26 +138,87 @@ def do_start
   # `sem-apply` AS api can issue database-level DDL (CREATE SCHEMA, etc.).
   # Idempotent: succeeds harmlessly when already owned by api, so it runs on
   # every start (both the create and reuse paths). Quiet to suppress the echo.
-  DbImages.psql_exec_quiet("ALTER DATABASE #{db} OWNER TO api")
+  DbImages.psql_exec_quiet(port, "ALTER DATABASE #{db} OWNER TO api")
 
-  # 3. Print the JDBC URL for the caller to export.
-  url = "jdbc:postgresql://#{DbImages::HOST}:#{DbImages::PORT}/#{db}"
+  # 3. Print the JDBC URL for the caller to export. The port is per container —
+  # a caller that hardcodes one is talking to somebody else's database.
+  url = "jdbc:postgresql://#{DbImages::HOST}:#{port}/#{db}"
   puts ""
   puts "CONF_DB_DEV_URL=#{url}"
   puts ""
 end
 
-# Pull (or build+push) the image, then run the container on :5433.
-# schema_tag is what build-and-push.sh takes (a git tag it replays); the image
-# ref already carries the recipe hash.
-def start_container(desired_image, schema_tag)
+# Ensure the container for this schema tag is up, and return its host port.
+#
+# The ONLY container this ever removes is a STOPPED one carrying the same schema
+# tag — that one holds no live sessions by construction, since a stopped
+# container serves nobody. Containers for other tags, and the legacy untagged
+# container, are never touched: they may be holding other sessions' databases.
+def ensure_container(container, desired_image, schema_tag, requested_port)
+  if DbImages.container_running?(container)
+    port = DbImages.container_port(container)
+    Util.exit_with_error(
+      "Container #{container} is running but publishes no host port for 5432/tcp. " \
+      "Refusing to guess. Stop it (docker stop #{container}) and re-run with --port."
+    ) if port.nil?
+    puts "Container #{container} already running on :#{port} (#{schema_tag}). Reusing."
+    if requested_port && requested_port != port
+      puts "NOTE: --port #{requested_port} ignored — the existing container is on :#{port}."
+    end
+    return port
+  end
+
+  if DbImages.container_exists?(container)
+    # Stopped container for the SAME tag. Its recorded port binding survives the
+    # stop, so re-running with no arguments still works.
+    existing_port = DbImages.container_port(container)
+    port = requested_port || existing_port
+    Util.exit_with_error(
+      "Container #{container} exists but is stopped and publishes no host port. " \
+      "Re-run with --port \"$(claude-db next-port)\"."
+    ) if port.nil?
+    puts "Removing stopped container #{container} and recreating it on :#{port}."
+    puts "(A stopped container serves no session — nothing is lost.)"
+    Util.run("docker rm -f #{Shellwords.shellescape(container)}")
+    start_container(container, desired_image, schema_tag, port)
+    DbPorts.record(
+      :port => port, :schema_tag => schema_tag, :container => container,
+      :session_id => DbImages.session_id_or_nil.to_s
+    )
+    return port
+  end
+
+  # No container for this tag: a new one, and only now is a port needed.
+  if requested_port.nil?
+    Util.exit_with_error(
+      "No container exists for schema tag #{schema_tag}, so a new one must be " \
+      "created — and that needs a host port.\n\n" \
+      "  claude-db start --port \"$(claude-db next-port)\"\n\n" \
+      "`claude-db next-port` picks a free port in " \
+      "#{DbPorts::RANGE_MIN}-#{DbPorts::RANGE_MAX} and records it in " \
+      "#{DbPorts::HISTORY_PATH}.\n" \
+      "Ports are per container now — there is no fixed port to fall back on, " \
+      "and guessing one would mean publishing over another session's container."
+    )
+  end
+
+  start_container(container, desired_image, schema_tag, requested_port)
+  DbPorts.record(
+    :port => requested_port, :schema_tag => schema_tag, :container => container,
+    :session_id => DbImages.session_id_or_nil.to_s
+  )
+  requested_port
+end
+
+# Pull (or build+push) the image, then run the container on `port`.
+def start_container(container, desired_image, schema_tag, port)
   ensure_image(desired_image, schema_tag)
   Util.run(
-    "docker run -d -p #{DbImages::PORT}:5432 --name #{DbImages::CONTAINER} #{desired_image}"
+    "docker run -d -p #{port}:5432 --name #{Shellwords.shellescape(container)} #{desired_image}"
   )
-  print "Waiting for Postgres on :#{DbImages::PORT}..."
+  print "Waiting for Postgres on :#{port}..."
   $stdout.flush
-  DbImages.wait_for_postgres
+  DbImages.wait_for_postgres(port)
   puts " ready."
 end
 
@@ -181,28 +266,30 @@ def do_end
   puts "Session DB : #{db}"
   puts ""
 
-  unless DbImages.container_running?
-    puts "Container not running — nothing to drop."
+  # No state file: session DB names are unique, so the database is found by
+  # scanning the containers for it. That is what makes `end` work when the
+  # schema tag has moved on since `start` and the database is in an older
+  # container — the case a fixed port silently got wrong.
+  holders = DbImages.running_containers_with_ports.select { |(_name, port)|
+    DbImages.database_exists?(port, db)
+  }
+
+  if holders.empty?
+    puts "Database #{db} not found in any running claude container — already cleaned up."
     puts ""
     return
   end
 
-  existing = DbImages.psql_query(
-    "SELECT 1 FROM pg_database WHERE datname = '#{db}'"
-  )
-
-  if existing != ["1"]
-    puts "Database #{db} does not exist — already cleaned up."
-    puts ""
-    return
+  holders.each do |(name, port)|
+    puts "Found #{db} in #{name} (:#{port})."
+    # Terminate active connections before dropping.
+    DbImages.psql_exec_quiet(
+      port,
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
+    )
+    DbImages.psql_exec(port, "DROP DATABASE #{db}")
+    puts "Dropped #{db} from #{name}."
   end
-
-  # Terminate active connections before dropping.
-  DbImages.psql_exec_quiet(
-    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
-  )
-  DbImages.psql_exec("DROP DATABASE #{db}")
-  puts "Dropped #{db}."
   puts ""
 end
 
@@ -213,35 +300,59 @@ def do_status
   puts Util.underline("claude-db status")
   puts ""
 
-  if DbImages.container_running?
-    image = DbImages.container_image
-    puts "Container : #{DbImages::CONTAINER}  RUNNING  image=#{image}"
-  else
-    puts "Container : #{DbImages::CONTAINER}  not running"
-  end
-
-  puts ""
-
-  if DbImages.container_running?
-    dbs    = DbImages.list_session_dbs
-    active = DbImages.active_session_dbs
-    if dbs.empty?
-      puts "Session databases : none"
-    else
-      puts "Session databases :"
-      dbs.each do |db|
-        state = active.include?(db) ? "active" : "idle"
-        puts "  #{db}  [#{state}]"
-      end
-    end
-  end
-
   # Read-only: report that this session cannot name itself rather than aborting a
   # command whose whole job is to show you the state.
-  sid = DbImages.session_id_or_nil
-  puts ""
-  if sid
-    puts "Current session DB : #{DbImages.db_name(sid)}"
+  sid        = DbImages.session_id_or_nil
+  current_db = sid ? DbImages.db_name(sid) : nil
+
+  containers = DbImages.claude_containers
+  if containers.empty?
+    puts "No #{DbImages::CONTAINER_PREFIX}* containers."
+    puts ""
+    return
+  end
+
+  containers.each do |name|
+    tag     = DbImages.container_schema_tag(name) || "(legacy — pre per-tag split)"
+    running = DbImages.container_running?(name)
+    port    = DbImages.container_port(name)
+    state   = running ? "RUNNING" : "stopped"
+    puts "#{name}"
+    puts "  state      : #{state}"
+    puts "  schema tag : #{tag}"
+    puts "  port       : #{port || '(none published)'}"
+    puts "  image      : #{DbImages.container_image(name)}"
+
+    if !running || port.nil?
+      puts "  databases  : (not reachable while #{running ? 'unpublished' : 'stopped'})"
+      puts ""
+      next
+    end
+
+    dbs    = DbImages.list_session_dbs(port)
+    active = DbImages.active_session_dbs(port)
+    if dbs.empty?
+      puts "  databases  : none"
+    else
+      puts "  databases  :"
+      dbs.each do |db|
+        flags = [active.include?(db) ? "active" : "idle"]
+        flags << "THIS SESSION" if db == current_db
+        puts "    #{db}  [#{flags.join(', ')}]"
+      end
+    end
+    puts ""
+  end
+
+  if current_db
+    holder = DbImages.find_container_with_db(current_db)
+    if holder
+      name, port = holder
+      puts "Current session DB : #{current_db}  in #{name}"
+      puts "CONF_DB_DEV_URL=jdbc:postgresql://#{DbImages::HOST}:#{port}/#{current_db}"
+    else
+      puts "Current session DB : #{current_db}  (not created yet — run `claude-db start`)"
+    end
   else
     puts "Current session DB : (none — export CLAUDE_SESSION_ID, or run from ~/code/ai/<feature>)"
   end
@@ -255,48 +366,98 @@ def do_gc
   puts Util.underline("claude-db gc")
   puts ""
 
-  unless DbImages.container_running?
-    puts "Container not running — nothing to GC."
-    puts ""
-    return
-  end
-
   current_db = DbImages.db_name(DbImages.session_id)
-  dbs        = DbImages.list_session_dbs
-  active     = DbImages.active_session_dbs
+  containers = DbImages.claude_containers
 
-  # Orphans: session DBs that are neither the current session nor actively used.
-  orphans = dbs.reject { |db| db == current_db || active.include?(db) }
-
-  if orphans.empty?
-    puts "No orphaned session databases found."
+  if containers.empty?
+    puts "No #{DbImages::CONTAINER_PREFIX}* containers — nothing to GC."
     puts ""
     return
   end
 
-  puts "Dropping #{orphans.length} orphaned database(s)..."
-  orphans.each do |db|
-    # Terminate lingering connections (safety net — should be none for orphans).
-    DbImages.psql_exec_quiet(
-      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
-    )
-    DbImages.psql_exec("DROP DATABASE #{db}")
-    puts "Dropped #{db}."
+  containers.each do |name|
+    running = DbImages.container_running?(name)
+    port    = running ? DbImages.container_port(name) : nil
+
+    if !running || port.nil?
+      # A container that cannot be inspected for databases is left alone. It may
+      # hold a stopped session's data, and removing it on a guess is exactly the
+      # class of mistake this rewrite exists to prevent.
+      puts "#{name}: #{running ? 'no published port' : 'stopped'} — skipping (cannot list its databases)."
+      next
+    end
+
+    dbs     = DbImages.list_session_dbs(port)
+    active  = DbImages.active_session_dbs(port)
+    orphans = dbs.reject { |db| db == current_db || active.include?(db) }
+
+    if orphans.empty?
+      puts "#{name} (:#{port}): no orphaned session databases."
+    else
+      puts "#{name} (:#{port}): dropping #{orphans.length} orphaned database(s)..."
+      orphans.each do |db|
+        # Terminate lingering connections (safety net — should be none for orphans).
+        DbImages.psql_exec_quiet(
+          port,
+          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
+        )
+        DbImages.psql_exec(port, "DROP DATABASE #{db}")
+        puts "  dropped #{db}"
+      end
+    end
+
+    remaining = DbImages.list_session_dbs(port)
+    next unless remaining.empty?
+
+    # Empty container: no session's data can be lost by removing it, and leaving
+    # it would hold its port out of the allocation range forever.
+    puts "#{name}: holds no session databases — removing and releasing its port."
+    Util.run("docker rm -f #{Shellwords.shellescape(name)}")
+    released = DbPorts.release_container(name)
+    puts "  released #{released} port allocation(s) from #{DbPorts::HISTORY_PATH}" if released > 0
   end
   puts ""
 end
 
 # ── entry point ─────────────────────────────────────────────────────────────
 
+# --port is parsed here rather than through Args: this is the only command with
+# an option, and Args.parse's shared option table has no port in it.
+def parse_port!(argv)
+  port = nil
+  until argv.empty?
+    arg = argv.shift
+    case arg
+    when "--port"
+      value = argv.shift
+      Util.exit_with_error("--port requires a value") if value.nil?
+      port = value
+    when /\A--port=(.*)\z/
+      port = Regexp.last_match(1)
+    else
+      Util.exit_with_error("Unknown argument: #{arg}")
+    end
+  end
+  return nil if port.nil?
+  unless port =~ /\A\d+\z/ && DbPorts.port_in_range?(port.to_i)
+    Util.exit_with_error(
+      "--port must be an integer in #{DbPorts::RANGE_MIN}-#{DbPorts::RANGE_MAX} (got: #{port}).\n" \
+      "Get one with: claude-db next-port"
+    )
+  end
+  port.to_i
+end
+
 show_usage if ARGV.empty?
 
 subcommand = ARGV.shift
 
 case subcommand
-when "start"  then do_start
-when "end"    then do_end
-when "status" then do_status
-when "gc"     then do_gc
+when "start"     then do_start(parse_port!(ARGV))
+when "end"       then do_end
+when "status"    then do_status
+when "gc"        then do_gc
+when "next-port" then do_next_port
 when "-h", "--help", "help" then show_usage
 else
   $stderr.puts "Unknown command: #{subcommand}"
