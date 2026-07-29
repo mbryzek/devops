@@ -47,7 +47,7 @@ INVOCATIONS = {
   "auth ai set"         => 'auth ai set <token> [--localhost]',
   "auth ai clear"       => 'auth ai clear [--localhost]',
   "auth ai revoke"      => 'auth ai revoke [--localhost]',
-  "invariants check"    => 'invariants [check] [--app APP] [--localhost] [--examples N | --all-examples]',
+  "invariants check"    => 'invariants [check] [--app APP] [--localhost] [--examples N | --all-examples] [--fix]',
   "invariants snoozes"  => 'invariants snoozes [--app APP] [--localhost]',
   "invariants snooze"   => 'invariants snooze <name> --app APP --days N --reason "TEXT" [--localhost]',
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
@@ -144,6 +144,15 @@ USAGE = <<~USAGE
         Check invariants across endpoints. `check` is the default when no
         subcommand is given. Shows up to N examples per failure (default 10),
         or all with --all-examples.
+
+        When an app has failures with data behind them, offers to hand them to
+        a Claude session (Opus 4.8, 1M context) to investigate — one session per
+        failing app, or one session fanning out a subagent per app when several
+        fail at once. The session gets every example, not just the 10 shown.
+        --fix skips the question and launches. Nothing is offered when stdin is
+        not a tty (cron, a pipe), or when the only problem is an app the CLI
+        could not reach — that is an auth/infra failure with nothing to
+        investigate. The prompt prose lives in devops/claude-invariants/.
 
     #{INVOCATIONS["queries top"]}
         Rank the queries the platform ran, with the code that issued each, from
@@ -1027,32 +1036,180 @@ def cmd_auth_ai_revoke(args)
   end
 end
 
+# ---------- interactive claude sessions ----------
+#
+# Shared by every command that hands the terminal to a Claude session to work
+# what it just found (`dev issues claim`, `dev invariants check`). The spawn
+# details live here once so the sessions they start are the same session.
+
+# Model the spawned session runs on: Opus 4.8 with the 1M-context window. This is
+# the interactive default (the `ccd` alias's model), NOT the headless-codegen
+# `CODEGEN_CLAUDE_MODEL` (haiku) — a human is driving this one to fix real bugs.
+INTERACTIVE_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
+
+# Pure, testable seam: the argv for an interactive investigate/fix session.
+# Mirrors the `ccd` alias (`claude --dangerously-skip-permissions`) pinned to
+# Opus 4.8 (1M context).
+def interactive_claude_argv(prompt)
+  ["claude", "--dangerously-skip-permissions", "--model", INTERACTIVE_CLAUDE_MODEL, prompt]
+end
+
+# Prefix a spawned-session prompt with the tab title to set. Claude Code owns the
+# terminal title once it starts, so the only way to pin it is to tell the session
+# what it should be — the CLI cannot emit the escape itself and make it stick.
+# A nil title (nothing worth naming) passes the prompt through untouched.
+def prompt_with_tab_title(title, prompt)
+  return prompt if title.nil?
+  "Set the terminal tab title to \"#{title}\" (printf '\\e]0;%s\\a' \"#{title}\"), then: #{prompt}"
+end
+
+# Hand the terminal to an interactive session. `exec` replaces this process, so
+# every caller must treat it as the last thing it does. When `claude` is not
+# launchable (not on PATH, or otherwise), degrade to printing the command rather
+# than dying on a stack trace and losing the prompt we just built. `note` says
+# what survives the failure, which differs by caller.
+def exec_claude(prompt, note: "Run it by hand with:")
+  exec(*interactive_claude_argv(prompt))
+rescue SystemCallError => e
+  warn "Could not start Claude (#{e.message}). #{note}"
+  warn "  claude \"#{prompt}\""
+end
+
 # ---------- invariants ----------
 
-def print_invariant_failures(result, example_limit: 10)
+# The failure block for one app, as lines: every non-zero invariant with its
+# count and examples, then every invariant that errored. Returned rather than
+# printed because the same text is both what the terminal shows and what the
+# investigation prompt hands to a Claude session — they must not drift.
+def invariant_failure_lines(result, example_limit: 10)
+  lines = []
   (result["non_zero"] || []).each do |inv|
-    puts "  - #{inv['name']}"
-    puts "    Count: #{inv['count']}"
+    lines << "  - #{inv['name']}"
+    lines << "    Count: #{inv['count']}"
     examples = inv["examples"] || []
     unless examples.empty?
-      puts "    Examples:"
+      lines << "    Examples:"
       shown = example_limit.nil? ? examples : examples.take(example_limit)
-      shown.each { |ex| puts "      * #{ex}" }
+      shown.each { |ex| lines << "      * #{ex}" }
       if !example_limit.nil? && examples.length > example_limit
-        puts "      ... and #{examples.length - example_limit} more"
+        lines << "      ... and #{examples.length - example_limit} more"
       end
     end
   end
 
   (result["error"] || []).each do |inv|
-    puts "  - #{inv['name']}"
-    puts "    Error: #{inv['error'] || 'Unknown error'}"
+    lines << "  - #{inv['name']}"
+    lines << "    Error: #{inv['error'] || 'Unknown error'}"
   end
+  lines
+end
+
+def print_invariant_failures(result, example_limit: 10)
+  puts invariant_failure_lines(result, example_limit: example_limit)
+end
+
+# The durable orientation appended to every invariant investigation prompt. Prose
+# lives in devops/claude-invariants/investigate-body.md so it can be edited
+# without touching this CLI (same arrangement as devops/claude-issues).
+def invariants_body_text
+  File.read(File.expand_path("../claude-invariants/investigate-body.md", __dir__))
+end
+
+# The prompt for ONE app's failures: what failed, verbatim as the terminal just
+# printed it, then the shared orientation. The failure block is passed through
+# untouched on purpose — a summary here would be the CLI pre-diagnosing, which is
+# exactly the thing the body file tells the session not to do.
+#
+# Every failing invariant goes in with ALL its examples (example_limit: nil).
+# The terminal truncates at 10 to stay readable; the session is the one consumer
+# that needs the whole population, since whether 1 row or 400 rows fail is often
+# the difference between two root causes.
+def invariants_app_prompt(endpoint, result)
+  failures = invariant_failure_lines(result, example_limit: nil).join("\n")
+  count = (result["non_zero"] || []).length + (result["error"] || []).length
+  total = count + (result["success"] || []).length
+  <<~PROMPT.strip
+    The `dev invariants` check is failing for #{endpoint[:name]} (#{count} failing invariant(s) of #{total} total).
+    Investigate each failure and resolve it.
+
+    Failing invariants, exactly as `dev invariants check --app #{endpoint[:app]}` reported them:
+
+    #{failures}
+
+    #{invariants_body_text.strip}
+  PROMPT
+end
+
+# Two or more apps failed at once. `dev` can only hand the TTY to one process, so
+# the per-app parallelism moves INSIDE the session: one subagent per app, which
+# is what "one session per app" means here. The apps are separate stacks and
+# separate repos, so the subagents share no state.
+def invariants_fanout_prompt(app_prompts)
+  sections = app_prompts.map { |app, prompt| "===== #{app} =====\n\n#{prompt}" }.join("\n\n")
+  <<~PROMPT.strip
+    #{app_prompts.length} apps have failing invariants. Dispatch ONE subagent per app and work
+    them in parallel — do NOT work them yourself in this session. Give each subagent its app's
+    brief below verbatim, and tell it the brief is the whole task. The apps are independent
+    stacks with independent repos, so the subagents share nothing.
+
+    Report back each app's outcome separately: the classification it landed on, and either its
+    PR/Reviewable URLs or the path to the findings it wrote.
+
+    #{sections}
+  PROMPT
+end
+
+# The prompt for whatever failed: one app's brief directly, or the fan-out when
+# several failed. `app_prompts` is a list of [app_name, prompt].
+def invariants_launch_prompt(app_prompts)
+  body = app_prompts.length == 1 ? app_prompts.first[1] : invariants_fanout_prompt(app_prompts)
+  prompt_with_tab_title(invariants_tab_title(app_prompts.map(&:first)), body)
+end
+
+def invariants_tab_title(app_names)
+  "Invariants: #{app_names.join(', ')}"
+end
+
+# Apps whose failures are worth a session, as [endpoint, result]: those with a
+# non-zero count or an invariant that errored. An app whose whole REQUEST failed
+# (session expired, unreachable) is deliberately excluded — that is an auth or
+# infrastructure problem with no data behind it, and a session pointed at it
+# would have nothing to investigate.
+def invariants_failing_apps(results)
+  results.sort_by { |r| r[:endpoint][:name] }.filter_map do |r|
+    next if r[:error]
+    result = r[:data] || {}
+    next if (result["non_zero"] || []).empty? && (result["error"] || []).empty?
+    [r[:endpoint], result]
+  end
+end
+
+# Offer to hand the failures to a Claude session. Skipped silently when nothing
+# has data behind it, and never prompts when stdin is not a tty — a cron run must
+# report and exit, never block on a question nobody can answer.
+def invariants_offer_investigation(results, auto_fix)
+  failing = invariants_failing_apps(results)
+  return if failing.empty?
+
+  names = failing.map { |endpoint, _| endpoint[:name] }
+  unless auto_fix
+    return unless interactive_terminal?
+    return unless Ask.for_boolean("Launch a Claude session to investigate #{names.join(', ')}? [y/n]")
+  end
+
+  app_prompts = failing.map { |endpoint, result| [endpoint[:name], invariants_app_prompt(endpoint, result)] }
+  puts ""
+  puts failing.length == 1 ?
+    "Starting Claude session (Opus 4.8, 1M context) to investigate #{names.first}..." :
+    "Starting Claude session (Opus 4.8, 1M context) to dispatch one subagent per failing app..."
+  puts ""
+  exec_claude(invariants_launch_prompt(app_prompts), note: "Investigate by hand with:")
 end
 
 def cmd_invariants_check(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   example_limit = 10
+  auto_fix = false
   i = 0
   while i < rest.length
     case rest[i]
@@ -1061,6 +1218,9 @@ def cmd_invariants_check(args)
       i += 2
     when "--all-examples"
       example_limit = nil
+      i += 1
+    when "--fix"
+      auto_fix = true
       i += 1
     else
       usage_exit("Unknown flag: #{rest[i]}", example: usage_for("invariants check"))
@@ -1121,10 +1281,14 @@ def cmd_invariants_check(args)
   if all_passed
     puts "All invariants passed"
     exit 0
-  else
-    puts "Some invariants failed"
-    exit 1
   end
+
+  puts "Some invariants failed"
+  # execs when it launches, so nothing below runs in that case.
+  invariants_offer_investigation(results, auto_fix)
+  # Nonzero so callers (cron, CI, `&&` chains) detect the failure rather than
+  # having to parse stdout for it.
+  exit 1
 end
 
 # Render the `created_by` audit union (from bryzek/audit), keyed off its discriminator:
@@ -1442,11 +1606,6 @@ def issue_session_uuid_from_comments(comments)
   nil
 end
 
-# Model the spawned session runs on: Opus 4.8 with the 1M-context window. This is
-# the interactive default (the `ccd` alias's model), NOT the headless-codegen
-# `CODEGEN_CLAUDE_MODEL` (haiku) — a human is driving this one to fix real bugs.
-ISSUE_CLAUDE_MODEL = "claude-opus-4-8[1m]".freeze
-
 # The prompt handed to the spawned Claude session when exactly one category was
 # claimed (one plan): the session works the plan directly. An investigate-only
 # category (a member `suggestion`) is briefed as such — its plan writes no code,
@@ -1514,21 +1673,12 @@ end
 # terminal title once it starts, so the only way to pin it is to tell the session
 # what it should be — the CLI cannot emit the escape itself and make it stick.
 def issue_prompt_with_tab_title(issues, prompt)
-  title = issue_tab_title(issues)
-  return prompt if title.nil?
-  "Set the terminal tab title to \"#{title}\" (printf '\\e]0;%s\\a' \"#{title}\"), then: #{prompt}"
-end
-
-# Pure, testable seam: the argv for the interactive session `dev issues claim`
-# launches after writing the plan(s). Mirrors the `ccd` alias
-# (`claude --dangerously-skip-permissions`) pinned to Opus 4.8 (1M context).
-def issue_claude_argv(prompt)
-  ["claude", "--dangerously-skip-permissions", "--model", ISSUE_CLAUDE_MODEL, prompt]
+  prompt_with_tab_title(issue_tab_title(issues), prompt)
 end
 
 # Single-plan argv (kept as the one-plan spawn path and its regression test).
 def issue_claude_command(category, path)
-  issue_claude_argv(issue_session_prompt(category, path))
+  interactive_claude_argv(issue_session_prompt(category, path))
 end
 
 # Every category that has at least one open issue in `open`: the known ones in
@@ -2035,7 +2185,7 @@ end
 # Spawn argv for `dev issues create`: the batch-claim argv plus --session-id, so
 # the uuid recorded on the issue IS the session's id and `--resume` works later.
 def issue_create_claude_argv(prompt, uuid)
-  ["claude", "--dangerously-skip-permissions", "--model", ISSUE_CLAUDE_MODEL,
+  ["claude", "--dangerously-skip-permissions", "--model", INTERACTIVE_CLAUDE_MODEL,
    "--session-id", uuid, prompt]
 end
 
@@ -2386,14 +2536,7 @@ def cmd_issues_claim(args)
     puts "  (re-run with --no-spawn to just write the plan(s))"
     puts ""
     prompt = issue_prompt_with_tab_title(claimed_issues, issue_claim_prompt(plans))
-    begin
-      exec(*issue_claude_argv(prompt))
-    rescue SystemCallError => e
-      # `claude` not on PATH (or otherwise unlaunchable). The plan(s) are already
-      # written, so degrade to the manual hand-off rather than a stack trace.
-      warn "Could not start Claude (#{e.message}). The plan(s) are saved — run with:"
-      warn "  claude \"#{prompt}\""
-    end
+    exec_claude(prompt, note: "The plan(s) are saved — run with:")
   end
 end
 

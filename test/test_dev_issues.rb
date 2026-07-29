@@ -567,7 +567,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_claim_argv_wraps_any_prompt_as_ccd_opus
-    argv = issue_claude_argv("do the thing")
+    argv = interactive_claude_argv("do the thing")
     assert_equal "claude", argv[0]
     assert_includes argv, "--dangerously-skip-permissions"
     assert_equal "claude-opus-4-8[1m]", argv[argv.index("--model") + 1]
