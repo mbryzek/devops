@@ -176,7 +176,6 @@ delete from court_reserve.memberships               where club_id in (select id 
 delete from court_reserve.membership_types          where club_id in (select id from _del_clubs);
 
 -- ---- playbook members (scores/transitions -> members) ----------------------
-delete from playbook.renewal_triages                where club_id in (select id from _del_clubs);
 delete from playbook.memberships                    where club_id in (select id from _del_clubs);
 delete from playbook.member_engagement_scores       where club_id in (select id from _del_clubs);
 delete from playbook.member_segment_transitions     where club_id in (select id from _del_clubs);
@@ -207,6 +206,9 @@ delete from playbook.courts                          where club_id in (select id
 
 -- ---- user_tracking ---------------------------------------------------------
 delete from user_tracking.page_views                where club_id in (select id from _del_clubs);
+
+-- ---- club onboarding state -------------------------------------------------
+delete from playbook.club_onboardings               where club_id in (select id from _del_clubs);
 
 -- ---- finally the clubs (self-FK NO ACTION handles parent/child subset) ------
 delete from playbook.clubs where id in (select id from _del_clubs);
