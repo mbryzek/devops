@@ -1054,6 +1054,62 @@ class TestDevIssues < Minitest::Test
     assert_equal true, captured.fetch(:form).fetch(:claim_on_create)
   end
 
+  # ---- dev issues list (read-only) ----
+
+  def test_list_prints_open_and_claimed_issues_by_default
+    issues = [
+      { "number" => "010", "status" => "open", "category" => "bug", "title" => "Chart empty" },
+      { "number" => "011", "status" => "claimed", "category" => "feature", "title" => "Add export" },
+    ]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: %w[open claimed])}" => issues) do
+        cmd_issues_list([])
+      end
+    end
+    assert_match(/ISS-010/, out)
+    assert_match(/ISS-011/, out)
+  end
+
+  def test_list_prints_no_issues_found_when_empty
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: %w[open claimed])}" => []) do
+        cmd_issues_list([])
+      end
+    end
+    assert_match(/No issues found\./, out)
+  end
+
+  def test_list_filters_by_category_and_explicit_status
+    issues = [{ "number" => "020", "status" => "fixed", "category" => "bug", "title" => "x" }]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: %w[fixed], category: 'bug')}" => issues) do
+        cmd_issues_list(["--category", "bug", "--status", "fixed"])
+      end
+    end
+    assert_match(/ISS-020/, out)
+  end
+
+  def test_list_rejects_an_invalid_status
+    out, status = capture_stderr_and_exit { cmd_issues_list(["--status", "bogus"]) }
+    assert_equal 1, status
+    assert_match(/--status must be one or more of/, out)
+  end
+
+  def test_list_rejects_an_invalid_category
+    out, status = capture_stderr_and_exit { cmd_issues_list(["--category", "bogus"]) }
+    assert_equal 1, status
+    assert_match(/--category must be one of/, out)
+  end
+
+  def test_a_credentialed_issue_list_still_cannot_reach_production
+    with_credentials do
+      err = assert_raises(DevTestSupport::NetworkBlocked) do
+        cmd_issues_list([])
+      end
+      assert_match(%r{GET /playbook/issues}, err.message)
+    end
+  end
+
   # ---- dev issues create: attachments (validated before any network call) ----
 
   def test_create_rejects_a_missing_image
