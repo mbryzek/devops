@@ -5541,7 +5541,8 @@ def changelog_capture_scan_line(scan)
   label = scan[:repo] == scan[:app] ? scan[:app] : "#{scan[:app]} (#{scan[:repo]})"
   return "  #{label}: #{scan[:skipped]}" if scan[:skipped]
 
-  "  #{label}: #{scan[:tags]} tag(s), #{scan[:new]} new, latest #{scan[:latest] || '(none)'}"
+  line = "  #{label}: #{scan[:tags]} tag(s), #{scan[:new]} new, latest #{scan[:latest] || '(none)'}"
+  scan[:gap] ? "#{line} -- SERVER #{scan[:gap].upcase}" : line
 end
 
 def cmd_changelog_capture(args)
@@ -5570,9 +5571,34 @@ def cmd_changelog_capture(args)
       sent += changelog_post_batches(endpoint, "releases", :releases, releases)
     end
 
+    # Re-read after sending, or every count would be short by exactly what this run just
+    # recorded and a clean capture would report a gap.
+    status = changelog_status(endpoint) if sent.positive?
+    scans.each { |s| s[:gap] = changelog_capture_gap(s, status.dig(s[:app], "release_count")) }
+
     puts "changelog capture: sent #{sent} release(s) from #{scans.length} app(s)"
     scans.each { |s| puts changelog_capture_scan_line(s) }
+    scans.select { |s| s[:gap] }.each do |s|
+      warn "changelog: #{s[:app]} #{s[:gap]} -- run `dev changelog push`, or re-capture with the " \
+           "missing tags present locally"
+    end
   end
+end
+
+# The completeness check `max_version` cannot make.
+#
+# capture only ever looks PAST the cursor, so "0 new" means "the newest tag is recorded",
+# NOT "every tag is recorded" -- a release missing below the watermark is invisible to it
+# forever. Comparing counts is the only thing that tells those apart, and it is the check
+# to run before archiving the lake.
+#
+# A nil count is "the server did not say", not zero: a platform that predates release_count
+# would otherwise report every tag as missing. Silence beats a false alarm.
+def changelog_capture_gap(scan, recorded)
+  return nil if scan[:skipped] || recorded.nil? || scan[:tags].zero?
+  diff = scan[:tags] - recorded.to_i
+  return nil if diff.zero?
+  diff.positive? ? "is missing #{diff} release(s)" : "has #{-diff} release(s) not in git"
 end
 
 # Versions the server has recorded but has no notes for, newest first so a --limit
