@@ -496,7 +496,7 @@ class TestDevIssues < Minitest::Test
     cmd = issue_claude_command("graphs", "/p/x.md")
     assert_equal "claude", cmd[0]
     assert_includes cmd, "--dangerously-skip-permissions"          # the `ccd` alias
-    assert_equal "claude-opus-4-8[1m]", cmd[cmd.index("--model") + 1]
+    assert_equal "claude-opus-5[1m]", cmd[cmd.index("--model") + 1]
     assert_equal issue_session_prompt("graphs", "/p/x.md"), cmd.last # prompt is the final arg
   end
 
@@ -570,7 +570,7 @@ class TestDevIssues < Minitest::Test
     argv = interactive_claude_argv("do the thing")
     assert_equal "claude", argv[0]
     assert_includes argv, "--dangerously-skip-permissions"
-    assert_equal "claude-opus-4-8[1m]", argv[argv.index("--model") + 1]
+    assert_equal "claude-opus-5[1m]", argv[argv.index("--model") + 1]
     assert_equal "do the thing", argv.last
   end
 
