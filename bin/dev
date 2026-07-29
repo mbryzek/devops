@@ -29,7 +29,6 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 $LOAD_PATH.unshift(File.expand_path('~/code/claude/lib'))
 require 'work/registry'
 
-$LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
 require 'codegen/api_config'
 require 'codegen/graph'
 require 'codegen/sync'
