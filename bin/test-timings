@@ -1,0 +1,294 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Summarize where time went in an sbt/ScalaTest run.
+#
+#   test-timings <log file> [--top N] [--project NAME] [--history]
+#
+# Reads a log produced by `./run.sh test` (which execs bin/run). No build
+# changes are required: every scala project already passes `-oDF` to ScalaTest
+# via `testOptions`, and the `D` flag prints a per-test duration. This parses
+# those durations back out.
+#
+# Deliberately read-only and best-effort: bin/run calls this AFTER deciding
+# pass/fail, and a parse failure here must never turn a green run red.
+
+require 'optparse'
+require 'fileutils'
+
+TOP_DEFAULT = 10
+
+# ScalaTest renders durations as a comma-separated list of unit parts, e.g.
+# "(3 milliseconds)", "(1 second, 200 milliseconds)", "(1 minute, 45 seconds)".
+UNIT_MS = {
+  'millisecond' => 1,
+  'second' => 1_000,
+  'minute' => 60_000,
+  'hour' => 3_600_000
+}.freeze
+
+# Parses "1 minute, 45 seconds" -> 105000. Returns nil if any part is not a
+# recognized "<n> <unit>" pair, which is how we reject false positives such as
+# a test name that merely happens to end in parentheses.
+def parse_duration(text)
+  parts = text.split(',').map(&:strip)
+  return nil if parts.empty?
+
+  total = 0
+  parts.each do |part|
+    m = /\A(\d+) (millisecond|second|minute|hour)s?\z/.match(part)
+    return nil unless m
+
+    total += m[1].to_i * UNIT_MS[m[2]]
+  end
+  total
+end
+
+def fmt(ms)
+  return format('%.0fms', ms) if ms < 1_000
+  return format('%.1fs', ms / 1000.0) if ms < 60_000
+
+  format('%dm%02ds', (ms / 60_000).floor, ((ms % 60_000) / 1000.0).round)
+end
+
+class Report
+  attr_reader :suites, :tests, :run_completed, :wall_ms, :total_tests_reported
+
+  def initialize
+    @suites = Hash.new { |h, k| h[k] = { ms: 0, count: 0 } }
+    @tests = []
+    @run_completed = []
+    @wall_ms = nil
+    @total_tests_reported = 0
+  end
+
+  # A suite header is ScalaTest's "[info] ClassName:" line. Requiring a
+  # class-shaped identifier keeps prose lines (spec subjects, "GET /foo:")
+  # from being mistaken for suites.
+  SUITE_RE = /\A\[info\] ([A-Z][A-Za-z0-9_$]*(?:\.[A-Za-z0-9_$]+)*):\s*\z/
+  # The duration group is the LAST parenthesized group on the line; test names
+  # routinely contain their own parentheses, so anchor to the end.
+  TEST_RE = /\A\[info\]\s+- (.*) \(([^()]*)\)\s*\z/
+  RUN_RE = /\ARun completed in (.*?)\.\s*\z/
+  WALL_RE = /\ATotal time: (\d+) s/
+  COUNT_RE = /\ATotal number of tests run: (\d+)\s*\z/
+
+  def parse(io)
+    suite = '<unknown suite>'
+    io.each_line do |raw|
+      line = raw.chomp
+      # sbt prefixes with [info]/[success]; strip for the non-suite matchers.
+      bare = line.sub(/\A\[(?:info|success|error|warn)\]\s*/, '')
+
+      if (m = SUITE_RE.match(line))
+        suite = m[1]
+        next
+      end
+
+      if (m = TEST_RE.match(line))
+        ms = parse_duration(m[2])
+        next if ms.nil?
+
+        @suites[suite][:ms] += ms
+        @suites[suite][:count] += 1
+        @tests << [ms, suite, m[1]]
+        next
+      end
+
+      if (m = RUN_RE.match(bare))
+        ms = parse_duration(m[1])
+        @run_completed << ms if ms
+        next
+      end
+
+      if (m = COUNT_RE.match(bare))
+        @total_tests_reported += m[1].to_i
+        next
+      end
+
+      # sbt prints one "Total time" per command; the test run is the last one.
+      @wall_ms = m[1].to_i * 1000 if (m = WALL_RE.match(bare))
+    end
+    self
+  end
+
+  def body_ms
+    @tests.sum { |ms, _, _| ms }
+  end
+
+  # Longest single test run == the critical path through testing itself.
+  # Anything in wall clock beyond it is compile + sbt/JVM startup.
+  def slowest_run_ms
+    @run_completed.max
+  end
+
+  def compile_ms
+    return nil if @wall_ms.nil? || slowest_run_ms.nil?
+
+    [@wall_ms - slowest_run_ms, 0].max
+  end
+end
+
+# ---------------------------------------------------------------------------
+# History: one row per run so a slowdown shows up as a trend, not a vibe.
+# ---------------------------------------------------------------------------
+
+HISTORY_DIR = File.join(Dir.home, '.cache', 'devops-test-timings')
+
+def history_file(project)
+  File.join(HISTORY_DIR, "#{project}.tsv")
+end
+
+def previous_run(project)
+  path = history_file(project)
+  return nil unless File.exist?(path)
+
+  last = File.readlines(path).reject { |l| l.strip.empty? }.last
+  return nil if last.nil?
+
+  cols = last.split("\t")
+  return nil if cols.length < 4
+
+  { wall_ms: cols[1].to_i, body_ms: cols[2].to_i, tests: cols[3].to_i }
+rescue StandardError
+  nil
+end
+
+def record_run(project, report)
+  return if report.wall_ms.nil?
+
+  FileUtils.mkdir_p(HISTORY_DIR)
+  File.open(history_file(project), 'a') do |f|
+    f.puts [
+      Time.now.strftime('%Y-%m-%dT%H:%M:%S'),
+      report.wall_ms,
+      report.body_ms,
+      report.tests.length,
+      report.suites.length
+    ].join("\t")
+  end
+rescue StandardError
+  # History is a nicety; never let it break a run.
+  nil
+end
+
+# ---------------------------------------------------------------------------
+
+options = { top: TOP_DEFAULT, project: nil, history: true }
+OptionParser.new do |opts|
+  opts.banner = 'Usage: test-timings <log file> [options]'
+  opts.on('--top N', Integer, "How many slow suites/tests to list (default #{TOP_DEFAULT})") { |v| options[:top] = v }
+  opts.on('--project NAME', 'Project name, used for the history file') { |v| options[:project] = v }
+  opts.on('--no-history', 'Do not read or write the run history') { options[:history] = false }
+end.parse!
+
+log = ARGV[0]
+if log.nil? || !File.exist?(log)
+  warn "test-timings: no such log file: #{log.inspect}"
+  exit 2
+end
+
+project = options[:project] || File.basename(Dir.pwd)
+report = File.open(log, 'r:UTF-8', invalid: :replace, undef: :replace) { |f| Report.new.parse(f) }
+
+if report.tests.empty?
+  warn 'test-timings: no per-test durations found in the log.'
+  warn 'test-timings: expected ScalaTest\'s -oD output; check testOptions includes Tests.Argument("-oDF").'
+  exit 0
+end
+
+prev = options[:history] ? previous_run(project) : nil
+
+puts ''
+puts '================ test timings ================'
+puts format('  %-22s %s', 'tests / suites:', "#{report.tests.length} tests across #{report.suites.length} suites")
+
+if report.wall_ms
+  line = format('  %-22s %s', 'wall clock:', fmt(report.wall_ms))
+  if prev && prev[:wall_ms].positive?
+    delta = report.wall_ms - prev[:wall_ms]
+    pct = (delta * 100.0 / prev[:wall_ms]).round
+    sign = delta.negative? ? '-' : '+'
+    line += format('  (prev %s, %s%s / %s%d%%)', fmt(prev[:wall_ms]), sign, fmt(delta.abs), sign, pct.abs)
+  end
+  puts line
+end
+
+if report.compile_ms
+  puts format('  %-22s %s', 'compile + startup:', "#{fmt(report.compile_ms)}  (approx: wall clock minus the longest test run)")
+end
+if report.slowest_run_ms
+  puts format('  %-22s %s', 'longest test run:', "#{fmt(report.slowest_run_ms)}  (critical path across #{report.run_completed.length} subproject test runs)")
+end
+
+body = report.body_ms
+puts format('  %-22s %s', 'time in test bodies:', fmt(body))
+
+# The headline. Test bodies are what you'd actually be optimizing by making a
+# test do less work; everything else is fixtures, suite construction, Play app
+# / server boot, compile and JVM startup.
+share = report.wall_ms&.positive? ? (body * 100.0 / report.wall_ms) : nil
+puts format('  %-22s %s', 'body share of wall:', format('%.0f%%', share)) if share
+
+puts ''
+puts '  slowest suites (time in test bodies):'
+ranked_suites = report.suites.sort_by { |_, v| -v[:ms] }
+ranked_suites.first(options[:top]).each do |name, v|
+  label = v[:count] == 1 ? 'test ' : 'tests'
+  puts format('    %9s  %4d %s  %8s avg  %s', fmt(v[:ms]), v[:count], label, fmt(v[:ms] / v[:count].to_f), name)
+end
+
+puts ''
+puts '  slowest individual tests:'
+report.tests.sort_by { |ms, _, _| -ms }.first(options[:top]).each do |ms, suite, name|
+  label = name.length > 78 ? "#{name[0, 75]}..." : name
+  puts format('    %9s  %s :: %s', fmt(ms), suite, label)
+end
+puts '============================================='
+
+# Decide whether it is worth pointing at --make-faster. Each reason names a
+# DIFFERENT lever, so the reason itself is the useful part, not just the nudge.
+SLOW_SUITE_MS = 10_000
+NUDGE_FLOOR_MS = 60_000
+REGRESSION_PCT = 20
+
+reasons = []
+
+slow_suites = ranked_suites.select { |_, v| v[:ms] >= SLOW_SUITE_MS }
+unless slow_suites.empty?
+  slow_ms = slow_suites.sum { |_, v| v[:ms] }
+  reasons << format('%d suite(s) each spend over %s in test bodies (%s total, %.0f%% of all test-body time)',
+                    slow_suites.length, fmt(SLOW_SUITE_MS), fmt(slow_ms), slow_ms * 100.0 / body)
+end
+
+if prev && prev[:wall_ms].positive? && report.wall_ms
+  pct = (report.wall_ms - prev[:wall_ms]) * 100.0 / prev[:wall_ms]
+  if pct >= REGRESSION_PCT
+    reasons << format('wall clock is %.0f%% slower than the previous run (%s -> %s)',
+                      pct, fmt(prev[:wall_ms]), fmt(report.wall_ms))
+  end
+end
+
+# A low body share means making individual tests "do less" is the WRONG lever:
+# the cost is fixtures, suite construction, app/server boot and compile.
+if share && share < 40
+  reasons << format('only %.0f%% of the wall clock is in test bodies - the rest is compile, ' \
+                    'JVM startup, suite construction and fixtures', share)
+end
+
+# Summed body time approaching the critical path means the suites are barely
+# overlapping, so parallelism is the lever rather than any individual test.
+if report.slowest_run_ms && body > report.slowest_run_ms * 0.8
+  reasons << format('test bodies total %s against a %s critical path, so suites are running ' \
+                    'close to serially - parallelism is the lever', fmt(body), fmt(report.slowest_run_ms))
+end
+
+if !reasons.empty? && report.wall_ms && report.wall_ms > NUDGE_FLOOR_MS
+  puts ''
+  puts '  Worth speeding up:'
+  reasons.each { |r| puts "    - #{r}" }
+  puts "  Run './run.sh test --make-faster' to have claude investigate and fix."
+  puts ''
+end
+
+record_run(project, report) if options[:history]
