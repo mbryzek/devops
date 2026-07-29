@@ -1,110 +1,128 @@
 #!/usr/bin/env ruby
-# verify-db-images — Audit and self-heal platformdb registry images.
+# verify-db-images — Audit and self-heal the session-DB registry images.
 #
-# Default scope: LATEST ONLY.  Only the current schema tag (resolved via
-# `sem-info tag latest` in platform-postgresql) is checked.  Historical tags
-# are intentionally skipped — retention (Task 7) purges images older than
-# 3 days, so backfilling historical tags would be pointless and slow.
+# Checks every Scala project with a schema repo (platform, acumen, ...) unless
+# scoped with --app.
+#
+# Default scope: LATEST ONLY.  Only each app's current schema tag (resolved via
+# `sem-info tag latest` in its schema repo) is checked.  Historical tags are
+# intentionally skipped — retention purges images older than 3 days, so
+# backfilling historical tags would be pointless and slow.
 #
 # Usage:
-#   verify-db-images             Audit latest schema tag; build if missing.
+#   verify-db-images             Audit every app's latest schema tag; build if missing.
+#   verify-db-images --app acumen
+#                                Audit one app.
 #   verify-db-images --tag TAG   Audit a specific SCHEMA tag (useful for testing
 #                                the missing-image path without touching latest).
-#                                The image tag IS the schema tag.
-#   verify-db-images --dry-run   Check only; never invoke build-and-push.sh.
+#                                The image tag IS the schema tag. Requires --app.
+#   verify-db-images --dry-run   Check only; never build.
 #
 # Exit codes:
-#   0  The checked tag has an image in the registry (or was successfully built).
-#   1  The tag is missing and could not be healed (dry-run or build failure).
+#   0  Every checked tag has an image in the registry (or was successfully built).
+#   1  At least one tag is missing and could not be healed (dry-run or build failure).
 
 DIR = File.dirname(__FILE__)
 load File.join(DIR, '../lib/common.rb')
 
+require 'shellwords'
+
 args = Args.parse(ARGV)
+
+if args.tag && !args.tag.empty? && (args.app.nil? || args.app.empty?)
+  Util.exit_with_error("--tag applies to one app's schema history — pass --app too")
+end
+
+apps = (args.app && !args.app.empty?) ? [DbApp.load(args.app)] : DbApp.all
 
 puts ""
 puts Util.underline("verify-db-images")
 puts ""
+puts "Apps   : #{apps.map(&:name).join(', ')}"
 puts "Scope  : latest tag only"
 puts "         (historical tags intentionally skipped — retention policy"
 puts "          purges images older than 3 days; backfill would be wasteful)"
-puts ""
-
-# Resolve the SCHEMA tag to check. --tag takes a schema (git) tag, the same
-# thing build-and-push.sh takes, and the image tag is that tag verbatim (see
-# DbImages.image_tag for the recipe-change regression that accepts).
-if args.tag && !args.tag.empty?
-  schema_tag = args.tag
-  puts "Tag source : explicit --tag argument"
-else
-  schema_tag = DbImages.current_schema_tag
-  puts "Tag source : sem-info tag latest  [#{DbImages::PLATFORM_POSTGRESQL_DIR}]"
-end
-
-target_tag = DbImages.image_tag(schema_tag)
-
-puts "Schema tag : #{schema_tag}"
-puts "Tag checked: #{target_tag}"
-puts "Image      : #{DbImages.image_ref(target_tag)}"
 puts ""
 
 # Authenticate so doctl can list registry tags.
 Util.run("doctl registry login --expiry-seconds 3600", :ignore_error => true)
 puts ""
 
-present = DbImages.registry_tag_exists?(target_tag)
-image   = DbImages.image_ref(target_tag)
+# Audit one app, healing when it can. Returns true when the image is present at
+# the end.
+def verify(app, args)
+  # --tag takes a schema (git) tag, and the image tag is that tag verbatim (see
+  # DbImages.image_tag for the recipe-change regression that accepts).
+  if args.tag && !args.tag.empty?
+    schema_tag = args.tag
+    tag_source = "explicit --tag argument"
+  else
+    schema_tag = app.current_schema_tag
+    tag_source = "sem-info tag latest  [#{app.repo_dir}]"
+  end
 
-if present
-  puts "AUDIT OK — #{image}"
-  puts "           Image exists in registry. No action needed."
+  target_tag = DbImages.image_tag(schema_tag)
+  image      = app.image_ref(target_tag)
+
+  puts Util.underline(app.name)
+  puts "Tag source : #{tag_source}"
+  puts "Schema tag : #{schema_tag}"
+  puts "Image      : #{image}"
   puts ""
-  exit 0
-end
 
-# Tag is missing from the registry.
-puts "AUDIT MISSING — #{image}"
-puts "                Image not found in registry."
-puts ""
+  if DbImages.registry_tag_exists?(app, target_tag)
+    puts "AUDIT OK — #{image}"
+    puts "           Image exists in registry. No action needed."
+    puts ""
+    return true
+  end
 
-if args.dry_run
-  build_script = File.join(DbImages::PLATFORM_POSTGRESQL_DIR, "docker", "build-and-push.sh")
-  puts "--dry-run: would self-heal by running:"
-  puts "  #{build_script} #{schema_tag}"
+  puts "AUDIT MISSING — #{image}"
+  puts "                Image not found in registry."
   puts ""
-  puts "RESULT: tag #{target_tag} is missing (dry-run; no build attempted). Exit 1."
-  puts ""
-  exit 1
-end
 
-# Self-heal: build and push via the incremental chain script.
-build_script = File.join(DbImages::PLATFORM_POSTGRESQL_DIR, "docker", "build-and-push.sh")
-unless File.executable?(build_script)
+  heal_cmd = "db-image build --app #{app.name} --tag #{schema_tag} --push"
+
+  if args.dry_run
+    puts "--dry-run: would self-heal by running:"
+    puts "  #{heal_cmd}"
+    puts ""
+    puts "RESULT: #{app.name} tag #{target_tag} is missing (dry-run; no build attempted)."
+    puts ""
+    return false
+  end
+
+  app.require_repo!
+  puts "Self-healing: #{heal_cmd}..."
+  puts ""
+  Util.run(
+    "#{File.join(DIR, 'db-image')} build --app #{Shellwords.shellescape(app.name)} " \
+    "--tag #{Shellwords.shellescape(schema_tag)} --push"
+  )
+
+  puts ""
+  puts "Re-checking registry after build..."
+  if DbImages.registry_tag_exists?(app, target_tag)
+    puts ""
+    puts "HEALED OK — #{image}"
+    puts "            Image is now present in registry."
+    puts ""
+    return true
+  end
+
   Util.exit_with_error(
-    "Build script not found or not executable: #{build_script}\n" \
-    "Clone platform-postgresql to #{DbImages::PLATFORM_POSTGRESQL_DIR} first."
+    "Build completed but #{image} is still not visible in the registry.\n" \
+    "Check doctl authentication and registry permissions."
   )
 end
 
-puts "Self-healing: invoking build-and-push.sh for #{schema_tag}..."
-puts ""
+results = apps.map { |app| [app.name, verify(app, args)] }
+missing = results.reject { |(_name, ok)| ok }.map(&:first)
 
-Dir.chdir(DbImages::PLATFORM_POSTGRESQL_DIR) do
-  Util.run("#{build_script} #{Shellwords.shellescape(schema_tag)}")
-end
-
-puts ""
-puts "Re-checking registry after build..."
-
-if DbImages.registry_tag_exists?(target_tag)
-  puts ""
-  puts "HEALED OK — #{image}"
-  puts "            Image is now present in registry."
-  puts ""
+if missing.empty?
   exit 0
 end
 
-Util.exit_with_error(
-  "Build completed but #{image} is still not visible in the registry.\n" \
-  "Check doctl authentication and registry permissions."
-)
+puts "RESULT: missing image(s) for #{missing.join(', ')}. Exit 1."
+puts ""
+exit 1

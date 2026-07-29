@@ -1,0 +1,481 @@
+#!/usr/bin/env ruby
+# db-image — build the session-DB Docker image for a Scala project's schema repo,
+#            and cut the baseline that image is built on top of.
+#
+# Every Scala project's schema repo (platform-postgresql, acumen-postgresql, ...)
+# produces the same thing: a Postgres image with that project's schema baked in,
+# plus a `<database>_template` clone that `claude-db` copies once per session.
+# The recipe is generic (devops/db-image/); only the schema artifacts differ, and
+# they live in the schema repo.
+#
+# Usage:
+#   db-image build --app acumen [--tag 0.1.45] [--push] [--repo-dir DIR]
+#       Build registry.digitalocean.com/bryzek/<database>:<tag>.
+#       Default tag is the repo's latest released schema tag.
+#       Without --push: a local, native-arch image. With: multi-arch, pushed.
+#
+#   db-image baseline --app acumen [--snapshot FILE] [--repo-dir DIR]
+#                                  [--keep-data schema.table]...
+#       Re-cut the committed baseline from a production snapshot (default
+#       ~/Downloads/<database>.sql). Writes docker/baseline-schema.sql,
+#       docker/sem-tracking.sql, docker/baseline-journal-settings.sql (when the
+#       app has a journal schema) and docker/baseline-tag into the schema repo.
+#
+# Why a baseline at all: replaying every script from empty to build an image
+# would take minutes-to-tens-of-minutes and, worse, produces a RECONSTRUCTION of
+# the schema rather than the schema. Anchoring on a production dump means the
+# image is what production is, and any drift shows up as a diff.
+#
+# Why a snapshot rather than bin/db-reinstall: db-reinstall drops Mike's local
+# database on :5432. Everything here happens in a throwaway container.
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+require 'fileutils'
+require 'shellwords'
+require 'tmpdir'
+
+RECIPE_DIR = File.expand_path(File.join(DIR, '..', 'db-image'))
+PG_IMAGE   = "postgres:18"
+
+# Everything below talks to 127.0.0.1, never "localhost": scratch containers
+# publish on 127.0.0.1 only, and "localhost" resolves to ::1 first on this
+# machine — sem-apply died mid-build on "connection to server at localhost
+# (::1) ... Connection refused" while plain psql happened to fall back to IPv4.
+SCRATCH_HOST = "127.0.0.1"
+
+def show_usage
+  puts <<~USAGE
+
+    Usage: db-image <command> --app NAME
+
+    Commands:
+      build      Build the image for a schema tag (default: latest released).
+                 --tag TAG       build this tag instead of latest
+                 --push          multi-arch build pushed to the registry
+                                 (default: local, native arch, no push)
+                 --repo-dir DIR  use this checkout instead of ~/code/<app>-postgresql
+
+      baseline   Re-cut the committed baseline from a production snapshot.
+                 --snapshot FILE      default ~/Downloads/<database>.sql
+                 --keep-data TABLE    also load this table's rows (repeatable) and
+                                      dump them to a temp dir, for authoring
+                                      docker/seed.sql. PRODUCTION DATA — never
+                                      commit it unreviewed.
+                 --repo-dir DIR       as above
+
+    Apps: #{DbApp.names.join(', ')}
+
+  USAGE
+  exit 1
+end
+
+# ── scratch postgres ─────────────────────────────────────────────────────────
+
+# Run a block against a throwaway postgres container, on a Docker-assigned
+# ephemeral host port. A hardcoded port collides ("Bind for 0.0.0.0:PORT failed")
+# whenever a leftover build container, a concurrent build, or an unrelated
+# service already holds it.
+def with_scratch_postgres
+  name = "db-image-scratch-#{Process.pid}"
+  cleanup = lambda { system("docker rm -f #{name} > /dev/null 2>&1") }
+  at_exit(&cleanup)
+
+  puts "==> Starting scratch #{PG_IMAGE} (#{name})..."
+  Util.run(
+    "docker run -d --name #{name} -e POSTGRES_HOST_AUTH_METHOD=trust " \
+    "-p #{SCRATCH_HOST}::5432 #{PG_IMAGE}"
+  )
+  port = `docker port #{name} 5432/tcp`.split("\n").first.to_s.split(":").last.to_s.strip
+  if port.empty?
+    Util.exit_with_error("Could not determine the scratch container's host port")
+  end
+  puts "==> Scratch postgres on #{SCRATCH_HOST}:#{port}"
+  wait_for_scratch(port)
+  yield port.to_i
+ensure
+  cleanup.call if cleanup
+end
+
+def wait_for_scratch(port, timeout: 60)
+  print "==> Waiting for postgres..."
+  $stdout.flush
+  deadline = Time.now + timeout
+  loop do
+    if system("psql -h #{SCRATCH_HOST} -p #{port} -U postgres -c 'SELECT 1' postgres > /dev/null 2>&1")
+      puts " ready."
+      return
+    end
+    Util.exit_with_error("scratch postgres did not become ready within #{timeout}s") if Time.now > deadline
+    sleep 1
+  end
+end
+
+def scratch_psql(port, database, *args, user: "postgres")
+  Util.run(
+    "psql -v ON_ERROR_STOP=1 -h #{SCRATCH_HOST} -p #{port} -U #{user} " \
+    "#{args.join(' ')} #{Shellwords.shellescape(database)}"
+  )
+end
+
+def scratch_query(port, database, sql)
+  `psql -h #{SCRATCH_HOST} -p #{port} -U postgres -At -c #{Shellwords.shellescape(sql)} #{Shellwords.shellescape(database)} 2>/dev/null`
+    .strip.split("\n").map(&:strip).reject(&:empty?)
+end
+
+# Create the role and database exactly the way the schema repo's own install.sh
+# does — its `psql ` lines, redirected at the scratch container. Reusing that
+# file rather than restating it keeps one definition of "how this database is
+# created" (it also carries the GRANT/ALTER OWNER the app expects).
+def create_database_from_install_sh(app, port)
+  install = app.path("install.sh")
+  unless File.exist?(install)
+    Util.exit_with_error("#{install} not found — cannot create #{app.database}")
+  end
+  puts "==> Creating #{app.database} via #{install}..."
+  lines = File.readlines(install).map(&:strip).select { |l| l.start_with?("psql ") }
+  if lines.empty?
+    Util.exit_with_error("#{install} has no psql lines — cannot create #{app.database}")
+  end
+  env = { "PGHOST" => SCRATCH_HOST, "PGPORT" => port.to_s }
+  lines.each do |line|
+    puts "    #{line}"
+    unless system(env, line)
+      Util.exit_with_error("Failed while running from install.sh: #{line}")
+    end
+  end
+end
+
+def transfer_ownership(app, port)
+  puts "==> Transferring ownership to #{app.role}..."
+  scratch_psql(
+    port, app.database,
+    "-c #{Shellwords.shellescape("SET db_image.role = '#{app.role}'")}",
+    "-f #{Shellwords.shellescape(File.join(RECIPE_DIR, 'transfer-ownership.sql'))}"
+  )
+end
+
+def journal_settings?(port, database)
+  scratch_query(port, database, "SELECT to_regclass('journal.settings') IS NOT NULL") == ["t"]
+end
+
+def dump(port, database, out_file, *args)
+  Util.run(
+    "pg_dump -h #{SCRATCH_HOST} -p #{port} -U postgres #{Shellwords.shellescape(database)} " \
+    "#{args.join(' ')} --file #{Shellwords.shellescape(out_file)}"
+  )
+end
+
+def dump_sem_tracking(port, database, out_file)
+  dump(port, database, out_file, "--data-only", "--no-owner",
+       "-t schema_evolution_manager.scripts",
+       "-t schema_evolution_manager.bootstrap_scripts")
+end
+
+# ── snapshot loading ─────────────────────────────────────────────────────────
+
+def load_snapshot(app, port, snapshot, keep)
+  puts "==> Loading #{snapshot} (schema + #{keep.length} kept table(s), all other data dropped)..."
+  kept = nil
+  dropped = nil
+  cmd = "psql -v ON_ERROR_STOP=1 -h #{SCRATCH_HOST} -p #{port} -U postgres -q #{Shellwords.shellescape(app.database)}"
+  IO.popen(cmd, "w") do |psql|
+    # Suppress row triggers while loading the kept tables: a snapshot's rows are
+    # already the post-trigger state, and re-firing (updated_at stamps, journal
+    # writes) would corrupt it. This does NOT relax foreign keys — pg_dump adds
+    # those AFTER the data, and ADD CONSTRAINT validates with a scan rather than
+    # a trigger. See the FK-closure note in load_snapshot's error handling.
+    psql.write("SET session_replication_role = replica;\n")
+    kept, dropped = DbSnapshot.stream_schema_only(snapshot, keep, psql)
+  end
+  unless $?.success?
+    # The usual cause is a --keep-data table that is not FK-closed: its rows
+    # point at rows in a table whose data was dropped, and the ALTER TABLE ADD
+    # CONSTRAINT at the end of the dump fails its validation scan. The error
+    # above names exactly the table to add. (db-filter-dump's allow-list policy
+    # has the same requirement, for the same reason.)
+    Util.exit_with_error(
+      "psql failed loading #{snapshot} (exit #{$?.exitstatus})\n" \
+      "If this is a foreign key violation, the --keep-data set is not FK-closed: " \
+      "add the referenced table named in the error above, or drop the one that references it."
+    )
+  end
+  puts "    kept data for: #{kept.uniq.sort.join(', ')}" unless kept.empty?
+  puts "    dropped #{dropped} COPY block(s)"
+end
+
+# ── build ────────────────────────────────────────────────────────────────────
+
+# Schema artifacts to bake, as a {schema:, seed:, sem_tracking:, journal:} hash
+# of absolute paths (journal may be nil). At the baseline tag these are the
+# committed files; at any later tag the schema is derived by replaying the
+# scripts added since, in a scratch container.
+def artifacts_for(app, tag, tmp)
+  seed = app.artifact(:seed)
+  Util.exit_with_error("#{app.path(DbApp::ARTIFACTS[:seed])} not found") if seed.nil?
+
+  committed = {
+    :schema       => app.artifact(:schema),
+    :seed         => seed,
+    :sem_tracking => app.artifact(:sem_tracking),
+    :journal      => app.artifact(:journal)
+  }
+  [:schema, :sem_tracking].each do |kind|
+    if committed[kind].nil?
+      Util.exit_with_error(
+        "#{app.path(DbApp::ARTIFACTS[kind])} not found — cut a baseline first:\n" \
+        "  db-image baseline --app #{app.name}"
+      )
+    end
+  end
+
+  baseline = app.baseline_tag
+  return committed if tag == baseline
+
+  delta = Dir.chdir(app.repo_dir) {
+    `git diff #{Shellwords.shellescape(baseline)}..#{Shellwords.shellescape(tag)} --name-only --diff-filter=A -- scripts/`
+      .split("\n").map(&:strip).reject(&:empty?).sort
+  }
+  if delta.empty?
+    puts "==> No scripts added between #{baseline} and #{tag} — using the committed baseline."
+    return committed
+  end
+
+  puts "==> Delta scripts to apply on top of #{baseline}:"
+  delta.each { |s| puts "    #{s}" }
+  build_incremental(app, tag, committed, tmp)
+end
+
+# Replay the delta scripts against the baseline in a scratch container and dump
+# the result. Uses sem-apply rather than raw psql so the tracking rows are
+# recorded exactly as they would be in a real database.
+def build_incremental(app, tag, committed, tmp)
+  out = { :seed => committed[:seed] }
+  with_scratch_postgres do |port|
+    create_database_from_install_sh(app, port)
+
+    puts "==> Applying baseline schema..."
+    scratch_psql(port, app.database, "-f #{Shellwords.shellescape(committed[:schema])}")
+
+    puts "==> Loading baseline SEM tracking data..."
+    scratch_psql(port, app.database, "-f #{Shellwords.shellescape(committed[:sem_tracking])}")
+
+    if committed[:journal]
+      # pg_dump --schema-only drops these rows; without them the delta scripts'
+      # journal.setup() calls would be the only rows in the dump below, and
+      # every table journaled before the baseline would vanish from the image's
+      # journal configuration.
+      puts "==> Loading baseline journal settings..."
+      scratch_psql(port, app.database, "-f #{Shellwords.shellescape(committed[:journal])}")
+    end
+
+    # Before sem-apply, not after: the baseline dump is --no-owner, so every
+    # object (including the schema_evolution_manager tables) is owned by
+    # postgres. sem-apply runs as the app role and its migrations issue
+    # ALTER/CREATE TABLE, which require ownership.
+    transfer_ownership(app, port)
+
+    # Extract the target tag's scripts without mutating the working tree.
+    scripts_dir = File.join(tmp, "scripts-#{tag}")
+    FileUtils.mkdir_p(scripts_dir)
+    Dir.chdir(app.repo_dir) do
+      Util.run("git archive #{Shellwords.shellescape(tag)} scripts | tar -x -C #{Shellwords.shellescape(scripts_dir)}")
+    end
+
+    puts "==> Running sem-apply for the delta scripts..."
+    Dir.chdir(scripts_dir) do
+      Util.run("sem-apply --url postgresql://#{app.role}@#{SCRATCH_HOST}:#{port}/#{app.database}")
+    end
+
+    out[:schema] = File.join(tmp, "schema.sql")
+    dump(port, app.database, out[:schema], "--schema-only", "--no-owner", "--no-privileges")
+
+    out[:sem_tracking] = File.join(tmp, "sem-tracking.sql")
+    dump_sem_tracking(port, app.database, out[:sem_tracking])
+
+    if journal_settings?(port, app.database)
+      # Data-only, so the sequence position rides along and the next
+      # journal.setup() against a session DB does not collide on the PK.
+      out[:journal] = File.join(tmp, "journal-settings.sql")
+      dump(port, app.database, out[:journal], "--data-only", "--no-owner", "-t journal.settings")
+    end
+  end
+  out
+end
+
+# Assemble the docker build context: the generic recipe from devops, plus this
+# app's artifacts at fixed names. COPY cannot reach outside the context and the
+# two live in different repos, so one is staged next to the other.
+def assemble_context(artifacts, tmp)
+  ctx = File.join(tmp, "context")
+  FileUtils.mkdir_p(File.join(ctx, "initdb"))
+  FileUtils.cp(File.join(RECIPE_DIR, "Dockerfile"), ctx)
+  FileUtils.cp(File.join(RECIPE_DIR, "transfer-ownership.sql"), ctx)
+  FileUtils.cp(File.join(RECIPE_DIR, "initdb", "10-schema.sh"), File.join(ctx, "initdb"))
+
+  FileUtils.cp(artifacts[:schema],       File.join(ctx, "schema.sql"))
+  FileUtils.cp(artifacts[:seed],         File.join(ctx, "seed.sql"))
+  FileUtils.cp(artifacts[:sem_tracking], File.join(ctx, "sem-tracking.sql"))
+  # Optionality as a zero-byte file, so the Dockerfile and the init script have
+  # one code path whether or not the app has a journal schema.
+  if artifacts[:journal]
+    FileUtils.cp(artifacts[:journal], File.join(ctx, "journal-settings.sql"))
+  else
+    File.write(File.join(ctx, "journal-settings.sql"), "-- no journal schema in this database\n")
+  end
+  ctx
+end
+
+BUILDER_NAME = "bryzek-multi"
+PLATFORMS    = "linux/amd64,linux/arm64"
+
+def do_build(app, tag: nil, push: false)
+  app.require_repo!
+  tag ||= app.current_schema_tag
+  image = app.image_ref(DbImages.image_tag(tag))
+
+  puts ""
+  puts Util.underline("db-image build  [app: #{app.name}  db: #{app.database}  tag: #{tag}]")
+  puts ""
+
+  Dir.mktmpdir("db-image") do |tmp|
+    artifacts = artifacts_for(app, tag, tmp)
+    ctx = assemble_context(artifacts, tmp)
+    build_args = "--build-arg DB_NAME=#{Shellwords.shellescape(app.database)} " \
+                 "--build-arg DB_ROLE=#{Shellwords.shellescape(app.role)}"
+
+    if push
+      Util.registry_login
+      # The default "docker" driver cannot push a multi-arch manifest in a
+      # single build; "docker-container" can.
+      unless system("docker buildx inspect #{BUILDER_NAME} > /dev/null 2>&1")
+        puts "==> Creating docker-container buildx builder '#{BUILDER_NAME}'..."
+        Util.run("docker buildx create --name #{BUILDER_NAME} --driver docker-container --bootstrap")
+      end
+      puts "==> Building and pushing #{image} (#{PLATFORMS})..."
+      Util.run(
+        "docker buildx build --builder #{BUILDER_NAME} --platform #{PLATFORMS} " \
+        "#{build_args} -t #{Shellwords.shellescape(image)} --push #{Shellwords.shellescape(ctx)}"
+      )
+      puts ""
+      puts "==> Pushed: #{image}"
+    else
+      puts "==> Building #{image} (native arch, local only)..."
+      Util.run("docker build #{build_args} -t #{Shellwords.shellescape(image)} #{Shellwords.shellescape(ctx)}")
+      puts ""
+      puts "==> Image ready: #{image}"
+    end
+  end
+end
+
+# ── baseline ─────────────────────────────────────────────────────────────────
+
+def default_snapshot(app)
+  File.expand_path("~/Downloads/#{app.database}.sql")
+end
+
+def do_baseline(app, snapshot: nil, keep_data: [])
+  app.require_repo!
+  snapshot ||= default_snapshot(app)
+  unless File.exist?(snapshot)
+    Util.exit_with_error(
+      "Snapshot not found: #{snapshot}\n" \
+      "Download a recent production backup of #{app.database} to ~/Downloads, " \
+      "or pass --snapshot FILE."
+    )
+  end
+
+  puts ""
+  puts Util.underline("db-image baseline  [app: #{app.name}  db: #{app.database}]")
+  puts "Snapshot : #{snapshot} (#{File.mtime(snapshot)})"
+  puts ""
+
+  with_scratch_postgres do |port|
+    create_database_from_install_sh(app, port)
+    load_snapshot(app, port, snapshot, DbSnapshot::SCHEMA_STATE_TABLES + keep_data)
+    transfer_ownership(app, port)
+
+    # Any scripts released after the snapshot was taken. sem-apply consults the
+    # tracking rows kept above, so this applies only what the snapshot lacks.
+    puts "==> Running sem-apply to bring the snapshot to the latest tag..."
+    Dir.chdir(app.repo_dir) do
+      Util.run("sem-apply --url postgresql://#{app.role}@#{SCRATCH_HOST}:#{port}/#{app.database}")
+    end
+
+    tag = app.current_schema_tag
+    puts "==> Baseline tag: #{tag}"
+
+    dump(port, app.database, app.path(DbApp::ARTIFACTS[:schema]),
+         "--schema-only", "--no-owner", "--no-privileges")
+    dump_sem_tracking(port, app.database, app.path(DbApp::ARTIFACTS[:sem_tracking]))
+
+    if journal_settings?(port, app.database)
+      dump(port, app.database, app.path(DbApp::ARTIFACTS[:journal]),
+           "--data-only", "--no-owner", "-t journal.settings")
+    end
+
+    File.write(app.path(DbApp::BASELINE_TAG_FILE), "#{tag}\n")
+
+    unless keep_data.empty?
+      out = Dir.mktmpdir("db-image-keep-data")
+      keep_data.each do |table|
+        file = File.join(out, "#{table}.sql")
+        dump(port, app.database, file, "--data-only", "--no-owner", "-t #{Shellwords.shellescape(table)}")
+      end
+      puts ""
+      Util.warning(
+        "--keep-data wrote PRODUCTION ROWS to #{out}\n" \
+        "  They are NOT part of the baseline. Use them to author docker/seed.sql\n" \
+        "  by hand, with synthetic values for anything personal, then delete them."
+      )
+    end
+  end
+
+  puts ""
+  puts "Baseline written to #{app.repo_dir}/docker:"
+  puts "  baseline-tag, baseline-schema.sql, sem-tracking.sql" +
+       (app.artifact(:journal) ? ", baseline-journal-settings.sql" : "")
+  puts ""
+  puts "Review the diff, then commit. docker/seed.sql is NOT regenerated — it is"
+  puts "hand-curated so that no production row can reach a pushed image."
+  puts ""
+end
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+def parse_args!(argv)
+  opts = { :keep_data => [] }
+  until argv.empty?
+    arg = argv.shift
+    case arg
+    when "--app"       then opts[:app] = argv.shift
+    when "--tag"       then opts[:tag] = argv.shift
+    when "--snapshot"  then opts[:snapshot] = argv.shift
+    when "--repo-dir"  then opts[:repo_dir] = argv.shift
+    when "--keep-data" then opts[:keep_data] << argv.shift
+    when "--push"      then opts[:push] = true
+    else Util.exit_with_error("Unknown argument: #{arg}")
+    end
+  end
+  opts
+end
+
+show_usage if ARGV.empty?
+
+command = ARGV.shift
+show_usage if ["-h", "--help", "help"].include?(command)
+
+opts = parse_args!(ARGV)
+if opts[:app].nil?
+  Util.exit_with_error("--app is required (one of: #{DbApp.names.join(', ')})")
+end
+app = DbApp.load(opts[:app], :repo_dir => opts[:repo_dir])
+
+case command
+when "build"    then do_build(app, :tag => opts[:tag], :push => !!opts[:push])
+when "baseline" then do_baseline(app, :snapshot => opts[:snapshot], :keep_data => opts[:keep_data])
+else
+  $stderr.puts "Unknown command: #{command}"
+  show_usage
+end

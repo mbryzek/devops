@@ -107,13 +107,15 @@ class TestDbImagesSessionId < Minitest::Test
     end
   end
 
-  # ── db_name ───────────────────────────────────────────────────────────────
+  # ── sanitize_session_id ───────────────────────────────────────────────────
+  #
+  # The database NAME (prefix + truncation) is per app — see test_db_apps.rb.
 
-  def test_db_name_sanitizes_a_feature_name
-    assert_equal 'platformdb_sess_cr_login_ladder', DbImages.db_name('cr-login-ladder')
+  def test_sanitize_replaces_punctuation_with_underscores
+    assert_equal 'cr_login_ladder', DbImages.sanitize_session_id('cr-login-ladder')
   end
 
-  def test_db_name_fits_the_postgres_identifier_limit
-    assert_operator DbImages.db_name('x' * 200).length, :<=, 63
+  def test_sanitize_collapses_and_strips_underscores
+    assert_equal 'a_b', DbImages.sanitize_session_id('--A..B--')
   end
 end

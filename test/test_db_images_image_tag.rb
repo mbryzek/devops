@@ -28,30 +28,5 @@ class TestDbImagesImageTag < Minitest::Test
     end
   end
 
-  def test_image_ref_is_registry_plus_schema_tag
-    assert_equal(
-      "registry.digitalocean.com/bryzek/platformdb:0.5.22",
-      DbImages.image_ref(DbImages.image_tag("0.5.22"))
-    )
-  end
-
-  # ── container naming ──────────────────────────────────────────────────────
-
-  def test_container_name_is_prefix_plus_schema_tag
-    assert_equal "platformdb-claude-0.5.22", DbImages.container_name("0.5.22")
-  end
-
-  def test_container_schema_tag_round_trips
-    assert_equal "0.5.22", DbImages.container_schema_tag(DbImages.container_name("0.5.22"))
-  end
-
-  # The pre-split container carries no tag. It may still hold other sessions'
-  # databases, so it has to be recognisable rather than mistaken for a tagged one.
-  def test_legacy_container_has_no_schema_tag
-    assert_nil DbImages.container_schema_tag(DbImages::LEGACY_CONTAINER)
-  end
-
-  def test_unrelated_container_has_no_schema_tag
-    assert_nil DbImages.container_schema_tag("some-other-postgres")
-  end
+  # Image ref and container naming are per app — see test_db_apps.rb.
 end

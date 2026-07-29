@@ -1,12 +1,14 @@
 require 'shellwords'
 
-# Registry + container constants and helpers for the platformdb Docker workflow.
+# Registry, Docker and Postgres mechanics for the session-DB image workflow.
 #
-# Used by bin/claude-db (per-session DB lifecycle) and any other tooling that
-# needs to know where images live or how to talk to a local container.
+# Everything here is APP-AGNOSTIC. Which database, which container, which image
+# — that is DbApp's job (lib/db_apps.rb), derived from the devops config. What
+# is left in here is the machinery every app shares: talking to Docker, talking
+# to Postgres on a given port, and naming a session.
 #
 # ONE CONTAINER PER SCHEMA TAG. There is no single container and no fixed port:
-# the container is "platformdb-claude-<schema-tag>" and its host port is
+# the container is "<database>-claude-<schema-tag>" and its host port is
 # allocated per container (see lib/db_ports.rb). Every helper that talks to
 # Postgres therefore takes the port of the container it is addressing.
 #
@@ -15,48 +17,15 @@ require 'shellwords'
 # rather than just the caller's (measured: one `claude-db start` wiped four
 # other sessions' databases).
 module DbImages
-  REGISTRY      = "registry.digitalocean.com/bryzek"
-  IMAGE_NAME    = "platformdb"
+  REGISTRY = "registry.digitalocean.com/bryzek"
 
-  # Container names are "<CONTAINER_PREFIX>-<schema-tag>". The bare prefix is
-  # also the name of the LEGACY pre-split container, which may still be running
-  # with other sessions' data in it — it is listed and (once empty) reaped, but
-  # never removed by force. No flag day.
-  CONTAINER_PREFIX = "platformdb-claude"
-  LEGACY_CONTAINER = CONTAINER_PREFIX
+  HOST = "localhost"
 
-  HOST          = "localhost"
-  TEMPLATE_DB   = "platformdb_template"
-  SESS_PREFIX   = "platformdb_sess_"
-
-  # Mike's main platform-postgresql checkout.  Used to resolve the current
-  # schema tag and to self-heal missing images via docker/build-and-push.sh.
-  PLATFORM_POSTGRESQL_DIR = File.expand_path("~/code/platform-postgresql")
-
-  # Full image reference for a given schema tag.
-  def DbImages.image_ref(tag)
-    "#{REGISTRY}/#{IMAGE_NAME}:#{tag}"
-  end
-
-  # Resolve the current schema tag by running sem-info inside the
-  # platform-postgresql checkout.
-  def DbImages.current_schema_tag
-    dir = PLATFORM_POSTGRESQL_DIR
-    unless File.directory?(dir)
-      Util.exit_with_error(
-        "platform-postgresql not found at #{dir}. " \
-        "Clone it or correct PLATFORM_POSTGRESQL_DIR in lib/db_images.rb."
-      )
-    end
-    tag = Dir.chdir(dir) { `sem-info tag latest 2>&1`.strip }
-    if tag.empty? || tag =~ /error/i
-      Util.exit_with_error("Could not resolve schema tag from #{dir}: #{tag}")
-    end
-    tag
-  end
+  # Postgres identifier limit — what session database names are truncated to.
+  MAX_IDENTIFIER_LENGTH = 63
 
   # Docker image tag for a schema tag: the schema tag itself, unmodified.
-  # The image ref is "registry.digitalocean.com/bryzek/platformdb:<schema-tag>".
+  # The image ref is "registry.digitalocean.com/bryzek/<database>:<schema-tag>".
   #
   # KNOWN REGRESSION, accepted deliberately — do NOT "fix" it by reintroducing a
   # derived tag. The image is schema PLUS recipe (docker/seed.sql,
@@ -76,11 +45,6 @@ module DbImages
   # Mitigation is discipline: BUMP THE SCHEMA TAG WHEN YOU CHANGE THE RECIPE.
   def DbImages.image_tag(schema_tag)
     schema_tag
-  end
-
-  # Image tag for the current schema tag — what every session should be on.
-  def DbImages.current_image_tag
-    DbImages.image_tag(DbImages.current_schema_tag)
   end
 
   # Feature directory every Claude session works in, one subdirectory per feature.
@@ -138,36 +102,45 @@ module DbImages
     name && !name.empty? ? name : nil
   end
 
-  # Postgres database name derived from a session ID.
+  # Session ID reduced to something legal in a Postgres identifier. The app's
+  # prefix and the length limit are applied by DbApp#session_db_name, which is
+  # the only caller — the prefix length varies per app.
   #
   # Sanitisation rules:
   #   - lowercase
   #   - non-alphanumeric characters → underscore
   #   - collapse consecutive underscores
   #   - strip leading / trailing underscores
-  #   - truncate so the total name fits within the 63-character Postgres limit
-  def DbImages.db_name(sid = nil)
-    sid ||= DbImages.session_id
-    sanitized = sid.downcase
-                   .gsub(/[^a-z0-9]/, '_')
-                   .gsub(/_+/, '_')
-                   .sub(/^_+/, '')
-                   .sub(/_+$/, '')
-    # SESS_PREFIX is 16 chars; Postgres max identifier length is 63
-    max_suffix = 63 - SESS_PREFIX.length
-    sanitized = sanitized[0, max_suffix]
-    "#{SESS_PREFIX}#{sanitized}"
+  def DbImages.sanitize_session_id(sid)
+    sid.downcase
+       .gsub(/[^a-z0-9]/, '_')
+       .gsub(/_+/, '_')
+       .sub(/^_+/, '')
+       .sub(/_+$/, '')
   end
 
-  # True if the given schema tag has a pushed image in the DO registry.
+  # A repository that has never been pushed to does not exist in the registry at
+  # all, and doctl reports that as a 404 rather than an empty list. For an app
+  # whose first image has not been built yet that is "no tags", not a failure —
+  # the whole point of verify-db-images is to notice and heal exactly that.
+  #
+  # Matched on the message because doctl exits 1 for every error alike; the
+  # alternative is treating a network outage as an empty registry, which is the
+  # mistake this deliberately avoids.
+  def DbImages.repository_missing?(doctl_output)
+    doctl_output =~ /repository not found/i ? true : false
+  end
+
+  # True if the given schema tag has a pushed image in `app`'s registry repo.
   #
   # Requires doctl to be authenticated.  Exits with an error on unexpected
   # doctl failures (e.g. network error) so callers are never silently misled
   # into thinking a tag is absent when it might just be unreachable.
-  def DbImages.registry_tag_exists?(tag)
+  def DbImages.registry_tag_exists?(app, tag)
     require 'json'
-    out = `doctl registry repository list-tags #{IMAGE_NAME} --output json 2>&1`
+    out = `doctl registry repository list-tags #{app.image_name} --output json 2>&1`
     unless $?.success?
+      return false if DbImages.repository_missing?(out)
       Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
     end
     (JSON.parse(out) || []).any? { |entry| entry["tag"] == tag }
@@ -182,30 +155,8 @@ module DbImages
 
   # ── containers ────────────────────────────────────────────────────────────
 
-  # Container name for a schema tag.
-  def DbImages.container_name(schema_tag)
-    "#{CONTAINER_PREFIX}-#{schema_tag}"
-  end
-
-  # Schema tag a container name encodes, or nil for the legacy untagged one.
-  def DbImages.container_schema_tag(name)
-    return nil if name == LEGACY_CONTAINER
-    prefix = "#{CONTAINER_PREFIX}-"
-    return nil unless name.start_with?(prefix)
-    tag = name[prefix.length..]
-    tag && !tag.empty? ? tag : nil
-  end
-
-  # Every platformdb-claude* container on this box, running or not, sorted by
-  # name. Includes the legacy untagged container when it is still around.
-  # `docker ps --filter name=` is a substring match, so the result is filtered
-  # against the prefix to keep an unrelated container from being adopted.
-  def DbImages.claude_containers
-    out = `docker ps -a --filter name=#{CONTAINER_PREFIX} --format '{{.Names}}' 2>/dev/null`
-    out.split("\n").map(&:strip).reject(&:empty?)
-       .select { |n| n == LEGACY_CONTAINER || n.start_with?("#{CONTAINER_PREFIX}-") }
-       .sort
-  end
+  # Container naming, and the list of an app's containers, live on DbApp — they
+  # are derived from the database name.
 
   # True when the named container exists at all (running or stopped).
   def DbImages.container_exists?(name)
@@ -277,36 +228,41 @@ module DbImages
     system(cmd)
   end
 
-  # Purge registry images older than 3 days, while always retaining:
-  #   (a) the current image tag (from current_image_tag)
-  #   (b) the baseline anchor BASELINE_TAG
+  # Purge `app`'s registry images older than 3 days, while always retaining:
+  #   (a) the app's current schema tag
+  #   (b) the app's baseline anchor (docker/baseline-tag), because every later
+  #       image is built by replaying scripts on top of it
   #
   # Inject `now:` for testable age logic.  Pass `dry_run: true` to print
   # what would be purged without deleting anything.
-  BASELINE_TAG    = "0.3.44"
-  PURGE_AGE_DAYS  = 3
+  PURGE_AGE_DAYS = 3
 
-  def DbImages.purge_old(now: Time.now, dry_run: false)
+  def DbImages.purge_old(app, now: Time.now, dry_run: false)
     require 'json'
     require 'time'
-    out = `doctl registry repository list-tags #{IMAGE_NAME} --output json 2>&1`
+    out = `doctl registry repository list-tags #{app.image_name} --output json 2>&1`
     unless $?.success?
+      if DbImages.repository_missing?(out)
+        puts "purge_old: #{app.image_name} has no registry repository yet — nothing to do"
+        return
+      end
       Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
     end
 
     entries = JSON.parse(out) || []
     if entries.empty?
-      puts "purge_old: no tags found in registry — nothing to do"
+      puts "purge_old: no tags found in #{app.image_name} — nothing to do"
       return
     end
 
     # Fail-safe: a purge run either knows the current latest tag (and retains
     # it) or purges nothing. Never delete when the latest is unknown — let any
-    # error from current_image_tag propagate rather than swallowing it to nil.
-    retained_tag = current_image_tag
+    # error from current_schema_tag propagate rather than swallowing it to nil.
+    retained_tag = DbImages.image_tag(app.current_schema_tag)
     if retained_tag.nil? || retained_tag.strip.empty?
       Util.exit_with_error("purge_old: cannot determine current latest tag — refusing to purge")
     end
+    baseline_tag = app.baseline_tag
     cutoff = now - PURGE_AGE_DAYS * 24 * 3600
 
     entries.each do |entry|
@@ -325,7 +281,7 @@ module DbImages
         next
       end
 
-      if tag == BASELINE_TAG
+      if tag == baseline_tag
         puts "RETAIN  #{tag}  (baseline anchor)"
         next
       end
@@ -342,46 +298,15 @@ module DbImages
       else
         puts "PURGE   #{tag}  (#{age_days}d old)"
         Util.run(
-          "doctl registry repository delete-tag #{IMAGE_NAME} " \
+          "doctl registry repository delete-tag #{app.image_name} " \
           "#{Shellwords.shellescape(tag)} --force"
         )
       end
     end
   end
 
-  # List all platformdb_sess_* database names in the container on `port`.
-  def DbImages.list_session_dbs(port)
-    psql_query(
-      port,
-      "SELECT datname FROM pg_database WHERE datname LIKE '#{SESS_PREFIX}%' ORDER BY datname"
-    )
-  end
-
-  # Session DB names in the container on `port` with at least one active backend.
-  def DbImages.active_session_dbs(port)
-    psql_query(
-      port,
-      "SELECT DISTINCT datname FROM pg_stat_activity WHERE datname LIKE '#{SESS_PREFIX}%'"
-    ).to_set
-  end
-
   # True when `db` exists in the container on `port`.
   def DbImages.database_exists?(port, db)
     psql_query(port, "SELECT 1 FROM pg_database WHERE datname = '#{db}'") == ["1"]
-  end
-
-  # Every running claude container paired with its port, as [name, port].
-  # Containers whose port cannot be determined are skipped — there is no way to
-  # talk to them and guessing a port would mean talking to somebody else's.
-  def DbImages.running_containers_with_ports
-    claude_containers.select { |n| container_running?(n) }.map { |n|
-      port = container_port(n)
-      port ? [n, port] : nil
-    }.compact
-  end
-
-  # The [container, port] holding `db`, or nil when no running container has it.
-  def DbImages.find_container_with_db(db)
-    running_containers_with_ports.find { |(_name, port)| database_exists?(port, db) }
   end
 end

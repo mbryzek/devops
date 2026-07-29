@@ -5464,7 +5464,7 @@ def queries_issue_body(selected, days:, sort:)
        itself and needs no plan.
     2. Get an execution plan. Use the session Postgres, never production:
        `export CLAUDE_SESSION_ID=<feature>` then
-       `eval "$(~/code/devops/bin/claude-db start | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')"`,
+       `eval "$(~/code/devops/bin/claude-db start --app platform | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')"`,
        then `EXPLAIN (ANALYZE, BUFFERS)` the statement. A sequential scan on a large
        table, or an estimate far from the actual row count, is the usual answer.
     3. Check the indexes that exist, in the table's DAO spec under
