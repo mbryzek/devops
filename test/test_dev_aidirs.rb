@@ -6,11 +6,11 @@ require 'fileutils'
 load File.expand_path('../bin/dev', __dir__)
 
 # Covers `dev aidirs prune`'s classification of ~/code/ai feature dirs into
-# :keep / :delete / :trash. Feature dirs are throwaway clones, so the posture is
-# aggressive: a dir idle past the cutoff is reaped whatever its git state — clean/
-# pushed dirs are hard-:delete'd, dirs holding work not on a remote (uncommitted,
-# stashed, detached, loose files, or local-only commits) are :trash'd so they stay
-# recoverable. A RECENT dir (touched within the cutoff) keeps the full protection:
+# :keep / :delete. Feature dirs are throwaway clones, so the posture is aggressive:
+# a dir idle past the cutoff is :delete'd whatever its git state — including one
+# holding work not on a remote (uncommitted, stashed, detached, loose files, or
+# local-only commits), which is deleted with a reason naming what it lost. A RECENT
+# dir (touched within the cutoff) keeps the full protection:
 # any at-risk state :keep's it, and gh is consulted so a merged/closed PR still lets
 # a recent, landed dir be deleted. gh is ONLY consulted for recent dirs. gh is
 # stubbed via the injected pr_state so no network is touched; git state is exercised
@@ -59,45 +59,46 @@ class TestDevAidirs < Minitest::Test
   end
 
   # ================================================================
-  # AGED OUT (cutoff in the future): reap regardless of git state.
+  # AGED OUT (cutoff in the future): delete regardless of git state.
   # gh is never consulted.
   # ================================================================
 
-  # ---- clean + pushed => hard delete, gh never consulted ----
+  # ---- clean + pushed => deleted with no reason, gh never consulted ----
 
-  def test_aged_clean_and_pushed_is_hard_deleted_without_pr_check
+  def test_aged_clean_and_pushed_is_deleted_without_pr_check
     Dir.mktmpdir do |dir|
       make_repo(dir, "acumen-ui", remote: true)
       pr = ->(_s, _b) { flunk "aged-out dirs must never consult gh" }
-      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
       assert_equal :delete, action
+      assert_nil reason, "nothing at risk => no reason to report"
     end
   end
 
-  # ---- at-risk work => trash (recoverable), gh never consulted ----
+  # ---- at-risk work => deleted too, with a reason; gh never consulted ----
 
-  def test_aged_local_only_commits_are_trashed_regardless_of_pr
+  def test_aged_local_only_commits_are_deleted_regardless_of_pr
     [MERGED, CLOSED, OPEN, NO_PR].each do |pr|
       Dir.mktmpdir do |dir|
         make_repo(dir, "platform") # local-only commit, no remote
         action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
-        assert_equal :trash, action, "aged local-only commits should be trashed"
+        assert_equal :delete, action, "aged local-only commits should be deleted"
         assert_match(/aged out: local-only commits in platform/, reason)
       end
     end
   end
 
-  def test_aged_uncommitted_changes_are_trashed
+  def test_aged_uncommitted_changes_are_deleted
     Dir.mktmpdir do |dir|
       repo = make_repo(dir, "platform", remote: true)
       File.write(File.join(repo, "f.txt"), "dirty")
       action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
-      assert_equal :trash, action
+      assert_equal :delete, action
       assert_match(/aged out: uncommitted changes in platform/, reason)
     end
   end
 
-  def test_aged_detached_head_is_trashed_without_pr_check
+  def test_aged_detached_head_is_deleted_without_pr_check
     Dir.mktmpdir do |dir|
       repo = make_repo(dir, "platform")
       git(repo, "checkout", "-q", "--detach")
@@ -105,51 +106,51 @@ class TestDevAidirs < Minitest::Test
       git(repo, "commit", "-qam", "detached work")
       pr = ->(_s, _b) { flunk "aged-out detached dir must not consult gh" }
       action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: pr)
-      assert_equal :trash, action
+      assert_equal :delete, action
       assert_match(/aged out: detached HEAD in platform/, reason)
     end
   end
 
-  def test_aged_stashed_changes_are_trashed
+  def test_aged_stashed_changes_are_deleted
     Dir.mktmpdir do |dir|
       repo = make_repo(dir, "platform", remote: true) # clean + pushed otherwise
       File.write(File.join(repo, "f.txt"), "wip")
       git(repo, "stash", "push", "-q")
       action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
-      assert_equal :trash, action
+      assert_equal :delete, action
       assert_match(/aged out: stashed changes in platform/, reason)
     end
   end
 
-  def test_aged_loose_nonrepo_content_is_trashed
+  def test_aged_loose_nonrepo_content_is_deleted
     Dir.mktmpdir do |dir|
       make_repo(dir, "acumen-ui", remote: true) # clean + pushed
       FileUtils.mkdir_p(File.join(dir, "notes"))
       File.write(File.join(dir, "notes", "findings.md"), "irreplaceable")
       action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
-      assert_equal :trash, action
+      assert_equal :delete, action
       assert_match(/aged out: unexpected non-repo content/, reason)
     end
   end
 
-  def test_aged_multi_repo_trashed_when_one_repo_has_local_work
+  def test_aged_multi_repo_deleted_when_one_repo_has_local_work
     Dir.mktmpdir do |dir|
       make_repo(dir, "acumen-ui", remote: true) # clean + pushed
       make_repo(dir, "platform")                # local-only, no remote
       action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
-      assert_equal :trash, action
+      assert_equal :delete, action
       assert_match(/platform/, reason)
     end
   end
 
-  def test_aged_empty_dir_is_hard_deleted
+  def test_aged_empty_dir_is_deleted
     Dir.mktmpdir do |dir|
       action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
       assert_equal :delete, action
     end
   end
 
-  def test_aged_symlink_only_dir_is_hard_deleted
+  def test_aged_symlink_only_dir_is_deleted
     Dir.mktmpdir do |dir|
       File.symlink("/tmp", File.join(dir, "devops"))
       action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)

@@ -73,8 +73,8 @@ class TestDbImagesSessionId < Minitest::Test
     assert_nil DbImages.feature_dir_name(DbImages::AI_DIR)
   end
 
-  # A sibling directory whose name merely STARTS with the ai dir's path is not
-  # inside it (~/code/ai-trash exists on this machine).
+  # A sibling directory whose name merely STARTS with the ai dir's path (e.g.
+  # ~/code/ai-trash) is not inside it.
   def test_feature_dir_name_is_nil_for_a_sibling_with_a_prefix_name
     assert_nil DbImages.feature_dir_name("#{DbImages::AI_DIR}-trash/whatever")
   end

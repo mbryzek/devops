@@ -60,7 +60,7 @@ INVOCATIONS = {
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
   "docker prune"        => 'docker prune [--days N] [--apply]',
-  "aidirs prune"        => 'aidirs prune [--days N] [--apply] [--trash]',
+  "aidirs prune"        => 'aidirs prune [--days N] [--apply]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
@@ -215,14 +215,13 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["aidirs prune"]}
         Reap feature dirs under ~/code/ai. These are throwaway clones, so any dir
-        idle more than N days (default 3) is removed regardless of git state: clean/
-        pushed dirs are hard-deleted, while dirs holding work not on a remote
-        (uncommitted, stashed, detached, loose files, or local-only commits) are
-        moved to ~/code/ai-trash/<timestamp> so they stay recoverable. Dirs touched
-        within N days are protected (with `gh` consulted so a landed merged/closed
-        PR still lets a recent dir be deleted). Dry-run by default: prints the
-        keep/delete/trash split and removes nothing. Pass --apply to act; --trash
-        additionally routes the clean/pushed deletes to the trash instead of rm.
+        idle more than N days (default 3) is deleted outright regardless of git
+        state — including dirs holding work not on a remote (uncommitted, stashed,
+        detached, loose files, or local-only commits); the dry-run names what each
+        one is losing. Dirs touched within N days are protected (with `gh` consulted
+        so a landed merged/closed PR still lets a recent dir be deleted). Dry-run by
+        default: prints the keep/delete split and removes nothing. Pass --apply to
+        delete.
 
     #{INVOCATIONS["browserslist update"]}
         Shallow-clone every ~/code/* repo with a package.json into
@@ -4293,11 +4292,11 @@ end
 #
 # Feature dirs under ~/code/ai are throwaway clones (one branch per dir, same
 # name across every repo inside) and cheap to recreate, so prune is AGGRESSIVE:
-# once a dir has gone `--days` (default 3) without activity we reap it whatever
-# its git state. The only concession is recoverability — an aged-out dir holding
-# work that isn't safely on a remote (uncommitted/stashed/detached/loose files or
-# local-only commits) is moved to ~/code/ai-trash/<ts>/ instead of hard-deleted,
-# so a stale clone that turns out to matter can be restored.
+# once a dir has gone `--days` (default 3) without activity we delete it outright,
+# whatever its git state. There is no staging area — a dir holding work that isn't
+# on a remote (uncommitted/stashed/detached/loose files or local-only commits) is
+# deleted too, with the reason printed so the dry-run says what it is losing.
+# Deferred deletion just moved the disk usage rather than reclaiming it.
 #
 # RECENT dirs (touched within the window) keep full protection: any at-risk state
 # keeps them, and `gh` is asked for the PR state so a squash-merged branch — whose
@@ -4386,19 +4385,16 @@ def ai_dir_last_activity(dir, repos)
   times.max
 end
 
-# Returns [action, reason, pr_notes] where action is :keep, :delete, or :trash,
-# reason is a short explanation (nil when hard-deleting), and pr_notes is an array
+# Returns [action, reason, pr_notes] where action is :keep or :delete, reason is a
+# short explanation (nil when there was nothing at risk), and pr_notes is an array
 # of "repo#N STATE" strings for any PR consulted while classifying — surfaced in
 # the output so the dir<->PR tie is visible (e.g. deleted because platform#1204
 # merged). pr_state is injected for testing; it defaults to the gh-backed lookup.
 #
 # Feature dirs are cheap to recreate, so the default posture is AGGRESSIVE: once a
-# dir has gone `cutoff` days without activity we reap it, whatever its git state.
-# The only concession is recoverability — an aged-out dir that still holds work
-# that isn't on a remote (uncommitted/stashed/detached/loose files, or local-only
-# commits) is :trash'd (moved aside, restorable) rather than hard-deleted, so a
-# stale clone that turns out to matter can be pulled back. Aged-out clean/pushed
-# dirs (nothing at risk) are :delete'd outright.
+# dir has gone `cutoff` days without activity we delete it, whatever its git state,
+# including work that isn't on a remote. The reason names what is being lost so the
+# dry-run is reviewable before --apply.
 #
 # RECENT dirs (touched within cutoff) keep the full old protection: any at-risk
 # state → :keep, and gh is consulted so a merged/closed PR still lets a landed dir
@@ -4408,8 +4404,7 @@ def classify_ai_dir(dir, cutoff_time:, pr_state:)
   repos = ai_dir_repos(dir)
   recent = ai_dir_last_activity(dir, repos) >= cutoff_time
 
-  # ---- aged out: reap regardless of git state; trash anything not safely on a
-  # remote, hard-delete only clean/pushed dirs. No gh calls. ----
+  # ---- aged out: delete regardless of git state. No gh calls. ----
   unless recent
     return classify_aged_out(dir, repos)
   end
@@ -4470,46 +4465,44 @@ def classify_ai_dir(dir, cutoff_time:, pr_state:)
   [:keep, "modified within cutoff", pr_notes]
 end
 
-# Classify a dir that has gone quiet past the cutoff. Aged-out dirs are always
-# reaped; the only question is HOW: :trash (recoverable) when it holds work not
-# safely on a remote, :delete (hard) when it's clean/pushed with nothing at risk.
-# gh is never consulted here — the action is the same whether or not a PR landed.
+# Classify a dir that has gone quiet past the cutoff. Every aged-out dir is
+# deleted; the only output that varies is the reason, which names what the dir
+# still holds that isn't on a remote (nil when it is clean and fully pushed) so
+# the dry-run shows what --apply would destroy. gh is never consulted here — the
+# action is the same whether or not a PR landed.
 def classify_aged_out(dir, repos)
-  if repos.empty?
-    return [:delete, nil, []] if dir_effectively_empty?(dir)
-    return [:trash, "aged out: unexpected non-repo content", []]
-  end
+  [:delete, aged_out_at_risk_reason(dir, repos), []]
+end
 
-  return [:trash, "aged out: unexpected non-repo content", []] if ai_dir_has_loose_content?(dir, repos)
+# Short description of the unsaved work an aged-out dir still holds, or nil when
+# nothing is at risk (every repo clean and fully pushed).
+def aged_out_at_risk_reason(dir, repos)
+  return dir_effectively_empty?(dir) ? nil : "aged out: unexpected non-repo content" if repos.empty?
+  return "aged out: unexpected non-repo content" if ai_dir_has_loose_content?(dir, repos)
 
   repos.each do |r|
     name = File.basename(r)
-    return [:trash, "aged out: detached HEAD in #{name}", []] if git_current_branch(r).nil?
-    return [:trash, "aged out: uncommitted changes in #{name}", []] unless git_clean?(r)
-    return [:trash, "aged out: stashed changes in #{name}", []] if git_has_stash?(r)
+    return "aged out: detached HEAD in #{name}" if git_current_branch(r).nil?
+    return "aged out: uncommitted changes in #{name}" unless git_clean?(r)
+    return "aged out: stashed changes in #{name}" if git_has_stash?(r)
     # Local-only commits aren't provably on a remote (a squash-merge would land
-    # them, but confirming that needs gh, which we skip for aged-out dirs). Trash
-    # so they stay recoverable rather than risk hard-deleting unlanded work.
-    if git_has_local_only_commits?(r)
-      return [:trash, "aged out: local-only commits in #{name}", []]
-    end
+    # them, but confirming that needs gh, which we skip for aged-out dirs), so
+    # flag them even though most are already landed work.
+    return "aged out: local-only commits in #{name}" if git_has_local_only_commits?(r)
   end
 
-  # Every repo is clean and fully pushed — nothing at risk, hard-delete.
-  [:delete, nil, []]
+  nil
 end
 
 def cmd_aidirs_prune(args)
   days = 3
   apply = false
-  trash = false
   while (arg = args.shift)
     case arg
     when "--days"
       raw = args.shift or usage_exit("--days requires a value", example: usage_for("aidirs prune"))
       days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("aidirs prune"))
     when "--apply" then apply = true
-    when "--trash" then trash = true
     when "-h", "--help" then puts USAGE; exit 0
     else usage_exit("Unknown flag: #{arg}", example: usage_for("aidirs prune"))
     end
@@ -4528,85 +4521,54 @@ def cmd_aidirs_prune(args)
             .sort
   pr_state = method(:gh_pr_state)
 
-  # An aged-out at-risk dir is classified :trash and is ALWAYS moved aside, never
-  # hard-deleted, regardless of the --trash flag. --trash additionally routes the
-  # clean/pushed :delete dirs to the trash too (belt-and-suspenders).
-  effective_trash = ->(action) { trash || action == :trash }
-
   keep = []
-  to_delete = [] # hard rm: aged-out clean/pushed dirs (unless --trash)
-  to_trash  = [] # moved aside: aged-out at-risk dirs, plus everything if --trash
+  to_delete = []
   dirs.each do |dir|
     action, reason, notes = classify_ai_dir(dir, cutoff_time: cutoff, pr_state: pr_state)
-    if action == :keep
-      keep << [dir, reason, notes]
-    elsif effective_trash.call(action)
-      to_trash << [dir, reason, notes]
-    else
-      to_delete << [dir, reason, notes]
-    end
+    (action == :keep ? keep : to_delete) << [dir, reason, notes]
   end
 
   puts "Scanned #{dirs.length} dir(s) under #{AI_ROOT}."
-  puts "Reaping any dir idle > #{days} day(s): clean/pushed dirs are deleted; dirs holding work not on a remote (uncommitted, stashed, detached, loose files, or local-only commits) are moved to trash so they stay recoverable."
+  puts "Deleting any dir idle > #{days} day(s), including dirs holding work not on a remote (uncommitted, stashed, detached, loose files, or local-only commits) — the reason below names what each one is losing."
   puts "Keeping dirs touched within #{days} day(s) (recent work is fully protected, and a landed merged/closed PR still lets a recent dir be deleted)."
   puts ""
   puts "Keeping #{keep.length}:"
   keep.each { |d, r, _| puts "  #{File.basename(d)}  (#{r})" }
 
-  print_removal_list = lambda do |label, list|
-    return if list.empty?
+  unless to_delete.empty?
     puts ""
-    puts "#{label} #{list.length}:"
-    list.each do |d, reason, notes|
+    puts "Delete #{to_delete.length}:"
+    to_delete.each do |d, reason, notes|
       note_parts = [reason, *(notes || [])].compact.reject(&:empty?)
       suffix = note_parts.empty? ? "" : "  (#{note_parts.join(', ')})"
       puts "  #{File.basename(d)}#{suffix}"
     end
   end
-  print_removal_list.call("Delete", to_delete)
-  print_removal_list.call("Trash", to_trash)
 
-  if to_delete.empty? && to_trash.empty?
+  if to_delete.empty?
     puts ""
     puts "Nothing to remove."
     return
   end
   unless apply
     puts ""
-    puts "(dry-run — pass --apply to remove these)"
+    puts "(dry-run — pass --apply to delete these)"
     return
   end
 
-  trash_root = nil
-  ensure_trash_root = lambda do
-    trash_root ||= begin
-      root = File.join("#{AI_ROOT}-trash", Time.now.strftime("%Y%m%d-%H%M%S"))
-      FileUtils.mkdir_p(root)
-      root
-    end
-  end
-
   deleted = 0
-  trashed = 0
   skipped = []
-  (to_delete + to_trash).each do |dir, _, _|
+  to_delete.each do |dir, _, _|
     # Re-check immediately before removing: parallel sessions routinely touch
-    # ~/code/ai/* between the scan and here, so a dir can become dirty/active in
-    # the window. Skip anything no longer classified for removal; re-derive the
-    # disposition too, in case it flipped between :delete and :trash.
+    # ~/code/ai/* between the scan and here, so a dir can become active in the
+    # window. Skip anything no longer classified for deletion.
     action, reason = classify_ai_dir(dir, cutoff_time: cutoff, pr_state: pr_state)
     if action == :keep
       skipped << [File.basename(dir), reason]
       next
     end
-    if effective_trash.call(action)
-      FileUtils.mv(dir, File.join(ensure_trash_root.call, File.basename(dir)))
-      trashed += 1
-    else
-      FileUtils.rm_rf(dir)
-      deleted += 1
-    end
+    FileUtils.rm_rf(dir)
+    deleted += 1
   end
 
   puts ""
@@ -4615,11 +4577,7 @@ def cmd_aidirs_prune(args)
     skipped.each { |name, r| puts "  #{name}  (#{r})" }
     puts ""
   end
-  puts "Deleted #{deleted} dir(s)." if deleted.positive?
-  if trashed.positive?
-    puts "Moved #{trashed} dir(s) to #{trash_root}"
-    puts "Restore: mv #{trash_root}/<name> #{AI_ROOT}/   —   empty: rm -rf #{trash_root}"
-  end
+  puts "Deleted #{deleted} dir(s)."
 end
 
 # Shared shallow-clone-into-workdir idiom used by both `browserslist update`
