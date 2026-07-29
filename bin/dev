@@ -4309,10 +4309,40 @@ def release_one(name)
   end
   # release-db accepts either `foo` or `foo-postgresql` as --app; pass the full
   # name so the script doesn't have to guess.
-  out, status = Open3.capture2e(env, release_bin, "--app", name, chdir: dir)
-  { ok: status.success?, log: out }
+  run_release_capturing(env, release_bin, name, dir)
 rescue => e
   { ok: false, log: "release_one raised: #{e.class}: #{e.message}" }
+end
+
+# Stable path (no timestamp) so `tail -f` can be pointed at it once and keep
+# working across every future `dev deploy` run.
+def deploy_log_path(app)
+  dir = File.expand_path("~/Library/Logs/dev-deploy")
+  FileUtils.mkdir_p(dir)
+  File.join(dir, "#{app}.log")
+end
+
+# Runs a release subprocess, streaming its combined stdout/stderr to `app`'s
+# stable log file line-by-line as it runs (so a `tail -f` started before or
+# during the run shows live progress), while also buffering the output to
+# return for the failure summary. Any file left over from a prior run is
+# deleted first, so stale output never masquerades as this run's progress.
+def run_release_capturing(env, release_bin, app, dir)
+  path = deploy_log_path(app)
+  File.delete(path) if File.exist?(path)
+  buffer = +""
+  status =
+    File.open(path, "w") do |f|
+      Open3.popen2e(env, release_bin, "--app", app, chdir: dir) do |_stdin, out_err, wait_thr|
+        out_err.each_line do |line|
+          f.write(line)
+          f.flush
+          buffer << line
+        end
+        wait_thr.value
+      end
+    end
+  { ok: status.success?, log: buffer }
 end
 
 # Libraries release through the same `bin/release` entry point as everything
@@ -4328,9 +4358,17 @@ def release_lib(dir)
   { ok: !!ok, log: ok ? "" : "release failed (its output is above, not captured)" }
 end
 
+# " -> <path>" shown next to the "[starting]" line. Libraries release with an
+# inherited terminal (see release_lib) so there's no file to point at.
+def deploy_log_suffix(name)
+  return "" if lib_repo?(name)
+
+  " -> #{deploy_log_path(name)}"
+end
+
 def release_serial(names, results, results_mutex)
   names.each do |name|
-    puts "  #{name} [starting]"
+    puts "  #{name} [starting]#{deploy_log_suffix(name)}"
     result =
       begin
         release_one(name)
@@ -4351,7 +4389,7 @@ def release_concurrent(names, concurrency, results, results_mutex)
       while (name = (queue.pop(true) rescue nil))
         result =
           begin
-            puts "  #{name} [starting]"
+            puts "  #{name} [starting]#{deploy_log_suffix(name)}"
             release_one(name)
           rescue => e
             { ok: false, log: "worker crashed: #{e.class}: #{e.message}" }
