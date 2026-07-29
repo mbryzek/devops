@@ -79,7 +79,6 @@ INVOCATIONS = {
   "features cancel"     => 'features cancel <subproject> <feature> [--localhost]',
   "changelog capture"   => 'changelog [capture] [--app APP]...',
   "changelog build"     => 'changelog build [--app APP]... [--limit N] [--batch-size N] [--localhost]',
-  "changelog push"      => 'changelog push [--app APP]... [--localhost]',
   "changelog status"    => 'changelog status [--localhost]',
 }.freeze
 
@@ -390,19 +389,9 @@ USAGE = <<~USAGE
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
-    #{INVOCATIONS["changelog push"]}
-        Backfill the `changelog` git repo into platform. The raw capture is reproducible
-        from git, but the notes are hundreds of non-deterministic model outputs that
-        cannot be regenerated cheaply, so they are moved rather than rebuilt. Sends only
-        the delta the server reports via /status -- new releases past its max_version,
-        and notes for exactly the versions it lists as missing them -- so a run on a
-        caught-up server is a no-op and its counts mean something. Runs as part of the
-        default pipeline (skipped when the machine has no lake clone); delete this
-        command once the lake is archived.
-
     #{INVOCATIONS["changelog status"]}
         What platform holds per app: the latest recorded version and how many are still
-        awaiting notes. The check to run after a backfill and before archiving the lake.
+        awaiting notes.
 
     #{INVOCATIONS["features list"]}
         Every feature flag in the code-driven catalog with its state, roles, and
@@ -443,7 +432,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["changelog capture"]}
         Record the changelog for the playbook* apps into platform, which serves it at
         /dev/changelog and /playbook/admin/changelog. With no subcommand it runs the full
-        pipeline: `capture`, then `push`, then `build`. `capture` reads each tracked app's
+        pipeline: `capture`, then `build`. `capture` reads each tracked app's
         git tags (playbook-admin, playbook-app, playbook-www) and records every release
         past the server's max_version, with all commits since the previous tag —
         idempotent, so it both records new releases and backfills history. Repeat --app to scope;
@@ -451,21 +440,18 @@ USAGE = <<~USAGE
         `release`; never blocks a release.
 
     #{INVOCATIONS["changelog build"]}
-        Turn raw <version>.tag.json files into curated <version>.notes.json via a
-        headless Claude session that judges which commits are worth a human note,
-        summarizes them, and links each to its PR and (best-effort) in-house issue
-        (ISS-###). Only versions without a notes file are built (cached — never
-        re-evaluated), newest first, a batch of versions per Claude session
-        (--batch-size N to change the batch; session startup, not the notes
+        Turn the raw commits of each recorded release into curated notes via a headless
+        Claude session that judges which commits are worth a human note, summarizes
+        them, and links each to its PR and (best-effort) in-house issue (ISS-###). The
+        work list is the server's own `versions_missing_notes`, so a version is built
+        once and never re-evaluated; notes are POSTed back per batch, which is what
+        makes a large backfill resumable. Newest first, a batch of versions per Claude
+        session (--batch-size N to change the batch; session startup, not the notes
         themselves, dominates the cost). Pass --limit N to build only the N most
         recent pending versions (e.g. to seed history without evaluating every past
         release). Enrichment uses your persisted playbook session; run
-        `dev auth login --app playbook` once first. After writing notes it regenerates
-        playbook-admin's committed snapshot (src/lib/changelog/data.json, what
-        /admin/changelog actually renders) in a scratch worktree and force-pushes it
-        to the long-lived `changelog-data` branch, opening the PR if none is open and
-        squash-merging it — best-effort, never fails the build. The page updates once
-        playbook-admin is released.
+        `dev auth login --app playbook` once first. /admin/changelog reads the API
+        live, so the page reflects new notes as soon as they are recorded.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -495,7 +481,7 @@ COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scr
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
-  "changelog"    => %w[capture build push status],
+  "changelog"    => %w[capture build status],
   "invariants"   => %w[check snoozes snooze unsnooze],
   "tasks"        => %w[requeue],
   "deploy"       => %w[status all],
@@ -5703,10 +5689,6 @@ def changelog_claude_timeout_secs(version_count)
   [[20 * 60, 5 * 60 * version_count].max, 60 * 60].min
 end
 
-def changelog_repo_dir
-  File.expand_path("~/code/changelog")
-end
-
 def changelog_app_checkout(app)
   File.expand_path("~/code/#{changelog_app_repo(app)}")
 end
@@ -5730,30 +5712,6 @@ end
 # Array-form git so paths/refs never go through the shell.
 def changelog_git_out(*cmd)
   IO.popen(["git", *cmd], err: File::NULL, &:read)
-end
-
-# Ensure the changelog data repo is present (clone on first use) and best-effort
-# up to date before we write into it.
-def ensure_changelog_repo!
-  dir = changelog_repo_dir
-  unless Dir.exist?(File.join(dir, ".git"))
-    puts "Cloning changelog repo to #{dir}..."
-    system("git", "clone", "git@github.com:mbryzek/changelog.git", dir) ||
-      Util.exit_with_error("Failed to clone changelog repo")
-  end
-  system("git", "-C", dir, "pull", "--rebase", "--quiet")
-  dir
-end
-
-# Commit + push best-effort. A push failure warns but never raises — capture runs
-# inside the release path and must not fail a release.
-def changelog_git_commit_push!(dir, message)
-  system("git", "-C", dir, "add", "-A")
-  unless system("git", "-C", dir, "commit", "-q", "-m", message)
-    puts "changelog: nothing to commit"
-    return
-  end
-  warn "changelog: push failed (committed locally at #{dir})" unless system("git", "-C", dir, "push", "-q")
 end
 
 # Repeatable --app (defaults to all tracked apps), plus --localhost, --limit and
@@ -5927,8 +5885,7 @@ def cmd_changelog_capture(args)
     puts "changelog capture: sent #{sent} release(s) from #{scans.length} app(s)"
     scans.each { |s| puts changelog_capture_scan_line(s) }
     scans.select { |s| s[:gap] }.each do |s|
-      warn "changelog: #{s[:app]} #{s[:gap]} -- run `dev changelog push`, or re-capture with the " \
-           "missing tags present locally"
+      warn "changelog: #{s[:app]} #{s[:gap]} -- re-capture with the missing tags present locally"
     end
   end
 end
@@ -5937,8 +5894,7 @@ end
 #
 # capture only ever looks PAST the cursor, so "0 new" means "the newest tag is recorded",
 # NOT "every tag is recorded" -- a release missing below the watermark is invisible to it
-# forever. Comparing counts is the only thing that tells those apart, and it is the check
-# to run before archiving the lake.
+# forever. Comparing counts is the only thing that tells those apart.
 #
 # A nil count is "the server did not say", not zero: a platform that predates release_count
 # would otherwise report every tag as missing. Silence beats a false alarm.
@@ -6163,166 +6119,7 @@ def cmd_changelog_build(args)
   end
 end
 
-# --- push: backfill the `changelog` lake into platform ------------------------
-
-# handle_errors, except that in the pipeline an API failure is a warning rather than a
-# non-zero exit -- the steps after push still have work to do.
-def changelog_push_errors(pipeline, &block)
-  return handle_errors(&block) unless pipeline
-  yield
-rescue SessionExpired, ApiError => e
-  warn "changelog push: #{e.message} (ignored)"
-end
-
-# An app's tag list, or [] when there is no checkout to read it from.
-def changelog_checkout_tags(app)
-  checkout = changelog_app_checkout(app)
-  Dir.exist?(File.join(checkout, ".git")) ? changelog_tags(checkout) : []
-end
-
-# The lake's versions for one file kind, in git's version order.
-#
-# NOT the lexical `Dir.glob(...).sort` this used to use: that orders 0.0.10 before
-# 0.0.2, and releases must be sent ascending or the server's max_version stops being a
-# valid resumable cursor. Ordering is borrowed from the checkout's `--sort=v:refname`
-# tag list, so nothing here parses a version. A version with no local tag sorts last,
-# which keeps it in the send rather than dropping it.
-def changelog_lake_versions(dir, suffix, order)
-  Dir.glob(File.join(dir, "*#{suffix}"))
-     .map { |f| File.basename(f, suffix) }
-     .sort_by { |v| [order.index(v) || order.length, v] }
-end
-
-# The lake releases the server does not have. Same cursor rule as capture: releases go
-# up in order, so the server holds a contiguous prefix and anything at or below
-# max_version is already there. An absent or unrecognized max_version sends everything
-# and lets the upsert dedupe -- resending is a no-op, skipping is not.
-def changelog_lake_pending_releases(versions, order, max_version)
-  cursor = max_version ? order.index(max_version) : nil
-  return versions if cursor.nil?
-  versions.reject { |v| (i = order.index(v)) && i <= cursor }
-end
-
-def changelog_lake_read(dir, version, suffix)
-  JSON.parse(File.read(File.join(dir, "#{version}#{suffix}")))
-rescue StandardError
-  nil
-end
-
-def changelog_lake_release(app, dir, version)
-  data = changelog_lake_read(dir, version, ".tag.json")
-  return nil if data.nil?
-  {
-    "application" => app,
-    "repo" => data["repo"] || changelog_app_repo(app),
-    "version" => data["version"],
-    "previous_version" => data["previous_version"],
-    "released_at" => data["released_at"],
-    "commits" => (data["commits"] || []).map { |c|
-      {
-        "sha" => c["sha"],
-        "subject" => c["subject"],
-        # The lake stores "" for a bodyless commit; the API models it as absent.
-        "body" => (c["body"].to_s.strip.empty? ? nil : c["body"].strip),
-        "pr_number" => c["pr_number"],
-      }.compact
-    },
-  }.compact
-end
-
-def changelog_lake_notes(app, dir, version)
-  data = changelog_lake_read(dir, version, ".notes.json")
-  return nil if data.nil?
-  {
-    "application" => app,
-    "version" => data["version"],
-    "entries" => (data["entries"] || []).map { |e|
-      { "summary" => e["summary"], "category" => e["category"],
-        "pr_number" => e["pr_number"], "issue_number" => e["issue_number"] }.compact
-    },
-  }
-end
-
-# Backfill the `changelog` git repo into platform.
-#
-# The raw capture is reproducible from git, but the notes are 581 non-deterministic
-# model outputs that cost real time and money -- rebuilding them is not an option, so
-# they are moved rather than regenerated.
-#
-# Sends only what the server is missing, from the same `/status` call capture uses. It
-# used to re-post the whole lake on every run -- 1190 records -- which made its output
-# ("371 release(s), 371 notes") a file count rather than a delta, so it could never
-# answer the question it exists to answer: is the server actually caught up?
-#
-# Delete this once the lake is archived; `capture` and `build` are the steady state.
-#
-# `pipeline: true` is push running as a step of `dev changelog` rather than on its own,
-# which makes it doubly subordinate:
-#
-#   - it never clones. Most machines have no lake, and cloning an archived repo is not
-#     something a post-release hook should do.
-#   - it never exits. On its own, a failed push should fail loudly; in the pipeline it is
-#     a backfill of an archived repo, and it must not be the reason `build` never runs.
-def cmd_changelog_push(args, pipeline: false)
-  flags = changelog_parse_flags(args)
-  apps = flags[:apps]
-  endpoint = platform_endpoint(flags[:use_localhost])
-  if pipeline && !Dir.exist?(File.join(changelog_repo_dir, ".git"))
-    puts "changelog push: no lake at #{changelog_repo_dir}, skipping"
-    return
-  end
-  repo = ensure_changelog_repo!
-
-  changelog_push_errors(pipeline) do
-    status = changelog_status(endpoint)
-    lines = []
-    total_releases = 0
-    total_notes = 0
-    apps.each do |app|
-      dir = File.join(repo, app)
-      unless Dir.exist?(dir)
-        lines << "  #{app}: no directory in the lake, skipping"
-        next
-      end
-      order = changelog_checkout_tags(app)
-
-      # Releases first: notes name a release that must already exist.
-      pending = changelog_lake_pending_releases(
-        changelog_lake_versions(dir, ".tag.json", order), order, status.dig(app, "max_version")
-      )
-      releases = pending.filter_map { |v| changelog_lake_release(app, dir, v) }
-      sent_releases = changelog_post_batches(endpoint, "releases", :releases, releases)
-
-      # Re-read the cursor after sending: a release recorded a moment ago is not in the
-      # status fetched before the send, so its notes would look like notes for a release
-      # the server does not have and be skipped every run.
-      status = changelog_status(endpoint) if sent_releases.positive?
-
-      # Notes are an exact delta, not a watermark: versions_missing_notes is the
-      # server's own list of what it still needs.
-      missing = status.dig(app, "versions_missing_notes") || []
-      notes = changelog_lake_versions(dir, ".notes.json", order)
-              .select { |v| missing.include?(v) }
-              .filter_map { |v| changelog_lake_notes(app, dir, v) }
-      sent_notes = changelog_post_batches(endpoint, "notes", :notes, notes)
-
-      total_releases += sent_releases
-      total_notes += sent_notes
-      lines << if sent_releases.zero? && sent_notes.zero?
-                 "  #{app}: already up to date"
-               else
-                 "  #{app}: #{sent_releases} release(s), #{sent_notes} notes"
-               end
-    end
-
-    puts "changelog push: sent #{total_releases} release(s) and #{total_notes} notes " \
-         "from #{apps.length} app(s)"
-    lines.each { |l| puts l }
-  end
-end
-
-# What the server holds, per app -- the check to run after a backfill and before
-# archiving the lake.
+# What the server holds, per app: how far capture has gotten and what build still owes.
 def cmd_changelog_status(args)
   flags = changelog_parse_flags(args)
   endpoint = platform_endpoint(flags[:use_localhost])
@@ -6344,12 +6141,10 @@ end
 # The full pipeline, and what bare `dev changelog` runs (including the post-release
 # hook in bin/release).
 #
-# push sits between capture and build deliberately: it hands the server notes the lake
-# already holds, so build does not pay a Claude session to regenerate notes that were
-# already written once. It never clones -- on a machine with no lake it is a no-op.
+# capture first: build's work list is the server's own versions_missing_notes, so a
+# release has to be recorded before there is anything to write notes for.
 def cmd_changelog_all(args)
   cmd_changelog_capture(args.dup)
-  cmd_changelog_push(args.dup, pipeline: true)
   cmd_changelog_build(args.dup)
 end
 
@@ -6490,7 +6285,6 @@ when "changelog"
   case sub
   when "capture" then cmd_changelog_capture(argv)
   when "build"   then cmd_changelog_build(argv)
-  when "push"    then cmd_changelog_push(argv)
   when "status"  then cmd_changelog_status(argv)
   when "all"     then cmd_changelog_all(argv)
   else                unknown("changelog subcommand", sub, SUBCOMMANDS["changelog"])
