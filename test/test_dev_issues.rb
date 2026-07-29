@@ -1033,6 +1033,27 @@ class TestDevIssues < Minitest::Test
     assert_match(/unexpected argument/, out)
   end
 
+  # ---- dev issues create: claim_on_create ----
+
+  # `dev issues create` must always ask the server to claim what it files, atomically —
+  # stub issue_file_claim_and_start itself (the codebase's own established boundary:
+  # its network + plan-writing side effects are not exercised by this suite, see
+  # `write_manual_issue_plan`/the module comment at the top of this file) rather than
+  # driving the full HTTP + editor + file-write path.
+  def test_create_requests_claim_on_create
+    captured = nil
+    define_singleton_method(:issue_edit_in_editor) { "Investigate the export bug" }
+    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    with_credentials do
+      cmd_issues_create(["--category", "bug", "--title", "Export bug", "--no-spawn"])
+    end
+    refute_nil captured
+    assert_equal true, captured.fetch(:form).fetch(:claim_on_create)
+  end
+
   # ---- dev issues create: attachments (validated before any network call) ----
 
   def test_create_rejects_a_missing_image

@@ -2428,7 +2428,7 @@ def cmd_issues_create(args)
 
     # No title unless one was given: the server files a placeholder and queues a
     # summarization of the body, so nothing is lost if that model call fails.
-    form = { category: category }
+    form = { category: category, claim_on_create: true }
     form[:title] = title if title && !title.empty?
     form[:body] = brief unless brief.empty?
     form[:source_url] = source_url if source_url
@@ -2442,19 +2442,22 @@ def cmd_issues_create(args)
   end
 end
 
-# Files `form`, claims it, writes its plan, and hands it to a Claude session.
+# Files `form` (already carrying claim_on_create: true), writes its plan, and hands
+# it to a Claude session.
 #
 # Every caller that files an issue FROM the laptop shares this tail, so a filed
-# issue is always in the same state whatever produced it: claimed, with a session
-# id recorded and a plan on disk. The ordering is load-bearing — the session
-# comment and the plan are both written BEFORE the spawn, so a failure leaves a
-# fully recoverable claimed issue rather than a half-filed one.
+# issue is always in the same state whatever produced it: claimed — via
+# claim_on_create in the create request itself (IssuesService.insert writes
+# status=claimed in the same insert transaction server-side, so there is no
+# window where the issue is open and a concurrent `dev issues claim` sweep could
+# grab it) — with a session id recorded and a plan on disk. The remaining
+# ordering is still load-bearing — the session comment and the plan are both
+# written BEFORE the spawn, so a failure leaves a fully recoverable claimed issue
+# rather than a half-filed one.
 def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spawn_session: true)
   issue = ApiClient.request(endpoint, :post, issues_path, body: form)
   number = issue.fetch("number")
   puts "Filed #{issue_label(issue)} (#{category})"
-
-  ApiClient.request(endpoint, :put, issues_path("/#{number}/status"), body: { status: "claimed" })
 
   # Mint the session id HERE so it is recorded even if the session dies on its
   # first turn — the model is never asked to self-report it.
@@ -5401,6 +5404,7 @@ def queries_offer_investigation(stats, days:, sort:, use_localhost:)
     category: QUERIES_ISSUE_CATEGORY,
     title: queries_issue_title(selected),
     body: queries_issue_body(selected, days: days, sort: sort),
+    claim_on_create: true,
   }
   issue_file_claim_and_start(
     endpoint: issue_endpoint(use_localhost), form: form, category: QUERIES_ISSUE_CATEGORY
