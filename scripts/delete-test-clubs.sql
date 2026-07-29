@@ -17,8 +17,21 @@
 -- Multi-level subtrees are flattened into id temp tables so no delete needs deep
 -- nesting. One transaction: any missed edge aborts + rolls back with zero changes.
 --
--- To regenerate the table list, query pg_constraint for FKs whose confrelid is
--- a table in the delete universe, starting from playbook.clubs.
+-- To find tables missing from this script (new FKs land here over time), run the
+-- transitive closure of FK children from playbook.clubs and diff it against the
+-- `delete from` lines below:
+--
+--   with recursive edges as (
+--     select cn.nspname||'.'||c.relname as child, fn.nspname||'.'||f.relname as parent
+--     from pg_constraint con
+--     join pg_class c on c.oid=con.conrelid join pg_namespace cn on cn.oid=c.relnamespace
+--     join pg_class f on f.oid=con.confrelid join pg_namespace fn on fn.oid=f.relnamespace
+--     where con.contype='f'
+--   ), closure as (
+--     select child from edges where parent='playbook.clubs'
+--     union
+--     select e.child from edges e join closure cl on e.parent=cl.child
+--   ) select distinct child from closure order by 1;
 begin;
 -- A concurrent scalatest run inserting into a child table would otherwise make the
 -- final clubs delete fail on an FK it cannot see. `for update` on the root set takes
@@ -97,6 +110,7 @@ delete from playbook.insights                       where club_id in (select id 
 delete from playbook.insight_runs                   where club_id in (select id from _del_clubs);
 delete from playbook.revenue_entries               where club_id in (select id from _del_clubs);
 delete from playbook.revenue_categories             where club_id in (select id from _del_clubs);
+delete from playbook.club_revenue_targets           where club_id in (select id from _del_clubs);
 delete from playbook.club_insight_settings          where club_id in (select id from _del_clubs);
 delete from playbook.club_memory_facts              where club_id in (select id from _del_clubs);
 delete from playbook.membership_categories          where club_id in (select id from _del_clubs);
@@ -115,6 +129,11 @@ delete from playbook.user_invitations                where club_id in (select id
 -- ---- court_reserve event/reservation cluster -------------------------------
 delete from court_reserve.reservation_courts        where reservation_id in (select id from _del_reservations) or court_id in (select id from _del_cr_courts);
 delete from court_reserve.reservation_players       where reservation_id in (select id from _del_reservations);
+-- reservation_coaches -> (reservations, playbook.coaches): both parents are in the
+-- delete universe, and a row can hang off either side, so scope to both.
+delete from court_reserve.reservation_coaches
+  where reservation_id in (select id from _del_reservations)
+     or coach_id in (select id from playbook.coaches where club_id in (select id from _del_clubs));
 delete from court_reserve.event_registrants         where club_id in (select id from _del_clubs);
 delete from court_reserve.event_summaries           where club_id in (select id from _del_clubs);
 delete from court_reserve.reservations              where club_id in (select id from _del_clubs);
@@ -157,6 +176,8 @@ delete from court_reserve.memberships               where club_id in (select id 
 delete from court_reserve.membership_types          where club_id in (select id from _del_clubs);
 
 -- ---- playbook members (scores/transitions -> members) ----------------------
+delete from playbook.renewal_triages                where club_id in (select id from _del_clubs);
+delete from playbook.memberships                    where club_id in (select id from _del_clubs);
 delete from playbook.member_engagement_scores       where club_id in (select id from _del_clubs);
 delete from playbook.member_segment_transitions     where club_id in (select id from _del_clubs);
 delete from playbook.member_engagement_backfills    where club_id in (select id from _del_clubs);
@@ -172,6 +193,7 @@ delete from playbook.coaches                        where club_id in (select id 
 -- log_review_tickets FK-references issues.issues, and a Court Reserve finding scoped to a
 -- single club carries that club_id — so its ticket must go before the issue it points at.
 delete from court_reserve.log_review_tickets        where issue_id in (select id from _del_issues);
+delete from issues.issue_apps                       where issue_id in (select id from _del_issues);
 delete from issues.issue_attachments                where issue_id in (select id from _del_issues);
 delete from issues.issue_comments                   where issue_id in (select id from _del_issues);
 delete from issues.issue_fixes                      where issue_id in (select id from _del_issues);
