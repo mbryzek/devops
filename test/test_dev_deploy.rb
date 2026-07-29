@@ -74,6 +74,24 @@ class TestDevPending < Minitest::Test
     refute db_repo?("acumen")
     refute db_repo?("postgresql-tools")
   end
+
+  def test_lib_repo_identifies_lib_prefix
+    assert lib_repo?("lib-util")
+    assert lib_repo?("lib-cipher")
+    refute lib_repo?("platform")
+    refute lib_repo?("hoa-frontend")
+    # A library is never also a DB repo, so the three release paths stay disjoint.
+    refute(lib_repos.any? { |n| db_repo?(n) })
+  end
+
+  # The lib list is the one `dev dependencies` already watches, so there is a
+  # single definition of "our scala libs" rather than a second hardcoded copy.
+  def test_lib_repos_come_from_the_dependencies_registry
+    assert_equal Dependencies::Updates::APPS.keys.select { |n| n.start_with?("lib-") }.sort,
+                 lib_repos.sort
+    assert_includes lib_repos, "lib-util"
+    refute_includes lib_repos, "platform"
+  end
 end
 
 # deploy_items derives DB repos from the apps registry (scala apps ship a
@@ -171,6 +189,27 @@ class TestPendingItems < Minitest::Test
     with_registry(apps) do
       _, dir = deploy_items.find { |n, _| n == "platform-postgresql" }
       assert_equal File.expand_path("~/code/platform-postgresql"), dir
+    end
+  end
+
+  # Libraries are not registry apps (they ship to Maven Central), so they are
+  # added independently of whatever the registry holds.
+  def test_libraries_are_always_included
+    with_registry([FakeApp.new(name: "platform", stack: :scala)]) do
+      lib_repos.each { |lib| assert_includes names, lib }
+    end
+  end
+
+  def test_library_path_is_sibling_of_apps
+    with_registry([FakeApp.new(name: "platform", stack: :scala)]) do
+      assert_equal File.expand_path("~/code/lib-util"), dirs["lib-util"]
+    end
+  end
+
+  # Libraries are not scala *apps*, so they must not sprout a DB repo.
+  def test_libraries_get_no_db_repo
+    with_registry([FakeApp.new(name: "platform", stack: :scala)]) do
+      refute_includes names, "lib-util-postgresql"
     end
   end
 
@@ -400,6 +439,81 @@ class TestPendingReleaseOrchestration < Minitest::Test
     out = capture_io { cmd_deploy_all([]) }
     assert_match(/Phase 1/, out)
     refute_match(/Phase 2/, out)
+  end
+
+  # ---- Phase 3: libraries ----
+  #
+  # `release-lib` owns the terminal while it prompts (tag confirmation, GPG
+  # passphrase), so libraries release last and one at a time — never alongside
+  # the parallel app phase, whose output would bury the prompt.
+
+  def with_tty(interactive)
+    orig = Object.instance_method(:interactive_terminal?)
+    Object.send(:define_method, :interactive_terminal?) { interactive }
+    yield
+  ensure
+    Object.send(:define_method, :interactive_terminal?, orig)
+  end
+
+  def test_libraries_release_after_apps_and_dbs
+    @rows = [
+      ["acumen",              { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql",   { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["lib-util",            { tag: "0.0.3", ahead: 1, last: "c" }],
+    ]
+    out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
+    assert_equal %w[acumen-postgresql acumen lib-util], @released
+    assert_match(/Phase 3: releasing 1 library serially \(interactive\): lib-util/, out)
+  end
+
+  def test_libraries_release_serially
+    order = []
+    order_mutex = Mutex.new
+    @rows = [
+      ["lib-util",  { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["lib-query", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    Object.send(:define_method, :release_one) do |name|
+      order_mutex.synchronize { order << "start:#{name}" }
+      sleep 0.02 # let another worker race — there shouldn't be one
+      order_mutex.synchronize { order << "end:#{name}" }
+      { ok: true, log: "" }
+    end
+    with_tty(true) { capture_io { cmd_deploy_all(["--concurrency", "8"]) } }
+    order.each_slice(2) do |start_evt, end_evt|
+      assert_equal start_evt.sub("start:", ""), end_evt.sub("end:", "")
+    end
+  end
+
+  def test_only_libraries_pending_no_app_or_db_phases
+    @rows = [["lib-cipher", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
+    refute_match(/Phase 1/, out)
+    refute_match(/Phase 2/, out)
+    assert_match(/Phase 3/, out)
+    assert_equal ["lib-cipher"], @released
+  end
+
+  # Without a terminal (pipe, cron) release-lib's first prompt would die on EOF.
+  # Skip the library rather than fail mid-release — but say so, and exit
+  # non-zero, because the fleet is still behind.
+  def test_libraries_skipped_without_a_terminal
+    @rows = [
+      ["acumen",   { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["lib-util", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out, exc = with_tty(false) { capture_io_with_exit { cmd_deploy_all([]) } }
+    assert_equal ["acumen"], @released, "the app must still release"
+    refute_nil exc
+    assert_equal 1, exc.status
+    assert_match(/skipped:\s+lib-util \(library release is interactive/, out)
+  end
+
+  def test_up_to_date_libraries_are_not_released
+    @rows = [["lib-util", { tag: "0.0.1", ahead: 0, last: "a" }]]
+    out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
+    assert_empty @released
+    assert_match(/All apps up to date/, out)
   end
 end
 
