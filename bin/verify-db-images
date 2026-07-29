@@ -8,8 +8,10 @@
 #
 # Usage:
 #   verify-db-images             Audit latest schema tag; build if missing.
-#   verify-db-images --tag TAG   Audit a specific tag (useful for testing the
-#                                missing-image path without touching latest).
+#   verify-db-images --tag TAG   Audit a specific SCHEMA tag (useful for testing
+#                                the missing-image path without touching latest).
+#                                The image tag audited is derived from it —
+#                                schema tag + image recipe hash.
 #   verify-db-images --dry-run   Check only; never invoke build-and-push.sh.
 #
 # Exit codes:
@@ -29,15 +31,20 @@ puts "         (historical tags intentionally skipped — retention policy"
 puts "          purges images older than 3 days; backfill would be wasteful)"
 puts ""
 
-# Resolve the tag to check.
+# Resolve the SCHEMA tag to check. --tag takes a schema (git) tag, the same
+# thing build-and-push.sh takes; the image tag is derived from it and carries
+# the image recipe hash on top (see platform-postgresql docker/image-tag.sh).
 if args.tag && !args.tag.empty?
-  target_tag = args.tag
+  schema_tag = args.tag
   puts "Tag source : explicit --tag argument"
 else
-  target_tag = DbImages.current_tag
+  schema_tag = DbImages.current_schema_tag
   puts "Tag source : sem-info tag latest  [#{DbImages::PLATFORM_POSTGRESQL_DIR}]"
 end
 
+target_tag = DbImages.image_tag(schema_tag)
+
+puts "Schema tag : #{schema_tag}"
 puts "Tag checked: #{target_tag}"
 puts "Image      : #{DbImages.image_ref(target_tag)}"
 puts ""
@@ -64,7 +71,7 @@ puts ""
 if args.dry_run
   build_script = File.join(DbImages::PLATFORM_POSTGRESQL_DIR, "docker", "build-and-push.sh")
   puts "--dry-run: would self-heal by running:"
-  puts "  #{build_script} #{target_tag}"
+  puts "  #{build_script} #{schema_tag}"
   puts ""
   puts "RESULT: tag #{target_tag} is missing (dry-run; no build attempted). Exit 1."
   puts ""
@@ -80,11 +87,11 @@ unless File.executable?(build_script)
   )
 end
 
-puts "Self-healing: invoking build-and-push.sh for #{target_tag}..."
+puts "Self-healing: invoking build-and-push.sh for #{schema_tag}..."
 puts ""
 
 Dir.chdir(DbImages::PLATFORM_POSTGRESQL_DIR) do
-  Util.run("#{build_script} #{Shellwords.shellescape(target_tag)}")
+  Util.run("#{build_script} #{Shellwords.shellescape(schema_tag)}")
 end
 
 puts ""

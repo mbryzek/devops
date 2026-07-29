@@ -24,7 +24,7 @@ module DbImages
 
   # Resolve the current schema tag by running sem-info inside the
   # platform-postgresql checkout.
-  def DbImages.current_tag
+  def DbImages.current_schema_tag
     dir = PLATFORM_POSTGRESQL_DIR
     unless File.directory?(dir)
       Util.exit_with_error(
@@ -37,6 +37,35 @@ module DbImages
       Util.exit_with_error("Could not resolve schema tag from #{dir}: #{tag}")
     end
     tag
+  end
+
+  # Docker image tag for a schema tag: "<schema-tag>-r<recipe-hash>".
+  #
+  # The image is schema PLUS recipe (seed rows, init script, Dockerfile), so a
+  # recipe-only change has to produce a different image tag — otherwise the
+  # registry and every local Docker cache keep serving the old image under the
+  # unchanged schema tag and the change reaches nobody until the next schema
+  # release. platform-postgresql's docker/image-tag.sh is the single definition
+  # of that tag; shelling out to it keeps this from drifting into a second one.
+  def DbImages.image_tag(schema_tag, dir: PLATFORM_POSTGRESQL_DIR)
+    script = File.join(dir, "docker", "image-tag.sh")
+    unless File.executable?(script)
+      Util.exit_with_error(
+        "Image tag script not found or not executable: #{script}\n" \
+        "Update the platform-postgresql checkout at #{dir} (this devops " \
+        "version requires docker/image-tag.sh)."
+      )
+    end
+    out = `#{Shellwords.shellescape(script)} #{Shellwords.shellescape(schema_tag)} 2>&1`.strip
+    unless $?.success? && !out.empty?
+      Util.exit_with_error("Could not compute image tag for #{schema_tag}: #{out}")
+    end
+    out
+  end
+
+  # Image tag for the current schema tag — what every session should be on.
+  def DbImages.current_image_tag
+    DbImages.image_tag(DbImages.current_schema_tag)
   end
 
   # Feature directory every Claude session works in, one subdirectory per feature.
@@ -183,7 +212,7 @@ module DbImages
   end
 
   # Purge registry images older than 3 days, while always retaining:
-  #   (a) the current latest tag (from current_tag)
+  #   (a) the current image tag (from current_image_tag)
   #   (b) the baseline anchor BASELINE_TAG
   #
   # Inject `now:` for testable age logic.  Pass `dry_run: true` to print
@@ -207,8 +236,8 @@ module DbImages
 
     # Fail-safe: a purge run either knows the current latest tag (and retains
     # it) or purges nothing. Never delete when the latest is unknown — let any
-    # error from current_tag propagate rather than swallowing it to nil.
-    retained_tag = current_tag
+    # error from current_image_tag propagate rather than swallowing it to nil.
+    retained_tag = current_image_tag
     if retained_tag.nil? || retained_tag.strip.empty?
       Util.exit_with_error("purge_old: cannot determine current latest tag — refusing to purge")
     end

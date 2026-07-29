@@ -56,31 +56,37 @@ end
 # ── start ──────────────────────────────────────────────────────────────────
 
 def do_start
-  tag = DbImages.current_tag
+  # Two tags, deliberately: the schema tag is the platform-postgresql git tag
+  # (what a build replays), the image tag is that plus the image recipe hash
+  # (what a container runs). A seed-data change moves the second and not the
+  # first — which is the whole point: it restarts the container onto the new
+  # image instead of silently reusing the cached one.
+  schema_tag = DbImages.current_schema_tag
+  image_tag  = DbImages.image_tag(schema_tag)
   puts ""
-  puts Util.underline("claude-db start  [schema tag: #{tag}]")
+  puts Util.underline("claude-db start  [schema tag: #{schema_tag}  image: #{image_tag}]")
   puts ""
 
-  desired_image = DbImages.image_ref(tag)
+  desired_image = DbImages.image_ref(image_tag)
 
   # 1. Ensure the container is running with the correct schema image.
   if DbImages.container_running?
     current_image = DbImages.container_image
     if current_image == desired_image
-      puts "Container #{DbImages::CONTAINER} already running (#{tag}). No restart needed."
+      puts "Container #{DbImages::CONTAINER} already running (#{image_tag}). No restart needed."
     else
       old_tag = current_image.split(':').last
-      puts "Container running with schema #{old_tag} — upgrading to #{tag}."
+      puts "Container running with image #{old_tag} — upgrading to #{image_tag}."
       puts "(Existing session databases in the old container will be gone after restart.)"
       Util.run("docker rm -f #{DbImages::CONTAINER}")
-      start_container(desired_image, tag)
+      start_container(desired_image, schema_tag)
     end
   else
     # Remove stale (stopped) container record if one exists.
     if system("docker inspect #{DbImages::CONTAINER} > /dev/null 2>&1")
       Util.run("docker rm -f #{DbImages::CONTAINER}")
     end
-    start_container(desired_image, tag)
+    start_container(desired_image, schema_tag)
   end
 
   # 2. Create this session's database (idempotent).
@@ -118,8 +124,10 @@ def do_start
 end
 
 # Pull (or build+push) the image, then run the container on :5433.
-def start_container(desired_image, tag)
-  ensure_image(desired_image, tag)
+# schema_tag is what build-and-push.sh takes (a git tag it replays); the image
+# ref already carries the recipe hash.
+def start_container(desired_image, schema_tag)
+  ensure_image(desired_image, schema_tag)
   Util.run(
     "docker run -d -p #{DbImages::PORT}:5432 --name #{DbImages::CONTAINER} #{desired_image}"
   )
@@ -131,7 +139,7 @@ end
 
 # Ensure the image is available locally, pulling from the registry or
 # self-healing via build-and-push.sh if the image does not exist yet.
-def ensure_image(desired_image, tag)
+def ensure_image(desired_image, schema_tag)
   if DbImages.image_available_locally?(desired_image)
     puts "Image #{desired_image} found in local cache."
     return
@@ -146,7 +154,7 @@ def ensure_image(desired_image, tag)
 
   # Pull failed — image not in registry.  Build and push it now.
   puts ""
-  puts "Image not found in registry. Self-healing: building and pushing #{tag}..."
+  puts "Image not found in registry. Self-healing: building and pushing #{schema_tag}..."
   build_script = File.join(DbImages::PLATFORM_POSTGRESQL_DIR, "docker", "build-and-push.sh")
   unless File.executable?(build_script)
     Util.exit_with_error(
@@ -155,7 +163,7 @@ def ensure_image(desired_image, tag)
     )
   end
   Dir.chdir(DbImages::PLATFORM_POSTGRESQL_DIR) do
-    Util.run("#{build_script} #{Shellwords.shellescape(tag)}")
+    Util.run("#{build_script} #{Shellwords.shellescape(schema_tag)}")
   end
   puts ""
   puts "Pulling freshly built image..."
