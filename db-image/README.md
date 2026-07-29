@@ -110,12 +110,39 @@ rather than hiding inside a reconstruction.
 5. Ownership transfer, then `pg_dump` of the schema, the SEM tracking rows, and
    `journal.settings` when the app has a journal schema.
 
+`bin/db-reinstall` is deliberately not reused for this: it drops Mike's local
+database on `:5432`. Everything above happens in a throwaway container.
+
+### `--keep-data`, and why it needs an FK-closed set
+
 `--keep-data schema.table` additionally loads one table's rows and dumps them to
 a temp directory, for authoring `docker/seed.sql` by hand. Those are **production
 rows** — synthesize anything personal before committing, and delete the dump.
 
-`bin/db-reinstall` is deliberately not reused for this: it drops Mike's local
-database on `:5432`. Everything above happens in a throwaway container.
+Whatever you keep has to bring along everything it points at. A `pg_dump` file is
+ordered in three parts:
+
+1. `CREATE TABLE …` — the tables, with no foreign keys yet
+2. `COPY … FROM stdin` — one block of rows per table
+3. `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` — the constraints, at the end
+
+Step 3 is where a partial keep-list breaks. `ADD CONSTRAINT` **validates the rows
+already in the table**, so keeping `public.users` while dropping `storage.files`
+fails when the FK is added: the kept users reference avatar files that were never
+loaded. Production is perfectly consistent — the subset is not.
+
+`session_replication_role = replica` (which the loader sets) does **not** help
+here, and it is worth being precise about why. That setting disables *triggers*,
+and FK enforcement during INSERT/UPDATE/COPY is implemented as triggers — so it
+does suppress checks while data is loading, which is why keeping tables works at
+all. But the validation inside `ADD CONSTRAINT` is a one-shot scan performed by
+the DDL itself, not a trigger, so nothing suppresses it.
+
+So a keep-list must be **FK-closed**: every table it names, plus everything those
+rows reference, transitively. The failure tells you exactly what is missing —
+the error names the constraint and the absent referenced table — so add that
+table and re-run, or drop the one that references it. (`bin/db-filter-dump`'s
+allow-list policy carries the same requirement, for the same reason.)
 
 ---
 

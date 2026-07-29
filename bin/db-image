@@ -182,10 +182,16 @@ def load_snapshot(app, port, snapshot, keep)
   cmd = "psql -v ON_ERROR_STOP=1 -h #{SCRATCH_HOST} -p #{port} -U postgres -q #{Shellwords.shellescape(app.database)}"
   IO.popen(cmd, "w") do |psql|
     # Suppress row triggers while loading the kept tables: a snapshot's rows are
-    # already the post-trigger state, and re-firing (updated_at stamps, journal
-    # writes) would corrupt it. This does NOT relax foreign keys — pg_dump adds
-    # those AFTER the data, and ADD CONSTRAINT validates with a scan rather than
-    # a trigger. See the FK-closure note in load_snapshot's error handling.
+    # already the post-trigger state, and re-firing them (updated_at stamps,
+    # journal writes) would corrupt it.
+    #
+    # This suppresses FK checks DURING the load too — those are triggers — but it
+    # does NOT make a partial keep-list safe. pg_dump emits foreign keys after the
+    # data as ALTER TABLE ADD CONSTRAINT, and that validates the rows already in
+    # the table with a one-shot scan performed by the DDL itself, not a trigger.
+    # Nothing suppresses that scan, so a kept table whose rows reference a dropped
+    # table's rows still fails. See the FK-closure note in load_snapshot below and
+    # the longer explanation in db-image/README.md.
     psql.write("SET session_replication_role = replica;\n")
     kept, dropped = DbSnapshot.stream_schema_only(snapshot, keep, psql)
   end
@@ -193,8 +199,10 @@ def load_snapshot(app, port, snapshot, keep)
     # The usual cause is a --keep-data table that is not FK-closed: its rows
     # point at rows in a table whose data was dropped, and the ALTER TABLE ADD
     # CONSTRAINT at the end of the dump fails its validation scan. The error
-    # above names exactly the table to add. (db-filter-dump's allow-list policy
-    # has the same requirement, for the same reason.)
+    # above names the constraint and the missing referenced table. A keep-list
+    # has to be closed transitively - every table it names, plus everything
+    # those rows reference. (db-filter-dump's allow-list policy has the same
+    # requirement, for the same reason.)
     Util.exit_with_error(
       "psql failed loading #{snapshot} (exit #{$?.exitstatus})\n" \
       "If this is a foreign key violation, the --keep-data set is not FK-closed: " \
