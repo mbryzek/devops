@@ -32,9 +32,11 @@ class TestDevDockerPrune < Minitest::Test
     { "Containers" => containers, "CreatedAt" => created, "UniqueSize" => unique, "Size" => size }
   end
 
-  def cache(shared: "false", last_used: OLD_CACHE_TS, created: OLD_CACHE_TS, size: "157MB", in_use: "false")
-    { "Shared" => shared, "LastUsedAt" => last_used, "CreatedAt" => created,
-      "Size" => size, "InUse" => in_use }
+  def cache(id: nil, parent: "", shared: "false", last_used: OLD_CACHE_TS, created: OLD_CACHE_TS,
+            size: "157MB", in_use: "false")
+    @cache_seq = (@cache_seq || 0) + 1
+    { "ID" => id || "rec#{@cache_seq}", "Parent" => parent, "Shared" => shared,
+      "LastUsedAt" => last_used, "CreatedAt" => created, "Size" => size, "InUse" => in_use }
   end
 
   def volume(links: "0", size: "1.625GB", anonymous: true)
@@ -128,7 +130,9 @@ class TestDevDockerPrune < Minitest::Test
     step = plan(df)["images"]
     assert_equal 2, step.count
     assert_equal 608_600_000, step.bytes, "sums UniqueSize, not Size"
-    assert step.at_least, "shared layers can free more, so the figure is a floor"
+    # Not a floor: layers unique among IMAGES can still be pinned by build cache
+    # records, which is how 1.48GB of "unique" layers freed 8.63MB on a real run.
+    refute step.at_least
   end
 
   # ---- build cache: dated by last use, sized by non-shared records ----
@@ -145,6 +149,42 @@ class TestDevDockerPrune < Minitest::Test
     assert_equal 3, step.count
     assert_equal 200_000_000, step.bytes, "shared records contribute 0 until their images go"
     assert step.at_least
+  end
+
+  # The estimate that a real run proved wrong: an aged base layer that a recent
+  # build still descends from is selected by buildkit's until filter and then
+  # released by nothing. All 56 aged records on the box this was found on were
+  # ancestors of retained ones, and the 2.54GB estimate freed 0B.
+  def test_aged_cache_records_pinned_by_a_newer_descendant_are_not_counted
+    df = { "BuildCache" => [
+      cache(id: "base", size: "2GB"),
+      cache(id: "recent", parent: "base", last_used: RECENT_CACHE_TS, size: "10MB"),
+    ] }
+    step = plan(df)["build cache"]
+    assert_equal 0, step.count
+    assert_equal 0, step.bytes
+    assert_includes step.note, "1 aged record(s) pinned by newer descendants"
+  end
+
+  # Pinning is transitive: the grandparent of a retained record is just as stuck.
+  def test_cache_pinning_walks_the_whole_ancestor_chain
+    df = { "BuildCache" => [
+      cache(id: "grandparent", size: "1GB"),
+      cache(id: "parent", parent: "grandparent", size: "1GB"),
+      cache(id: "recent", parent: "parent", last_used: RECENT_CACHE_TS, size: "10MB"),
+      cache(id: "orphan", size: "500MB"),  # aged with nothing descending from it
+    ] }
+    step = plan(df)["build cache"]
+    assert_equal 1, step.count, "only the orphan is actually releasable"
+    assert_equal 500_000_000, step.bytes
+  end
+
+  # Multiple parents come back space- or comma-separated depending on version.
+  def test_cache_parents_parse_from_either_separator
+    assert_equal %w[a b], docker_cache_parents("Parent" => "a b")
+    assert_equal %w[a b], docker_cache_parents("Parent" => "a,b")
+    assert_equal [], docker_cache_parents("Parent" => "")
+    assert_equal [], docker_cache_parents({})
   end
 
   # `-a` means in-use is not a filter on the way out; a record in use by a live
@@ -196,6 +236,45 @@ class TestDevDockerPrune < Minitest::Test
     assert_equal ["docker", "builder", "prune", "-af", "--filter", "until=72h"], commands["build cache"]
   end
 
+  # ---- docker's own reclaimed totals ----
+
+  # `docker builder prune` delegates to buildx, which prints a different line than
+  # the other three prune commands. Matching only "Total reclaimed space" reported
+  # every build cache prune as 0B no matter what it freed.
+  def test_reads_both_spellings_of_dockers_reclaimed_total
+    assert_equal 1_200_000_000, docker_parse_size(
+      DOCKER_RECLAIMED_LINE.match("Total reclaimed space: 1.2GB\n")[1]
+    )
+    assert_equal 0, docker_parse_size(DOCKER_RECLAIMED_LINE.match("Total:\t0B\n")[1])
+    assert_equal 2_540_000_000, docker_parse_size(DOCKER_RECLAIMED_LINE.match("Total:\t2.54GB\n")[1])
+  end
+
+  def test_reclaimed_total_ignores_unrelated_output
+    assert_nil DOCKER_RECLAIMED_LINE.match("Deleted: sha256:abc123\n")
+    assert_nil DOCKER_RECLAIMED_LINE.match("Total reclaimed space is not a line\n")
+  end
+
+  # ---- argument parsing ----
+
+  def test_defaults_to_thirty_days
+    opts = parse_docker_prune_args([])
+    assert_equal 30, opts.days
+    refute opts.apply
+    refute opts.keep_named_volumes
+  end
+
+  def test_flags_override_the_defaults
+    opts = parse_docker_prune_args(["--days", "7", "--apply", "--keep-named-volumes"])
+    assert_equal 7, opts.days
+    assert opts.apply
+    assert opts.keep_named_volumes
+  end
+
+  def test_rejects_a_non_positive_window
+    _, status = capture_stderr_and_exit { parse_docker_prune_args(["--days", "0"]) }
+    refute_nil status, "--days 0 would filter nothing and must not silently pass"
+  end
+
   # ---- rendering ----
 
   def test_missing_sections_render_as_empty_rather_than_crashing
@@ -209,7 +288,7 @@ class TestDevDockerPrune < Minitest::Test
   def test_render_marks_lower_bounds_and_totals_them
     df = { "Images" => [image], "Volumes" => [volume(size: "1GB", anonymous: false)] }
     out = capture_stdout { render_docker_prune_plan(docker_prune_plan(df, cutoff: CUTOFF)) }
-    assert_match(/images\s+1 image\s+>= 304\.30MB/, out)
+    assert_match(/images\s+1 image\s+304\.30MB/, out)
     assert_match(/volumes\s+1 volume\s+1\.00GB/, out)
     assert_match(/total\s+>= 1\.30GB/, out)
   end
