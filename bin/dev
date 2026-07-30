@@ -59,7 +59,7 @@ INVOCATIONS = {
   "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
   "config check"        => 'config check [--app APP]',
   "config rollout"      => 'config rollout [--app APP]',
-  "docker prune"        => 'docker prune [--days N] [--apply]',
+  "docker prune"        => 'docker prune [--days N] [--apply] [--keep-named-volumes]',
   "aidirs prune"        => 'aidirs prune [--days N] [--apply]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
@@ -253,9 +253,14 @@ USAGE = <<~USAGE
         Apply k8s-secrets and rollout restart workloads (picks up ConfigMap changes).
 
     #{INVOCATIONS["docker prune"]}
-        Remove Docker images, build cache, and dangling volumes older than N days
-        (default 7). Useful when local disk fills from pushed-but-unused builds.
-        Dry-run by default (lists what would be removed); pass --apply to remove.
+        Remove stopped containers, unused images, and build cache older than N
+        days (default 7), plus every unused volume (docker offers no age filter
+        for volumes). Useful when local disk fills from pushed-but-unused builds.
+        Dry-run by default: reports the actual candidates per step, so the sizes
+        describe this run rather than `docker system df`'s RECLAIMABLE column,
+        which ignores the age filter. Pass --apply to remove.
+        --keep-named-volumes takes anonymous volumes only, leaving named unused
+        volumes (stopped session DBs, hand-created ones) in place.
 
     #{INVOCATIONS["aidirs prune"]}
         Reap feature dirs under ~/code/ai. These are throwaway clones, so any dir
@@ -3502,16 +3507,188 @@ def purge_scratch_workdirs(prefix, keep: nil, root: CODE_ROOT)
 end
 
 # ---------- docker prune ----------
+#
+# The RECLAIMABLE column of `docker system df` answers a different question than
+# "what will this run delete", and the difference is not small: it ignores the
+# --days age filter entirely, and it counts every unused volume even though
+# `docker volume prune` (since Docker 23) only removes ANONYMOUS ones unless -a
+# is passed. On the box this was written for that gap was 7.49GB of named volumes
+# advertised and never touched. So the dry-run below enumerates the actual
+# candidates out of `docker system df -v` per step rather than quoting a summary
+# table that promises what the commands don't do.
+
+# Docker renders sizes with go-units HumanSize: decimal (1kB = 1000B), suffix
+# B/kB/MB/GB/TB/PB. Binary suffixes (KiB) appear in some older output, so tolerate
+# the "i" too.
+#
+# It also emits NEGATIVE sizes in scientific notation — "-9.61e+07B" — because an
+# image's UniqueSize is derived as Size - SharedSize and goes negative when layers
+# are shared more ways than that arithmetic assumes. 46 of 179 images on the box
+# this was written for. A regex that only accepts [\d.] silently reads every one
+# of them as zero, so the sign and exponent are parsed here and clamped at the
+# point of aggregation instead.
+DOCKER_SIZE_UNITS = { "B" => 1, "KB" => 10**3, "MB" => 10**6, "GB" => 10**9,
+                      "TB" => 10**12, "PB" => 10**15 }.freeze
+
+def docker_parse_size(str)
+  m = /\A\s*(-?[\d.]+(?:[eE][+-]?\d+)?)\s*([kKMGTP]?i?B)\s*\z/.match(str.to_s) or return 0
+  (m[1].to_f * DOCKER_SIZE_UNITS.fetch(m[2].delete("i").upcase, 1)).round
+end
+
+def docker_format_size(bytes)
+  [["TB", 10**12], ["GB", 10**9], ["MB", 10**6], ["kB", 10**3]].each do |name, scale|
+    return format("%.2f%s", bytes.to_f / scale, name) if bytes >= scale
+  end
+  "#{bytes}B"
+end
+
+# `docker system df -v` renders timestamps two ways: "2026-07-30 09:05:48 -0400 EDT"
+# (images/containers/volumes) and "2026-05-12 03:12:25.566497 +0000 UTC" (build
+# cache). Both carry a numeric offset ahead of the zone abbreviation, so parse up
+# to the offset and drop the trailing name, which Time.parse reads inconsistently.
+def docker_parse_time(str)
+  m = /\A(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?) ([+-]\d{4})/.match(str.to_s) or return nil
+  Time.parse("#{m[1]} #{m[2]}")
+rescue ArgumentError
+  nil
+end
+
+# An unparseable timestamp reads as "not old enough", so an object we can't date
+# is left OUT of the estimate. This command's failure mode was over-promising;
+# under-counting an oddity is the direction that keeps the number trustworthy.
+def docker_older?(stamp, cutoff)
+  t = docker_parse_time(stamp)
+  !t.nil? && t < cutoff
+end
+
+# `docker container prune` skips anything running/paused/restarting, and its
+# until filter compares CREATED time (not exit time).
+DOCKER_LIVE_STATES = %w[running paused restarting].freeze
+
+def docker_anonymous_volume?(volume)
+  volume["Labels"].to_s.include?("com.docker.volume.anonymous")
+end
+
+# One prune step's candidates. `at_least` marks a byte total that is a lower
+# bound rather than a figure to hold the command to.
+DockerPruneStep = Struct.new(:label, :cmd, :unit, :count, :bytes, :at_least, :note,
+                             keyword_init: true)
+
+# Turn parsed `docker system df -v` JSON into the per-step candidate list, applying
+# each step's own predicate — the same one the underlying docker command uses.
+#
+# Two totals are deliberately lower bounds. Images: UniqueSize omits layers shared
+# with other images, which do free up once the last holder goes. Build cache:
+# shared records are backed by layers an image still references, so they free
+# nothing now — but the image step runs FIRST, and pruning images can leave those
+# records non-shared and reclaimable by the time the cache step runs.
+def docker_prune_plan(df, cutoff:, keep_named_volumes: false)
+  containers = (df["Containers"] || [])
+               .reject { |c| DOCKER_LIVE_STATES.include?(c["State"].to_s.downcase) }
+               .select { |c| docker_older?(c["CreatedAt"], cutoff) }
+  # Containers is "0" for unreferenced and "-1" when docker declined to compute it.
+  images = (df["Images"] || [])
+           .select { |i| i["Containers"].to_i <= 0 && docker_older?(i["CreatedAt"], cutoff) }
+  cache = (df["BuildCache"] || []).select do |r|
+    stamp = r["LastUsedAt"].to_s.empty? ? r["CreatedAt"] : r["LastUsedAt"]
+    docker_older?(stamp, cutoff)
+  end
+  unused_volumes = (df["Volumes"] || []).select { |v| v["Links"].to_i.zero? }
+  volumes = keep_named_volumes ? unused_volumes.select { |v| docker_anonymous_volume?(v) } : unused_volumes
+
+  named_skipped = keep_named_volumes ? unused_volumes.length - volumes.length : 0
+  volume_note = if keep_named_volumes
+                  "anonymous only, no age filter" +
+                    (named_skipped.zero? ? "" : "; #{named_skipped} named unused volume(s) left in place")
+                else
+                  "every unused volume, no age filter"
+                end
+
+  [
+    DockerPruneStep.new(
+      label: "containers", unit: "container", count: containers.length,
+      bytes: containers.sum { |c| docker_parse_size(c["Size"]) }, at_least: false,
+      note: "stopped, created before the cutoff; writable layers only"
+    ),
+    DockerPruneStep.new(
+      label: "images", unit: "image", count: images.length,
+      # Clamp: a negative UniqueSize is a docker accounting artifact, not disk
+      # that comes back, and letting it subtract would understate the step.
+      bytes: images.sum { |i| [docker_parse_size(i["UniqueSize"]), 0].max }, at_least: true,
+      note: "unique layers only; shared layers free up as their last holder goes"
+    ),
+    DockerPruneStep.new(
+      label: "build cache", unit: "record", count: cache.length,
+      bytes: cache.reject { |r| r["Shared"] == "true" }.sum { |r| docker_parse_size(r["Size"]) },
+      at_least: true,
+      note: "non-shared records only; shared ones free up once the images above go"
+    ),
+    DockerPruneStep.new(
+      label: "volumes", unit: "volume", count: volumes.length,
+      bytes: volumes.sum { |v| docker_parse_size(v["Size"]) }, at_least: false,
+      note: volume_note
+    ),
+  ]
+end
+
+def docker_prune_commands(filter:, keep_named_volumes:)
+  {
+    "containers"  => ["docker", "container", "prune", "-f", "--filter", filter],
+    "images"      => ["docker", "image", "prune", "-af", "--filter", filter],
+    "build cache" => ["docker", "builder", "prune", "-af", "--filter", filter],
+    # -a is what makes this reach named unused volumes; without it docker takes
+    # anonymous ones only and the step is near-noop on a box full of named ones.
+    "volumes"     => ["docker", "volume", "prune", "-f", *(keep_named_volumes ? [] : ["-a"])],
+  }
+end
+
+def docker_system_df_verbose
+  out, status = Open3.capture2("docker", "system", "df", "-v", "--format", "json")
+  abort("docker not available or daemon not running") unless status.success?
+  JSON.parse(out)
+rescue Errno::ENOENT
+  abort("docker not available or daemon not running")
+rescue JSON::ParserError => e
+  abort("could not read `docker system df -v --format json`: #{e.message}")
+end
+
+def render_docker_prune_plan(steps)
+  width = steps.map { |s| s.label.length }.max
+  steps.each do |s|
+    size = "#{s.at_least ? '>= ' : '   '}#{docker_format_size(s.bytes)}"
+    objects = "#{s.count} #{s.unit}#{'s' unless s.count == 1}"
+    puts format("  %-#{width}s  %-14s %10s   (%s)", s.label, objects, size, s.note)
+  end
+  total = steps.sum(&:bytes)
+  puts format("  %-#{width}s  %-14s %10s", "total", "", ">= #{docker_format_size(total)}")
+end
+
+# Stream a prune step's output while collecting the "Total reclaimed space" line
+# docker prints at the end — that figure is authoritative, unlike anything we can
+# compute up front, so the run summary is built from docker's own numbers.
+def run_docker_prune_step(cmd)
+  reclaimed = 0
+  IO.popen(cmd, err: [:child, :out]) do |io|
+    io.each_line do |line|
+      print line
+      m = /Total reclaimed space:\s*(\S+)/.match(line)
+      reclaimed = docker_parse_size(m[1]) if m
+    end
+  end
+  [$?.success?, reclaimed]
+end
 
 def cmd_docker_prune(args)
   days = 7
   apply = false
+  keep_named_volumes = false
   while (arg = args.shift)
     case arg
     when "--days"
       raw = args.shift or usage_exit("--days requires a value", example: usage_for("docker prune"))
       days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("docker prune"))
     when "--apply" then apply = true
+    when "--keep-named-volumes" then keep_named_volumes = true
     when "-h", "--help" then puts USAGE; exit 0
     else usage_exit("Unknown flag: #{arg}", example: usage_for("docker prune"))
     end
@@ -3520,31 +3697,37 @@ def cmd_docker_prune(args)
 
   hours = days * 24
   filter = "until=#{hours}h"
+  commands = docker_prune_commands(filter: filter, keep_named_volumes: keep_named_volumes)
 
   puts "Pruning Docker resources older than #{days} day(s) (filter: #{filter})."
   puts ""
-  puts "Pre-prune state:"
-  abort("docker not available or daemon not running") unless system("docker", "system", "df")
-  puts ""
-  puts "(dry-run — pass --apply to remove)" unless apply
+  df = docker_system_df_verbose
+  steps = docker_prune_plan(df, cutoff: Time.now - hours * 3600, keep_named_volumes: keep_named_volumes)
 
-  steps = [
-    ["containers",  ["docker", "container", "prune", "-f", "--filter", filter]],
-    ["images",      ["docker", "image",     "prune", "-af", "--filter", filter]],
-    ["build cache", ["docker", "builder",   "prune", "-af", "--filter", filter]],
-    ["volumes (all dangling — no age filter)", ["docker", "volume", "prune", "-f"]],
-  ]
-  steps.each do |label, cmd|
+  puts apply ? "Removing:" : "Would remove (dry-run — pass --apply to do it):"
+  render_docker_prune_plan(steps)
+
+  unless apply
     puts ""
-    suffix = apply ? "" : "  (dry-run, skipping)"
-    puts "==> #{label}: #{cmd.join(' ')}#{suffix}"
-    next unless apply
-    abort("FAILED at step: #{label}") unless system(*cmd)
+    puts "Commands --apply would run:"
+    commands.each { |label, cmd| puts format("  %-12s %s", label, cmd.join(" ")) }
+    return
+  end
+
+  reclaimed = {}
+  commands.each do |label, cmd|
+    puts ""
+    puts "==> #{label}: #{cmd.join(' ')}"
+    ok, freed = run_docker_prune_step(cmd)
+    abort("FAILED at step: #{label}") unless ok
+    reclaimed[label] = freed
   end
 
   puts ""
-  puts "Post-prune state:"
-  system("docker", "system", "df")
+  puts "Reclaimed (docker's own totals):"
+  width = reclaimed.keys.map(&:length).max
+  reclaimed.each { |label, bytes| puts format("  %-#{width}s  %10s", label, docker_format_size(bytes)) }
+  puts format("  %-#{width}s  %10s", "total", docker_format_size(reclaimed.values.sum))
 end
 
 # ---------- prod version probes ----------
