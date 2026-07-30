@@ -3009,9 +3009,20 @@ def cmd_issues_snooze(args)
 end
 
 # The deploy-detection info of the most recent fix, or nil when the latest fix
-# shipped without one (a document fix — advanced to `deployed` by hand).
+# shipped without one (a document fix, or a webhook fix whose repo platform could
+# not name — see issue_fix_repo).
 def issue_fix_deployment(issue)
   (issue["fixes"] || []).last&.fetch("deployment", nil)
+end
+
+# The repo the most recent fix shipped from, parsed out of its PR url, or nil when
+# the fix is not a PR (a document link). Repo-keyed rather than app-keyed on purpose:
+# the registry answers "does this repo release anything?" by repo_name, and the same
+# parse-the-url technique already keys the changelog's ISS map.
+def issue_fix_repo(issue)
+  url = (issue["fixes"] || []).last&.fetch("url", nil).to_s
+  m = url.match(%r{\Ahttps://github\.com/[^/]+/([^/]+)/pull/\d+})
+  m && m[1]
 end
 
 # ---------- claimed -> fixed, adopted from merged PRs ----------
@@ -3266,8 +3277,30 @@ def cmd_issues_reconcile(args)
     fixed.each do |c|
       deployment = issue_fix_deployment(c)
       if deployment.nil?
-        puts "  skip #{issue_link(c)}: no deploy info (document fix — advance manually)"
-        skipped += 1
+        # No app recorded. Two very different reasons land here, and only the registry
+        # tells them apart — which is exactly why the platform webhook never guesses.
+        # `issue_app` names five apps while the registry tracks about twenty
+        # deployables, so a webhook fix with no app is either a repo that releases
+        # nothing (devops, schema-evolution-manager — the merge IS the release) or a
+        # deployable the tracker has no enum value for (acumen, rallyd, lib-* — which
+        # really do release, so calling the merge "live" would be a claim the
+        # auto-verifier acts on). Promote only the first kind.
+        repo = issue_fix_repo(c)
+        if repo && issue_repo_releases_nothing?(registry, repo)
+          if apply
+            ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
+                              body: { status: "deployed", visibility: "internal",
+                                      comment: "#{repo} releases nothing, so the merge is the release; awaiting verification." })
+            puts "  deployed #{issue_link(c)}: #{repo} releases nothing"
+          else
+            puts "  would deploy #{issue_link(c)}: #{repo} releases nothing"
+          end
+          deployed += 1
+        else
+          reason = repo ? "#{repo} releases, but no app was recorded — advance once it ships" : "document fix — advance manually"
+          puts "  skip #{issue_link(c)}: #{reason}"
+          skipped += 1
+        end
         next
       end
       app_name = deployment["app"]

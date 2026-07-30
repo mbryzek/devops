@@ -885,6 +885,31 @@ class TestDevIssues < Minitest::Test
     assert_nil issue_fix_deployment(graph_issue)
   end
 
+  # ---- issue_fix_repo ----
+  #
+  # ISS-136. The platform webhook records a fix with no app whenever it cannot map the
+  # repo to an `issue_app` value, because it has no registry and must not guess that a
+  # merge is a release. The repo comes back out of the PR url so the registry — the one
+  # place that knows — can decide whether anything will ever release it.
+
+  def test_fix_repo_reads_the_repo_out_of_the_latest_pr_url
+    issue = graph_issue.merge("fixes" => [
+      { "url" => "https://github.com/mbryzek/platform/pull/1" },
+      { "url" => "https://github.com/mbryzek/devops/pull/241" },
+    ])
+    assert_equal "devops", issue_fix_repo(issue)
+  end
+
+  def test_fix_repo_nil_for_a_document_fix_and_no_fixes
+    assert_nil issue_fix_repo(graph_issue.merge("fixes" => [{ "url" => "https://docs.google.com/d/1" }]))
+    assert_nil issue_fix_repo(graph_issue)
+  end
+
+  # A url that merely mentions github must not be mistaken for a merged PR.
+  def test_fix_repo_nil_for_a_non_pr_github_url
+    assert_nil issue_fix_repo(graph_issue.merge("fixes" => [{ "url" => "https://github.com/mbryzek/devops/issues/12" }]))
+  end
+
   # ---- issue_released_since_fix? (deployed-detection logic) ----
 
   def test_released_since_fix_true_when_release_newer_than_fix
