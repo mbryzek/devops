@@ -77,7 +77,24 @@ Rules:
 }
 
 if [ "$1" = "test" ]; then
-  rm -f "/tmp/$PROJECT-test-"*.log
+  # Tidy up old logs, but NEVER touch one a concurrent run is still writing.
+  #
+  # This used to be `rm -f "/tmp/$PROJECT-test-"*.log`, which deleted the log of every other run in
+  # flight. Two overlapping `./run.sh test` invocations is not a hypothetical - it is what happens
+  # the moment you get impatient with a slow run and start a second one in another terminal. The
+  # second run's rm unlinked the first run's log out from under its `tee`, so when the first run
+  # finished, every grep below read a file that no longer existed: zero failures, zero canceled,
+  # zero compile errors, and a nonzero sbt status. That combination reports "sbt exited 1, with
+  # test failure(s)" against an empty log, and with --fix it launches a claude session to fix
+  # failures that do not exist (2026-07-30, acumen).
+  #
+  # Age-based deletion keeps the directory from growing without bound and cannot race: a log older
+  # than a day is not being written by anything.
+  #
+  # The trailing slash on /tmp/ is required, not stylistic: on macOS /tmp is a symlink to
+  # private/tmp, and `find /tmp` stats the symlink and never descends, so the same command without
+  # it silently matches nothing.
+  find /tmp/ -maxdepth 1 -name "$PROJECT-test-*.log" -type f -mtime +0 -delete 2>/dev/null
 
   # --fix: after the run, parse the log and, if there are any failures/errors,
   # launch a claude session (ccd == claude --dangerously-skip-permissions) to
@@ -116,6 +133,18 @@ if [ "$1" = "test" ]; then
   rm -f "$STATUS_FILE"
   # No status written => sbt died without the group completing; treat as failure.
   [ -n "$SBT_STATUS" ] || SBT_STATUS=1
+
+  # Every count below is grepped out of $LOG, and grep against a file that is not there writes
+  # nothing to stdout, so the counts come back as empty strings rather than zeros. That produced a
+  # report of "sbt exited 1, with  test failure(s),  canceled test(s), and  compile error(s)" and,
+  # with --fix, a claude session sent to fix nothing. If the log is gone, say so and stop guessing.
+  if [ ! -f "$LOG" ]; then
+    echo ""
+    echo "ERROR: the log $LOG disappeared while the run was in progress."
+    echo "Nothing can be reported about this run. If another './run.sh test' was running at the"
+    echo "same time, re-run this one on its own."
+    exit 1
+  fi
 
   # Summarize results from the log.
   #
