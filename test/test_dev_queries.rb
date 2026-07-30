@@ -81,9 +81,10 @@ class TestDevQueriesInvestigate < Minitest::Test
   DAO_SITE = "generated.db.playbook.BaseMemberEngagementScoresDao.findAll(MemberEngagementScoresDao.scala:242)".freeze
 
   def stat(sql: "select id from playbook.members where club_id = ?", call_site: DAO_SITE,
-           total_ms: 67757, calls: 1348, mean_ms: 50, max_ms: 255)
+           total_ms: 67757, calls: 1348, mean_ms: 50, max_ms: 255, multi_statement_calls: 0)
     { "sql" => sql, "call_site" => call_site, "total_ms" => total_ms,
-      "calls" => calls, "mean_ms" => mean_ms, "max_ms" => max_ms }
+      "calls" => calls, "mean_ms" => mean_ms, "max_ms" => max_ms,
+      "multi_statement_calls" => multi_statement_calls }
   end
 
   # Drive the prompt with a canned answer and a stubbed tty, and record whether
@@ -216,6 +217,7 @@ class TestDevQueriesInvestigate < Minitest::Test
     assert_includes body, "FIRST statement prepared in its block"
     assert_includes body, "collapsed to a single `?`"
     assert_includes body, "sums across nodes and windows"
+    assert_includes body, "the application caller, not the DAO"
   end
 
   def test_body_carries_the_stats_and_the_untruncated_statement
@@ -229,5 +231,27 @@ class TestDevQueriesInvestigate < Minitest::Test
   def test_body_says_when_a_query_was_never_attributed
     body = queries_issue_body([stat(call_site: nil)], days: 1, sort: "calls")
     assert_includes body, "never got hot"
+  end
+
+  # ISS-110 was filed against a select whose 107ms mean was a 500-row batch upsert running behind
+  # it. The share is stated per query, and stated as a sentence, because a bare percentage is what
+  # a session skims past.
+  def test_body_says_when_the_duration_covers_sibling_statements
+    body = queries_issue_body([stat(calls: 2067, multi_statement_calls: 2067)], days: 7, sort: "total_ms")
+    assert_includes body, "2067 of 2067 calls (100%)"
+    assert_includes body, "cover sibling statements too"
+  end
+
+  def test_body_says_when_the_duration_is_the_statements_alone
+    body = queries_issue_body([stat(calls: 1348, multi_statement_calls: 0)], days: 7, sort: "total_ms")
+    assert_includes body, "0 of 1348 calls — the duration below is this statement's alone"
+  end
+
+  def test_multi_share_is_quiet_for_the_ordinary_single_statement_case
+    assert_equal "-", queries_multi_share(stat(multi_statement_calls: 0))
+  end
+
+  def test_multi_share_is_a_percentage_of_calls
+    assert_equal "50%", queries_multi_share(stat(calls: 1348, multi_statement_calls: 674))
   end
 end
