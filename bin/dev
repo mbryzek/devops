@@ -1683,7 +1683,7 @@ ISSUE_STATUSES = %w[open claimed needs_review fixed deployed verified dismissed 
 # `needs_review` rather than a PR. Each is one plan and one session; the durable
 # prompt body is devops/claude-issues/<category>-body.md where a category has
 # its own pipeline, and default-body.md otherwise (see issue_body_text).
-ISSUE_CATEGORIES = %w[graphs worker insights suggestion feature bug improvement].freeze
+ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement].freeze
 
 # The categories `dev issues create` offers when filing from the laptop, and the
 # changelog vocabulary they mirror (a `bug` ships as changelog `fix`). A SUBSET

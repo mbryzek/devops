@@ -8,6 +8,7 @@ decoding guide, and working rules a fix session needs:
 | `graphs-body.md`     | category `graphs`               | the native graph dashboards in playbook-app             |
 | `worker-body.md`     | category `worker`               | the async workers — chiefly the Court Reserve pipeline  |
 | `insights-body.md`   | category `insights`             | insight-generation quality (playbook + playbook-admin)  |
+| `club_backfill-body.md` | category `club_backfill`     | a club's initial history load held short of completion  |
 | `suggestion-body.md` | category `suggestion`           | investigating a member's request, not building it       |
 | `default-body.md`    | every other category            | triaging the issue, then the shared working rules       |
 | `manual-body.md`     | `dev issues create` (prepended) | what is specific to a hand-filed issue                  |
@@ -44,4 +45,5 @@ The issue tracker is the single system of record for this work — there is no e
 It replaced the old playbook-feedback queue (`dev feedback`, removed along with its API), which
 was the last thing it superseded. `worker` issues are auto-filed by the daily log review; `insights` issues
 are captured in-app when an admin reviews an insight or rejects a proposed checklist item;
-`suggestion` issues are submitted by club members in playbook-app; the rest are filed by hand.
+`suggestion` issues are submitted by club members in playbook-app; `club_backfill` issues are auto-filed
+by the club history backfill driver when it refuses to stamp completion; the rest are filed by hand.
