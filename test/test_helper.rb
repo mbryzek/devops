@@ -85,6 +85,31 @@ module DevTestSupport
     $stdout = old
   end
 
+  # Run a block with $stdin replaced by `text`, reporting tty? as `tty`. Commands
+  # that branch on $stdin.tty? (whether there is anyone to prompt) have two
+  # genuinely different behaviours, and only this makes the non-terminal one — the
+  # one every Claude session and cron run takes — testable.
+  def with_stdin(text, tty: false)
+    buf = StringIO.new(text)
+    buf.define_singleton_method(:tty?) { tty }
+    old = $stdin
+    $stdin = buf
+    yield
+  ensure
+    $stdin = old
+  end
+
+  # Everything the block wrote to $stdout, as a String.
+  def capture_stdout
+    buf = StringIO.new
+    old = $stdout
+    $stdout = buf
+    yield
+    buf.string
+  ensure
+    $stdout = old
+  end
+
   def capture_stderr_and_exit
     buf = StringIO.new
     old = $stderr
