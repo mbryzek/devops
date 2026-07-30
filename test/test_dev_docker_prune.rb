@@ -22,8 +22,8 @@ class TestDevDockerPrune < Minitest::Test
   OLD    = "2026-05-12 03:12:25 -0400 EDT"       # ~2.5 months back
   RECENT = "2026-07-30 09:05:48 -0400 EDT"       # hours back
   RECENT_OLDER = "2026-07-28 09:05:48 -0400 EDT" # days back, still inside the window
-  OLD_CACHE_TS    = "2026-05-12 03:12:25.566497142 +0000 UTC"
-  RECENT_CACHE_TS = "2026-07-30 09:05:48.123456789 +0000 UTC"
+  # The fractional-second, UTC-suffixed rendering docker uses for some timestamps.
+  FRACTIONAL_TS = "2026-05-12 03:12:25.566497142 +0000 UTC"
 
   def container(state:, created: OLD, size: "20.5kB")
     { "State" => state, "CreatedAt" => created, "Size" => size }
@@ -36,16 +36,14 @@ class TestDevDockerPrune < Minitest::Test
       "Containers" => containers, "CreatedAt" => created, "UniqueSize" => unique, "Size" => size }
   end
 
-  # Raw `docker buildx du --format json`: Parents is an array, Shared a real
-  # boolean, and LastUsedAt is usually prose.
-  def cache(id: nil, parents: [], shared: false, last_used: "2 months ago", created: OLD_CACHE_TS,
-            size: "157MB")
+  # Raw `docker buildx du --format json`: Shared is a real boolean where
+  # `docker system df -v` gives the string "true"/"false".
+  def cache(id: nil, shared: false, size: "157MB")
     @cache_seq = (@cache_seq || 0) + 1
-    { "ID" => id || "rec#{@cache_seq}", "Parents" => parents, "Shared" => shared,
-      "LastUsedAt" => last_used, "CreatedAt" => created, "Size" => size }
+    { "ID" => id || "rec#{@cache_seq}", "Shared" => shared, "Size" => size }
   end
 
-  def records(*raw) = raw.map { |r| docker_cache_record(r, now: NOW) }
+  def records(*raw) = raw.map { |r| docker_cache_record(r) }
 
   def volume(links: "0", size: "1.625GB", anonymous: true)
     { "Links" => links, "Size" => size,
@@ -103,7 +101,7 @@ class TestDevDockerPrune < Minitest::Test
 
   def test_parses_both_timestamp_renderings
     assert_equal Time.parse("2026-05-12 03:12:25 -0400"), docker_parse_time(OLD)
-    assert_equal Time.parse("2026-05-12 03:12:25.566497142 +0000"), docker_parse_time(OLD_CACHE_TS)
+    assert_equal Time.parse("2026-05-12 03:12:25.566497142 +0000"), docker_parse_time(FRACTIONAL_TS)
   end
 
   def test_unparseable_timestamp_is_not_a_candidate
@@ -146,100 +144,43 @@ class TestDevDockerPrune < Minitest::Test
     refute step.at_least
   end
 
-  # ---- build cache: dated by last use, sized by non-shared records ----
+  # ---- build cache: every record, no age filter ----
 
-  def test_cache_step_counts_by_last_use_and_sizes_only_non_shared_records
+  # An age filter on cache spares records that are ancestors of recent ones, which
+  # buildkit then cannot release: `--filter until=72h` freed 9.2MB of a builder
+  # holding 5.27GB, and 0B of one holding 101GB. Cache is now taken whole.
+  def test_cache_steps_carry_no_age_filter
+    steps = plan({}, cache_by_builder: { "desktop-linux" => records(cache) })
+    assert_equal ["docker", "buildx", "prune", "--builder", "desktop-linux", "-af"],
+                 steps["cache/desktop-linux"].cmd
+    assert_includes steps["cache/desktop-linux"].note, "no age filter"
+  end
+
+  # Age is irrelevant now, so a record's timestamp must not change the count.
+  def test_cache_step_counts_every_record_whatever_its_age
+    cache_by_builder = { "desktop-linux" => records(cache, cache, cache) }
+    assert_equal 3, plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"].count
+  end
+
+  # A shared record's bytes belong to an image that still holds them, so they are
+  # not freed by pruning cache — which is why the step stays a lower bound.
+  def test_cache_step_sizes_only_non_shared_records
     cache_by_builder = { "desktop-linux" => records(
-      cache,
-      cache(shared: true, size: "900MB"),      # counted, but frees nothing yet
-      cache(last_used: "20 hours ago"),        # inside the age filter
-      # Never used: falls back to CreatedAt rather than reading as undatable.
-      cache(last_used: "", created: OLD_CACHE_TS, size: "43MB"),
+      cache(size: "100MB"),
+      cache(shared: true, size: "900MB"),
     ) }
     step = plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"]
-    assert_equal 3, step.count
-    assert_equal 200_000_000, step.bytes, "shared records contribute 0 until their images go"
+    assert_equal 2, step.count
+    assert_equal 100_000_000, step.bytes
     assert step.at_least
   end
 
-  # The estimate that a real run proved wrong: an aged base layer that a recent
-  # build still descends from is selected by buildkit's until filter and then
-  # released by nothing. All 56 aged records on the box this was found on were
-  # ancestors of retained ones, and the 2.54GB estimate freed 0B.
-  def test_aged_cache_records_pinned_by_a_newer_descendant_are_not_counted
-    cache_by_builder = { "desktop-linux" => records(
-      cache(id: "base", size: "2GB"),
-      cache(id: "recent", parents: ["base"], last_used: "20 hours ago", size: "10MB"),
-    ) }
-    step = plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"]
-    assert_equal 0, step.count
-    assert_equal 0, step.bytes
-    assert_includes step.note, "1 aged record(s) pinned by newer descendants"
-  end
-
-  # Pinning is transitive: the grandparent of a retained record is just as stuck.
-  def test_cache_pinning_walks_the_whole_ancestor_chain
-    cache_by_builder = { "desktop-linux" => records(
-      cache(id: "grandparent", size: "1GB"),
-      cache(id: "parent", parents: ["grandparent"], size: "1GB"),
-      cache(id: "recent", parents: ["parent"], last_used: "20 hours ago", size: "10MB"),
-      cache(id: "orphan", size: "500MB"),  # aged with nothing descending from it
-    ) }
-    step = plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"]
-    assert_equal 1, step.count, "only the orphan is actually releasable"
-    assert_equal 500_000_000, step.bytes
-  end
-
-  # Two sources describe the same records with different schemas: buildx du gives
-  # a Parents array and a real boolean, docker system df -v a Parent string and
-  # "true"/"false". Both must normalize to the same record.
   def test_cache_records_normalize_from_either_schema
-    from_buildx = docker_cache_record({ "ID" => "a", "Parents" => %w[p1 p2], "Shared" => true,
-                                        "Size" => "1GB", "LastUsedAt" => "2 days ago" }, now: NOW)
-    from_df = docker_cache_record({ "ID" => "a", "Parent" => "p1 p2", "Shared" => "true",
-                                    "Size" => "1GB", "LastUsedAt" => (NOW - 2 * 86_400).strftime("%Y-%m-%d %H:%M:%S %z UTC") }, now: NOW)
-    assert_equal %w[p1 p2], from_buildx.parents
-    assert_equal from_buildx.parents, from_df.parents
-    assert from_buildx.shared
+    from_buildx = docker_cache_record("ID" => "a", "Shared" => true, "Size" => "1GB")
+    from_df = docker_cache_record("ID" => "a", "Shared" => "true", "Size" => "1GB")
+    assert_equal from_buildx, from_df
     assert from_df.shared
     assert_equal 1_000_000_000, from_df.bytes
-    assert_in_delta from_buildx.last_used.to_i, from_df.last_used.to_i, 1
-  end
-
-  def test_cache_parents_parse_from_either_separator
-    assert_equal %w[a b], docker_cache_parents("Parent" => "a b")
-    assert_equal %w[a b], docker_cache_parents("Parent" => "a,b")
-    assert_equal %w[a b], docker_cache_parents("Parents" => %w[a b])
-    assert_equal [], docker_cache_parents("Parents" => nil)
-    assert_equal [], docker_cache_parents({})
-  end
-
-  # buildx du renders most LastUsedAt values as prose. Reading those as nil would
-  # date every record as unknown and silently spare it.
-  def test_parses_relative_timestamps
-    assert_equal NOW - 33 * 60, docker_parse_relative_time("33 minutes ago", now: NOW)
-    assert_equal NOW - 20 * 3600, docker_parse_relative_time("20 hours ago", now: NOW)
-    assert_equal NOW - 4 * 86_400, docker_parse_relative_time("4 days ago", now: NOW)
-    assert_equal NOW - 60, docker_parse_relative_time("About a minute ago", now: NOW)
-    assert_equal NOW, docker_parse_relative_time("Less than a second ago", now: NOW)
-    assert_nil docker_parse_relative_time("who knows", now: NOW)
-  end
-
-  # ---- every builder, not just the current one ----
-
-  # `docker builder prune` only reaches the current builder. A docker-container
-  # builder like bryzek-multi held 2,911 records / 5.28GB that no prune touched and
-  # that `docker system df` never reported.
-  def test_each_builder_gets_its_own_step_and_prune_command
-    cache_by_builder = {
-      "desktop-linux" => records(cache(size: "1GB")),
-      "bryzek-multi"  => records(cache(size: "5GB")),
-    }
-    steps = plan({}, cache_by_builder: cache_by_builder)
-    assert_equal 1_000_000_000, steps["cache/desktop-linux"].bytes
-    assert_equal 5_000_000_000, steps["cache/bryzek-multi"].bytes
-    assert_equal ["docker", "buildx", "prune", "--builder", "bryzek-multi", "-af", "--filter", "until=72h"],
-                 steps["cache/bryzek-multi"].cmd
   end
 
   # ---- surplus tags ----
@@ -301,9 +242,8 @@ class TestDevDockerPrune < Minitest::Test
   # Every ordinary prune command must stay whole and copy-pasteable.
   def test_ordinary_commands_display_in_full
     assert_equal "docker volume prune -f -a", docker_display_cmd(["docker", "volume", "prune", "-f", "-a"])
-    assert_equal "docker buildx prune --builder bryzek-multi -af --filter until=72h",
-                 docker_display_cmd(["docker", "buildx", "prune", "--builder", "bryzek-multi", "-af",
-                                     "--filter", "until=72h"])
+    assert_equal "docker buildx prune --builder bryzek-multi -af",
+                 docker_display_cmd(["docker", "buildx", "prune", "--builder", "bryzek-multi", "-af"])
     assert_equal "(nothing to remove)", docker_display_cmd(nil)
   end
 
@@ -343,7 +283,7 @@ class TestDevDockerPrune < Minitest::Test
     steps = plan({}, cache_by_builder: { "desktop-linux" => records(cache) })
     assert_equal ["docker", "container", "prune", "-f", "--filter", "until=72h"], steps["containers"].cmd
     assert_equal ["docker", "image", "prune", "-af", "--filter", "until=72h"], steps["images"].cmd
-    assert_equal ["docker", "buildx", "prune", "--builder", "desktop-linux", "-af", "--filter", "until=72h"],
+    assert_equal ["docker", "buildx", "prune", "--builder", "desktop-linux", "-af"],
                  steps["cache/desktop-linux"].cmd
   end
 

@@ -253,15 +253,19 @@ USAGE = <<~USAGE
         Apply k8s-secrets and rollout restart workloads (picks up ConfigMap changes).
 
     #{INVOCATIONS["docker prune"]}
-        Remove stopped containers, unused images, and build cache older than N
-        days (default 3), plus every unused volume (docker offers no age filter
-        for volumes). Useful when local disk fills from pushed-but-unused builds.
+        Remove stopped containers and unused images older than N days (default 3),
+        plus every unused volume and ALL build cache on every builder — neither of
+        those takes an age filter. Useful when local disk fills from
+        pushed-but-unused builds.
         Dry-run by default: reports the actual candidates per step, so the sizes
         describe this run rather than `docker system df`'s RECLAIMABLE column,
         which ignores the age filter. Pass --apply to remove.
-        Build cache is pruned per BUILDER: `docker builder prune` only reaches the
-        current one, so a docker-container builder accumulates cache that nothing
-        touches and that `docker system df` does not even report.
+        Build cache is pruned per BUILDER and in full: `docker builder prune` only
+        reaches the current one, so a docker-container builder accumulates cache
+        that nothing touches and that `docker system df` does not even report. An
+        age filter there spares records that are ancestors of recent ones, which
+        buildkit then cannot release — it freed 9.2MB of a 5.27GB builder here.
+        The cost of taking it all is one cold build.
         --keep-tags N (default 5) also drops all but the N newest tags per
         repository at any age, since registry tags land faster than any age
         window retires them; --keep-tags 0 disables that step.
@@ -3788,25 +3792,6 @@ def docker_older?(stamp, cutoff)
   !t.nil? && t < cutoff
 end
 
-DOCKER_RELATIVE_UNITS = { "second" => 1, "minute" => 60, "hour" => 3600, "day" => 86_400,
-                          "week" => 604_800, "month" => 2_592_000, "year" => 31_536_000 }.freeze
-
-# `docker buildx du --format json` renders LastUsedAt as prose — "33 minutes ago",
-# "About a minute ago" — for most records while CreatedAt stays absolute. (2,821 of
-# 2,908 records on one builder here.) Same field, same document, two formats; the
-# absolute parser reads every prose one as nil, which would silently spare records.
-def docker_parse_relative_time(str, now: Time.now)
-  s = str.to_s.strip
-  return now if s.match?(/\ALess than a second ago\z/i)
-  m = /\A(?:About\s+)?(\d+|a|an)\s+(second|minute|hour|day|week|month|year)s?\s+ago\z/i.match(s) or return nil
-  count = m[1].match?(/\A\d+\z/) ? m[1].to_i : 1
-  now - count * DOCKER_RELATIVE_UNITS.fetch(m[2].downcase)
-end
-
-def docker_cache_time(value, now: Time.now)
-  docker_parse_time(value) || docker_parse_relative_time(value, now: now)
-end
-
 # `docker container prune` skips anything running/paused/restarting, and its
 # until filter compares CREATED time (not exit time).
 DOCKER_LIVE_STATES = %w[running paused restarting].freeze
@@ -3816,25 +3801,19 @@ def docker_anonymous_volume?(volume)
 end
 
 # One build cache record, normalized. Two sources describe the same records with
-# different schemas — `docker system df -v` says "Parent" as a string and "Shared"
-# as "true"/"false", `docker buildx du` says "Parents" as an array and Shared as a
-# real boolean — so everything downstream works on this shape instead of branching
-# on which command it came from.
-DockerCacheRecord = Struct.new(:id, :parents, :shared, :bytes, :last_used, keyword_init: true)
+# different schemas — `docker system df -v` says Shared as "true"/"false" where
+# `docker buildx du` uses a real boolean — so everything downstream works on this
+# shape instead of branching on which command it came from.
+#
+# No timestamp: the cache steps carry no age filter, so a record's age decides
+# nothing. Only whether an image still shares its layers does.
+DockerCacheRecord = Struct.new(:id, :shared, :bytes, keyword_init: true)
 
-def docker_cache_parents(record)
-  parents = record["Parents"] || record["Parent"]
-  Array(parents).flat_map { |p| p.to_s.split(/[,\s]+/) }.reject(&:empty?)
-end
-
-def docker_cache_record(raw, now: Time.now)
+def docker_cache_record(raw)
   DockerCacheRecord.new(
     id: raw["ID"].to_s,
-    parents: docker_cache_parents(raw),
     shared: [true, "true"].include?(raw["Shared"]),
-    bytes: docker_parse_size(raw["Size"]),
-    last_used: docker_cache_time(raw["LastUsedAt"], now: now) ||
-               docker_cache_time(raw["CreatedAt"], now: now)
+    bytes: docker_parse_size(raw["Size"])
   )
 end
 
@@ -3854,7 +3833,7 @@ end
 # nil (rather than []) when a builder cannot be read: the "default" builder rejects
 # `buildx du` unless you switch context to it, and a builder we cannot inspect must
 # be reported as skipped rather than silently shown as empty.
-def docker_buildx_cache(builder, now: Time.now)
+def docker_buildx_cache(builder)
   # capture2e, not capture2: the "default" builder answers `buildx du` with an
   # ERROR on stderr telling you to switch context, which would otherwise print
   # itself in the middle of the plan.
@@ -3863,34 +3842,15 @@ def docker_buildx_cache(builder, now: Time.now)
   out.each_line.filter_map do |line|
     next if line.strip.empty?
     raw = JSON.parse(line) rescue nil
-    raw && docker_cache_record(raw, now: now)
+    raw && docker_cache_record(raw)
   end
 end
 
-def docker_cache_by_builder(now: Time.now)
+def docker_cache_by_builder
   docker_buildx_builders.each_with_object({}) do |name, h|
-    records = docker_buildx_cache(name, now: now)
+    records = docker_buildx_cache(name)
     h[name] = records unless records.nil? || records.empty?
   end
-end
-
-# Which aged-out build cache records buildkit can actually release. A record is
-# pinned as long as anything descended from it is retained — the base layer a
-# recent build still reuses was itself pulled months ago, so it dates as ancient
-# while being very much in use. buildkit's until filter selects those records and
-# then frees nothing, which is how a 2.54GB estimate turned into a 0B run: all 56
-# aged records on that box were ancestors of recently-used ones.
-def docker_releasable_cache(aged, retained:, all:)
-  by_id = all.each_with_object({}) { |r, h| h[r.id] = r }
-  pinned = Set.new
-  stack = retained.map(&:id)
-  until stack.empty?
-    id = stack.pop
-    next if pinned.include?(id) || !by_id.key?(id)
-    pinned << id
-    stack.concat(by_id[id].parents)
-  end
-  aged.reject { |r| pinned.include?(r.id) }
 end
 
 # Tags beyond the newest `keep` for each repository, regardless of age. Pruning by
@@ -3957,7 +3917,7 @@ def docker_prune_plan(df, cutoff:, filter:, cache_by_builder: {}, keep_named_vol
       bytes: containers.sum { |c| docker_parse_size(c["Size"]) }, at_least: false,
       note: "stopped, created before the cutoff; writable layers only"
     ),
-    *docker_cache_steps(cache_by_builder, cutoff: cutoff, filter: filter),
+    *docker_cache_steps(cache_by_builder),
     DockerPruneStep.new(
       label: "images", unit: "image", count: images.length,
       cmd: ["docker", "image", "prune", "-af", "--filter", filter],
@@ -3983,19 +3943,22 @@ def docker_prune_plan(df, cutoff:, filter:, cache_by_builder: {}, keep_named_vol
   ]
 end
 
-# One step per builder. `docker builder prune` only reaches the current one, so
-# each builder gets its own `buildx prune --builder`.
-def docker_cache_steps(cache_by_builder, cutoff:, filter:)
-  cache_by_builder.map do |builder, all_cache|
-    aged, retained = all_cache.partition { |r| !r.last_used.nil? && r.last_used < cutoff }
-    releasable = docker_releasable_cache(aged, retained: retained, all: all_cache)
-    pinned = aged.length - releasable.length
+# One step per builder, with NO age filter — the same posture as volumes.
+#
+# An age filter on cache buys nothing and costs everything. A record it spares is
+# usually an ancestor of a recent one, so buildkit selects it and then releases
+# nothing: on this box `--filter until=72h` freed 9.2MB of a builder holding
+# 5.27GB, and 0B of another holding 101GB. Meanwhile what the filter protects is
+# reproducible — the first build after a full prune is cold, and that is the
+# entire cost. Sizes remain lower bounds because a shared record's layers come
+# back once the image sharing them is pruned later in the same run.
+def docker_cache_steps(cache_by_builder)
+  cache_by_builder.map do |builder, records|
     DockerPruneStep.new(
-      label: "cache/#{builder}", unit: "record", count: releasable.length,
-      cmd: ["docker", "buildx", "prune", "--builder", builder, "-af", "--filter", filter],
-      bytes: releasable.reject(&:shared).sum(&:bytes), at_least: true,
-      note: "non-shared and unpinned" +
-            (pinned.zero? ? "" : "; #{pinned} aged record(s) pinned by newer descendants")
+      label: "cache/#{builder}", unit: "record", count: records.length,
+      cmd: ["docker", "buildx", "prune", "--builder", builder, "-af"],
+      bytes: records.reject(&:shared).sum(&:bytes), at_least: true,
+      note: "every record, no age filter; non-shared bytes only"
     )
   end
 end
@@ -4070,8 +4033,8 @@ DOCKER_PRUNE_DEFAULT_KEEP_TAGS = 5
 
 # Matches `aidirs prune`: 3 days, on the same reasoning that what this deletes is
 # reproducible. An image re-pulls and a cache record rebuilds, so a short window
-# costs a slow build, not work — and anything still in daily use is pinned by a
-# newer descendant and survives regardless (see docker_releasable_cache).
+# costs a slow build, not work. Applies to containers and images only — build
+# cache ignores age entirely (see docker_cache_steps).
 DOCKER_PRUNE_DEFAULT_DAYS = 3
 
 def parse_docker_prune_args(args)
@@ -4107,7 +4070,7 @@ def cmd_docker_prune(args)
   puts ""
   df = docker_system_df_verbose
   steps = docker_prune_plan(df, cutoff: now - hours * 3600, filter: filter,
-                            cache_by_builder: docker_cache_by_builder(now: now),
+                            cache_by_builder: docker_cache_by_builder,
                             keep_named_volumes: opts.keep_named_volumes, keep_tags: opts.keep_tags)
 
   puts apply ? "Removing:" : "Would remove (dry-run — pass --apply to do it):"
