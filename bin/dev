@@ -254,7 +254,7 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["docker prune"]}
         Remove stopped containers, unused images, and build cache older than N
-        days (default 30), plus every unused volume (docker offers no age filter
+        days (default 3), plus every unused volume (docker offers no age filter
         for volumes). Useful when local disk fills from pushed-but-unused builds.
         Dry-run by default: reports the actual candidates per step, so the sizes
         describe this run rather than `docker system df`'s RECLAIMABLE column,
@@ -3715,10 +3715,11 @@ end
 
 DockerPruneOptions = Struct.new(:days, :apply, :keep_named_volumes, keyword_init: true)
 
-# 30 days rather than a week: an image or cache record that goes a month untouched
-# is genuinely stale, whereas a 7-day window swept up layers still being rebuilt
-# against daily.
-DOCKER_PRUNE_DEFAULT_DAYS = 30
+# Matches `aidirs prune`: 3 days, on the same reasoning that what this deletes is
+# reproducible. An image re-pulls and a cache record rebuilds, so a short window
+# costs a slow build, not work — and anything still in daily use is pinned by a
+# newer descendant and survives regardless (see docker_releasable_cache).
+DOCKER_PRUNE_DEFAULT_DAYS = 3
 
 def parse_docker_prune_args(args)
   opts = DockerPruneOptions.new(days: DOCKER_PRUNE_DEFAULT_DAYS, apply: false, keep_named_volumes: false)

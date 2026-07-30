@@ -256,9 +256,11 @@ class TestDevDockerPrune < Minitest::Test
 
   # ---- argument parsing ----
 
-  def test_defaults_to_thirty_days
+  # Same window as `aidirs prune`, and short on purpose: everything this deletes
+  # is reproducible, and anything genuinely live is pinned by a newer descendant.
+  def test_defaults_to_three_days
     opts = parse_docker_prune_args([])
-    assert_equal 30, opts.days
+    assert_equal 3, opts.days
     refute opts.apply
     refute opts.keep_named_volumes
   end
