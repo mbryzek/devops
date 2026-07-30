@@ -433,8 +433,14 @@ USAGE = <<~USAGE
         issue to the queue now.
 
     #{INVOCATIONS["issues reconcile"]}
-        Flip `fixed` issues to `deployed` once their target app has released past the
-        fix. Read-only against the deploy registry (same live-version signal as
+        Two passes, in order. First: adopt every `claimed` issue whose fix has
+        already merged — a merged PR titled `ISS-<number>: ...` is the signal — so a
+        session that forgot to close its issue out cannot strand it outside the
+        pipeline. It lands `fixed` when the repo releases a tracked deployable, and
+        straight to `deployed` when it does not (devops, acumen, the shared libs:
+        there is no release to wait for, so the merge is the release). Then: flip
+        `fixed` issues to `deployed` once their target app has released past the fix.
+        Read-only against GitHub and the deploy registry (same live-version signal as
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
@@ -2918,9 +2924,12 @@ def cmd_issues_status(args)
     registry = Work::Registry.load
     # deploy_tracked, not deployable: a fix can ship in an app (e.g. playbook-app)
     # that has no pingable prod URL, and reconcile reads its live version from k8s.
-    app = registry.deploy_tracked.find { |a| a.name == target_app }
+    # Intersected with ISSUE_APPS because the registry is the wider set — it tracks
+    # every deployable under ~/code, and naming one the `issue_app` enum does not
+    # have is a 422 from the server rather than a message from here.
+    app = registry.deploy_tracked.find { |a| a.name == target_app && ISSUE_APPS.include?(a.name) }
     unless app
-      valid = registry.deploy_tracked.map(&:name).sort.join(", ")
+      valid = registry.deploy_tracked.map(&:name).select { |n| ISSUE_APPS.include?(n) }.sort.join(", ")
       Util.exit_with_error("Unknown --app '#{target_app}'. Valid apps: #{valid}")
     end
     body[:app] = target_app
@@ -3001,6 +3010,155 @@ def issue_fix_deployment(issue)
   (issue["fixes"] || []).last&.fetch("deployment", nil)
 end
 
+# ---------- claimed -> fixed, adopted from merged PRs ----------
+#
+# `claimed -> fixed` is the one transition in the issue lifecycle with no
+# automation behind it: a human or a Claude fix session is supposed to call
+# `dev issues status <n> --status fixed` at PR time. When that is missed the issue
+# is not merely late, it is INVISIBLE — every downstream automation (this
+# command's deploy pass, the platform's hourly IssueDeployReconciler, the 7-day
+# auto-verify) starts from `fixed`, so a claimed issue never reaches `deployed`
+# ("awaiting verification") no matter how many releases ship its fix. Twelve
+# issues sat that way on 2026-07-30 and had to be walked forward by hand.
+#
+# The backstop needs no one to remember anything: the PR title carries
+# `ISS-<number>` (CLAUDE.md requires the prefix), so the merge itself says which
+# issue shipped. Adopting at MERGE rather than at PR-open is also the more correct
+# signal — an abandoned PR never advances its issue.
+
+# The owner every repo a fix can ship from lives under.
+ISSUE_PR_SEARCH_OWNER = "mbryzek".freeze
+
+# How many merged PRs the sweep considers, newest first. The org merges a handful
+# a day and a claimed issue turns over in days, so this is generous by an order of
+# magnitude — and it is one search call, not one per claimed issue.
+ISSUE_PR_SEARCH_LIMIT = 200
+
+# Every issue number named in a PR title: "Fix hover + labels (ISS-095, ISS-096)"
+# -> ["095", "096"]. Matched in the zero-padded display form CLAUDE.md requires and
+# the API keys on, so no normalization can drift between the two.
+def issue_numbers_in_title(title)
+  title.to_s.scan(/\bISS-(\d{3,})\b/).flatten.uniq
+end
+
+# Merged PRs across the org whose title names an issue, grouped by issue number and
+# newest merge first within each. For a merged PR, closedAt IS the merge time.
+#
+# Returns {} when `gh` is missing, unauthenticated, or the search fails. This runs
+# at the tail of every release: GitHub being unreachable costs a warning, never a
+# release. Fail-closed — an empty result adopts nothing rather than guessing.
+def issue_merged_prs_by_number(limit: ISSUE_PR_SEARCH_LIMIT)
+  out, status = Open3.capture2(
+    "gh", "search", "prs", "--owner", ISSUE_PR_SEARCH_OWNER, "--merged",
+    "--match", "title", "ISS-", "--sort", "created", "--order", "desc",
+    "--limit", limit.to_s, "--json", "number,title,url,repository,closedAt"
+  )
+  unless status.success?
+    warn "issues reconcile: `gh search prs` failed; skipping the merged-PR sweep"
+    return {}
+  end
+  by_number = Hash.new { |h, k| h[k] = [] }
+  JSON.parse(out).each do |pr|
+    entry = {
+      "repo" => pr.dig("repository", "name"),
+      "number" => pr["number"],
+      "url" => pr["url"],
+      "title" => pr["title"],
+      "merged_at" => pr["closedAt"],
+    }
+    issue_numbers_in_title(pr["title"]).each { |n| by_number[n] << entry }
+  end
+  by_number.each_value { |prs| prs.sort_by! { |pr| pr["merged_at"].to_s }.reverse! }
+  by_number
+rescue Errno::ENOENT
+  warn "issues reconcile: `gh` not found; skipping the merged-PR sweep"
+  {}
+rescue JSON::ParserError => e
+  warn "issues reconcile: could not read `gh search prs` output (#{e}); skipping the merged-PR sweep"
+  {}
+end
+
+def issue_pr_label(pr)
+  "#{pr['repo']}##{pr['number']}"
+end
+
+# The merged PR that most recently landed for a claimed issue, or nil when none
+# has. Only merges AFTER the claim count: a reopened issue accumulates PRs, and the
+# one that shipped the previous round says nothing about the round in flight now.
+# An issue with no claimed_at (filed before the field existed) takes any merge.
+def issue_adoptable_pr(issue, prs_by_number)
+  claimed_at = issue_parse_time(issue["claimed_at"])
+  (prs_by_number[issue["number"]] || []).find do |pr|
+    next true if claimed_at.nil?
+    merged_at = issue_parse_time(pr["merged_at"])
+    !merged_at.nil? && merged_at > claimed_at
+  end
+end
+
+def issue_parse_time(value)
+  value.nil? ? nil : Time.parse(value)
+rescue ArgumentError
+  nil
+end
+
+# The apps an issue is allowed to name, mirroring the `issue_app` enum in
+# platform's spec/issues.json. This is NOT the deploy registry: the registry tracks
+# every deployable under ~/code (acumen, rallyd, hoa-frontend, apibuilder-ui, ...),
+# while an issue can only name a playbook deployable. Sending any other name is a
+# 422 — so the intersection is what makes the sweep's writes valid.
+ISSUE_APPS = %w[platform playbook-admin playbook-app playbook-www workers].freeze
+
+# The deployable a repo releases AND an issue can name, or nil. Keyed on repo_name
+# rather than name because a deployable can be renamed ahead of its repo
+# (reference_deployable_name_is_not_the_repo_name).
+def issue_app_for_repo(registry, repo)
+  registry.deploy_tracked.find { |a| a.repo_name == repo && ISSUE_APPS.include?(a.name) }
+end
+
+# True when nothing will ever release this repo: it ships no deployable at all
+# (devops, lib-*, schema-evolution-manager), so the merge IS the release and the
+# issue can go straight to `deployed` — the state that means "awaiting
+# verification". Following plans/github-merge-webhook-design.md, which reaches the
+# same conclusion for the webhook.
+#
+# Deliberately NOT true of a deployable the tracker simply cannot name (acumen,
+# rallyd): those really do release, so calling a merge "live" would be a claim the
+# auto-verifier then acts on. Those land `fixed` and the deploy pass lists them for
+# a human, which is the honest answer until `issue_app` learns about them.
+def issue_repo_releases_nothing?(registry, repo)
+  registry.deploy_tracked.none? { |a| a.repo_name == repo }
+end
+
+# The fix payload for adopting `pr`: always the PR url, plus the (app,
+# baseline_version) pair when the repo maps to a deployable whose live version we
+# can actually read. The baseline is the version live RIGHT NOW, not at merge time —
+# conservative in the only direction that matters, since a too-high baseline delays
+# the deployed transition by a release instead of declaring a fix live early.
+def issue_adoption_body(registry, version_cache, pr)
+  body = { status: "fixed", url: pr["url"] }
+  app = issue_app_for_repo(registry, pr["repo"])
+  return body if app.nil?
+  info = version_cache[app.name] ||= fetch_app_version(registry, app)
+  return body if info[:error] || info["version"].nil?
+  body.merge(app: app.name, baseline_version: info["version"])
+end
+
+def issue_adoption_note(body, pr, merge_is_release)
+  return "#{issue_pr_label(pr)} merged (#{body[:app]} baseline #{body[:baseline_version]})" if body[:app]
+  if merge_is_release
+    "#{issue_pr_label(pr)} merged; #{pr['repo']} releases nothing, so the merge is the release"
+  else
+    "#{issue_pr_label(pr)} merged; no issue app for #{pr['repo']} — advance once it releases"
+  end
+end
+
+# Tail line for the adoption pass, or nil when it adopted nothing. Same rule as
+# issues_reconcile_summary: counts are only news when something moved.
+def issues_adopt_summary(adopted:, apply:)
+  return nil if adopted.zero?
+  "#{adopted} #{apply ? 'adopted' : 'would adopt'} from merged PRs."
+end
+
 # Tail line for `dev issues reconcile`, or nil when there is nothing worth
 # summarizing. Counts are only news when something actually moved: with no
 # transitions the per-issue lines above already say everything, and a
@@ -3010,10 +3168,59 @@ def issues_reconcile_summary(deployed:, skipped:, total:, apply:)
   "#{deployed} #{apply ? 'deployed' : 'would deploy'}, #{skipped} skipped, #{total} fixed total."
 end
 
-# Flip `fixed` issues to `deployed` once their target app has released past the fix.
-# Read-only against the deploy registry (the same live-version signal `dev deploy status`
-# uses) — the release pipeline is never touched. Dry-run by default; --apply records
-# the transitions.
+# Adopt every claimed issue whose fix has already merged as `fixed`, and return how
+# many were adopted. Runs BEFORE the deploy pass so an issue rescued here is
+# considered for `deployed` in the same sweep rather than waiting for the next one.
+#
+# Silent on the zero state, like the deploy pass: this is release output, and
+# "nothing to adopt" is the normal case between misses.
+def issues_adopt_merged_prs(endpoint:, registry:, version_cache:, apply:)
+  claimed = ApiClient.request(endpoint, :get, issues_list_path(statuses: "claimed")) || []
+  return 0 if claimed.empty?
+
+  prs_by_number = issue_merged_prs_by_number
+  return 0 if prs_by_number.empty?
+
+  adoptable = claimed.filter_map do |issue|
+    pr = issue_adoptable_pr(issue, prs_by_number)
+    [issue, pr] if pr
+  end
+  return 0 if adoptable.empty?
+
+  puts ""
+  puts "Claimed issues whose fix already merged (adopt as fixed):"
+  adoptable.each do |issue, pr|
+    body = issue_adoption_body(registry, version_cache, pr)
+    merge_is_release = issue_repo_releases_nothing?(registry, pr["repo"])
+    note = issue_adoption_note(body, pr, merge_is_release)
+    landing = merge_is_release ? "deployed" : "fixed"
+    if apply
+      path = issues_path("/#{URI.encode_www_form_component(issue['number'])}/status")
+      # `fixed` first even when the destination is `deployed`: the url (and with it
+      # the recorded fix) is only meaningful on the fixed transition, and the
+      # timeline should read as the two facts it is — this PR fixed it, and there is
+      # no release to wait for.
+      ApiClient.request(endpoint, :put, path,
+                        body: body.merge(comment: "#{note}.", visibility: "internal"))
+      if merge_is_release
+        ApiClient.request(endpoint, :put, path,
+                          body: { status: "deployed", visibility: "internal",
+                                  comment: "No release to wait for; awaiting verification." })
+      end
+      puts "  #{landing.ljust(8)} #{issue_link(issue)} <- #{note}"
+    else
+      puts "  would #{merge_is_release ? 'deploy' : 'fix'} #{issue_link(issue)} <- #{note}"
+    end
+  end
+  adoptable.length
+end
+
+# Two passes over the issue tracker, both keyed on facts nobody has to remember:
+# claimed issues whose PR has merged become `fixed`, then `fixed` issues whose
+# target app has released past the fix become `deployed`. Read-only against GitHub
+# and the deploy registry (the same live-version signal `dev deploy status` uses) —
+# the release pipeline is never touched. Dry-run by default; --apply records the
+# transitions.
 def cmd_issues_reconcile(args)
   rest, _app, use_localhost = parse_common_flags(args)
   apply = false
@@ -3027,11 +3234,25 @@ def cmd_issues_reconcile(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
+
+    adopted = issues_adopt_merged_prs(endpoint: endpoint, registry: registry,
+                                      version_cache: version_cache, apply: apply)
+    adopt_summary = issues_adopt_summary(adopted: adopted, apply: apply)
+    if adopt_summary
+      puts ""
+      puts adopt_summary
+    end
+
+    # Read AFTER the adoption pass so anything just rescued is evaluated for deploy
+    # in this same run.
     fixed = ApiClient.request(endpoint, :get, issues_list_path(statuses: "fixed")) || []
     # Silent on the zero state. This runs after every release, where "nothing to
     # do" is the common case and a "nothing to do" line is pure noise. `dev issues
     # list --status fixed` is the human-facing view.
-    return if fixed.empty?
+    if fixed.empty?
+      puts "Re-run with --apply to record the transitions." if !apply && adopted > 0
+      return
+    end
 
     puts ""
     puts "Fixed issues awaiting deploy (advance to deployed once their app has released):"
@@ -3077,7 +3298,7 @@ def cmd_issues_reconcile(args)
       puts ""
       puts summary
     end
-    puts "Re-run with --apply to record the transitions." if !apply && deployed > 0
+    puts "Re-run with --apply to record the transitions." if !apply && (deployed + adopted) > 0
   end
 end
 
