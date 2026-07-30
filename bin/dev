@@ -234,9 +234,13 @@ USAGE = <<~USAGE
     #{INVOCATIONS["deploy all"]}
         Release every pending item without prompting. Three phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
-             with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1.
-          2. Apps release in parallel (concurrency defaults to 10) via
-             `release` with RELEASE_AUTO_TAG=1.
+             with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1 —
+             alongside, in parallel, every app that does NOT depend on a
+             pending DB (acumen does not wait on platform-postgresql).
+          2. Apps that DO depend on a pending DB (foo on foo-postgresql)
+             release in parallel (concurrency defaults to 10) via
+             `release` with RELEASE_AUTO_TAG=1, once their DB is done.
+             With no DB pending, all apps release here.
           3. Libraries (lib-*) release serially via `release`, which
              dispatches a lib- checkout to `release-lib`. That stays
              interactive — it confirms the tag and GPG asks for the
@@ -5263,27 +5267,44 @@ def cmd_deploy_all(args)
   run_deploys(pending, concurrency: concurrency, errors: errors)
 end
 
-# Phase 2 banner for an app release. A single app releases serially, so the
+# The DB a pending app must wait for, or nil when nothing pending gates it.
+# The dependency is the naming convention: `foo` runs against `foo-postgresql`.
+# An app with no pending DB of its own (acumen while only platform-postgresql
+# is pending) is NOT gated — it releases alongside the DB phase.
+def blocking_db_for(app, db_pending)
+  db = "#{app}-postgresql"
+  db_pending.include?(db) ? db : nil
+end
+
+# Phase banner for an app release. A single app releases serially, so the
 # concurrency detail is noise — omit it. For multiple apps, show the effective
 # pool size (`release_concurrent` caps workers at the number of apps), never the
 # raw requested concurrency.
-def deploy_phase2_message(to_run, concurrency)
+def deploy_app_phase_message(phase, to_run, concurrency)
   if to_run.length == 1
-    "Phase 2: releasing #{to_run.first}"
+    "Phase #{phase}: releasing #{to_run.first}"
   else
-    "Phase 2: releasing #{to_run.length} app(s) with concurrency=#{[concurrency, to_run.length].min}: #{to_run.join(', ')}"
+    "Phase #{phase}: releasing #{to_run.length} app(s) with concurrency=#{[concurrency, to_run.length].min}: #{to_run.join(', ')}"
   end
 end
 
-# Releases `names` (DBs first, serially; then apps in parallel) and prints the
-# summary. Shared by `deploy all` and the `deploy status` prompt, so both get
-# identical ordering, skip-on-DB-failure, and exit-code behavior. `errors` are
-# deploy-detection failures to report alongside the summary; callers that have
-# already displayed them pass none. Exits non-zero if any release fails.
+# Releases `names` and prints the summary. Shared by `deploy all` and the
+# `deploy status` prompt, so both get identical ordering, skip-on-DB-failure,
+# and exit-code behavior. `errors` are deploy-detection failures to report
+# alongside the summary; callers that have already displayed them pass none.
+# Exits non-zero if any release fails.
+#
+# Only an app whose OWN database is pending waits for the DB phase. Everything
+# else releases concurrently with it: a serial DB phase used to stall the whole
+# fleet behind one unrelated migration (acumen sat behind platform-postgresql).
+# DBs still release serially among themselves, and still before the app they
+# gate.
 def run_deploys(pending, concurrency:, errors: [])
   db_pending  = pending.select { |n| db_repo?(n) }
   lib_pending = pending.select { |n| lib_repo?(n) }
   app_pending = pending - db_pending - lib_pending
+
+  gated_apps, free_apps = app_pending.partition { |n| blocking_db_for(n, db_pending) }
 
   results_mutex = Mutex.new
   results = {}
@@ -5291,29 +5312,34 @@ def run_deploys(pending, concurrency:, errors: [])
 
   unless db_pending.empty?
     puts "Phase 1: releasing #{db_pending.length} database(s) serially: #{db_pending.join(', ')}"
+    unless free_apps.empty?
+      puts "         in parallel with #{free_apps.length} app(s) that depend on none of them: #{free_apps.join(', ')}"
+    end
     puts ""
-    release_serial(db_pending, results, results_mutex)
+    db_thread = Thread.new { release_serial(db_pending, results, results_mutex) }
+    release_concurrent(free_apps, concurrency, results, results_mutex)
+    db_thread.join
     puts ""
   end
 
-  # Skip an app whose matching DB just failed: deploying an app against an
-  # unmigrated schema is exactly the failure mode the DB-first ordering is
-  # meant to prevent.
-  failed_db_apps = db_pending.reject { |n| results[n] && results[n][:ok] }.map { |n| n.sub(/-postgresql\z/, "") }
-  to_run = app_pending.reject do |n|
-    if failed_db_apps.include?(n)
-      skipped[n] = "db release failed (#{n}-postgresql)"
+  # Skip an app whose own DB just failed: deploying an app against an unmigrated
+  # schema is exactly the failure mode the DB-first ordering is meant to prevent.
+  phase2_apps = db_pending.empty? ? app_pending : gated_apps
+  to_run = phase2_apps.reject do |n|
+    db = blocking_db_for(n, db_pending)
+    if db && !(results[db] && results[db][:ok])
+      skipped[n] = "db release failed (#{db})"
       true
     else
       false
     end
   end
 
-  if to_run.empty? && !app_pending.empty?
-    puts "Phase 2: all #{app_pending.length} app(s) skipped due to DB failures"
+  if to_run.empty? && !phase2_apps.empty?
+    puts "Phase 2: all #{phase2_apps.length} app(s) skipped due to DB failures"
     puts ""
   elsif !to_run.empty?
-    puts deploy_phase2_message(to_run, concurrency)
+    puts deploy_app_phase_message(2, to_run, concurrency)
     puts ""
     release_concurrent(to_run, concurrency, results, results_mutex)
   end
