@@ -1056,27 +1056,41 @@ class TestDevIssues < Minitest::Test
 
   # ---- dev issues list (read-only) ----
 
-  def test_list_prints_open_and_claimed_issues_by_default
+  def test_list_prints_every_status_by_default
+    issues = [
+      { "number" => "010", "status" => "open", "category" => "bug", "title" => "Chart empty" },
+      { "number" => "012", "status" => "verified", "category" => "feature", "title" => "Add export" },
+    ]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [])}" => issues) do
+        cmd_issues_list([])
+      end
+    end
+    assert_match(/ISS-010/, out)
+    assert_match(/ISS-012/, out)
+  end
+
+  def test_list_prints_no_issues_found_when_empty
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [])}" => []) do
+        cmd_issues_list([])
+      end
+    end
+    assert_match(/No issues found\./, out)
+  end
+
+  def test_list_filters_to_repeated_status_flags
     issues = [
       { "number" => "010", "status" => "open", "category" => "bug", "title" => "Chart empty" },
       { "number" => "011", "status" => "claimed", "category" => "feature", "title" => "Add export" },
     ]
     out, = capture_io do
       with_stubbed_api("GET #{issues_list_path(statuses: %w[open claimed])}" => issues) do
-        cmd_issues_list([])
+        cmd_issues_list(["--status", "open", "--status", "claimed"])
       end
     end
     assert_match(/ISS-010/, out)
     assert_match(/ISS-011/, out)
-  end
-
-  def test_list_prints_no_issues_found_when_empty
-    out, = capture_io do
-      with_stubbed_api("GET #{issues_list_path(statuses: %w[open claimed])}" => []) do
-        cmd_issues_list([])
-      end
-    end
-    assert_match(/No issues found\./, out)
   end
 
   def test_list_filters_by_category_and_explicit_status

@@ -66,7 +66,7 @@ INVOCATIONS = {
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
-  "issues list"         => 'issues list [--category CATEGORY] [--status open,claimed] [--localhost]',
+  "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
@@ -331,11 +331,12 @@ USAGE = <<~USAGE
         `dev auth login --app playbook` once first.
 
     #{INVOCATIONS["issues list"]}
-        Read-only. Lists issues matching the given statuses (default:
-        open,claimed) and optional category. Use this to check whether work is
-        already tracked before filing a new issue — unlike `issues claim`, this
-        never claims anything. Authenticates with your persisted playbook
-        session — run `dev auth login --app playbook` once first.
+        Read-only. Lists every issue by default; repeat --status to filter to
+        just those (e.g. --status open --status claimed), and/or --category to
+        scope to one category. Use this to check whether work is already
+        tracked before filing a new issue — unlike `issues claim`, this never
+        claims anything. Authenticates with your persisted playbook session —
+        run `dev auth login --app playbook` once first.
 
     #{INVOCATIONS["issues show"]}
         Print one issue and its full comment history, oldest first, with the status
@@ -2510,7 +2511,9 @@ end
 def cmd_issues_list(args)
   rest, _app, use_localhost = parse_common_flags(args)
   category = nil
-  statuses = %w[open claimed]
+  # Empty = no statuses param at all on the wire, which the server reads as "every
+  # status" (see issues_list_path) — the default is everything, not just open/claimed.
+  statuses = []
   leftover = []
   i = 0
   while i < rest.length
@@ -2521,9 +2524,9 @@ def cmd_issues_list(args)
       usage_exit("--category requires a value", example: usage_for("issues list")) if category.nil?
       i += 2
     when "--status"
-      raw = rest[i + 1]
-      usage_exit("--status requires a value", example: usage_for("issues list")) if raw.nil?
-      statuses = raw.split(",")
+      v = rest[i + 1]
+      usage_exit("--status requires a value", example: usage_for("issues list")) if v.nil?
+      statuses << v
       i += 2
     else
       leftover << a
