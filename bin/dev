@@ -53,6 +53,7 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "queries top"         => 'queries [top] [--days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
+  "claude-usage top"    => 'claude-usage [top] [--days N] [--limit N] [--sort cost_usd|input_tokens|output_tokens|requests] [--localhost]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "deploy status"       => 'deploy [status] [--app APP]',
   "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
@@ -181,6 +182,17 @@ USAGE = <<~USAGE
         `improvement` issue holding those queries and hand it straight to a
         Claude session, the way `dev issues create` does. Blank input files
         nothing, and nothing is offered when output is piped.
+
+    #{INVOCATIONS["claude-usage top"]}
+        Rank Claude API token usage/cost by (feature, model), from the daily
+        rollups computed by the platform's ComputeClaudeUsageRollupProcessor.
+        `top` is the default when no subcommand is given. Sorted by cost_usd by
+        default -- `--sort input_tokens|output_tokens|requests` for the others.
+
+        Rows are numbered: at the prompt, pick any of them to file an
+        `improvement` issue investigating why that feature costs what it does,
+        handed straight to a Claude session, the way `dev issues create` does.
+        Blank input files nothing, and nothing is offered when output is piped.
 
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
@@ -493,7 +505,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues changelog features queries].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues changelog features queries claude-usage].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -511,6 +523,7 @@ SUBCOMMANDS = {
   "issues"       => %w[create list claim show status snooze reconcile resume],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
+  "claude-usage" => %w[top],
 }.freeze
 
 def levenshtein(a, b)
@@ -5705,6 +5718,214 @@ rescue StandardError
   80
 end
 
+# ---------- claude-usage ----------
+#
+# Same shape as `dev queries top`: rank a cost dimension, offer to file the
+# selection as an investigation. Here the dimension is Claude API token usage/
+# cost per (feature, model), from claude.usage_daily_rollups (computed nightly
+# by core.processor.ComputeClaudeUsageRollupProcessor from claude.requests /
+# claude.responses). `feature` is the label callers set on AiRequest -- see
+# com.bryzek.ai.claude.ClaudeRequestMetadata in lib-ai -- and is blank for any
+# caller that hasn't been labeled yet.
+
+def cmd_claude_usage_top(args)
+  limit = 25
+  days = 7
+  sort = "cost_usd"
+  use_localhost = false
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--limit"
+      limit = Integer(args[i + 1] || usage_exit("--limit requires a value", example: usage_for("claude-usage top")))
+      i += 1
+    when "--days"
+      days = Integer(args[i + 1] || usage_exit("--days requires a value", example: usage_for("claude-usage top")))
+      i += 1
+    when "--sort"
+      sort = args[i + 1] || usage_exit("--sort requires a value", example: usage_for("claude-usage top"))
+      unless %w[cost_usd input_tokens output_tokens requests].include?(sort)
+        usage_exit("Unknown --sort value: #{sort}", example: usage_for("claude-usage top"))
+      end
+      i += 1
+    when "--localhost", "--local" then use_localhost = true
+    else usage_exit("Unknown flag: #{args[i]}", example: usage_for("claude-usage top"))
+    end
+    i += 1
+  end
+
+  endpoint = platform_endpoint(use_localhost)
+  handle_errors do
+    stats = ApiClient.request(
+      endpoint, :get,
+      "/dev/claude/usage?days=#{days}&sort=#{sort}&limit=#{limit}&offset=0"
+    )
+
+    if stats.nil? || stats.empty?
+      puts "No Claude usage in the last #{days} day(s)."
+      next
+    end
+
+    puts ""
+    puts Util.underline("Top #{stats.length} Claude usage by #{sort} (last #{days} day(s))")
+    puts ""
+    printf(
+      "%4s  %-30s  %-18s  %10s  %12s  %12s  %12s  %12s\n",
+      "#", "FEATURE", "MODEL", "REQUESTS", "INPUT TOK", "OUTPUT TOK", "CACHE RD", "COST USD"
+    )
+    stats.each_with_index do |s, idx|
+      printf(
+        "%4d  %-30s  %-18s  %10d  %12d  %12d  %12d  %12.2f\n",
+        idx + 1,
+        s["feature"] || "(unlabeled)",
+        s["model"],
+        s["requests"],
+        s["input_tokens"],
+        s["output_tokens"],
+        s["cache_read_input_tokens"],
+        s["cost_usd"].to_f,
+      )
+    end
+    puts ""
+
+    claude_usage_offer_investigation(stats, days: days, sort: sort, use_localhost: use_localhost)
+  end
+end
+
+# Offer to hand the selected feature/model rows to a Claude session, via an
+# issue -- same rationale as queries_offer_investigation: the ranking answers
+# "what costs the most", the investigation ("why, and can it be cheaper") is a
+# real code change, and routing through `issues` makes it trackable.
+def claude_usage_offer_investigation(stats, days:, sort:, use_localhost:)
+  return unless $stdin.tty?
+
+  answer = Ask.for_string(
+    "Investigate any of these? Enter numbers (e.g. 1,3), `all`, or `none` [none]:",
+    default: "none",
+  )
+  selected = Ask.parse_selection(answer, stats)
+  if selected.nil?
+    puts "Invalid selection — nothing filed. Re-run to pick again."
+    return
+  end
+  return if selected.empty?
+
+  require_playbook_session!(use_localhost)
+  form = {
+    category: CLAUDE_USAGE_ISSUE_CATEGORY,
+    title: claude_usage_issue_title(selected),
+    body: claude_usage_issue_body(selected, days: days, sort: sort),
+  }
+  issue_file_claim_and_start(
+    endpoint: issue_endpoint(use_localhost), form: form, category: CLAUDE_USAGE_ISSUE_CATEGORY
+  )
+end
+
+# Claude spend is an improvement, not a bug: nothing is broken, it costs more
+# than it should. `improvement` is one of the manual categories, so these
+# issues land in the same queue `dev issues claim` already works.
+CLAUDE_USAGE_ISSUE_CATEGORY = "improvement".freeze
+
+def claude_usage_issue_title(selected)
+  return "Expensive Claude usage: #{selected.length} features from the usage ranking" if selected.length > 1
+
+  s = selected.first
+  "Expensive Claude usage: #{s['feature'] || '(unlabeled)'} / #{s['model']}"
+end
+
+# The issue body handed to the investigating session. Same shape as
+# queries_issue_body: the durable half (how the numbers are produced, where the
+# code lives, how to read them) is baked in so a session does not have to
+# re-derive it; the per-instance data (the selected rows) goes last.
+def claude_usage_issue_body(selected, days:, sort:)
+  <<~BODY
+    #{selected.length} #{selected.length == 1 ? 'row' : 'rows'} selected from `dev claude-usage top` (ranked by #{sort}, last #{days} day(s)).
+    Work out why #{selected.length == 1 ? 'it costs' : 'they cost'} what #{selected.length == 1 ? 'it does' : 'they do'} and make #{selected.length == 1 ? 'it' : 'them'} cheaper (prompt caching, a
+    smaller/cheaper model, fewer tool-loop turns, trimming the prompt) -- or establish
+    that the cost is justified and say why. Either outcome closes this issue.
+
+    ## How these numbers are produced
+
+    Every Claude API call made through `com.bryzek.ai.claude.ClaudeClient` (lib-ai) is
+    journaled to `claude.requests` / `claude.responses` by whichever `ClaudeStore` the
+    calling app wired up (e.g. `playbook.ai.PlaybookClaudeStore`, `core.ai.DbClaudeStore`).
+    The caller labels the call with a `feature` string via `AiRequest`/`ClaudeRequestMetadata`
+    -- this is the low-cardinality dimension the ranking groups by; unlabeled callers show
+    up as `(unlabeled)`. Nightly, `core.processor.ComputeClaudeUsageRollupProcessor`
+    aggregates the prior UTC day's requests/responses by (feature, model) into
+    `claude.usage_daily_rollups`. `dev claude-usage top` reads those rollups back through
+    `GET /dev/claude/usage`, summed across every day in the requested period.
+
+    Dollar cost is computed from token counts via the per-model rates in
+    `core.ai.ClaudePricing` -- a hardcoded price list, not billing data, so it can drift
+    from Anthropic's actual invoice if pricing changed since that file was last updated.
+
+    ## Where the code lives
+
+    - `~/code/lib-ai/app/scala/com/bryzek/ai/claude/ClaudeClient.scala` -- the shared client, `AiRequest`, `ClaudeRequestMetadata.feature`
+    - `~/code/platform/playbook/app/playbook/ai/PlaybookClaudeStore.scala` -- playbook's persisting store (full content)
+    - `~/code/platform/core/app/core/ai/DbClaudeStore.scala` -- the shared store for every other app (`persistContent` toggles whether raw prompt/response text is kept)
+    - `~/code/platform/core/app/core/ai/ClaudePricing.scala` -- the per-model $/M-token rates behind `cost_usd`
+    - `~/code/platform/core/app/core/processor/ComputeClaudeUsageRollupProcessor.scala` -- the nightly aggregation
+    - `~/code/platform/core/app/core/db/InternalClaudeUsageDao.scala` -- the aggregation behind this ranking
+    - `~/code/platform/dao/spec/db-claude.json` -- the DAO spec for `claude.requests` / `claude.responses` / `claude.usage_daily_rollups`
+
+    ## Decoding what you are looking at
+
+    - **`(unlabeled)` means the calling code hasn't set `feature` on its `AiRequest`**,
+      not that the calls don't matter -- grep for `chatCompletion[`, `chatText(`, `chatComments(`,
+      or `runToolLoop[` calls with no `feature =` argument to find them.
+    - **`cost_usd` is a list-price estimate, not a bill.** It does not account for
+      Anthropic account-level discounts, and prompt-cache write/read multipliers are
+      approximated (5-minute-TTL write cost; a 1h-TTL cache write is under-costed).
+    - **Rows are summed across every day in the period.** A feature with one very
+      expensive day and otherwise-quiet usage looks the same as steady moderate usage --
+      if that distinction matters, re-run with `--days 1` and compare across days.
+    - **Cache read/write tokens are tracked but only cache-read is shown in the table**
+      (`s['cache_creation_input_tokens']` is in the raw JSON if you need it) -- a feature
+      with high input tokens but low cache-read is a prompt-caching candidate that isn't
+      using it yet (see `shared/prompt-caching.md` in the claude-api skill, or
+      `~/code/claude/plans/` for any existing caching work on this feature).
+
+    ## Suggested investigation
+
+    1. Read the feature's call site(s) (the `feature =` string usually maps 1:1 to a
+       processor or service class -- grep for the literal string). Establish whether the
+       cost is per-request (agentic tool loop, large system prompt) or volume (many small
+       calls) before proposing a fix; the two have different remedies.
+    2. Check whether prompt caching (`AiRequest(cacheSystem = true, ...)` or
+       `cacheLastMessage = true`) is already enabled and actually hitting -- the journaled
+       `claude.responses` rows have `usage_cache_read_input_tokens`; a persistent zero
+       there with caching enabled means something is invalidating the prefix between
+       calls (see `shared/prompt-caching.md`'s silent-invalidator checklist).
+    3. Check the model tier (`claude.responses.model`) against the task's actual
+       difficulty -- Opus-tier reasoning work that could run on Sonnet or Haiku is a
+       common, low-risk win.
+    4. For an agentic tool loop, check `maxCalls`/`maxTokens`/`effort` against what the
+       task needs -- a generous default copied from another pipeline is a common source
+       of avoidable spend.
+    5. Confirm the win. Re-run `dev claude-usage top --days 1` after the fix is deployed
+       and compare `cost_usd` for this feature -- the ranking is the same instrument that
+       found it. The rollup is nightly, so same-day changes are not visible yet.
+
+    ## The #{selected.length == 1 ? 'row' : 'rows'}
+
+    #{selected.each_with_index.map { |s, i| claude_usage_issue_body_entry(s, i + 1) }.join("\n\n")}
+  BODY
+end
+
+# One selected feature/model row as it appears at the bottom of the issue body.
+def claude_usage_issue_body_entry(s, position)
+  <<~ENTRY.strip
+    ### #{position}. #{s['feature'] || '(unlabeled)'} / #{s['model']}
+
+    - requests: #{s['requests']}
+    - input tokens: #{s['input_tokens']}, output tokens: #{s['output_tokens']}
+    - cache creation tokens: #{s['cache_creation_input_tokens']}, cache read tokens: #{s['cache_read_input_tokens']}
+    - cost: $#{format('%.2f', s['cost_usd'].to_f)}
+  ENTRY
+end
+
 # ---------- slow-routes ----------
 
 def slow_routes_truncate(str, width)
@@ -6410,6 +6631,12 @@ when "queries"
   case sub
   when "top" then cmd_queries_top(argv)
   else            unknown("queries subcommand", sub, SUBCOMMANDS["queries"])
+  end
+when "claude-usage"
+  sub = resolve_subcommand(argv, default: "top")
+  case sub
+  when "top" then cmd_claude_usage_top(argv)
+  else            unknown("claude-usage subcommand", sub, SUBCOMMANDS["claude-usage"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")
