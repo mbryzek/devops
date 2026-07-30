@@ -343,9 +343,12 @@ class TestPendingReleaseOrchestration < Minitest::Test
     assert_equal ["acumen"], @released
   end
 
-  # ---- Two-phase ordering + DB-failure skip ----
+  # ---- Phase ordering + DB-failure skip ----
+  #
+  # A DB gates only the app named after it (foo-postgresql -> foo). Unrelated
+  # apps release in parallel with the serial DB phase rather than waiting it out.
 
-  def test_dbs_release_before_apps
+  def test_each_app_waits_for_its_own_db
     @rows = [
       ["acumen",              { tag: "0.0.1", ahead: 1, last: "a" }],
       ["acumen-postgresql",   { tag: "0.0.2", ahead: 1, last: "b" }],
@@ -380,6 +383,45 @@ class TestPendingReleaseOrchestration < Minitest::Test
       assert_match(/^end:/, end_evt)
       assert_equal start_evt.sub("start:", ""), end_evt.sub("end:", "")
     end
+  end
+
+  # The regression: acumen has no dependency on platform-postgresql, so it must
+  # not sit behind that migration. Its release starts while the DB is still
+  # running.
+  def test_app_with_no_pending_db_releases_alongside_the_db_phase
+    events = []
+    events_mutex = Mutex.new
+    @rows = [
+      ["acumen",              { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform",            { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["platform-postgresql", { tag: "0.0.3", ahead: 1, last: "c" }],
+    ]
+    Object.send(:define_method, :release_one) do |name|
+      events_mutex.synchronize { events << "start:#{name}" }
+      sleep 0.05 if name == "platform-postgresql"
+      events_mutex.synchronize { events << "end:#{name}" }
+      { ok: true, log: "" }
+    end
+    out = capture_io { cmd_deploy_all(["--concurrency", "8"]) }
+    assert_operator events.index("start:acumen"), :<, events.index("end:platform-postgresql"),
+      "acumen must not wait for an unrelated DB, got #{events.inspect}"
+    # platform DOES depend on it, so it still waits.
+    assert_operator events.index("end:platform-postgresql"), :<, events.index("start:platform"),
+      "platform must wait for its own DB, got #{events.inspect}"
+    assert_match(/in parallel with 1 app\(s\) that depend on none of them: acumen/, out)
+  end
+
+  # Nothing is gated, so every app rides along with the DB phase and there is no
+  # second app phase to announce.
+  def test_no_phase_2_when_no_app_depends_on_a_pending_db
+    @rows = [
+      ["acumen",              { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal %w[acumen platform-postgresql].sort, @released.sort
+    assert_match(/Phase 1/, out)
+    refute_match(/Phase 2/, out)
   end
 
   def test_failed_db_skips_matching_app_but_releases_unrelated_apps
@@ -814,20 +856,20 @@ class TestDeployStatusPrompt < Minitest::Test
 
   # A lone app releases serially, so the banner drops the concurrency detail.
   def test_phase2_message_single_app_omits_concurrency
-    assert_equal "Phase 2: releasing platform", deploy_phase2_message(["platform"], 10)
+    assert_equal "Phase 2: releasing platform", deploy_app_phase_message(2, ["platform"], 10)
   end
 
   # Multiple apps show the effective pool, capped at the number of apps.
   def test_phase2_message_caps_concurrency_to_app_count
     assert_equal "Phase 2: releasing 2 app(s) with concurrency=2: rallyd, hackathon",
-      deploy_phase2_message(%w[rallyd hackathon], 10)
+      deploy_app_phase_message(2, %w[rallyd hackathon], 10)
   end
 
   # When fewer apps than the requested concurrency would still saturate, the
   # requested value is shown unchanged.
   def test_phase2_message_uses_requested_concurrency_when_lower
     assert_equal "Phase 2: releasing 5 app(s) with concurrency=2: a, b, c, d, e",
-      deploy_phase2_message(%w[a b c d e], 2)
+      deploy_app_phase_message(2, %w[a b c d e], 2)
   end
 end
 
