@@ -40,7 +40,8 @@ works. A claimed `suggestion` runs as an investigation rather than a fix: the se
 issue and the code, then hands back a recommendation with `dev issues status --status
 needs_review`, instead of opening a PR.
 
-The issue tracker replaces Linear and the old playbook-feedback queue (`dev feedback`, removed
-along with its API). `worker` issues are auto-filed by the daily log review; `insights` issues
+The issue tracker is the single system of record for this work — there is no external tracker.
+It replaced the old playbook-feedback queue (`dev feedback`, removed along with its API), which
+was the last thing it superseded. `worker` issues are auto-filed by the daily log review; `insights` issues
 are captured in-app when an admin reviews an insight or rejects a proposed checklist item;
 `suggestion` issues are submitted by club members in playbook-app; the rest are filed by hand.
