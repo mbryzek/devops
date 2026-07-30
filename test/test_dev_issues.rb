@@ -1180,6 +1180,87 @@ class TestDevIssues < Minitest::Test
     assert_equal "", out
   end
 
+  # ---- deploy pass: fixes that arrive with no app recorded ----
+  #
+  # ISS-136 taught the deploy pass to split that branch two ways, but only
+  # `issue_fix_repo` was covered in isolation. These drive `cmd_issues_reconcile`
+  # itself, so the branch is exercised where it actually runs — an issue that got to
+  # `fixed` WITHOUT going through the adoption pass, which is what a session running
+  # `dev issues status --status fixed --url "<PR>"` produces.
+
+  def fixed_via_pr(url)
+    graph_issue.merge(
+      "status" => "fixed",
+      "fixed_at" => "2026-07-30T15:00:00Z",
+      "fixes" => [{ "url" => url }],
+    )
+  end
+
+  # ISS-131's own shape: marked fixed by hand with a devops PR, then stranded,
+  # because before ISS-136 this branch skipped everything with no app.
+  def test_deploy_pass_promotes_a_hand_recorded_fix_in_a_repo_that_releases_nothing
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" =>
+                           [fixed_via_pr("https://github.com/mbryzek/devops/pull/248")]) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/would deploy ISS-034: devops releases nothing/, out)
+    assert_match(/1 would deploy, 0 skipped, 1 fixed total\./, out)
+    refute_match(/advance manually/, out)
+  end
+
+  # Dry-run above wrote nothing. The stub flunks on any request it was not told
+  # about, so the PUT being answered here IS the assertion that it was sent.
+  def test_deploy_pass_apply_records_the_merge_is_the_release_transition
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" =>
+                           [fixed_via_pr("https://github.com/mbryzek/devops/pull/248")],
+                         "PUT #{issues_path('/034/status')}" => graph_issue.merge("status" => "deployed")) do
+          cmd_issues_reconcile(["--apply"])
+        end
+      end
+    end
+    assert_match(/deployed ISS-034: devops releases nothing/, out)
+    assert_match(/1 deployed, 0 skipped, 1 fixed total\./, out)
+  end
+
+  # acumen DOES release. Calling its merge live would be a claim the auto-verifier
+  # then acts on, so it keeps skipping — but says which of the two cases it was.
+  def test_deploy_pass_skips_a_releasing_repo_that_has_no_app_recorded
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" =>
+                           [fixed_via_pr("https://github.com/mbryzek/acumen/pull/130")]) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/skip ISS-034: acumen releases, but no app was recorded/, out)
+    refute_match(/would deploy/, out)
+  end
+
+  # A Google Doc describing a manual fix has no repo and no release to infer. This
+  # is the case the skip line was originally written for, and it must keep skipping.
+  def test_deploy_pass_skips_a_document_fix_for_a_human
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" =>
+                           [fixed_via_pr("https://docs.google.com/document/d/abc")]) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/skip ISS-034: document fix — advance manually/, out)
+  end
+
   # ---- playbook tenant login wiring ----
 
   def test_issue_endpoint_is_playbook_on_platform_host
