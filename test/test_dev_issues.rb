@@ -908,6 +908,253 @@ class TestDevIssues < Minitest::Test
     refute issue_released_since_fix?({ "version" => "0.1.5" }, fixed_issue(deployment: nil))
   end
 
+  # ---- claimed -> fixed, adopted from merged PRs ----
+
+  def merged_pr(repo: "acumen", number: 173, merged_at: "2026-07-20T05:09:05Z", title: "ISS-034: fix it")
+    {
+      "repo" => repo,
+      "number" => number,
+      "url" => "https://github.com/mbryzek/#{repo}/pull/#{number}",
+      "title" => title,
+      "merged_at" => merged_at,
+    }
+  end
+
+  # A deployable stand-in: the adoption path only ever asks for name and repo_name.
+  Deployable = Struct.new(:name, :repo_name)
+
+  def registry_with(*apps)
+    Struct.new(:deploy_tracked).new(apps)
+  end
+
+  def test_issue_numbers_in_title_finds_every_reference
+    assert_equal %w[095 096],
+                 issue_numbers_in_title("Chart hover robustness + engagement labels (ISS-095, ISS-096)")
+  end
+
+  def test_issue_numbers_in_title_dedupes_repeats
+    assert_equal ["114"], issue_numbers_in_title("ISS-114: retry bound (closes ISS-114)")
+  end
+
+  # The padded three-digit display form is the contract. An unpadded or embedded
+  # lookalike is not a reference, and matching one would mark the wrong issue fixed.
+  def test_issue_numbers_in_title_ignores_lookalikes
+    assert_empty issue_numbers_in_title("ISS-12: too short to be an issue number")
+    assert_empty issue_numbers_in_title("MISS-114 is not a reference")
+    assert_empty issue_numbers_in_title("no reference at all")
+  end
+
+  def test_adoptable_pr_takes_the_newest_merge_after_the_claim
+    issue = graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")
+    prs = { "034" => [merged_pr(number: 9, merged_at: "2026-07-21T00:00:00Z"),
+                      merged_pr(number: 8, merged_at: "2026-07-20T00:00:00Z")] }
+    assert_equal 9, issue_adoptable_pr(issue, prs)["number"]
+  end
+
+  # A reopened issue keeps the PRs of its earlier rounds. Adopting one of those
+  # would declare the CURRENT round fixed on the strength of work that shipped
+  # before it was even claimed.
+  def test_adoptable_pr_ignores_a_merge_that_predates_the_claim
+    issue = graph_issue.merge("claimed_at" => "2026-07-25T00:00:00Z")
+    prs = { "034" => [merged_pr(merged_at: "2026-07-20T00:00:00Z")] }
+    assert_nil issue_adoptable_pr(issue, prs)
+  end
+
+  def test_adoptable_pr_takes_any_merge_when_the_issue_never_recorded_a_claim
+    issue = graph_issue.reject { |k, _| k == "claimed_at" }
+    prs = { "034" => [merged_pr(merged_at: "2020-01-01T00:00:00Z")] }
+    refute_nil issue_adoptable_pr(issue, prs)
+  end
+
+  def test_adoptable_pr_is_nil_when_no_pr_names_the_issue
+    assert_nil issue_adoptable_pr(graph_issue, { "099" => [merged_pr] })
+  end
+
+  # A repo that releases a tracked deployable gets the (app, baseline) pair, which
+  # is what lets the deploy pass detect the release.
+  def test_adoption_body_records_the_app_and_its_live_version_as_baseline
+    registry = registry_with(Deployable.new("playbook-app", "playbook-app"))
+    cache = { "playbook-app" => { "version" => "0.1.9" } }
+    body = issue_adoption_body(registry, cache, merged_pr(repo: "playbook-app", number: 356))
+    assert_equal "fixed", body[:status]
+    assert_equal "https://github.com/mbryzek/playbook-app/pull/356", body[:url]
+    assert_equal "playbook-app", body[:app]
+    assert_equal "0.1.9", body[:baseline_version]
+  end
+
+  # acumen, devops and the shared libs carry fixes but release no tracked
+  # deployable. Recording a document-style fix puts the issue in front of a human
+  # in the deploy pass instead of leaving it stranded in `claimed`.
+  def test_adoption_body_is_url_only_for_a_repo_with_no_deployable
+    body = issue_adoption_body(registry_with, {}, merged_pr(repo: "acumen"))
+    refute body.key?(:app)
+    refute body.key?(:baseline_version)
+  end
+
+  # Fail-closed: an unreadable live version means no baseline rather than a guessed
+  # one, since a wrong baseline is what would declare a fix live before it is.
+  def test_adoption_body_omits_the_pair_when_the_live_version_is_unreadable
+    registry = registry_with(Deployable.new("workers", "workers"))
+    cache = { "workers" => { error: "unreachable" } }
+    body = issue_adoption_body(registry, cache, merged_pr(repo: "workers"))
+    refute body.key?(:app)
+  end
+
+  def test_adoption_note_names_the_pr_and_the_baseline
+    body = { app: "playbook-app", baseline_version: "0.1.9" }
+    assert_equal "playbook-app#356 merged (playbook-app baseline 0.1.9)",
+                 issue_adoption_note(body, merged_pr(repo: "playbook-app", number: 356), false)
+  end
+
+  def test_adoption_note_says_the_merge_is_the_release_for_a_repo_that_ships_nothing
+    assert_match(/devops releases nothing, so the merge is the release/,
+                 issue_adoption_note({}, merged_pr(repo: "devops"), true))
+  end
+
+  def test_adoption_note_names_the_missing_issue_app_for_a_releasing_repo
+    assert_match(/no issue app for acumen — advance once it releases/,
+                 issue_adoption_note({}, merged_pr, false))
+  end
+
+  # devops, the shared libs and schema-evolution-manager have no version endpoint
+  # that could ever advance the issue, so `fixed` there means stranded forever.
+  def test_repo_releases_nothing_only_when_it_is_not_deploy_tracked
+    registry = registry_with(Deployable.new("acumen", "acumen"))
+    assert issue_repo_releases_nothing?(registry, "devops")
+    refute issue_repo_releases_nothing?(registry, "acumen")
+  end
+
+  # The registry is the wider set: it tracks acumen, rallyd and a dozen others that
+  # `issue_app` has no value for. Sending one of those as `app` is a 422, so the
+  # adoption must not offer it — the issue lands `fixed` with no app instead.
+  def test_adoption_body_omits_an_app_the_issue_tracker_cannot_name
+    registry = registry_with(Deployable.new("acumen", "acumen"))
+    cache = { "acumen" => { "version" => "0.9.99" } }
+    body = issue_adoption_body(registry, cache, merged_pr(repo: "acumen"))
+    refute body.key?(:app)
+    assert_equal "https://github.com/mbryzek/acumen/pull/173", body[:url]
+  end
+
+  def test_issue_apps_are_the_playbook_deployables_only
+    refute_includes ISSUE_APPS, "acumen"
+    assert_equal %w[platform playbook-admin playbook-app playbook-www workers], ISSUE_APPS.sort
+  end
+
+  def test_adopt_summary_is_omitted_when_nothing_was_adopted
+    assert_nil issues_adopt_summary(adopted: 0, apply: true)
+  end
+
+  def test_adopt_summary_counts_what_moved
+    assert_equal "2 adopted from merged PRs.", issues_adopt_summary(adopted: 2, apply: true)
+    assert_equal "2 would adopt from merged PRs.", issues_adopt_summary(adopted: 2, apply: false)
+  end
+
+  # Replace a top-level `dev` function for the duration of a block. The sweep must
+  # never reach the network from a test — `gh` and the version probe here would
+  # answer for the real org and the real production apps.
+  def with_stubbed_function(name, impl)
+    original = method(name)
+    Object.send(:define_method, name, impl)
+    yield
+  ensure
+    Object.send(:define_method, name, original)
+  end
+
+  def with_merged_prs(map, &block)
+    with_stubbed_function(:issue_merged_prs_by_number, ->(**_kwargs) { map }, &block)
+  end
+
+  # Force the adoption payload, so the deploy-tracked landing can be exercised
+  # without a live version probe.
+  def with_adoption_body(body, &block)
+    with_stubbed_function(:issue_adoption_body, ->(_registry, _cache, _pr) { body }, &block)
+  end
+
+  # The whole point of the backstop: an issue nobody marked fixed still moves.
+  def test_reconcile_adopts_a_claimed_issue_whose_pr_merged
+    claimed = [graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")]
+    out, = capture_io do
+      with_merged_prs("034" => [merged_pr]) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => claimed,
+                         "GET #{issues_list_path(statuses: 'fixed')}" => []) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/^Claimed issues whose fix already merged/, out)
+    assert_match(/would fix ISS-034 <- acumen#173 merged/, out)
+    assert_match(/1 would adopt from merged PRs\./, out)
+    assert_match(/Re-run with --apply/, out)
+  end
+
+  # ISS-127's shape: devops merges, releases nothing, and its issue would otherwise
+  # wait on a release that is never coming. Straight to `deployed` — the state that
+  # means "awaiting verification" — is the whole point of the merge-is-the-release
+  # path.
+  def test_reconcile_sends_a_repo_that_releases_nothing_straight_to_deployed
+    claimed = [graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")]
+    out, = capture_io do
+      with_merged_prs("034" => [merged_pr(repo: "devops", number: 241)]) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => claimed,
+                         "GET #{issues_list_path(statuses: 'fixed')}" => []) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/would deploy ISS-034 <- devops#241 merged; devops releases nothing/, out)
+  end
+
+  # Dry-run above wrote nothing; --apply is what records the transition. The stub
+  # flunks on any request it was not told about, so the PUT being answered here IS
+  # the assertion that it was sent.
+  def test_reconcile_apply_records_the_adoption
+    claimed = [graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")]
+    out, = capture_io do
+      with_merged_prs("034" => [merged_pr]) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => claimed,
+                         "GET #{issues_list_path(statuses: 'fixed')}" => [],
+                         "PUT #{issues_path('/034/status')}" => graph_issue.merge("status" => "fixed")) do
+          cmd_issues_reconcile(["--apply"])
+        end
+      end
+    end
+    assert_match(/fixed    ISS-034 <- acumen#173 merged/, out)
+    assert_match(/1 adopted from merged PRs\./, out)
+    refute_match(/Re-run with --apply/, out)
+  end
+
+  # A fix in a repo that DOES release a tracked deployable stops at `fixed` — the
+  # deploy pass owns the rest, once that app ships past the baseline.
+  def test_reconcile_adoption_stops_at_fixed_for_a_deploy_tracked_repo
+    claimed = [graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")]
+    pr = merged_pr(repo: "playbook-app", number: 356)
+    body = { status: "fixed", url: pr["url"], app: "playbook-app", baseline_version: "0.1.9" }
+    out, = capture_io do
+      with_merged_prs("034" => [pr]) do
+        with_adoption_body(body) do
+          with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => claimed,
+                           "GET #{issues_list_path(statuses: 'fixed')}" => []) do
+            cmd_issues_reconcile([])
+          end
+        end
+      end
+    end
+    assert_match(/would fix ISS-034 <- playbook-app#356 merged \(playbook-app baseline 0\.1\.9\)/, out)
+  end
+
+  # A claimed issue with no merged PR is work in flight, not a miss.
+  def test_reconcile_says_nothing_about_claimed_issues_without_a_merged_pr
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [graph_issue],
+                         "GET #{issues_list_path(statuses: 'fixed')}" => []) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_equal "", out
+  end
+
   # ---- playbook tenant login wiring ----
 
   def test_issue_endpoint_is_playbook_on_platform_host
@@ -1461,7 +1708,8 @@ class TestDevIssues < Minitest::Test
   def test_reconcile_titles_its_output
     fixed = [{ "number" => "034", "status" => "fixed" }]
     out, = capture_io do
-      with_stubbed_api("GET #{issues_list_path(statuses: 'fixed')}" => fixed) do
+      with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                       "GET #{issues_list_path(statuses: 'fixed')}" => fixed) do
         cmd_issues_reconcile([])
       end
     end
@@ -1475,7 +1723,8 @@ class TestDevIssues < Minitest::Test
   # rather than printing a "nothing to do" line into every release.
   def test_reconcile_prints_nothing_when_no_issues_are_awaiting_deploy
     out, = capture_io do
-      with_stubbed_api("GET #{issues_list_path(statuses: 'fixed')}" => []) do
+      with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                       "GET #{issues_list_path(statuses: 'fixed')}" => []) do
         cmd_issues_reconcile([])
       end
     end
