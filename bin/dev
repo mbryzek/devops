@@ -66,6 +66,7 @@ INVOCATIONS = {
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues list"         => 'issues list [--category CATEGORY] [--status open,claimed] [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
@@ -319,13 +320,22 @@ USAGE = <<~USAGE
         (source_url), and any pasted or dragged-in file path is uploaded as a real
         attachment — both are lifted out of the body. Repeat --image PATH to
         attach files explicitly: each is uploaded to the issue AND handed to the
-        session as a local path, so it can read the file directly. The issue is then created, claimed, stamped with the Claude
-        session id (an internal timeline comment), written to a plan under
+        session as a local path, so it can read the file directly. The issue is
+        created already claimed (atomically, in one request — no window where a
+        concurrent `dev issues claim` sweep could grab it), then stamped with the
+        Claude session id (an internal timeline comment), written to a plan under
         ~/code/claude/plans/, and the terminal is handed to an interactive session
         (Opus 5, 1M context) pinned to that session id. Reattach later with
         `dev issues resume`. Pass --no-spawn to stop after writing the plan.
         Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first.
+
+    #{INVOCATIONS["issues list"]}
+        Read-only. Lists issues matching the given statuses (default:
+        open,claimed) and optional category. Use this to check whether work is
+        already tracked before filing a new issue — unlike `issues claim`, this
+        never claims anything. Authenticates with your persisted playbook
+        session — run `dev auth login --app playbook` once first.
 
     #{INVOCATIONS["issues show"]}
         Print one issue and its full comment history, oldest first, with the status
@@ -497,7 +507,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create claim show status snooze reconcile resume],
+  "issues"       => %w[create list claim show status snooze reconcile resume],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
 }.freeze
@@ -2433,7 +2443,7 @@ def cmd_issues_create(args)
 
     # No title unless one was given: the server files a placeholder and queues a
     # summarization of the body, so nothing is lost if that model call fails.
-    form = { category: category }
+    form = { category: category, claim_on_create: true }
     form[:title] = title if title && !title.empty?
     form[:body] = brief unless brief.empty?
     form[:source_url] = source_url if source_url
@@ -2447,19 +2457,22 @@ def cmd_issues_create(args)
   end
 end
 
-# Files `form`, claims it, writes its plan, and hands it to a Claude session.
+# Files `form` (already carrying claim_on_create: true), writes its plan, and hands
+# it to a Claude session.
 #
 # Every caller that files an issue FROM the laptop shares this tail, so a filed
-# issue is always in the same state whatever produced it: claimed, with a session
-# id recorded and a plan on disk. The ordering is load-bearing — the session
-# comment and the plan are both written BEFORE the spawn, so a failure leaves a
-# fully recoverable claimed issue rather than a half-filed one.
+# issue is always in the same state whatever produced it: claimed — via
+# claim_on_create in the create request itself (IssuesService.insert writes
+# status=claimed in the same insert transaction server-side, so there is no
+# window where the issue is open and a concurrent `dev issues claim` sweep could
+# grab it) — with a session id recorded and a plan on disk. The remaining
+# ordering is still load-bearing — the session comment and the plan are both
+# written BEFORE the spawn, so a failure leaves a fully recoverable claimed issue
+# rather than a half-filed one.
 def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spawn_session: true)
   issue = ApiClient.request(endpoint, :post, issues_path, body: form)
   number = issue.fetch("number")
   puts "Filed #{issue_label(issue)} (#{category})"
-
-  ApiClient.request(endpoint, :put, issues_path("/#{number}/status"), body: { status: "claimed" })
 
   # Mint the session id HERE so it is recorded even if the session dies on its
   # first turn — the model is never asked to self-report it.
@@ -2488,6 +2501,59 @@ def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spa
     warn "  dev issues resume #{number}"
   end
   issue
+end
+
+# Read-only. Unlike `issues claim`, which lists open issues but also claims
+# whatever is selected, this never has a side effect — it exists so a caller
+# (a human, or Claude checking for a duplicate before filing) can see what is
+# already tracked without risking claiming it.
+def cmd_issues_list(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  category = nil
+  statuses = %w[open claimed]
+  leftover = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--category"
+      category = rest[i + 1]
+      usage_exit("--category requires a value", example: usage_for("issues list")) if category.nil?
+      i += 2
+    when "--status"
+      raw = rest[i + 1]
+      usage_exit("--status requires a value", example: usage_for("issues list")) if raw.nil?
+      statuses = raw.split(",")
+      i += 2
+    else
+      leftover << a
+      i += 1
+    end
+  end
+
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--category must be one of: #{ISSUE_CATEGORIES.join(', ')}" if category && !ISSUE_CATEGORIES.include?(category)
+  bad = statuses - ISSUE_STATUSES
+  problems << "--status must be one or more of: #{ISSUE_STATUSES.join(', ')}" unless bad.empty?
+  report_arg_problems("issues list", problems, usage_for("issues list"))
+
+  require_playbook_session!(use_localhost)
+
+  puts ""
+  puts Util.underline("Issues#{use_localhost ? ' (localhost)' : ''}")
+  puts ""
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    issues = ApiClient.request(endpoint, :get, issues_list_path(statuses: statuses, category: category)) || []
+    if issues.empty?
+      puts "No issues found."
+    else
+      issues.each_with_index { |issue, idx| puts issue_summary_line(issue, idx + 1) }
+    end
+    puts ""
+  end
 end
 
 # Read one issue and its timeline. `dev issues status --comment` has always been
@@ -5426,6 +5492,7 @@ def queries_offer_investigation(stats, days:, sort:, use_localhost:)
     category: QUERIES_ISSUE_CATEGORY,
     title: queries_issue_title(selected),
     body: queries_issue_body(selected, days: days, sort: sort),
+    claim_on_create: true,
   }
   issue_file_claim_and_start(
     endpoint: issue_endpoint(use_localhost), form: form, category: QUERIES_ISSUE_CATEGORY
@@ -6352,6 +6419,7 @@ when "issues"
   sub = argv.shift
   case sub
   when "create"    then cmd_issues_create(argv)
+  when "list"      then cmd_issues_list(argv)
   when "show"      then cmd_issues_show(argv)
   when "resume"    then cmd_issues_resume(argv)
   when "claim"     then cmd_issues_claim(argv)
