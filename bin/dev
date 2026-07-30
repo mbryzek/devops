@@ -171,6 +171,11 @@ USAGE = <<~USAGE
         surfaces a query whose modest mean is multiplied by a large call count;
         --by-mean sorts by average for the opposite shape.
 
+        MULTI is the share of a statement's calls whose block ran more than one
+        statement. A duration covers its whole block and is charged to the first
+        statement in it, so at a high share the cost belongs partly to a sibling
+        and the statement shown is not the thing to optimize.
+
         Rows are numbered: at the prompt, pick any of them to file an
         `improvement` issue holding those queries and hand it straight to a
         Claude session, the way `dev issues create` does. Blank input files
@@ -5351,11 +5356,15 @@ def cmd_queries_top(args)
     puts ""
     puts Util.underline("Top #{stats.length} queries by #{sort} (last #{days} day(s))")
     puts ""
-    printf("%4s  %12s  %10s  %9s  %9s  %s\n", "#", "TOTAL MS", "CALLS", "MEAN MS", "MAX MS", "CALL SITE")
+    printf(
+      "%4s  %12s  %10s  %9s  %9s  %7s  %s\n",
+      "#", "TOTAL MS", "CALLS", "MEAN MS", "MAX MS", "MULTI", "CALL SITE"
+    )
     stats.each_with_index do |s, idx|
       printf(
-        "%4d  %12d  %10d  %9d  %9d  %s\n",
+        "%4d  %12d  %10d  %9d  %9d  %7s  %s\n",
         idx + 1, s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
+        queries_multi_share(s),
         s["call_site"] || "(never got hot)"
       )
       queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
@@ -5364,6 +5373,22 @@ def cmd_queries_top(args)
 
     queries_offer_investigation(stats, days: days, sort: sort, use_localhost: use_localhost)
   end
+end
+
+# What share of a statement's calls came from a block that ran more than one statement, so its
+# duration covers siblings and not just this statement.
+#
+# Shown as a percentage rather than a count because it is only ever read against `calls`: 100% says
+# the number to its left is a whole block's cost and this statement merely happened to be prepared
+# first, which is the difference between an expensive query and a cheap query in an expensive block.
+# A batch upsert runs a prefilter select and then writes 500 rows, and the select carries the bill.
+# "-" is 0, kept quiet so the ordinary single-statement case does not compete with the ranking.
+def queries_multi_share(stat)
+  calls = stat["calls"].to_i
+  multi = stat["multi_statement_calls"].to_i
+  return "-" if multi.zero? || calls.zero?
+
+  "#{(multi * 100.0 / calls).round}%"
 end
 
 # Offer to hand the selected queries to a Claude session, via an issue.
@@ -5440,7 +5465,10 @@ end
 # behaviours that make a naive reading wrong, and all three are stated: the
 # duration is charged to the FIRST statement of its block, the SQL is normalized,
 # and rows are summed across nodes and 6-hour windows. A session that does not
-# know the first one will chase an `insert` that is really a whole transaction.
+# know the first one will chase an `insert` that is really a whole transaction --
+# and one did (ISS-110), against a select that turned out to cost 20ms in front of
+# a 500-row batch upsert, which is why the multi-statement share is now stated per
+# query rather than left as a caveat to remember.
 #
 # The per-instance data (the selected queries and their numbers) goes last.
 def queries_issue_body(selected, days:, sort:)
@@ -5479,27 +5507,37 @@ def queries_issue_body(selected, days:, sort:)
 
     - **The duration is charged to the FIRST statement prepared in its block, and covers
       the WHOLE block.** A `withTransaction` that inserts, then updates, then selects
-      charges all three to the insert. Before optimizing the statement shown, read its
-      call site and check whether it is the only statement in that block — if it is not,
-      the cost you are chasing may belong to a sibling statement.
+      charges all three to the insert. **`multi-statement` below tells you how often that
+      happened for this statement — READ IT FIRST.** At a high share, the cost shown is a
+      block's cost and this statement merely ran first, so optimizing the statement is
+      optimizing the wrong thing: find the block at the call site and look at what else
+      runs in it. A generated batch upsert is the canonical case — it runs a prefilter
+      select and then writes up to 500 rows, and the select carries the whole bill.
     - **The SQL is normalized**: runs of bind placeholders are collapsed to a single `?`,
-      so `in (?)` may have been two binds or two thousand. The number of binds is a
-      prime suspect and is NOT visible here — find it at the call site.
+      flat (`in (?)`) and row-wise (`in ((?))`) alike, so the list may have been two
+      elements or two thousand. The width is a prime suspect and is NOT visible here —
+      find it at the call site.
     - **`(never got hot)` means no call site, not no caller**: the query never reached
       100 calls in a window on any single node, so the stack walk never ran. Find the
       caller by grepping the statement's head (a distinctive column list or table name)
       under `~/code/platform`.
-    - **`calls` and `total_ms` are sums across nodes and windows.** Per-node cost is
-      roughly this divided by the number of pods serving; `max_ms` is a true single-call
-      worst case, not an average of maxima.
-    - A generated `Base*Dao.findAll` call site names the DAO, not the interesting code.
-      The question there is which caller asks for it, how often, and with what filters.
+    - **`calls`, `total_ms` and `multi-statement` are sums across nodes and windows.**
+      Per-node cost is roughly this divided by the number of pods serving; `max_ms` is a
+      true single-call worst case, not an average of maxima.
+    - **The call site is the application caller, not the DAO**: generated `generated.db.`
+      frames are skipped, because the statement already names the table and the shape. Two
+      different callers can issue byte-identical SQL and so share one entry — a batch
+      upsert's prefilter select and a plain `findAll` do — and only one of them gets its
+      stack walked, so the site names a caller of this statement, not necessarily the
+      only one. If the site and the statement seem to disagree, look for the other caller.
 
     ## Suggested investigation
 
     1. Read the call site and the code around it. Establish the shape first: is this one
        query per request, a loop issuing one per row, or a batch job? An N+1 answers
-       itself and needs no plan.
+       itself and needs no plan. If `multi-statement` is high, establish what ELSE runs in
+       the block before you time this statement at all — a select that reads as 107ms mean
+       can be a 20ms select in front of a 500-row write.
     2. Get an execution plan. Use the session Postgres, never production:
        `export CLAUDE_SESSION_ID=<feature>` then
        `eval "$(~/code/devops/bin/claude-db start --app platform | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')"`,
@@ -5532,11 +5570,26 @@ def queries_issue_body_entry(s, position)
 
     - total: #{s['total_ms']} ms across #{s['calls']} calls
     - mean: #{s['mean_ms']} ms, max: #{s['max_ms']} ms
+    - multi-statement: #{queries_issue_body_multi(s)}
 
     ```sql
     #{s['sql'].to_s.gsub(/\s+/, ' ').strip}
     ```
   ENTRY
+end
+
+# Spelled out rather than shown as the terminal's bare percentage: the issue is read by a session
+# with no other context, and the number is worthless without the sentence that says what to do with
+# it. The percentage alone invited exactly the reading it exists to prevent.
+def queries_issue_body_multi(s)
+  calls = s["calls"].to_i
+  multi = s["multi_statement_calls"].to_i
+  return "0 of #{calls} calls — the duration below is this statement's alone" if multi.zero?
+
+  share = calls.zero? ? 0 : (multi * 100.0 / calls).round
+  "#{multi} of #{calls} calls (#{share}%) ran more than one statement in their block, " \
+    "so those durations cover sibling statements too — check what else runs in that block " \
+    "before treating this cost as this statement's"
 end
 
 # How much of the statement is worth reading. One line of head was enough to tell two
