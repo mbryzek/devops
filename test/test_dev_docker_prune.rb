@@ -21,6 +21,7 @@ class TestDevDockerPrune < Minitest::Test
   CUTOFF = NOW - 7 * 24 * 3600
   OLD    = "2026-05-12 03:12:25 -0400 EDT"       # ~2.5 months back
   RECENT = "2026-07-30 09:05:48 -0400 EDT"       # hours back
+  RECENT_OLDER = "2026-07-28 09:05:48 -0400 EDT" # days back, still inside the window
   OLD_CACHE_TS    = "2026-05-12 03:12:25.566497142 +0000 UTC"
   RECENT_CACHE_TS = "2026-07-30 09:05:48.123456789 +0000 UTC"
 
@@ -28,24 +29,34 @@ class TestDevDockerPrune < Minitest::Test
     { "State" => state, "CreatedAt" => created, "Size" => size }
   end
 
-  def image(containers: "0", created: OLD, unique: "304.3MB", size: "795MB")
-    { "Containers" => containers, "CreatedAt" => created, "UniqueSize" => unique, "Size" => size }
+  def image(id: nil, repo: "registry/platform", tag: nil, containers: "0", created: OLD,
+            unique: "304.3MB", size: "795MB")
+    @image_seq = (@image_seq || 0) + 1
+    { "ID" => id || "img#{@image_seq}", "Repository" => repo, "Tag" => tag || "0.0.#{@image_seq}",
+      "Containers" => containers, "CreatedAt" => created, "UniqueSize" => unique, "Size" => size }
   end
 
-  def cache(id: nil, parent: "", shared: "false", last_used: OLD_CACHE_TS, created: OLD_CACHE_TS,
-            size: "157MB", in_use: "false")
+  # Raw `docker buildx du --format json`: Parents is an array, Shared a real
+  # boolean, and LastUsedAt is usually prose.
+  def cache(id: nil, parents: [], shared: false, last_used: "2 months ago", created: OLD_CACHE_TS,
+            size: "157MB")
     @cache_seq = (@cache_seq || 0) + 1
-    { "ID" => id || "rec#{@cache_seq}", "Parent" => parent, "Shared" => shared,
-      "LastUsedAt" => last_used, "CreatedAt" => created, "Size" => size, "InUse" => in_use }
+    { "ID" => id || "rec#{@cache_seq}", "Parents" => parents, "Shared" => shared,
+      "LastUsedAt" => last_used, "CreatedAt" => created, "Size" => size }
   end
+
+  def records(*raw) = raw.map { |r| docker_cache_record(r, now: NOW) }
 
   def volume(links: "0", size: "1.625GB", anonymous: true)
     { "Links" => links, "Size" => size,
       "Labels" => anonymous ? "com.docker.volume.anonymous=" : "com.example.keep=1" }
   end
 
-  def plan(df, keep_named_volumes: false)
-    docker_prune_plan(df, cutoff: CUTOFF, keep_named_volumes: keep_named_volumes)
+  # keep_tags defaults to 0 so a test that says nothing about tags exercises only
+  # the age-based steps; the tag sweep has its own tests.
+  def plan(df, cache_by_builder: {}, keep_named_volumes: false, keep_tags: 0)
+    docker_prune_plan(df, cutoff: CUTOFF, filter: "until=72h", cache_by_builder: cache_by_builder,
+                      keep_named_volumes: keep_named_volumes, keep_tags: keep_tags)
       .each_with_object({}) { |s, h| h[s.label] = s }
   end
 
@@ -138,14 +149,14 @@ class TestDevDockerPrune < Minitest::Test
   # ---- build cache: dated by last use, sized by non-shared records ----
 
   def test_cache_step_counts_by_last_use_and_sizes_only_non_shared_records
-    df = { "BuildCache" => [
+    cache_by_builder = { "desktop-linux" => records(
       cache,
-      cache(shared: "true", size: "900MB"),  # counted, but frees nothing yet
-      cache(last_used: RECENT_CACHE_TS),     # inside the age filter
+      cache(shared: true, size: "900MB"),      # counted, but frees nothing yet
+      cache(last_used: "20 hours ago"),        # inside the age filter
       # Never used: falls back to CreatedAt rather than reading as undatable.
       cache(last_used: "", created: OLD_CACHE_TS, size: "43MB"),
-    ] }
-    step = plan(df)["build cache"]
+    ) }
+    step = plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"]
     assert_equal 3, step.count
     assert_equal 200_000_000, step.bytes, "shared records contribute 0 until their images go"
     assert step.at_least
@@ -156,11 +167,11 @@ class TestDevDockerPrune < Minitest::Test
   # released by nothing. All 56 aged records on the box this was found on were
   # ancestors of retained ones, and the 2.54GB estimate freed 0B.
   def test_aged_cache_records_pinned_by_a_newer_descendant_are_not_counted
-    df = { "BuildCache" => [
+    cache_by_builder = { "desktop-linux" => records(
       cache(id: "base", size: "2GB"),
-      cache(id: "recent", parent: "base", last_used: RECENT_CACHE_TS, size: "10MB"),
-    ] }
-    step = plan(df)["build cache"]
+      cache(id: "recent", parents: ["base"], last_used: "20 hours ago", size: "10MB"),
+    ) }
+    step = plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"]
     assert_equal 0, step.count
     assert_equal 0, step.bytes
     assert_includes step.note, "1 aged record(s) pinned by newer descendants"
@@ -168,30 +179,132 @@ class TestDevDockerPrune < Minitest::Test
 
   # Pinning is transitive: the grandparent of a retained record is just as stuck.
   def test_cache_pinning_walks_the_whole_ancestor_chain
-    df = { "BuildCache" => [
+    cache_by_builder = { "desktop-linux" => records(
       cache(id: "grandparent", size: "1GB"),
-      cache(id: "parent", parent: "grandparent", size: "1GB"),
-      cache(id: "recent", parent: "parent", last_used: RECENT_CACHE_TS, size: "10MB"),
+      cache(id: "parent", parents: ["grandparent"], size: "1GB"),
+      cache(id: "recent", parents: ["parent"], last_used: "20 hours ago", size: "10MB"),
       cache(id: "orphan", size: "500MB"),  # aged with nothing descending from it
-    ] }
-    step = plan(df)["build cache"]
+    ) }
+    step = plan({}, cache_by_builder: cache_by_builder)["cache/desktop-linux"]
     assert_equal 1, step.count, "only the orphan is actually releasable"
     assert_equal 500_000_000, step.bytes
   end
 
-  # Multiple parents come back space- or comma-separated depending on version.
+  # Two sources describe the same records with different schemas: buildx du gives
+  # a Parents array and a real boolean, docker system df -v a Parent string and
+  # "true"/"false". Both must normalize to the same record.
+  def test_cache_records_normalize_from_either_schema
+    from_buildx = docker_cache_record({ "ID" => "a", "Parents" => %w[p1 p2], "Shared" => true,
+                                        "Size" => "1GB", "LastUsedAt" => "2 days ago" }, now: NOW)
+    from_df = docker_cache_record({ "ID" => "a", "Parent" => "p1 p2", "Shared" => "true",
+                                    "Size" => "1GB", "LastUsedAt" => (NOW - 2 * 86_400).strftime("%Y-%m-%d %H:%M:%S %z UTC") }, now: NOW)
+    assert_equal %w[p1 p2], from_buildx.parents
+    assert_equal from_buildx.parents, from_df.parents
+    assert from_buildx.shared
+    assert from_df.shared
+    assert_equal 1_000_000_000, from_df.bytes
+    assert_in_delta from_buildx.last_used.to_i, from_df.last_used.to_i, 1
+  end
+
   def test_cache_parents_parse_from_either_separator
     assert_equal %w[a b], docker_cache_parents("Parent" => "a b")
     assert_equal %w[a b], docker_cache_parents("Parent" => "a,b")
-    assert_equal [], docker_cache_parents("Parent" => "")
+    assert_equal %w[a b], docker_cache_parents("Parents" => %w[a b])
+    assert_equal [], docker_cache_parents("Parents" => nil)
     assert_equal [], docker_cache_parents({})
   end
 
-  # `-a` means in-use is not a filter on the way out; a record in use by a live
-  # build is still a candidate, so counting it matches what the command does.
-  def test_cache_step_ignores_in_use_flag
-    df = { "BuildCache" => [cache(in_use: "true")] }
-    assert_equal 1, plan(df)["build cache"].count
+  # buildx du renders most LastUsedAt values as prose. Reading those as nil would
+  # date every record as unknown and silently spare it.
+  def test_parses_relative_timestamps
+    assert_equal NOW - 33 * 60, docker_parse_relative_time("33 minutes ago", now: NOW)
+    assert_equal NOW - 20 * 3600, docker_parse_relative_time("20 hours ago", now: NOW)
+    assert_equal NOW - 4 * 86_400, docker_parse_relative_time("4 days ago", now: NOW)
+    assert_equal NOW - 60, docker_parse_relative_time("About a minute ago", now: NOW)
+    assert_equal NOW, docker_parse_relative_time("Less than a second ago", now: NOW)
+    assert_nil docker_parse_relative_time("who knows", now: NOW)
+  end
+
+  # ---- every builder, not just the current one ----
+
+  # `docker builder prune` only reaches the current builder. A docker-container
+  # builder like bryzek-multi held 2,911 records / 5.28GB that no prune touched and
+  # that `docker system df` never reported.
+  def test_each_builder_gets_its_own_step_and_prune_command
+    cache_by_builder = {
+      "desktop-linux" => records(cache(size: "1GB")),
+      "bryzek-multi"  => records(cache(size: "5GB")),
+    }
+    steps = plan({}, cache_by_builder: cache_by_builder)
+    assert_equal 1_000_000_000, steps["cache/desktop-linux"].bytes
+    assert_equal 5_000_000_000, steps["cache/bryzek-multi"].bytes
+    assert_equal ["docker", "buildx", "prune", "--builder", "bryzek-multi", "-af", "--filter", "until=72h"],
+                 steps["cache/bryzek-multi"].cmd
+  end
+
+  # ---- surplus tags ----
+
+  def test_surplus_tags_keeps_the_newest_per_repository
+    images = [
+      image(repo: "registry/platform", created: RECENT),
+      image(repo: "registry/platform", created: OLD),
+      image(repo: "registry/platform", created: OLD),
+      image(repo: "registry/acumen", created: OLD),
+    ]
+    surplus = docker_surplus_tag_images(images, keep: 1)
+    assert_equal 2, surplus.length, "one kept per repo, the rest surplus"
+    assert_equal ["registry/platform"], surplus.map { |i| i["Repository"] }.uniq
+  end
+
+  def test_surplus_tags_never_touches_images_a_container_holds_or_untagged_ones
+    images = [
+      image(repo: "registry/platform", containers: "1", created: OLD),
+      image(repo: "registry/platform", containers: "1", created: OLD),
+      image(repo: "<none>", created: OLD),
+      image(repo: "<none>", created: OLD),
+    ]
+    assert_empty docker_surplus_tag_images(images, keep: 0)
+  end
+
+  # The two image rows must never bill the same image twice.
+  def test_surplus_step_excludes_images_the_age_step_already_claims
+    df = { "Images" => [image(id: "old1", created: OLD), image(id: "old2", created: OLD)] }
+    steps = plan(df, keep_tags: 0)
+    assert_equal 2, steps["images"].count
+    assert_equal 0, steps["surplus tags"].count
+  end
+
+  def test_surplus_step_removes_by_id_and_reports_disabled_at_zero
+    df = { "Images" => [
+      image(id: "keep", created: RECENT),
+      image(id: "drop", created: RECENT_OLDER),
+    ] }
+    step = plan(df, keep_tags: 1)["surplus tags"]
+    assert_equal 1, step.count
+    assert_equal ["docker", "image", "rm", "drop"], step.cmd
+    assert_includes plan(df, keep_tags: 0)["surplus tags"].note, "disabled"
+  end
+
+  def test_surplus_step_has_no_command_when_nothing_is_surplus
+    assert_nil plan({}, keep_tags: 5)["surplus tags"].cmd
+  end
+
+  # A hundred sha256 arguments is not an explanation of what the step does.
+  def test_long_commands_are_summarized_for_display
+    cmd = ["docker", "image", "rm", *Array.new(101) { |i| "sha256:#{i}" }]
+    shown = docker_display_cmd(cmd)
+    assert_includes shown, "docker image rm sha256:0"
+    assert_includes shown, "(100 more arg(s))"
+    refute_includes shown, "sha256:100"
+  end
+
+  # Every ordinary prune command must stay whole and copy-pasteable.
+  def test_ordinary_commands_display_in_full
+    assert_equal "docker volume prune -f -a", docker_display_cmd(["docker", "volume", "prune", "-f", "-a"])
+    assert_equal "docker buildx prune --builder bryzek-multi -af --filter until=72h",
+                 docker_display_cmd(["docker", "buildx", "prune", "--builder", "bryzek-multi", "-af",
+                                     "--filter", "until=72h"])
+    assert_equal "(nothing to remove)", docker_display_cmd(nil)
   end
 
   # ---- volumes: the actual bug ----
@@ -222,18 +335,25 @@ class TestDevDockerPrune < Minitest::Test
   # The regression itself: without -a, docker takes anonymous volumes only, so the
   # step frees a rounding error of what the plan (and df) advertise.
   def test_volume_prune_command_passes_dash_a_unless_named_volumes_are_kept
-    default = docker_prune_commands(filter: "until=168h", keep_named_volumes: false)
-    assert_equal ["docker", "volume", "prune", "-f", "-a"], default["volumes"]
-
-    kept = docker_prune_commands(filter: "until=168h", keep_named_volumes: true)
-    assert_equal ["docker", "volume", "prune", "-f"], kept["volumes"]
+    assert_equal ["docker", "volume", "prune", "-f", "-a"], plan({})["volumes"].cmd
+    assert_equal ["docker", "volume", "prune", "-f"], plan({}, keep_named_volumes: true)["volumes"].cmd
   end
 
   def test_age_filtered_commands_carry_the_requested_window
-    commands = docker_prune_commands(filter: "until=72h", keep_named_volumes: false)
-    assert_equal ["docker", "container", "prune", "-f", "--filter", "until=72h"], commands["containers"]
-    assert_equal ["docker", "image", "prune", "-af", "--filter", "until=72h"], commands["images"]
-    assert_equal ["docker", "builder", "prune", "-af", "--filter", "until=72h"], commands["build cache"]
+    steps = plan({}, cache_by_builder: { "desktop-linux" => records(cache) })
+    assert_equal ["docker", "container", "prune", "-f", "--filter", "until=72h"], steps["containers"].cmd
+    assert_equal ["docker", "image", "prune", "-af", "--filter", "until=72h"], steps["images"].cmd
+    assert_equal ["docker", "buildx", "prune", "--builder", "desktop-linux", "-af", "--filter", "until=72h"],
+                 steps["cache/desktop-linux"].cmd
+  end
+
+  # Cache pins image layers, so cache must run BEFORE images or the image row
+  # reports ~0 while the cache row is credited with everything — exactly what a
+  # real run showed: 37 images freeing 18.54MB, then 20.55GB from the cache step.
+  def test_cache_steps_run_before_images
+    labels = docker_prune_plan({}, cutoff: CUTOFF, filter: "until=72h",
+                               cache_by_builder: { "desktop-linux" => records(cache) }).map(&:label)
+    assert_equal %w[containers cache/desktop-linux images surplus\ tags volumes], labels
   end
 
   # ---- docker's own reclaimed totals ----
@@ -280,18 +400,32 @@ class TestDevDockerPrune < Minitest::Test
   # ---- rendering ----
 
   def test_missing_sections_render_as_empty_rather_than_crashing
-    steps = docker_prune_plan({}, cutoff: CUTOFF)
+    steps = docker_prune_plan({}, cutoff: CUTOFF, filter: "until=72h")
     assert_equal [0, 0, 0, 0], steps.map(&:count)
     out = capture_stdout { render_docker_prune_plan(steps) }
     assert_includes out, "0 containers"
     assert_includes out, "total"
   end
 
-  def test_render_marks_lower_bounds_and_totals_them
+  # With no cache step in play nothing is a lower bound, so the total must not
+  # wear a ">=" it hasn't earned.
+  def test_render_totals_exactly_when_no_step_is_a_lower_bound
     df = { "Images" => [image], "Volumes" => [volume(size: "1GB", anonymous: false)] }
-    out = capture_stdout { render_docker_prune_plan(docker_prune_plan(df, cutoff: CUTOFF)) }
+    out = capture_stdout do
+      render_docker_prune_plan(docker_prune_plan(df, cutoff: CUTOFF, filter: "until=72h", keep_tags: 0))
+    end
     assert_match(/images\s+1 image\s+304\.30MB/, out)
     assert_match(/volumes\s+1 volume\s+1\.00GB/, out)
-    assert_match(/total\s+>= 1\.30GB/, out)
+    assert_match(/total\s+1\.30GB/, out)
+    refute_match(/total\s+>=/, out)
+  end
+
+  def test_render_marks_the_total_as_a_bound_once_a_cache_step_is_present
+    out = capture_stdout do
+      render_docker_prune_plan(docker_prune_plan({}, cutoff: CUTOFF, filter: "until=72h", keep_tags: 0,
+                                                 cache_by_builder: { "desktop-linux" => records(cache(size: "1GB")) }))
+    end
+    assert_match(%r{cache/desktop-linux\s+1 record\s+>= 1\.00GB}, out)
+    assert_match(/total\s+>= 1\.00GB/, out)
   end
 end
