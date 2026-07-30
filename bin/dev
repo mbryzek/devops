@@ -66,7 +66,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
@@ -358,16 +358,25 @@ USAGE = <<~USAGE
         (source_url), and any pasted or dragged-in file path is uploaded as a real
         attachment — both are lifted out of the body. Repeat --image PATH to
         attach files explicitly: each is uploaded to the issue AND handed to the
-        session as a local path, so it can read the file directly. The issue is
-        created already claimed (atomically, in one request — no window where a
-        concurrent `dev issues claim` sweep could grab it), then stamped with the
-        Claude session id (an internal timeline comment), written to a plan under
-        ~/code/claude/plans/, and the terminal is handed to an interactive session
-        (Opus 5, 1M context) pinned to that session id. Reattach later with
-        `dev issues resume`. Pass --no-spawn to stop once the issue is filed and
-        claimed — no session id, no plan, nothing to resume: that is the mode for
-        filing work you are already doing yourself, and it prints the
-        `issues status` command to close it.
+        session as a local path, so it can read the file directly.
+
+        --status says who the issue belongs to. `claimed` is yours to work now;
+        `open` hands it to the queue and starts no session. From a terminal it
+        defaults to `claimed` — that is what filing from the laptop means. Off a
+        terminal it is REQUIRED, because a Claude session files both work it is
+        doing and findings it is only reporting, and a claimed issue nobody is
+        working is invisible to `dev issues claim` (which only offers OPEN ones),
+        so it is worse than a mislabeled one — it is unpickupable.
+
+        A claimed issue is claimed atomically, in the create request itself — no
+        window where it is open and a concurrent sweep could grab it — then
+        stamped with the Claude session id (an internal timeline comment),
+        written to a plan under ~/code/claude/plans/, and the terminal is handed
+        to an interactive session (Opus 5, 1M context) pinned to that session id.
+        Reattach later with `dev issues resume`. Pass --no-spawn to stop once the
+        issue is filed and claimed — no session id, no plan, nothing to resume:
+        that is the mode for filing work you are already doing yourself, and it
+        prints the `issues status` command to close it.
         Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first.
 
@@ -1685,6 +1694,21 @@ ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
 
 ISSUE_SEVERITIES = %w[low medium high].freeze
 
+# The two statuses `dev issues create` can file INTO, and the whole point of
+# making the caller pick: `claimed` means "I am working this right now", `open`
+# means "this belongs to the queue".
+#
+# `create` files claimed by default because that is what filing from the laptop
+# means — file it and start. That default is wrong for a headless caller (a
+# Claude session), which files an issue for two very different reasons: the work
+# it is already doing (claimed), and a finding it is only reporting (open). It
+# cannot tell them apart from the outside, so it must say which, and
+# `issue_create_status` makes it say so on a non-tty rather than inheriting a
+# default that silently parks other people's work in `claimed` — where `dev
+# issues claim` will not offer it, because claim only sweeps OPEN issues. A
+# phantom claim does not just mislabel the issue, it makes it unpickupable.
+ISSUE_CREATE_STATUSES = %w[open claimed].freeze
+
 # Extensions the platform storage file_type enum accepts, mapped to the MIME type
 # the data_url upload needs. Anything not listed is rejected locally, before any
 # network call, so a bad path never leaves an orphan issue behind.
@@ -2449,6 +2473,7 @@ def cmd_issues_create(args)
   title = nil
   category = nil
   severity = nil
+  status = nil
   body = nil
   images = []
   spawn_session = true
@@ -2473,6 +2498,10 @@ def cmd_issues_create(args)
       severity = rest[i + 1]
       usage_exit("--severity requires a value", example: usage_for("issues create")) if severity.nil?
       i += 2
+    when "--status"
+      status = rest[i + 1]
+      usage_exit("--status requires a value", example: usage_for("issues create")) if status.nil?
+      i += 2
     when "--image"
       path = rest[i + 1]
       usage_exit("--image requires a path", example: usage_for("issues create")) if path.nil?
@@ -2495,6 +2524,11 @@ def cmd_issues_create(args)
                 "or in-app — work those with `dev issues claim`)"
   end
   problems << "--severity must be one of: #{ISSUE_SEVERITIES.join(', ')}" if severity && !ISSUE_SEVERITIES.include?(severity)
+  if status && !status.empty? && !ISSUE_CREATE_STATUSES.include?(status)
+    problems << "--status must be one of: #{ISSUE_CREATE_STATUSES.join(', ')} " \
+                "(a new issue is either yours to work now or the queue's — move it anywhere else " \
+                "afterwards with `dev issues status`)"
+  end
   images.each do |p|
     if !File.file?(p)
       problems << "--image #{p}: no such file"
@@ -2516,6 +2550,12 @@ def cmd_issues_create(args)
     )
   end
   category ||= Ask.select_from_list("Category", ISSUE_MANUAL_CATEGORIES)
+
+  status = issue_create_status(status)
+  # Filing something as the queue's work and then opening a session to work it
+  # are contradictory instructions. The status is the one the caller stated, so
+  # the session is what gives way.
+  spawn_session = false if status == "open"
 
   brief = issue_resolve_brief(body)
   Util.exit_with_error("Aborting: empty issue. Nothing filed.") if brief.nil?
@@ -2541,35 +2581,63 @@ def cmd_issues_create(args)
 
     # No title unless one was given: the server files a placeholder and queues a
     # summarization of the body, so nothing is lost if that model call fails.
-    form = { category: category, claim_on_create: true }
+    form = { category: category }
     form[:title] = title if title && !title.empty?
     form[:body] = brief unless brief.empty?
     form[:source_url] = source_url if source_url
     form[:severity] = severity if severity
     form[:attachments] = attachments unless attachments.empty?
 
-    issue_file_claim_and_start(
-      endpoint: endpoint, form: form, category: category,
+    issue_file_and_start(
+      endpoint: endpoint, form: form, category: category, status: status,
       local_paths: images.map { |p| File.expand_path(p) }, spawn_session: spawn_session
     )
   end
 end
 
-# Files `form` (already carrying claim_on_create: true) and, unless spawn_session is
-# false, writes its plan and hands it to a Claude session.
+# Resolve the status the issue is filed into.
 #
-# Every caller that files an issue FROM the laptop shares this tail, so a filed
-# issue is always claimed — via claim_on_create in the create request itself
-# (IssuesService.insert writes status=claimed in the same insert transaction
-# server-side, so there is no window where the issue is open and a concurrent
-# `dev issues claim` sweep could grab it). With a session, it also carries a
-# recorded session id and a plan on disk; the ordering there is load-bearing — the
-# session comment and the plan are both written BEFORE the spawn, so a failure
-# leaves a fully recoverable claimed issue rather than a half-filed one.
-def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spawn_session: true)
-  issue = ApiClient.request(endpoint, :post, issues_path, body: form)
+# On a terminal there is a person at the prompt who ran `create` to start working
+# — `claimed` is what they meant, and prompting for it would be a keystroke that
+# always has the same answer. Off a terminal there is no such default that is
+# right: a Claude session files BOTH the work it is doing and findings it is only
+# reporting, and guessing `claimed` for the second kind is exactly the bug this
+# flag exists to stop. So make it say which.
+def issue_create_status(status)
+  return status if status && !status.empty?
+  return "claimed" if $stdin.tty?
+
+  Util.exit_with_error(
+    "--status is required when stdin is not a terminal: `--status claimed` if you are working " \
+    "this issue in THIS session, `--status open` if you are only filing it for the queue. " \
+    "A claimed issue is invisible to `dev issues claim`, so claiming work you are not doing " \
+    "leaves it for nobody."
+  )
+end
+
+# Files `form` at `status` and, unless spawn_session is false, writes its plan and
+# hands it to a Claude session.
+#
+# Every caller that files an issue FROM the laptop shares this tail, and the
+# claim is derived HERE from `status` rather than set by each caller: a caller
+# that forgot `claim_on_create` used to file an OPEN issue and then hand it to a
+# session anyway, which is the same phantom-state bug from the other direction
+# (`dev claude-usage` did exactly that). One producer of the flag, no drift.
+#
+# `claim_on_create` claims in the create request itself (IssuesService.insert
+# writes status=claimed in the same insert transaction server-side), so a claimed
+# issue has no window where it is open and a concurrent `dev issues claim` sweep
+# could grab it. With a session, the issue also carries a recorded session id and
+# a plan on disk; the ordering there is load-bearing — the session comment and the
+# plan are both written BEFORE the spawn, so a failure leaves a fully recoverable
+# claimed issue rather than a half-filed one.
+def issue_file_and_start(endpoint:, form:, category:, status: "claimed", local_paths: [], spawn_session: true)
+  claimed = status == "claimed"
+  issue = ApiClient.request(endpoint, :post, issues_path, body: form.merge(claim_on_create: claimed))
   number = issue.fetch("number")
   puts "Filed #{issue_label(issue)} (#{category})"
+
+  return issue_filed_open(issue) unless claimed
 
   # --no-spawn stops HERE, before any session id or plan exists. The session
   # scaffolding is only meaningful when a session is going to run: minting a uuid
@@ -2620,6 +2688,18 @@ def issue_filed_without_session(issue)
   puts "  dev issues status #{number} --status fixed --url \"<PR URL>\" --app <app> --baseline-version <live version>"
   puts "Or hand it back to the queue:"
   puts "  dev issues status #{number} --status open"
+  issue
+end
+
+# The `--status open` tail: the issue belongs to the queue, and the filer is done
+# with it. Nothing is claimed, no session is started, and there is nothing for the
+# filer to close — so print how it gets picked up rather than how it gets closed.
+def issue_filed_open(issue)
+  number = issue.fetch("number")
+  puts "Left #{issue_label(issue)} open — nobody is working it."
+  puts ""
+  puts "Pick it up later with:"
+  puts "  dev issues claim --issues #{number}"
   issue
 end
 
@@ -6295,10 +6375,9 @@ def queries_offer_investigation(stats, days:, sort:, use_localhost:)
     category: QUERIES_ISSUE_CATEGORY,
     title: queries_issue_title(selected),
     body: queries_issue_body(selected, days: days, sort: sort),
-    claim_on_create: true,
   }
-  issue_file_claim_and_start(
-    endpoint: issue_endpoint(use_localhost), form: form, category: QUERIES_ISSUE_CATEGORY
+  issue_file_and_start(
+    endpoint: issue_endpoint(use_localhost), form: form, category: QUERIES_ISSUE_CATEGORY, status: "claimed"
   )
 end
 
@@ -6603,8 +6682,8 @@ def claude_usage_offer_investigation(stats, days:, sort:, use_localhost:)
     title: claude_usage_issue_title(selected),
     body: claude_usage_issue_body(selected, days: days, sort: sort),
   }
-  issue_file_claim_and_start(
-    endpoint: issue_endpoint(use_localhost), form: form, category: CLAUDE_USAGE_ISSUE_CATEGORY
+  issue_file_and_start(
+    endpoint: issue_endpoint(use_localhost), form: form, category: CLAUDE_USAGE_ISSUE_CATEGORY, status: "claimed"
   )
 end
 

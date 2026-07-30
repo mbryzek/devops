@@ -101,7 +101,7 @@ class TestDevQueriesInvestigate < Minitest::Test
       stub_singleton(Ask, :for_string, ->(_msg, _opts = {}) { answer }) do
         stub_global(:require_playbook_session!, ->(_local) { nil }) do
           stub_global(:issue_endpoint, ->(_local) { "endpoint" }) do
-            stub_global(:issue_file_claim_and_start, lambda { |**kwargs|
+            stub_global(:issue_file_and_start, lambda { |**kwargs|
               filed = kwargs[:form]
               { "number" => "041" }
             }) do

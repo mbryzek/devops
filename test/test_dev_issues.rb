@@ -1386,17 +1386,18 @@ class TestDevIssues < Minitest::Test
     assert_match(/unexpected argument/, out)
   end
 
-  # ---- dev issues create: claim_on_create ----
+  # ---- dev issues create: --status ----
 
-  # `dev issues create` must always ask the server to claim what it files, atomically —
-  # stub issue_file_claim_and_start itself (the codebase's own established boundary:
-  # its network + plan-writing side effects are not exercised by this suite, see
-  # `write_manual_issue_plan`/the module comment at the top of this file) rather than
-  # driving the full HTTP + editor + file-write path.
-  def test_create_requests_claim_on_create
+  # From a terminal there is a person who ran `create` to start working, so the
+  # status they meant is `claimed` and no prompt is worth the keystroke. Stub
+  # issue_file_and_start itself (the codebase's own established boundary: its
+  # network + plan-writing side effects are not exercised by this suite, see
+  # `write_manual_issue_plan`/the module comment at the top of this file) rather
+  # than driving the full HTTP + editor + file-write path.
+  def test_create_defaults_to_claimed_on_a_terminal
     captured = nil
     define_singleton_method(:issue_edit_in_editor) { "Investigate the export bug" }
-    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
       captured = kwargs
       { "number" => "099" }
     end
@@ -1409,7 +1410,112 @@ class TestDevIssues < Minitest::Test
       end
     end
     refute_nil captured
-    assert_equal true, captured.fetch(:form).fetch(:claim_on_create)
+    assert_equal "claimed", captured.fetch(:status)
+  end
+
+  # The bug this flag exists for: a Claude session files both the work it is doing
+  # and findings it is only reporting, and the old always-claim default parked the
+  # second kind in `claimed`, where `dev issues claim` (which only offers OPEN
+  # issues) can never hand it to anyone. Off a terminal there is no safe default,
+  # so refuse to guess.
+  def test_create_without_a_terminal_requires_an_explicit_status
+    define_singleton_method(:issue_file_and_start) { |**| flunk("filed an issue without being told its status") }
+    out, status = capture_stderr_and_exit do
+      with_credentials { with_stdin("Some brief", tty: false) { cmd_issues_create(["--category", "bug", "--body", "Some brief"]) } }
+    end
+    assert_equal 1, status
+    assert_includes out, "--status is required"
+  end
+
+  def test_create_passes_an_explicit_open_status_through
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    with_credentials do
+      with_stdin("Some brief", tty: false) do
+        cmd_issues_create(["--category", "bug", "--status", "open", "--body", "Some brief"])
+      end
+    end
+    assert_equal "open", captured.fetch(:status)
+  end
+
+  # Filing something as the queue's work and opening a session to work it are
+  # contradictory. The stated status wins and the session is dropped — including
+  # when nothing passed --no-spawn, which is the default path.
+  def test_create_with_open_status_starts_no_session
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    with_credentials do
+      with_stdin("Some brief", tty: false) do
+        cmd_issues_create(["--category", "bug", "--status", "open", "--body", "Some brief"])
+      end
+    end
+    assert_equal false, captured.fetch(:spawn_session)
+  end
+
+  # Only the two statuses a NEW issue can honestly be in. Everything downstream
+  # (`fixed`, `deployed`, …) describes work that has happened, so it can only be
+  # reached with `dev issues status`.
+  def test_create_rejects_a_status_that_is_not_open_or_claimed
+    out, status = capture_stderr_and_exit { cmd_issues_create(["--category", "bug", "--status", "fixed"]) }
+    assert_equal 1, status
+    assert_includes out, "--status must be one of: open, claimed"
+  end
+
+  # ---- dev issues create: the claim reaches the server ----
+
+  # The claim has to happen in the create request itself: claiming as a second
+  # call leaves a window where the issue is open and a concurrent `dev issues
+  # claim` sweep could hand the same work to a second session.
+  def test_file_and_start_claims_on_create_for_a_claimed_issue
+    captured = nil
+    define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
+    with_stubbed_api("POST /playbook/issues" => ->(body) { captured = body; { "number" => "099" } }) do
+      capture_stdout do
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "claimed", spawn_session: false
+        )
+      end
+    end
+    assert_equal true, captured.fetch(:claim_on_create)
+  end
+
+  def test_file_and_start_does_not_claim_an_open_issue
+    captured = nil
+    define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for an issue nobody claimed") }
+    out = nil
+    with_stubbed_api("POST /playbook/issues" => ->(body) { captured = body; { "number" => "099" } }) do
+      out = capture_stdout do
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "open"
+        )
+      end
+    end
+    assert_equal false, captured.fetch(:claim_on_create)
+    assert_includes out, "Left ISS-099 open"
+  end
+
+  # An open issue has nothing for the filer to close and no session to resume, so
+  # what it needs printed is how it gets picked up.
+  def test_file_and_start_prints_how_to_claim_an_open_issue
+    out = nil
+    with_stubbed_api("POST /playbook/issues" => { "number" => "099" }) do
+      out = capture_stdout do
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "open"
+        )
+      end
+    end
+    assert_includes out, "dev issues claim --issues 099"
+    refute_includes out, "--status fixed"
   end
 
   # ---- dev issues create: filing without a terminal ----
@@ -1421,13 +1527,13 @@ class TestDevIssues < Minitest::Test
   def test_create_takes_the_brief_from_body_without_opening_an_editor
     captured = nil
     define_singleton_method(:issue_edit_in_editor) { flunk("opened $EDITOR despite --body") }
-    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
       captured = kwargs
       { "number" => "099" }
     end
     with_credentials do
       with_stdin("", tty: false) do
-        cmd_issues_create(["--category", "bug", "--body", "CSV export drops the last row", "--no-spawn"])
+        cmd_issues_create(["--category", "bug", "--status", "claimed", "--body", "CSV export drops the last row", "--no-spawn"])
       end
     end
     assert_equal "CSV export drops the last row", captured.fetch(:form).fetch(:body)
@@ -1437,14 +1543,14 @@ class TestDevIssues < Minitest::Test
   # strip: markdown headings in a brief have to survive verbatim.
   def test_create_keeps_markdown_headings_in_a_body
     captured = nil
-    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
       captured = kwargs
       { "number" => "099" }
     end
     brief = "## Steps\n1. Export\n\n## Expected\nAll rows"
     with_credentials do
       with_stdin("", tty: false) do
-        cmd_issues_create(["--category", "bug", "--body", brief, "--no-spawn"])
+        cmd_issues_create(["--category", "bug", "--status", "claimed", "--body", brief, "--no-spawn"])
       end
     end
     assert_equal brief, captured.fetch(:form).fetch(:body)
@@ -1455,13 +1561,13 @@ class TestDevIssues < Minitest::Test
   def test_create_takes_the_brief_from_piped_stdin
     captured = nil
     define_singleton_method(:issue_edit_in_editor) { flunk("opened $EDITOR on a non-terminal stdin") }
-    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
       captured = kwargs
       { "number" => "099" }
     end
     with_credentials do
       with_stdin("Worker retries forever on a 404\n", tty: false) do
-        cmd_issues_create(["--category", "bug", "--no-spawn"])
+        cmd_issues_create(["--category", "bug", "--status", "claimed", "--no-spawn"])
       end
     end
     assert_equal "Worker retries forever on a 404", captured.fetch(:form).fetch(:body)
@@ -1472,9 +1578,9 @@ class TestDevIssues < Minitest::Test
   # broken" rather than "you have to pass a brief".
   def test_create_without_a_terminal_or_a_body_says_which_flag_to_pass
     define_singleton_method(:issue_edit_in_editor) { flunk("opened $EDITOR on a non-terminal stdin") }
-    define_singleton_method(:issue_file_claim_and_start) { |**| flunk("filed an issue with no brief") }
+    define_singleton_method(:issue_file_and_start) { |**| flunk("filed an issue with no brief") }
     out, status = capture_stderr_and_exit do
-      with_credentials { with_stdin("", tty: false) { cmd_issues_create(["--category", "bug"]) } }
+      with_credentials { with_stdin("", tty: false) { cmd_issues_create(["--category", "bug", "--status", "claimed"]) } }
     end
     assert_equal 1, status
     assert_includes out, "--body"
@@ -1484,9 +1590,9 @@ class TestDevIssues < Minitest::Test
   # answer it cannot parse, so on EOF it would recurse forever instead of failing —
   # never reach it without a terminal.
   def test_create_without_a_terminal_requires_an_explicit_category
-    define_singleton_method(:issue_file_claim_and_start) { |**| flunk("filed an issue with no category") }
+    define_singleton_method(:issue_file_and_start) { |**| flunk("filed an issue with no category") }
     out, status = capture_stderr_and_exit do
-      with_credentials { with_stdin("Some brief", tty: false) { cmd_issues_create(["--body", "Some brief"]) } }
+      with_credentials { with_stdin("Some brief", tty: false) { cmd_issues_create(["--body", "Some brief", "--status", "claimed"]) } }
     end
     assert_equal 1, status
     assert_includes out, "--category is required"
@@ -1505,9 +1611,9 @@ class TestDevIssues < Minitest::Test
     out = nil
     with_stubbed_api("POST /playbook/issues" => filed) do
       out = capture_stdout do
-        issue_file_claim_and_start(
-          endpoint: "https://example.test", form: { category: "bug", claim_on_create: true },
-          category: "bug", spawn_session: false
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "claimed", spawn_session: false
         )
       end
     end
@@ -1525,9 +1631,9 @@ class TestDevIssues < Minitest::Test
     out = nil
     with_stubbed_api("POST /playbook/issues" => { "number" => "099" }) do
       out = capture_stdout do
-        issue_file_claim_and_start(
-          endpoint: "https://example.test", form: { category: "bug", claim_on_create: true },
-          category: "bug", spawn_session: false
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "claimed", spawn_session: false
         )
       end
     end

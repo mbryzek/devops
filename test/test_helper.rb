@@ -130,14 +130,19 @@ module DevTestSupport
   # the network. Credentials are stubbed present here - NetworkGuard reads them as
   # absent, which would stop a command at its credential guard before it ever got
   # to the request under test.
+  #
+  # A stubbed value that responds to #call is called with the request body and its
+  # return value is the response - which is how a test asserts on what was SENT
+  # (a form field, a payload shape) rather than only on what came back.
   def with_stubbed_api(responses)
     test = self
     orig_request = ApiClient.method(:request)
     orig_sid = ApiClient.method(:session_id_for)
-    ApiClient.define_singleton_method(:request) do |_endpoint, method, path, **_opts|
+    ApiClient.define_singleton_method(:request) do |_endpoint, method, path, **opts|
       key = "#{method.to_s.upcase} #{path}"
       test.flunk("unstubbed request: #{key}") unless responses.key?(key)
-      responses.fetch(key)
+      stubbed = responses.fetch(key)
+      stubbed.respond_to?(:call) ? stubbed.call(opts[:body]) : stubbed
     end
     ApiClient.define_singleton_method(:session_id_for) { |app, use_localhost:| "sess-#{app}" }
     yield
