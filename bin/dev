@@ -3014,6 +3014,15 @@ def issue_fix_deployment(issue)
   (issue["fixes"] || []).last&.fetch("deployment", nil)
 end
 
+# The repo of the latest fix, when that fix is a merged PR in the org. nil for a
+# document fix (a Google Doc describing a manual/process fix), which really does
+# need a human — there is no repo, and nothing to infer a release from.
+def issue_fix_repo(issue)
+  url = (issue["fixes"] || []).last&.fetch("url", nil)
+  m = url.to_s.match(%r{github\.com/#{ISSUE_PR_SEARCH_OWNER}/([^/]+)/pull/\d+})
+  m && m[1]
+end
+
 # ---------- claimed -> fixed, adopted from merged PRs ----------
 #
 # `claimed -> fixed` is the one transition in the issue lifecycle with no
@@ -3266,8 +3275,28 @@ def cmd_issues_reconcile(args)
     fixed.each do |c|
       deployment = issue_fix_deployment(c)
       if deployment.nil?
-        puts "  skip #{issue_link(c)}: no deploy info (document fix — advance manually)"
-        skipped += 1
+        # No deploy pair, but the fix may still be provably live: a merged PR in a
+        # repo that releases nothing IS its own release. The adoption pass applies
+        # the same rule at merge time; this catches the issues that got here the
+        # other way — a session running `dev issues status --status fixed --url`,
+        # exactly as the done-checklist tells it to. Without this they sit in
+        # `fixed` forever waiting on a release that is never coming (ISS-131 did).
+        repo = issue_fix_repo(c)
+        if repo && issue_repo_releases_nothing?(registry, repo)
+          if apply
+            ApiClient.request(endpoint, :put,
+                              issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
+                              body: { status: "deployed", visibility: "internal",
+                                      comment: "#{repo} releases nothing, so the merge is the release. Awaiting verification." })
+            puts "  deployed #{issue_link(c)} (#{repo} releases nothing — the merge is the release)"
+          else
+            puts "  would deploy #{issue_link(c)} (#{repo} releases nothing — the merge is the release)"
+          end
+          deployed += 1
+        else
+          puts "  skip #{issue_link(c)}: no deploy info (document fix — advance manually)"
+          skipped += 1
+        end
         next
       end
       app_name = deployment["app"]
