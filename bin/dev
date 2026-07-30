@@ -66,7 +66,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
@@ -325,7 +325,11 @@ USAGE = <<~USAGE
         improvement: the manually-filed categories, mirroring the changelog
         vocabulary; graphs/worker/insights are auto-filed and batch-claimed by
         `issues claim`), then opens $EDITOR on a buffer that IS the brief the
-        Claude session works from. No title is needed: the server files the issue
+        Claude session works from. The brief can come from --body "TEXT" or be
+        piped in on stdin instead — that is what a headless caller (a Claude
+        session filing the work it is already doing, cron) must use, since there
+        is no terminal there to open $EDITOR on; --category is required in that
+        case too, for the same reason. No title is needed: the server files it
         under a placeholder ("New Bug", …) and a background task summarizes the
         body into a real one moments later — pass --title to set it yourself.
         A URL on its own line is recorded as the page the issue is about
@@ -338,7 +342,10 @@ USAGE = <<~USAGE
         Claude session id (an internal timeline comment), written to a plan under
         ~/code/claude/plans/, and the terminal is handed to an interactive session
         (Opus 5, 1M context) pinned to that session id. Reattach later with
-        `dev issues resume`. Pass --no-spawn to stop after writing the plan.
+        `dev issues resume`. Pass --no-spawn to stop once the issue is filed and
+        claimed — no session id, no plan, nothing to resume: that is the mode for
+        filing work you are already doing yourself, and it prints the
+        `issues status` command to close it.
         Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first.
 
@@ -2357,6 +2364,41 @@ def issue_resume_claude_argv(uuid)
   ["claude", "--resume", uuid]
 end
 
+# Where the brief comes from, in precedence order: --body, then piped stdin, then
+# $EDITOR. Only the last of those needs a terminal, so a headless caller (a Claude
+# session filing its own work, cron, `claude --print`) has two ways to file without
+# one — before this, every `create` shelled out to $EDITOR unconditionally and died
+# on the non-tty with a screenful of vim escape codes.
+#
+# Returns nil when nothing meaningful was supplied, which aborts before any API call.
+# `#` lines are stripped ONLY out of the editor buffer, where they are the
+# template's own instructions. A --body/piped brief is taken verbatim: it is written
+# by a caller, not a template, and markdown headings there are content.
+def issue_resolve_brief(body)
+  return issue_nonempty_brief(body) if body && !body.empty?
+  return issue_edit_in_editor if $stdin.tty?
+
+  # Non-interactive with no --body: stdin IS the brief. Empty stdin here is a
+  # caller that meant to pass one and didn't, so say which flag to reach for
+  # rather than aborting with the generic "empty issue".
+  piped = issue_nonempty_brief($stdin.read)
+  if piped.nil?
+    Util.exit_with_error(
+      "No issue body (stdin is not a terminal, so $EDITOR cannot be opened, and nothing was piped in). " \
+      "Pass --body \"TEXT\" or pipe the brief on stdin."
+    )
+  end
+  piped
+end
+
+# A brief supplied verbatim (--body, piped stdin): nil when it holds nothing but
+# whitespace, mirroring parse_issue_editor_brief's contract so both sources abort
+# the same way.
+def issue_nonempty_brief(text)
+  content = text.to_s.strip
+  content.empty? ? nil : content
+end
+
 # Open $EDITOR on the commit-style template and parse the result. Falls back to
 # vi when neither VISUAL nor EDITOR is set, matching git's own behaviour.
 def issue_edit_in_editor
@@ -2369,8 +2411,8 @@ def issue_edit_in_editor
   end
 end
 
-# File a new issue from the laptop and hand it straight to a Claude session.
-# Ordering is load-bearing: the editor and every upload happen BEFORE the issue
+# File a new issue and (unless --no-spawn) hand it straight to a Claude session.
+# Ordering is load-bearing: the brief and every upload happen BEFORE the issue
 # is created, and the session comment + plan are written BEFORE the spawn — so a
 # failure leaves either nothing at all or a fully recoverable claimed issue,
 # never a half-filed one.
@@ -2379,6 +2421,7 @@ def cmd_issues_create(args)
   title = nil
   category = nil
   severity = nil
+  body = nil
   images = []
   spawn_session = true
   leftover = []
@@ -2386,6 +2429,10 @@ def cmd_issues_create(args)
   while i < rest.length
     a = rest[i]
     case a
+    when "--body"
+      body = rest[i + 1]
+      usage_exit("--body requires a value", example: usage_for("issues create")) if body.nil?
+      i += 2
     when "--title"
       title = rest[i + 1]
       usage_exit("--title requires a value", example: usage_for("issues create")) if title.nil?
@@ -2431,9 +2478,18 @@ def cmd_issues_create(args)
 
   require_playbook_session!(use_localhost)
 
+  # The category prompt is the other thing in this command that needs a terminal:
+  # Ask.select_from_list re-asks itself on an unparseable answer, so on a non-tty it
+  # would spin on EOF forever rather than fail. Make the caller name it instead.
+  if category.nil? && !$stdin.tty?
+    Util.exit_with_error(
+      "--category is required when stdin is not a terminal (nothing can answer the prompt): " \
+      "one of #{ISSUE_MANUAL_CATEGORIES.join(', ')}."
+    )
+  end
   category ||= Ask.select_from_list("Category", ISSUE_MANUAL_CATEGORIES)
 
-  brief = issue_edit_in_editor
+  brief = issue_resolve_brief(body)
   Util.exit_with_error("Aborting: empty issue. Nothing filed.") if brief.nil?
 
   # Lift the pasted page URL and any pasted file paths out of the brief: the URL
@@ -2471,22 +2527,29 @@ def cmd_issues_create(args)
   end
 end
 
-# Files `form` (already carrying claim_on_create: true), writes its plan, and hands
-# it to a Claude session.
+# Files `form` (already carrying claim_on_create: true) and, unless spawn_session is
+# false, writes its plan and hands it to a Claude session.
 #
 # Every caller that files an issue FROM the laptop shares this tail, so a filed
-# issue is always in the same state whatever produced it: claimed — via
-# claim_on_create in the create request itself (IssuesService.insert writes
-# status=claimed in the same insert transaction server-side, so there is no
-# window where the issue is open and a concurrent `dev issues claim` sweep could
-# grab it) — with a session id recorded and a plan on disk. The remaining
-# ordering is still load-bearing — the session comment and the plan are both
-# written BEFORE the spawn, so a failure leaves a fully recoverable claimed issue
-# rather than a half-filed one.
+# issue is always claimed — via claim_on_create in the create request itself
+# (IssuesService.insert writes status=claimed in the same insert transaction
+# server-side, so there is no window where the issue is open and a concurrent
+# `dev issues claim` sweep could grab it). With a session, it also carries a
+# recorded session id and a plan on disk; the ordering there is load-bearing — the
+# session comment and the plan are both written BEFORE the spawn, so a failure
+# leaves a fully recoverable claimed issue rather than a half-filed one.
 def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spawn_session: true)
   issue = ApiClient.request(endpoint, :post, issues_path, body: form)
   number = issue.fetch("number")
   puts "Filed #{issue_label(issue)} (#{category})"
+
+  # --no-spawn stops HERE, before any session id or plan exists. The session
+  # scaffolding is only meaningful when a session is going to run: minting a uuid
+  # for a session that never starts leaves `dev issues resume` pointing at a
+  # nonexistent Claude session, and the plan is a brief for a fresh session that,
+  # in the --no-spawn case, is not coming — the caller (a Claude session filing
+  # the work it is already doing) is the one who will close it.
+  return issue_filed_without_session(issue) unless spawn_session
 
   # Mint the session id HERE so it is recorded even if the session dies on its
   # first turn — the model is never asked to self-report it.
@@ -2499,11 +2562,6 @@ def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spa
   puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
 
   prompt = issue_prompt_with_tab_title([issue], issue_session_prompt(category, path))
-  unless spawn_session
-    puts ""
-    puts "Start it with:  #{issue_create_claude_argv(prompt, uuid).join(' ')}"
-    return issue
-  end
 
   puts ""
   puts "Starting Claude session (Opus 5, 1M context)..."
@@ -2514,6 +2572,26 @@ def issue_file_claim_and_start(endpoint:, form:, category:, local_paths: [], spa
     warn "Could not start Claude (#{e.message}). #{issue_label(issue)} is claimed and the plan is saved — resume with:"
     warn "  dev issues resume #{number}"
   end
+  issue
+end
+
+# The --no-spawn tail: the issue is filed and claimed, and that is the whole
+# artifact. Print what the filer needs next — how to close it — rather than a
+# paste-ready `claude` command for a session nobody asked to start.
+#
+# The issue IS claimed (claim_on_create), which keeps a concurrent `dev issues
+# claim` sweep from handing the same work to a second session. The tradeoff: since
+# `claim` only offers OPEN issues, this one will not resurface there — put it back
+# in the queue with `dev issues status <n> --status open` if you want it worked by
+# someone else after all.
+def issue_filed_without_session(issue)
+  number = issue.fetch("number")
+  puts "Claimed #{issue_label(issue)} — no session started (--no-spawn)."
+  puts ""
+  puts "Close it when the fix ships:"
+  puts "  dev issues status #{number} --status fixed --url \"<PR URL>\" --app <app> --baseline-version <live version>"
+  puts "Or hand it back to the queue:"
+  puts "  dev issues status #{number} --status open"
   issue
 end
 

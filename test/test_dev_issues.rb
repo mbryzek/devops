@@ -1047,11 +1047,139 @@ class TestDevIssues < Minitest::Test
       captured = kwargs
       { "number" => "099" }
     end
+    # tty: true pins this to the editor path it stubs — on a non-terminal stdin the
+    # brief would come from stdin instead, and which branch ran would depend on how
+    # the suite was invoked.
     with_credentials do
-      cmd_issues_create(["--category", "bug", "--title", "Export bug", "--no-spawn"])
+      with_stdin("", tty: true) do
+        cmd_issues_create(["--category", "bug", "--title", "Export bug", "--no-spawn"])
+      end
     end
     refute_nil captured
     assert_equal true, captured.fetch(:form).fetch(:claim_on_create)
+  end
+
+  # ---- dev issues create: filing without a terminal ----
+
+  # The whole point of --body: a caller with no terminal (a Claude session filing the
+  # work it is already doing, cron, `claude --print`) can file an issue. Before this,
+  # `create` shelled out to $EDITOR unconditionally, so every headless run died on
+  # `vi` — "Editor `vi` exited non-zero. Nothing filed."
+  def test_create_takes_the_brief_from_body_without_opening_an_editor
+    captured = nil
+    define_singleton_method(:issue_edit_in_editor) { flunk("opened $EDITOR despite --body") }
+    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    with_credentials do
+      with_stdin("", tty: false) do
+        cmd_issues_create(["--category", "bug", "--body", "CSV export drops the last row", "--no-spawn"])
+      end
+    end
+    assert_equal "CSV export drops the last row", captured.fetch(:form).fetch(:body)
+  end
+
+  # A --body is content, not an editor buffer, so `#` lines are NOT instructions to
+  # strip: markdown headings in a brief have to survive verbatim.
+  def test_create_keeps_markdown_headings_in_a_body
+    captured = nil
+    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    brief = "## Steps\n1. Export\n\n## Expected\nAll rows"
+    with_credentials do
+      with_stdin("", tty: false) do
+        cmd_issues_create(["--category", "bug", "--body", brief, "--no-spawn"])
+      end
+    end
+    assert_equal brief, captured.fetch(:form).fetch(:body)
+  end
+
+  # The unix half of the same escape hatch: with no --body and no terminal, stdin IS
+  # the brief.
+  def test_create_takes_the_brief_from_piped_stdin
+    captured = nil
+    define_singleton_method(:issue_edit_in_editor) { flunk("opened $EDITOR on a non-terminal stdin") }
+    define_singleton_method(:issue_file_claim_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    with_credentials do
+      with_stdin("Worker retries forever on a 404\n", tty: false) do
+        cmd_issues_create(["--category", "bug", "--no-spawn"])
+      end
+    end
+    assert_equal "Worker retries forever on a 404", captured.fetch(:form).fetch(:body)
+  end
+
+  # No --body, no terminal, nothing piped: name the flag to reach for. The old
+  # failure here was a screenful of vim escape codes, which read as "the tool is
+  # broken" rather than "you have to pass a brief".
+  def test_create_without_a_terminal_or_a_body_says_which_flag_to_pass
+    define_singleton_method(:issue_edit_in_editor) { flunk("opened $EDITOR on a non-terminal stdin") }
+    define_singleton_method(:issue_file_claim_and_start) { |**| flunk("filed an issue with no brief") }
+    out, status = capture_stderr_and_exit do
+      with_credentials { with_stdin("", tty: false) { cmd_issues_create(["--category", "bug"]) } }
+    end
+    assert_equal 1, status
+    assert_includes out, "--body"
+  end
+
+  # The other prompt in this command. Ask.select_from_list re-asks itself on an
+  # answer it cannot parse, so on EOF it would recurse forever instead of failing —
+  # never reach it without a terminal.
+  def test_create_without_a_terminal_requires_an_explicit_category
+    define_singleton_method(:issue_file_claim_and_start) { |**| flunk("filed an issue with no category") }
+    out, status = capture_stderr_and_exit do
+      with_credentials { with_stdin("Some brief", tty: false) { cmd_issues_create(["--body", "Some brief"]) } }
+    end
+    assert_equal 1, status
+    assert_includes out, "--category is required"
+  end
+
+  # ---- dev issues create: --no-spawn writes no session scaffolding ----
+
+  # --no-spawn means no session is coming, so the session id and the plan are both
+  # wrong to write: the uuid would leave `dev issues resume` pointing at a Claude
+  # session that never existed, and the plan is a brief for a fresh session when the
+  # caller filing the issue is the one already working it. Only the create POST is
+  # stubbed — a session comment POST would fail the test as an unstubbed request.
+  def test_no_spawn_records_no_session_and_writes_no_plan
+    define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
+    filed = { "number" => "099", "status" => "claimed" }
+    out = nil
+    with_stubbed_api("POST /playbook/issues" => filed) do
+      out = capture_stdout do
+        issue_file_claim_and_start(
+          endpoint: "https://example.test", form: { category: "bug", claim_on_create: true },
+          category: "bug", spawn_session: false
+        )
+      end
+    end
+    assert_includes out, "Filed ISS-099 (bug)"
+    assert_includes out, "no session started"
+    refute_includes out, "reattach later"
+    refute_includes out, "Start it with"
+  end
+
+  # What the filer actually needs next is how to close the issue — it is already
+  # claimed, and `dev issues claim` only offers OPEN issues, so the way back into
+  # the queue has to be printed too or the issue looks stranded.
+  def test_no_spawn_prints_how_to_close_the_issue
+    define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
+    out = nil
+    with_stubbed_api("POST /playbook/issues" => { "number" => "099" }) do
+      out = capture_stdout do
+        issue_file_claim_and_start(
+          endpoint: "https://example.test", form: { category: "bug", claim_on_create: true },
+          category: "bug", spawn_session: false
+        )
+      end
+    end
+    assert_includes out, "dev issues status 099 --status fixed"
+    assert_includes out, "dev issues status 099 --status open"
   end
 
   # ---- dev issues list (read-only) ----
