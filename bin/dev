@@ -273,7 +273,10 @@ USAGE = <<~USAGE
         and push changes to main. Use --app NAME to limit to one repo (matched by
         directory name under ~/code). The temp dir is deleted on success unless
         --keep-tmp-dir is passed; it is always kept if any repo fails so output
-        can be inspected. Quiet by default; use --verbose to stream full output.
+        can be inspected. Any ~/code/browserslist.* dirs left behind by earlier
+        runs (a failed run keeps its clones) are deleted first, so at most one
+        run's worth of node_modules is ever on disk. Quiet by default; use
+        --verbose to stream full output.
 
     #{INVOCATIONS["codegen sync"]}
         Regenerate every codegen-consuming repo against the latest generator and
@@ -3422,6 +3425,82 @@ def cmd_features_cancel(args)
   end
 end
 
+# ---------- scratch workdirs ----------
+#
+# `dev codegen sync` and `dev browserslist update` clone every repo into a
+# timestamped throwaway dir under ~/code (codegen-sync.<run_id>,
+# browserslist.<date>). Each clone drags in its own node_modules — one sweep is
+# ~2-3 GB, largely duplicated 112 MB `workerd` binaries — and nothing ever
+# removed them, so by 2026-07-30 twenty-eight abandoned sweeps held ~48 GB.
+#
+# Every run now purges its own older siblings before it clones anything. These
+# dirs are pure scratch: the clones are disposable, any real output is already
+# pushed as a branch/PR, and the one consumed artifact (codegen-sync-status.json)
+# is read out of the newest dir right after the run that wrote it. Purging FIRST
+# rather than at the end leaves the current run's dir intact for that reader
+# while still bounding disk use to roughly one run's worth.
+
+CODE_ROOT = File.expand_path("~/code")
+
+# A dir touched this recently may belong to a sweep that is still running, whose
+# clones must not be deleted from under it. A sweep clones everything up front
+# and then works inside the clones, so its top-level mtime can lag the run by a
+# long while — hence hours, not minutes.
+SCRATCH_ACTIVE_WINDOW_SECS = 3 * 60 * 60
+
+def format_bytes(bytes)
+  units = %w[B KB MB GB TB]
+  i = 0
+  size = bytes.to_f
+  while size >= 1024 && i < units.length - 1
+    size /= 1024
+    i += 1
+  end
+  i.zero? ? "#{bytes} B" : format("%.1f %s", size, units[i])
+end
+
+# Apparent disk usage of `dir` in bytes, or 0 when `du` can't report it. Shelling
+# out to du beats walking the tree in Ruby and matches what Finder reports.
+def dir_size_bytes(dir)
+  out, _err, status = Open3.capture3("du", "-sk", dir)
+  return 0 unless status.success?
+  out.split("\t").first.to_i * 1024
+rescue Errno::ENOENT
+  0
+end
+
+# Scratch dirs matching ~/code/<prefix>.* that are safe to delete: not `keep`
+# (the current run's dir) and not modified inside the active window. `root` and
+# `now` are injected by tests; callers use the defaults.
+def stale_scratch_workdirs(prefix, keep: nil, root: CODE_ROOT, now: Time.now)
+  cutoff = now - SCRATCH_ACTIVE_WINDOW_SECS
+  keep = File.expand_path(keep) if keep
+  Dir.glob(File.join(root, "#{prefix}.*"))
+     .select { |p| File.directory?(p) && !File.symlink?(p) }
+     .reject { |p| keep && File.expand_path(p) == keep }
+     .reject { |p| File.mtime(p) > cutoff }
+     .sort
+end
+
+# Deletes prior runs' scratch dirs and reports what it reclaimed. Called at the
+# START of a sweep, before cloning, so a run always begins from a clean slate.
+def purge_scratch_workdirs(prefix, keep: nil, root: CODE_ROOT)
+  stale = stale_scratch_workdirs(prefix, keep: keep, root: root)
+  return 0 if stale.empty?
+
+  puts "Cleaning up #{stale.length} stale #{prefix}.* dir(s) from prior runs:"
+  reclaimed = 0
+  stale.each do |dir|
+    bytes = dir_size_bytes(dir)
+    FileUtils.rm_rf(dir)
+    reclaimed += bytes
+    puts "  removed #{File.basename(dir)} (#{format_bytes(bytes)})"
+  end
+  puts "Reclaimed #{format_bytes(reclaimed)}."
+  puts ""
+  reclaimed
+end
+
 # ---------- docker prune ----------
 
 def cmd_docker_prune(args)
@@ -3788,6 +3867,10 @@ CODEGEN_DEVOPS_REPO = "mbryzek/devops".freeze
 # branch from a prior run never blocks or gets clobbered. The gate against
 # duplicate work is an OPEN PR (see open_codegen_pr), not branch existence.
 CODEGEN_BRANCH_PREFIX = "codegen-sync".freeze
+# The scratch dir under ~/code holding a sweep's clones — same stem as the
+# branch, so one run's dir and branch are recognizably a pair, and
+# purge_scratch_workdirs can find prior runs by this prefix.
+CODEGEN_WORKDIR_PREFIX = CODEGEN_BRANCH_PREFIX
 CODEGEN_STACKS = %i[scala elm sveltekit].freeze
 CODEGEN_CLAUDE_TIMEOUT_SECS = 20 * 60
 # The per-repo sessions do mechanical work (fix compile errors, commit, open a
@@ -4176,7 +4259,9 @@ def cmd_codegen_sync(argv)
   # name so reruns never collide with a prior run's clones or remote branch.
   run_id = ENV["CODEGEN_SYNC_DATE"] || Time.now.strftime("%Y%m%d-%H%M%S")
   branch = "#{CODEGEN_BRANCH_PREFIX}-#{run_id}"
-  workdir = File.expand_path("~/code/codegen-sync.#{run_id}")
+  workdir = File.join(CODE_ROOT, "#{CODEGEN_WORKDIR_PREFIX}.#{run_id}")
+  # Before cloning ~2-3 GB of fresh checkouts, reclaim every prior sweep's.
+  purge_scratch_workdirs(CODEGEN_WORKDIR_PREFIX, keep: workdir)
   FileUtils.mkdir_p(workdir)
   ensure_codegen_devops(workdir)
 
@@ -4789,6 +4874,10 @@ end
 
 # ---------- browserslist ----------
 
+# Scratch dir stem under ~/code for a browserslist sweep's clones — one dir per
+# day, and purge_scratch_workdirs finds earlier days by this prefix.
+BROWSERSLIST_WORKDIR_PREFIX = "browserslist".freeze
+
 def git_current_branch(path)
   # -q keeps `symbolic-ref` from printing "fatal: ref HEAD is not a symbolic ref"
   # to stderr for a detached HEAD — that's an expected state here (caller treats a
@@ -5171,7 +5260,9 @@ def cmd_browserslist_update(args)
   end
 
   date = Time.now.strftime("%Y%m%d")
-  workdir = File.join(code_root, "browserslist.#{date}")
+  workdir = File.join(code_root, "#{BROWSERSLIST_WORKDIR_PREFIX}.#{date}")
+  # Reclaim earlier days' clones before adding another day's worth.
+  purge_scratch_workdirs(BROWSERSLIST_WORKDIR_PREFIX, keep: workdir)
   FileUtils.mkdir_p(workdir) unless File.directory?(workdir)
 
   puts "Working in #{workdir}"
