@@ -254,7 +254,7 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["docker prune"]}
         Remove stopped containers, unused images, and build cache older than N
-        days (default 7), plus every unused volume (docker offers no age filter
+        days (default 30), plus every unused volume (docker offers no age filter
         for volumes). Useful when local disk fills from pushed-but-unused builds.
         Dry-run by default: reports the actual candidates per step, so the sizes
         describe this run rather than `docker system df`'s RECLAIMABLE column,
@@ -3569,6 +3569,29 @@ def docker_anonymous_volume?(volume)
   volume["Labels"].to_s.include?("com.docker.volume.anonymous")
 end
 
+def docker_cache_parents(record)
+  record["Parent"].to_s.split(/[,\s]+/).reject(&:empty?)
+end
+
+# Which aged-out build cache records buildkit can actually release. A record is
+# pinned as long as anything descended from it is retained — the base layer a
+# recent build still reuses was itself pulled months ago, so it dates as ancient
+# while being very much in use. buildkit's until filter selects those records and
+# then frees nothing, which is how a 2.54GB estimate turned into a 0B run: all 56
+# aged records on that box were ancestors of recently-used ones.
+def docker_releasable_cache(aged, retained:, all:)
+  by_id = all.each_with_object({}) { |r, h| h[r["ID"]] = r }
+  pinned = Set.new
+  stack = retained.map { |r| r["ID"] }
+  until stack.empty?
+    id = stack.pop
+    next if pinned.include?(id) || !by_id.key?(id)
+    pinned << id
+    stack.concat(docker_cache_parents(by_id[id]))
+  end
+  aged.reject { |r| pinned.include?(r["ID"]) }
+end
+
 # One prune step's candidates. `at_least` marks a byte total that is a lower
 # bound rather than a figure to hold the command to.
 DockerPruneStep = Struct.new(:label, :cmd, :unit, :count, :bytes, :at_least, :note,
@@ -3589,10 +3612,13 @@ def docker_prune_plan(df, cutoff:, keep_named_volumes: false)
   # Containers is "0" for unreferenced and "-1" when docker declined to compute it.
   images = (df["Images"] || [])
            .select { |i| i["Containers"].to_i <= 0 && docker_older?(i["CreatedAt"], cutoff) }
-  cache = (df["BuildCache"] || []).select do |r|
+  all_cache = df["BuildCache"] || []
+  aged_cache, retained_cache = all_cache.partition do |r|
     stamp = r["LastUsedAt"].to_s.empty? ? r["CreatedAt"] : r["LastUsedAt"]
     docker_older?(stamp, cutoff)
   end
+  cache = docker_releasable_cache(aged_cache, retained: retained_cache, all: all_cache)
+  cache_pinned = aged_cache.length - cache.length
   unused_volumes = (df["Volumes"] || []).select { |v| v["Links"].to_i.zero? }
   volumes = keep_named_volumes ? unused_volumes.select { |v| docker_anonymous_volume?(v) } : unused_volumes
 
@@ -3614,14 +3640,15 @@ def docker_prune_plan(df, cutoff:, keep_named_volumes: false)
       label: "images", unit: "image", count: images.length,
       # Clamp: a negative UniqueSize is a docker accounting artifact, not disk
       # that comes back, and letting it subtract would understate the step.
-      bytes: images.sum { |i| [docker_parse_size(i["UniqueSize"]), 0].max }, at_least: true,
-      note: "unique layers only; shared layers free up as their last holder goes"
+      bytes: images.sum { |i| [docker_parse_size(i["UniqueSize"]), 0].max }, at_least: false,
+      note: "unique among images; layers the build cache also pins free only when it goes"
     ),
     DockerPruneStep.new(
       label: "build cache", unit: "record", count: cache.length,
       bytes: cache.reject { |r| r["Shared"] == "true" }.sum { |r| docker_parse_size(r["Size"]) },
       at_least: true,
-      note: "non-shared records only; shared ones free up once the images above go"
+      note: "non-shared and unpinned" +
+            (cache_pinned.zero? ? "" : "; #{cache_pinned} aged record(s) pinned by newer descendants")
     ),
     DockerPruneStep.new(
       label: "volumes", unit: "volume", count: volumes.length,
@@ -3660,40 +3687,61 @@ def render_docker_prune_plan(steps)
     puts format("  %-#{width}s  %-14s %10s   (%s)", s.label, objects, size, s.note)
   end
   total = steps.sum(&:bytes)
-  puts format("  %-#{width}s  %-14s %10s", "total", "", ">= #{docker_format_size(total)}")
+  prefix = steps.any?(&:at_least) ? ">= " : "   "
+  puts format("  %-#{width}s  %-14s %10s", "total", "", "#{prefix}#{docker_format_size(total)}")
 end
 
-# Stream a prune step's output while collecting the "Total reclaimed space" line
-# docker prints at the end — that figure is authoritative, unlike anything we can
-# compute up front, so the run summary is built from docker's own numbers.
+# Stream a prune step's output while collecting the total docker prints at the
+# end — that figure is authoritative, unlike anything we can compute up front, so
+# the run summary is built from docker's own numbers.
+#
+# Two spellings, because the build cache step is not the same program: container,
+# image and volume prune print "Total reclaimed space: 1.2GB", while `docker
+# builder prune` delegates to buildx, which prints a tab-separated "Total:\t0B".
+# Matching only the first spelling silently reports every cache prune as 0B.
+DOCKER_RECLAIMED_LINE = /^Total(?: reclaimed space)?:\s*(\S+)\s*$/
+
 def run_docker_prune_step(cmd)
   reclaimed = 0
   IO.popen(cmd, err: [:child, :out]) do |io|
     io.each_line do |line|
       print line
-      m = /Total reclaimed space:\s*(\S+)/.match(line)
+      m = DOCKER_RECLAIMED_LINE.match(line)
       reclaimed = docker_parse_size(m[1]) if m
     end
   end
   [$?.success?, reclaimed]
 end
 
-def cmd_docker_prune(args)
-  days = 7
-  apply = false
-  keep_named_volumes = false
+DockerPruneOptions = Struct.new(:days, :apply, :keep_named_volumes, keyword_init: true)
+
+# 30 days rather than a week: an image or cache record that goes a month untouched
+# is genuinely stale, whereas a 7-day window swept up layers still being rebuilt
+# against daily.
+DOCKER_PRUNE_DEFAULT_DAYS = 30
+
+def parse_docker_prune_args(args)
+  opts = DockerPruneOptions.new(days: DOCKER_PRUNE_DEFAULT_DAYS, apply: false, keep_named_volumes: false)
   while (arg = args.shift)
     case arg
     when "--days"
       raw = args.shift or usage_exit("--days requires a value", example: usage_for("docker prune"))
-      days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("docker prune"))
-    when "--apply" then apply = true
-    when "--keep-named-volumes" then keep_named_volumes = true
+      opts.days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("docker prune"))
+    when "--apply" then opts.apply = true
+    when "--keep-named-volumes" then opts.keep_named_volumes = true
     when "-h", "--help" then puts USAGE; exit 0
     else usage_exit("Unknown flag: #{arg}", example: usage_for("docker prune"))
     end
   end
-  usage_exit("--days must be > 0", example: usage_for("docker prune")) if days <= 0
+  usage_exit("--days must be > 0", example: usage_for("docker prune")) if opts.days <= 0
+  opts
+end
+
+def cmd_docker_prune(args)
+  opts = parse_docker_prune_args(args)
+  days = opts.days
+  apply = opts.apply
+  keep_named_volumes = opts.keep_named_volumes
 
   hours = days * 24
   filter = "until=#{hours}h"
