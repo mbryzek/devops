@@ -126,6 +126,26 @@ class TestDeployProgress < Minitest::Test
     assert_includes out, "platform  FAILED"
   end
 
+  # The recap belongs under the FAILED line, not above it. Two apps finishing
+  # into one stream put the second app's phases directly beneath the first
+  # app's summary line, which reads as the first app's — that's how a
+  # 19-second failure appeared to have run a 97-second stage.
+  def test_failure_phase_list_prints_below_its_own_header
+    io = tty_io
+    p = DeployProgress.new(io: io)
+    p.start("properties")
+    p.start("acumen")
+    p.feed("acumen", "Pushing Docker image... done (97s)\n")
+    p.finish("properties", ok: false)
+    p.finish("acumen", ok: false)
+
+    # The live block redraws the running stage every tick, so compare against
+    # the LAST occurrence — the recap — not the first.
+    lines = visible(io).lines.map(&:rstrip).reject(&:empty?)
+    assert_operator lines.index { |l| l.include?("acumen  FAILED") },
+      :<, lines.rindex { |l| l.include?("Pushing Docker image... done (97s)") }
+  end
+
   # A release killed mid-stage never prints the stage's completion half. Left
   # alone that stage would render as still running forever.
   def test_unfinished_phase_is_closed_out_on_finish
@@ -219,6 +239,35 @@ class TestDeployProgress < Minitest::Test
     p.message("Phase 2: releasing platform")
 
     assert_includes visible(io), "Phase 2: releasing platform"
+  end
+
+  # --- encoding ------------------------------------------------------------
+
+  # Pipe reads are ASCII-8BIT and land on arbitrary byte boundaries, so a
+  # multi-byte character routinely arrives split in half. Reassembling it in a
+  # UTF-8 buffer raises; the display holds bytes and decodes whole lines.
+  def test_feed_handles_a_multibyte_character_split_across_chunks
+    io = plain_io
+    p = DeployProgress.new(io: io)
+    p.start("acumen")
+    bytes = "Syncing ConfigMap → Secrets... done (2s)\n".b
+    split = bytes.index("\xE2".b) + 1
+    p.feed("acumen", bytes[0, split])
+    p.feed("acumen", bytes[split..])
+
+    assert_includes visible(io), "acumen  Syncing ConfigMap → Secrets... done (2s)"
+    assert io.string.valid_encoding?
+  end
+
+  # Malformed bytes (a truncated stream, binary junk in a build tool's output)
+  # must not crash the display — they render as replacement characters.
+  def test_feed_scrubs_invalid_bytes
+    io = plain_io
+    p = DeployProgress.new(io: io)
+    p.start("acumen")
+    p.feed("acumen", "Building \xE2 image... done (2s)\n".dup.force_encoding(Encoding::ASCII_8BIT))
+
+    assert_includes visible(io), "done (2s)"
   end
 
   # --- disabled ------------------------------------------------------------

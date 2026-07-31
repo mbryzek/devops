@@ -203,6 +203,18 @@ module Util
       "\e]8;;#{url}\e\\#{text}\e]8;;\e\\"
     end
 
+    # Decode subprocess bytes as UTF-8, replacing anything invalid.
+    #
+    # Every pipe read hands back ASCII-8BIT, and a chunked read can split a
+    # multi-byte character across two chunks. Two things then go wrong unless
+    # the bytes are decoded deliberately: a regex match on the raw string can
+    # blow up on a malformed byte, and writing it to a text-mode IO transcodes
+    # (Encoding::UndefinedConversionError). Hold subprocess output as binary,
+    # and run it through here at the edges where it becomes text.
+    def Util.to_utf8(str)
+      str.to_s.dup.force_encoding(Encoding::UTF_8).scrub
+    end
+
     def Util.installed?(cmd)
       system("which #{cmd} > /dev/null 2>&1") ? true : false
     end

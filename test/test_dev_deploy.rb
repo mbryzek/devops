@@ -335,6 +335,26 @@ class TestPendingReleaseOrchestration < Minitest::Test
     assert_equal 1, err.status
   end
 
+  # The captured log in `results` can be short (a crash message, an empty
+  # buffer) exactly when the failure is least obvious. The per-app log file
+  # holds everything, so the summary names it — the one-time hint printed
+  # before the release started has long since scrolled away.
+  def test_failure_summary_names_the_apps_log_file
+    app = "test-dev-deploy-log-fixture"
+    path = deploy_log_path(app)
+    File.write(path, "the full story\n")
+    @rows = [[app, { tag: "0.0.1", ahead: 1, last: "abc" }]]
+    @release_results = { app => { ok: false, log: "boom" } }
+
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
+
+    assert_equal 1, exc.status
+    assert_includes out, "full log: #{path}"
+    assert_includes out, "boom"
+  ensure
+    File.delete(path) if path && File.exist?(path)
+  end
+
   def test_releases_prod_stale_app_with_no_new_commits
     @rows = [
       ["acumen", { tag: "0.0.2", ahead: 0, last: "a", prod: "0.0.1", prod_stale: true }],
@@ -934,5 +954,67 @@ class TestDevDeployLog < Minitest::Test
     progress.finish(APP, ok: true)
 
     assert_includes io.string, APP
+  end
+
+  # The regression that killed the acumen + properties releases on 2026-07-31:
+  # a release printing a non-ASCII character (a "…" from Util.step) blew up the
+  # capture with `Encoding::UndefinedConversionError: "\xE2" from ASCII-8BIT to
+  # UTF-8`, and the release's own output was replaced by that message. The
+  # padding pushes the character past a 4096-byte read boundary so its bytes
+  # arrive in two separate chunks — the harder half of the same bug.
+  def test_run_release_capturing_survives_multibyte_output_split_across_chunks
+    script = write_script(<<~SH)
+      printf 'x%.0s' $(seq 1 4095)
+      printf 'Rolling out… done (63s)\\n'
+    SH
+
+    result = run_release_capturing({}, script, APP, Dir.pwd, DeployProgress::Disabled.new)
+
+    assert result[:ok], result[:log]
+    assert_equal Encoding::UTF_8, result[:log].encoding
+    assert result[:log].valid_encoding?
+    assert_includes result[:log], "Rolling out… done (63s)"
+    assert_includes File.read(@path, encoding: "UTF-8"), "Rolling out… done (63s)"
+  end
+
+  # A release that fails is worth nothing to debug if its output is discarded:
+  # the captured log is the diagnostic, not the exit status.
+  def test_run_release_capturing_keeps_output_of_a_failing_release
+    script = write_script(<<~SH)
+      echo 'Building sbt distribution… failed (18s)'
+      exit 3
+    SH
+
+    result = run_release_capturing({}, script, APP, Dir.pwd, DeployProgress::Disabled.new)
+
+    refute result[:ok]
+    assert_includes result[:log], "Building sbt distribution… failed (18s)"
+  end
+
+  # A bug in the capture path (a broken display, an unwritable log) is not a
+  # failed deploy — the release ran and its exit status is the truth. It still
+  # has to be reported rather than silently swallowed.
+  def test_run_release_capturing_reports_a_capture_bug_without_failing_the_release
+    progress = Object.new
+    def progress.start(_app); end
+    def progress.feed(_app, _chunk) = raise("display exploded")
+    def progress.finish(_app, ok:, version: nil); end
+    def progress.messages = (@messages ||= [])
+    def progress.message(text) = messages << text
+
+    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd, progress)
+
+    assert result[:ok]
+    assert_includes result[:log], "output capture failed"
+    assert_includes progress.messages.join("\n"), "display exploded"
+  end
+
+  private
+
+  def write_script(body)
+    path = File.join(Dir.mktmpdir("dev-deploy-test"), "release")
+    File.write(path, "#!/bin/sh\n#{body}")
+    File.chmod(0o755, path)
+    path
   end
 end
