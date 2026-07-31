@@ -12,6 +12,16 @@ ARG DB_ROLE=api
 ENV DB_NAME=${DB_NAME}
 ENV DB_ROLE=${DB_ROLE}
 
+# /schema is created here, explicitly 0755, rather than being left to COPY.
+# A directory COPY creates implicitly inherits the --chmod of the file being
+# copied into it — 0644, so drw-r--r--, with NO execute bit. The files inside
+# are then perfectly readable and completely unreachable: the unprivileged
+# postgres user cannot traverse the directory, and initdb dies on
+# "psql: error: /schema/schema.sql: Permission denied". That broke every image
+# built after --chmod was introduced (acumendb 0.1.53, platformdb 0.5.34-0.5.37;
+# ISS-139 / ISS-156), which is every session DB for both apps.
+RUN mkdir -p /schema && chmod 755 /schema
+
 # The build context is assembled by bin/db-image: the generic recipe from
 # devops/db-image plus the schema repo's artifacts, all at fixed names. That
 # indirection exists because COPY cannot reach outside the context, and the
@@ -37,3 +47,15 @@ COPY --chmod=644 transfer-ownership.sql  /schema/transfer-ownership.sql
 # becomes 0711 — executable but unreadable, and the kernel must READ a script to
 # honor its shebang. That failed as "/bin/bash: 10-schema.sh: Permission denied".
 COPY --chmod=755 initdb/10-schema.sh /docker-entrypoint-initdb.d/10-schema.sh
+
+# Prove, at BUILD time, that the user who will actually read these files can.
+# Every mode bug here (the 0600 artifacts, the 0711 init script, the 0644
+# directory) was invisible until a container started minutes-to-days later and
+# failed initdb, by which point the broken image was already in the registry
+# under a tag that will never move again. Reading them as postgres during the
+# build is the only check that fails the thing that produced the bug, so it is
+# the last instruction: everything the container needs at runtime exists by now.
+RUN su postgres -s /bin/sh -c '\
+      for f in /schema/*.sql /docker-entrypoint-initdb.d/10-schema.sh; do \
+        test -r "$f" || { echo "NOT READABLE BY postgres: $f"; ls -la /schema /docker-entrypoint-initdb.d; exit 1; }; \
+      done'

@@ -165,6 +165,20 @@ measured wiping four other sessions' databases.
 
 **Mitigation is discipline: bump the schema tag when you change the recipe.**
 
+When the recipe change is a **fix to a broken image** there is nothing to bump —
+the already-pushed tag is the broken one. Rebuild and push each app's current
+tag over it, then throw away the stale local copies, or every machine keeps
+serving the broken image out of its Docker cache:
+
+```
+db-image build --app platform --tag $(cd ~/code/platform-postgresql && sem-info tag latest) --push
+db-image build --app acumen   --tag $(cd ~/code/acumen-postgresql   && sem-info tag latest) --push
+docker rmi registry.digitalocean.com/bryzek/<database>:<tag>   # on every machine that pulled it
+```
+
+Note this heals only the current tag. Older tags stay broken, which is fine —
+retention purges images older than 3 days, and `claude-db` starts on latest.
+
 ---
 
 ## Ports
