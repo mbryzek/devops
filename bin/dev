@@ -5210,7 +5210,7 @@ def write_dependencies_status_json(workdir, results)
   File.write(File.join(workdir, "dependencies-status.json"), JSON.pretty_generate(data))
 end
 
-def release_one(name)
+def release_one(name, progress)
   dir = deploy_item_dir(name)
   return { ok: false, log: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
@@ -5235,7 +5235,7 @@ def release_one(name)
   end
   # release-db accepts either `foo` or `foo-postgresql` as --app; pass the full
   # name so the script doesn't have to guess.
-  run_release_capturing(env, release_bin, name, dir)
+  run_release_capturing(env, release_bin, name, dir, progress)
 rescue => e
   { ok: false, log: "release_one raised: #{e.class}: #{e.message}" }
 end
@@ -5249,21 +5249,33 @@ def deploy_log_path(app)
 end
 
 # Runs a release subprocess, streaming its combined stdout/stderr to `app`'s
-# stable log file line-by-line as it runs (so a `tail -f` started before or
-# during the run shows live progress), while also buffering the output to
-# return for the failure summary. Any file left over from a prior run is
-# deleted first, so stale output never masquerades as this run's progress.
-def run_release_capturing(env, release_bin, app, dir)
+# stable log file as it runs (so a `tail -f` started before or during the run
+# shows live progress), while also buffering the output to return for the
+# failure summary and feeding `progress` for the live phase display. Any file
+# left over from a prior run is deleted first, so stale output never
+# masquerades as this run's progress.
+#
+# Reads chunks rather than lines. Util.step writes a stage's label the moment
+# the stage begins and its "done (15s)" half only when it ends, so the running
+# stage is by definition a line with no newline on it yet — `each_line` would
+# hold it back until it was already finished.
+def run_release_capturing(env, release_bin, app, dir, progress)
   path = deploy_log_path(app)
   File.delete(path) if File.exist?(path)
   buffer = +""
   status =
     File.open(path, "w") do |f|
       Open3.popen2e(env, release_bin, "--app", app, chdir: dir) do |_stdin, out_err, wait_thr|
-        out_err.each_line do |line|
-          f.write(line)
-          f.flush
-          buffer << line
+        begin
+          loop do
+            chunk = out_err.readpartial(4096)
+            f.write(chunk)
+            f.flush
+            buffer << chunk
+            progress.feed(app, chunk)
+          end
+        rescue EOFError
+          # Child closed the pipe: normal end of output.
         end
         wait_thr.value
       end
@@ -5284,44 +5296,40 @@ def release_lib(dir)
   { ok: !!ok, log: ok ? "" : "release failed (its output is above, not captured)" }
 end
 
-# " -> <path>" shown next to the "[starting]" line. Libraries release with an
-# inherited terminal (see release_lib) so there's no file to point at.
-def deploy_log_suffix(name)
-  return "" if lib_repo?(name)
-
-  " -> #{deploy_log_path(name)}"
+# Where to `tail -f` for the full output behind the phase display. Printed once
+# per run rather than per app: the paths differ only by app name, and the live
+# display already says which stage each app is on.
+def deploy_log_hint
+  "Logs: #{File.join(File.dirname(deploy_log_path("app")), "<app>.log")}"
 end
 
-def release_serial(names, results, results_mutex)
-  names.each do |name|
-    puts "  #{name} [starting]#{deploy_log_suffix(name)}"
-    result =
-      begin
-        release_one(name)
-      rescue => e
-        { ok: false, log: "worker crashed: #{e.class}: #{e.message}" }
-      end
-    results_mutex.synchronize { results[name] = result }
-    puts "  #{name} [#{result[:ok] ? 'done' : 'FAIL'}]"
-  end
+# One app's release, start to finish, narrated through `progress`. Shared by
+# the serial and concurrent drivers so both render identically.
+def release_tracked(name, progress, results, results_mutex)
+  progress.start(name)
+  result =
+    begin
+      release_one(name, progress)
+    rescue => e
+      { ok: false, log: "worker crashed: #{e.class}: #{e.message}" }
+    end
+  results_mutex.synchronize { results[name] = result }
+  progress.finish(name, ok: result[:ok])
+  result
 end
 
-def release_concurrent(names, concurrency, results, results_mutex)
+def release_serial(names, results, results_mutex, progress)
+  names.each { |name| release_tracked(name, progress, results, results_mutex) }
+end
+
+def release_concurrent(names, concurrency, results, results_mutex, progress)
   return if names.empty?
   queue = Queue.new
   names.each { |n| queue << n }
   workers = Array.new([concurrency, names.length].min) do
     Thread.new do
       while (name = (queue.pop(true) rescue nil))
-        result =
-          begin
-            puts "  #{name} [starting]#{deploy_log_suffix(name)}"
-            release_one(name)
-          rescue => e
-            { ok: false, log: "worker crashed: #{e.class}: #{e.message}" }
-          end
-        results_mutex.synchronize { results[name] = result }
-        puts "  #{name} [#{result[:ok] ? 'done' : 'FAIL'}]"
+        release_tracked(name, progress, results, results_mutex)
       end
     end
   end
@@ -5390,38 +5398,50 @@ def run_deploys(pending, concurrency:, errors: [])
   results = {}
   skipped = {}
 
-  unless db_pending.empty?
-    puts "Phase 1: releasing #{db_pending.length} database(s) serially: #{db_pending.join(', ')}"
-    unless free_apps.empty?
-      puts "         in parallel with #{free_apps.length} app(s) that depend on none of them: #{free_apps.join(', ')}"
-    end
-    puts ""
-    db_thread = Thread.new { release_serial(db_pending, results, results_mutex) }
-    release_concurrent(free_apps, concurrency, results, results_mutex)
-    db_thread.join
+  # Only the captured phases write those logs — a libraries-only run has none.
+  unless db_pending.empty? && app_pending.empty?
+    puts deploy_log_hint
     puts ""
   end
 
-  # Skip an app whose own DB just failed: deploying an app against an unmigrated
-  # schema is exactly the failure mode the DB-first ordering is meant to prevent.
-  phase2_apps = db_pending.empty? ? app_pending : gated_apps
-  to_run = phase2_apps.reject do |n|
-    db = blocking_db_for(n, db_pending)
-    if db && !(results[db] && results[db][:ok])
-      skipped[n] = "db release failed (#{db})"
-      true
-    else
-      false
+  # The display owns stdout for the captured phases (1 and 2). Phase 3 is
+  # excluded on purpose: release-lib inherits the terminal to prompt for a GPG
+  # passphrase, and nothing may be redrawing over a prompt.
+  DeployProgress.for.run do |progress|
+    unless db_pending.empty?
+      progress.message("Phase 1: releasing #{db_pending.length} database(s) serially: #{db_pending.join(', ')}")
+      unless free_apps.empty?
+        progress.message("         in parallel with #{free_apps.length} app(s) that depend on none of them: #{free_apps.join(', ')}")
+      end
+      progress.message("")
+      db_thread = Thread.new { release_serial(db_pending, results, results_mutex, progress) }
+      release_concurrent(free_apps, concurrency, results, results_mutex, progress)
+      db_thread.join
+      progress.message("")
     end
-  end
 
-  if to_run.empty? && !phase2_apps.empty?
-    puts "Phase 2: all #{phase2_apps.length} app(s) skipped due to DB failures"
-    puts ""
-  elsif !to_run.empty?
-    puts deploy_app_phase_message(2, to_run, concurrency)
-    puts ""
-    release_concurrent(to_run, concurrency, results, results_mutex)
+    # Skip an app whose own DB just failed: deploying an app against an
+    # unmigrated schema is exactly the failure mode the DB-first ordering is
+    # meant to prevent.
+    phase2_apps = db_pending.empty? ? app_pending : gated_apps
+    to_run = phase2_apps.reject do |n|
+      db = blocking_db_for(n, db_pending)
+      if db && !(results[db] && results[db][:ok])
+        skipped[n] = "db release failed (#{db})"
+        true
+      else
+        false
+      end
+    end
+
+    if to_run.empty? && !phase2_apps.empty?
+      progress.message("Phase 2: all #{phase2_apps.length} app(s) skipped due to DB failures")
+      progress.message("")
+    elsif !to_run.empty?
+      progress.message(deploy_app_phase_message(2, to_run, concurrency))
+      progress.message("")
+      release_concurrent(to_run, concurrency, results, results_mutex, progress)
+    end
   end
 
   # Libraries go last and one at a time: `release-lib` owns the terminal while
@@ -5433,7 +5453,7 @@ def run_deploys(pending, concurrency:, errors: [])
       puts ""
       puts "Phase 3: releasing #{lib_pending.length} librar#{lib_pending.length == 1 ? 'y' : 'ies'} serially (interactive): #{lib_pending.join(', ')}"
       puts ""
-      release_serial(lib_pending, results, results_mutex)
+      release_serial(lib_pending, results, results_mutex, DeployProgress::Disabled.new)
     else
       lib_pending.each do |n|
         skipped[n] = "library release is interactive - run `release-lib` in #{deploy_item_dir(n)}"

@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require 'stringio'
 require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 load File.expand_path('../lib/tag.rb', __dir__)
@@ -243,7 +244,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     released_mutex = @released_mutex
 
     Object.send(:define_method, :resolve_deploy_items) { |_| rows_ref.call }
-    Object.send(:define_method, :release_one) do |name|
+    Object.send(:define_method, :release_one) do |name, _progress|
       released_mutex.synchronize { released_ref.call << name }
       results_ref.call.fetch(name) { { ok: true, log: "ok" } }
     end
@@ -327,7 +328,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
 
   def test_handles_release_one_raising
     @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "abc" }]]
-    Object.send(:define_method, :release_one) { |_| raise "kaboom" }
+    Object.send(:define_method, :release_one) { |_, _progress| raise "kaboom" }
     err = assert_raises(SystemExit) do
       capture_io { cmd_deploy_all([]) }
     end
@@ -368,7 +369,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["acumen-postgresql",   { tag: "0.0.1", ahead: 1, last: "a" }],
       ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
     ]
-    Object.send(:define_method, :release_one) do |name|
+    Object.send(:define_method, :release_one) do |name, _progress|
       order_mutex.synchronize { order << "start:#{name}" }
       sleep 0.02 # let other workers race — they shouldn't
       order_mutex.synchronize { order << "end:#{name}" }
@@ -396,7 +397,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["platform",            { tag: "0.0.2", ahead: 1, last: "b" }],
       ["platform-postgresql", { tag: "0.0.3", ahead: 1, last: "c" }],
     ]
-    Object.send(:define_method, :release_one) do |name|
+    Object.send(:define_method, :release_one) do |name, _progress|
       events_mutex.synchronize { events << "start:#{name}" }
       sleep 0.05 if name == "platform-postgresql"
       events_mutex.synchronize { events << "end:#{name}" }
@@ -515,7 +516,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["lib-util",  { tag: "0.0.1", ahead: 1, last: "a" }],
       ["lib-query", { tag: "0.0.2", ahead: 1, last: "b" }],
     ]
-    Object.send(:define_method, :release_one) do |name|
+    Object.send(:define_method, :release_one) do |name, _progress|
       order_mutex.synchronize { order << "start:#{name}" }
       sleep 0.02 # let another worker race — there shouldn't be one
       order_mutex.synchronize { order << "end:#{name}" }
@@ -788,7 +789,7 @@ class TestDeployStatusPrompt < Minitest::Test
     @released = []
     @orig_release = Object.instance_method(:release_one)
     released_ref = @released
-    Object.send(:define_method, :release_one) do |name|
+    Object.send(:define_method, :release_one) do |name, _progress|
       released_ref << name
       { ok: true, log: "ok" }
     end
@@ -892,25 +893,24 @@ class TestDevDeployLog < Minitest::Test
     assert_equal deploy_log_path(APP), deploy_log_path(APP)
   end
 
-  def test_deploy_log_suffix_points_at_the_log_path
-    assert_equal " -> #{@path}", deploy_log_suffix(APP)
-  end
-
-  def test_deploy_log_suffix_empty_for_libraries
-    assert_equal "", deploy_log_suffix("lib-util")
+  # Printed once per run rather than per app, so it names the directory and the
+  # per-app filename pattern instead of one concrete path.
+  def test_deploy_log_hint_names_the_log_directory
+    assert_includes deploy_log_hint, File.dirname(@path)
+    assert_includes deploy_log_hint, "<app>.log"
   end
 
   def test_run_release_capturing_deletes_stale_file_before_writing
     File.write(@path, "stale output from a previous run\n")
 
-    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd)
+    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd, DeployProgress::Disabled.new)
 
     assert result[:ok]
     refute_match(/stale output/, File.read(@path))
   end
 
   def test_run_release_capturing_streams_output_to_the_log_file
-    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd)
+    result = run_release_capturing({}, "/bin/echo", APP, Dir.pwd, DeployProgress::Disabled.new)
 
     expected = "--app #{APP}\n"
     assert result[:ok]
@@ -919,8 +919,20 @@ class TestDevDeployLog < Minitest::Test
   end
 
   def test_run_release_capturing_reports_failure_status
-    result = run_release_capturing({}, "/usr/bin/false", APP, Dir.pwd)
+    result = run_release_capturing({}, "/usr/bin/false", APP, Dir.pwd, DeployProgress::Disabled.new)
 
     refute result[:ok]
+  end
+
+  # The phase display is fed from the same stream that reaches the log, so a
+  # release that narrates itself through Util.step shows up in both.
+  def test_run_release_capturing_feeds_the_progress_display
+    io = StringIO.new
+    progress = DeployProgress.new(io: io)
+    progress.start(APP)
+    run_release_capturing({}, "/bin/echo", APP, Dir.pwd, progress)
+    progress.finish(APP, ok: true)
+
+    assert_includes io.string, APP
   end
 end

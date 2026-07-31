@@ -46,14 +46,32 @@ module Util
     # A named stage of a release. Quiet mode: "label... done (12s)" on one
     # line. Verbose mode: the traditional underlined section header. Returns
     # the block's value.
+    #
+    # The two halves are written separately and flushed, which is deliberate:
+    # `dev deploy` reads this stream from the subprocess pipe and treats the
+    # dangling "label... " as "this stage is running now" (DeployProgress).
+    # Print the whole line at once and the parent can only ever narrate stages
+    # that are already over.
+    #
+    # The completion half is printed from an ensure block so a stage that
+    # raises — Util.run aborts with exit_with_error, which is a SystemExit —
+    # still closes its line, as "failed (8s)". Otherwise a failed release left
+    # a dangling partial line that both the log and the parent read as a stage
+    # still in progress.
     def Util.step(label)
       if Util.quiet?
         print "#{label}... "
         $stdout.flush
         started = Time.now
-        result = yield
-        puts "done (#{(Time.now - started).round}s)"
-        result
+        ok = false
+        begin
+          result = yield
+          ok = true
+          result
+        ensure
+          puts "#{ok ? 'done' : 'failed'} (#{(Time.now - started).round}s)"
+          $stdout.flush
+        end
       else
         puts ""
         puts Util.underline(label)

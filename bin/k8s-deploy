@@ -53,41 +53,42 @@ Util.detail("=" * 60)
 Util.detail("")
 
 # Generate manifests
-Util.detail("Generating Kubernetes manifests...")
-app_config_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
-template_file = File.join(K8S_DIR, 'templates', 'scala-play-app.pkl')
 manifest_file = "/tmp/#{args.app}-deploy-#{tag}.yaml"
+manifest = Util.step("Generating Kubernetes manifests") do
+  app_config_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
+  template_file = File.join(K8S_DIR, 'templates', 'scala-play-app.pkl')
 
-unless File.exist?(app_config_file)
-  Util.exit_with_error("App config not found: #{app_config_file}")
+  unless File.exist?(app_config_file)
+    Util.exit_with_error("App config not found: #{app_config_file}")
+  end
+
+  unless File.exist?(template_file)
+    Util.exit_with_error("Template not found: #{template_file}")
+  end
+
+  # Read app config to get port
+  config_output = `cd #{K8S_DIR} && pkl eval -f json apps/#{args.app}.pkl 2>/dev/null`
+  config = JSON.parse(config_output) rescue {}
+  app_port = config["appPort"] || 9000
+
+  # Build env vars for template (NodePort is auto-assigned by K8s)
+  env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{tag}"
+  env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE} REGISTRY=#{account['registry']}"
+  env_vars += " WEB_MEMORY=#{config['webMemory']}" if config['webMemory']
+  env_vars += " JOB_MEMORY=#{config['jobMemory']}" if config['jobMemory']
+  env_vars += " JAVA_AGENT=#{config['javaAgent']}" if config['javaAgent']
+
+  cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval templates/scala-play-app.pkl"
+  generated = `#{cmd} 2>&1`
+
+  unless $?.success?
+    Util.exit_with_error("Error generating manifest:\n#{generated}")
+  end
+
+  File.write(manifest_file, generated)
+  Util.detail("Manifest written to: #{manifest_file}")
+  generated
 end
-
-unless File.exist?(template_file)
-  Util.exit_with_error("Template not found: #{template_file}")
-end
-
-# Read app config to get port
-config_output = `cd #{K8S_DIR} && pkl eval -f json apps/#{args.app}.pkl 2>/dev/null`
-config = JSON.parse(config_output) rescue {}
-app_port = config["appPort"] || 9000
-
-# Build env vars for template (NodePort is auto-assigned by K8s)
-env_vars = "APP=#{args.app} PORT=#{app_port} VERSION=#{tag}"
-env_vars += " K8S_NAMESPACE=#{K8S_NAMESPACE} REGISTRY=#{account['registry']}"
-env_vars += " WEB_MEMORY=#{config['webMemory']}" if config['webMemory']
-env_vars += " JOB_MEMORY=#{config['jobMemory']}" if config['jobMemory']
-env_vars += " JAVA_AGENT=#{config['javaAgent']}" if config['javaAgent']
-
-cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval templates/scala-play-app.pkl"
-manifest = `#{cmd} 2>&1`
-
-unless $?.success?
-  Util.exit_with_error("Error generating manifest:\n#{manifest}")
-end
-
-File.write(manifest_file, manifest)
-Util.detail("Manifest written to: #{manifest_file}")
-Util.detail("")
 
 if args.dry_run
   puts "DRY RUN - Manifest contents:"
@@ -146,21 +147,22 @@ Util.detail("Deploying web and job in parallel (job tier tolerates a brief outag
 Util.detail("")
 
 # Step 1: Apply Services and PodDisruptionBudget only (non-disruptive)
-Util.detail("  [1/2] Applying Services and PodDisruptionBudget...")
-log_cluster_state(args.app, K8S_NAMESPACE, "BEFORE deploy")
+Util.step("Applying Services and PodDisruptionBudget") do
+  log_cluster_state(args.app, K8S_NAMESPACE, "BEFORE deploy")
 
-# Extract only Service and PodDisruptionBudget resources from manifest
-svc_pdb_file = "/tmp/#{args.app}-svc-pdb.yaml"
-docs = File.read(manifest_file).split(/^---\s*$/)
-svc_pdb_docs = docs.select { |doc| doc =~ /kind:\s*(Service|PodDisruptionBudget)/ }
-File.write(svc_pdb_file, svc_pdb_docs.join("---\n"))
-Util.run("kubectl apply -f #{svc_pdb_file}")
-FileUtils.rm_f(svc_pdb_file)
-Util.detail("  ✓ Services and PDB applied")
+  # Extract only Service and PodDisruptionBudget resources from manifest
+  svc_pdb_file = "/tmp/#{args.app}-svc-pdb.yaml"
+  docs = File.read(manifest_file).split(/^---\s*$/)
+  svc_pdb_docs = docs.select { |doc| doc =~ /kind:\s*(Service|PodDisruptionBudget)/ }
+  File.write(svc_pdb_file, svc_pdb_docs.join("---\n"))
+  Util.run("kubectl apply -f #{svc_pdb_file}")
+  FileUtils.rm_f(svc_pdb_file)
+end
 
-# Runs concurrently for web and job, so each rollout prints one
-# self-contained completion line in quiet mode; kubectl's own "Waiting
-# for..." stream goes to the release log.
+# Runs concurrently for web and job. Both tiers roll out inside ONE stage (see
+# below), so per-tier timing is detail for the log rather than its own line —
+# two stages cannot be in flight at once in the parent's phase display, and the
+# pair finishes together anyway.
 def wait_for_rollout(label, rollout_cmd)
   started = Time.now
   if Util.quiet?
@@ -168,9 +170,7 @@ def wait_for_rollout(label, rollout_cmd)
     rollout_cmd = "(#{rollout_cmd}) >> '#{Util.log_file}' 2>&1"
   end
   success = system(rollout_cmd)
-  if Util.quiet?
-    puts "  #{label} #{success ? 'done' : 'FAILED'} (#{(Time.now - started).round}s)"
-  end
+  Util.detail("  #{label} #{success ? 'done' : 'FAILED'} (#{(Time.now - started).round}s)")
   success
 end
 
@@ -180,28 +180,44 @@ Util.detail("  [2/2] Applying Deployment #{deployment_name} and StatefulSet #{st
 Util.run("kubectl apply -f #{manifest_file} -l tier=web")
 Util.run("kubectl apply -f #{manifest_file} -l tier=job")
 
-puts "Deploying #{deployment_name} + #{statefulset_name} in parallel..." if Util.quiet?
+deployment_success = false
+statefulset_success = false
 
-# Monitor state during rollout
-monitor_thread = Thread.new do
-  10.times do
-    sleep 2
-    log_cluster_state(args.app, K8S_NAMESPACE, "DURING rollout")
+# Raised only to make Util.step close its line as "failed (Ns)" — the step
+# tracks success by whether its block returns normally, so a rollout that timed
+# out has to leave the block by raising or it would render as done. Caught
+# immediately: the pod/event/log diagnostics below are the real output, and
+# they must run before the script exits.
+class RolloutIncomplete < StandardError; end
+
+begin
+  Util.step("Rolling out #{deployment_name} + #{statefulset_name}") do
+    # Monitor state during rollout
+    monitor_thread = Thread.new do
+      10.times do
+        sleep 2
+        log_cluster_state(args.app, K8S_NAMESPACE, "DURING rollout")
+      end
+    end
+
+    deployment_thread = Thread.new do
+      wait_for_rollout(deployment_name,
+        "kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+    end
+    statefulset_thread = Thread.new do
+      wait_for_rollout(statefulset_name,
+        "kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
+    end
+
+    deployment_success = deployment_thread.value
+    statefulset_success = statefulset_thread.value
+    monitor_thread.kill rescue nil
+
+    raise RolloutIncomplete unless deployment_success && statefulset_success
   end
+rescue RolloutIncomplete
+  nil
 end
-
-deployment_thread = Thread.new do
-  wait_for_rollout(deployment_name,
-    "kubectl rollout status deployment/#{deployment_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-end
-statefulset_thread = Thread.new do
-  wait_for_rollout(statefulset_name,
-    "kubectl rollout status statefulset/#{statefulset_name} -n #{K8S_NAMESPACE} --timeout=#{timeout}s")
-end
-
-deployment_success = deployment_thread.value
-statefulset_success = statefulset_thread.value
-monitor_thread.kill rescue nil
 
 log_cluster_state(args.app, K8S_NAMESPACE, "AFTER rollout")
 if deployment_success
