@@ -36,57 +36,79 @@ def wrangler_cmd(label, cmd)
   "XDG_CONFIG_HOME=#{File.join(PROFILES_DIR, label)} wrangler #{cmd}"
 end
 
-# Verify the label's wrangler profile is logged in AND can reach the expected account.
-# Missing/expired profile -> offer an interactive `wrangler login` right here (one-time
-# per account; wrangler auto-refreshes the OAuth token on later runs). Logged into the
-# wrong account -> fail with the logout command. Runs BEFORE tagging/building so an auth
-# problem leaves nothing half-deployed.
-def ensure_wrangler_profile(label, acct)
+# Is the label's wrangler profile logged in AND able to reach the expected account?
+# true when it is; false when it simply has not been authenticated yet. A profile
+# logged into the WRONG account aborts here instead of returning — re-running
+# `wrangler login` cannot turn one account into another, so there is nothing to retry.
+def wrangler_profile_ok?(label, acct)
   email = acct['email']
   account_id = acct['account_id']
 
-  2.times do |attempt|
-    whoami = `#{wrangler_cmd(label, "whoami")} 2>&1`
-    if whoami.include?(account_id)
-      puts "Cloudflare profile '#{label}' OK (#{email})"
-      return
-    end
+  whoami = `#{wrangler_cmd(label, "whoami")} 2>&1`
+  if whoami.include?(account_id)
+    Util.detail("Cloudflare profile '#{label}' OK (#{email})")
+    return true
+  end
 
-    if logged_in_as = whoami[/associated with the email\s+([^\s.]+@[^\s.]+\.\S+?)\.?\s/, 1]
-      # Logged in, but the expected account id is not visible: wrong account.
-      Util.exit_with_error(
-        "Cloudflare profile '#{label}' is logged in as #{logged_in_as}, which cannot access " \
-        "account #{account_id} (expected login: #{email}).\n" \
-        "Reset it with: #{wrangler_cmd(label, "logout")}"
-      )
-    end
+  if logged_in_as = whoami[/associated with the email\s+([^\s.]+@[^\s.]+\.\S+?)\.?\s/, 1]
+    # Logged in, but the expected account id is not visible: wrong account.
+    Util.exit_with_error(
+      "Cloudflare profile '#{label}' is logged in as #{logged_in_as}, which cannot access " \
+      "account #{account_id} (expected login: #{email}).\n" \
+      "Reset it with: #{wrangler_cmd(label, "logout")}"
+    )
+  end
 
-    if attempt > 0
+  false
+end
+
+# Verify the label's wrangler profile is logged in AND can reach the expected account.
+# Missing/expired profile -> offer an interactive `wrangler login` right here (one-time
+# per account; wrangler auto-refreshes the OAuth token on later runs). Runs BEFORE
+# tagging/building so an auth problem leaves nothing half-deployed.
+#
+# The check is a stage; the login is deliberately NOT. Util.step owns a single line of
+# stdout for the duration of its block, and an interactive prompt printed into the middle
+# of that line mangles both the prompt and the stage the parent is reading.
+def ensure_wrangler_profile(label, acct)
+  email = acct['email']
+  return if Util.step("Checking Cloudflare login (#{label})") { wrangler_profile_ok?(label, acct) }
+
+  puts ""
+  puts "Cloudflare profile '#{label}' is not authenticated."
+  login_cmd = wrangler_cmd(label, "login")
+  # `dev deploy` runs each release under Open3.popen2e with a closed stdin, so
+  # the interactive browser login can't happen here. Rather than crash on the
+  # dead prompt, fail with the exact one-time command to run by hand, then
+  # re-deploy. (Auth is a rare, one-time step; wrangler refreshes the OAuth
+  # token automatically on later runs.)
+  unless $stdin.tty?
+    Util.exit_with_error(
+      "Cloudflare profile '#{label}' (#{email}) is not authenticated and stdin is not interactive.\n" \
+      "Authenticate once by hand:\n  #{login_cmd}\n" \
+      "then re-run the deploy."
+    )
+  end
+  unless Ask.for_boolean("Run `wrangler login` now? Authorize as #{email} in the browser.")
+    Util.exit_with_error("Cannot deploy the '#{label}' target without a wrangler login")
+  end
+  unless system(login_cmd)
+    Util.exit_with_error("wrangler login failed for profile '#{label}'")
+  end
+
+  Util.step("Rechecking Cloudflare login (#{label})") do
+    unless wrangler_profile_ok?(label, acct)
       Util.exit_with_error("Cloudflare profile '#{label}' (#{email}) is still not authenticated after login")
     end
-
-    puts ""
-    puts "Cloudflare profile '#{label}' is not authenticated."
-    login_cmd = wrangler_cmd(label, "login")
-    # `dev deploy` runs each release under Open3.capture2e with a closed stdin, so
-    # the interactive browser login can't happen here. Rather than crash on the
-    # dead prompt, fail with the exact one-time command to run by hand, then
-    # re-deploy. (Auth is a rare, one-time step; wrangler refreshes the OAuth
-    # token automatically on later runs.)
-    unless $stdin.tty?
-      Util.exit_with_error(
-        "Cloudflare profile '#{label}' (#{email}) is not authenticated and stdin is not interactive.\n" \
-        "Authenticate once by hand:\n  #{login_cmd}\n" \
-        "then re-run the deploy."
-      )
-    end
-    unless Ask.for_boolean("Run `wrangler login` now? Authorize as #{email} in the browser.")
-      Util.exit_with_error("Cannot deploy the '#{label}' target without a wrangler login")
-    end
-    unless system(login_cmd)
-      Util.exit_with_error("wrangler login failed for profile '#{label}'")
-    end
   end
+end
+
+# How a target reads in a stage label: "personal", or "playbook env plybk" when the
+# target builds a named wrangler env. Only used to disambiguate an app with more than
+# one target — for the single-target apps the bare "Building" is clearer.
+def target_description(target)
+  env = target.wrangler_env.to_s.strip
+  env.empty? ? target.cloudflare_account : "#{target.cloudflare_account} env #{env}"
 end
 
 # Parse args BEFORE anything touches Config: ReleaseHelper's constructor loads the
@@ -94,6 +116,21 @@ end
 args = Args.parse(ARGV)
 
 helper = ReleaseHelper.new("sveltekit")
+
+# Concise by default, exactly like release-scala: one "label... done (12s)" line per
+# stage, with the full output of every command appended to the log. That stream is
+# also what `dev deploy` parses to show this app's phases live while it runs — before
+# this, a Cloudflare release was a name and an elapsed clock for its whole duration.
+# --verbose restores the traditional full streaming output.
+#
+# The log name carries no version, unlike release-scala's: a sveltekit release does
+# not know its tag until Tag.ask, which is several stages in.
+Util.quiet!("/tmp/devops-release/#{helper.app}.log") unless args.verbose
+
+puts ""
+puts Util.underline("Releasing #{helper.app}")
+puts "Full log: #{Util.log_file}" if Util.quiet?
+puts ""
 
 unless system('which wrangler > /dev/null 2>&1')
   Util.exit_with_error("wrangler CLI not found. Install with: npm install -g wrangler")
@@ -128,7 +165,7 @@ if account = args.cloudflare_account
     configured = targets.map(&:cloudflare_account).uniq.join(", ")
     Util.exit_with_error("No deploy target for cloudflare account '#{account}' in #{helper.app}. Configured: #{configured}")
   end
-  puts "Deploying only the '#{account}' target (--cloudflare-account)"
+  Util.detail("Deploying only the '#{account}' target (--cloudflare-account)")
   targets = matching
 end
 
@@ -145,17 +182,23 @@ end.to_h
 resolved.each { |label, acct| ensure_wrangler_profile(label, acct) }
 
 # Tag + write version once — one released version, deployed to every selected target.
+# Tag.ask prompts (unless RELEASE_AUTO_TAG), so like the wrangler login above it stays
+# outside any Util.step: a stage owns its line of stdout for the length of its block.
 tag = Tag.ask
-helper.maybe_tag_and_push(tag)
-
-# Stamp the release under ~/.devops/versions (set-version no longer writes a
-# .env.version into the repo checkout) and expose the same values to every
-# build below: $env/static/public bakes PUBLIC_VERSION / PUBLIC_RELEASED_AT
-# into /_internal_/version at build time, overriding the empty defaults each
-# repo commits in its .env.
 released_at = Time.now.utc.iso8601
-helper.run(File.expand_path("~/code/claude/bin/set-version") +
-  " --app #{helper.app} --version #{tag} --released-at #{released_at}")
+
+Util.step("Tagging #{tag}") do
+  helper.maybe_tag_and_push(tag)
+
+  # Stamp the release under ~/.devops/versions (set-version no longer writes a
+  # .env.version into the repo checkout) and expose the same values to every
+  # build below: $env/static/public bakes PUBLIC_VERSION / PUBLIC_RELEASED_AT
+  # into /_internal_/version at build time, overriding the empty defaults each
+  # repo commits in its .env.
+  helper.run(File.expand_path("~/code/claude/bin/set-version") +
+    " --app #{helper.app} --version #{tag} --released-at #{released_at}")
+end
+
 ENV['PUBLIC_VERSION'] = tag
 ENV['PUBLIC_RELEASED_AT'] = released_at
 
@@ -180,19 +223,25 @@ targets.each do |target|
   ENV.delete('CLOUDFLARE_API_TOKEN')
   ENV['CLOUDFLARE_ACCOUNT_ID'] = acct['account_id']
 
-  puts ""
-  puts "==> Deploying #{helper.app} to #{label}#{env ? " (env #{env})" : " (primary)"}"
+  Util.detail("")
+  Util.detail("==> Deploying #{helper.app} to #{label}#{env ? " (env #{env})" : " (primary)"}")
+
+  # Name the target in the stage labels only when there is more than one to tell
+  # apart — most apps deploy a single target, where a bare "Building" reads better.
+  scope = targets.length > 1 ? " (#{target_description(target)})" : ""
 
   # Clean + build for this target. A named env builds via `npm run build:<env>`
   # (loads .env.<env>); the primary builds via `npm run build` (.env.production).
-  helper.run "rm -rf build .svelte-kit/cloudflare"
-  if env
-    unless File.exist?(".env.#{env}")
-      Util.exit_with_error(".env.#{env} not found (required to build the '#{env}' target)")
+  Util.step("Building#{scope}") do
+    helper.run "rm -rf build .svelte-kit/cloudflare"
+    if env
+      unless File.exist?(".env.#{env}")
+        Util.exit_with_error(".env.#{env} not found (required to build the '#{env}' target)")
+      end
+      helper.run_system("npm run build:#{env}")
+    else
+      helper.run_system("npm run build")
     end
-    helper.run_system("npm run build:#{env}")
-  else
-    helper.run_system("npm run build")
   end
 
   output_dir = if Dir.exist?("build")
@@ -203,15 +252,25 @@ targets.each do |target|
     Util.exit_with_error("No build output found (expected build/ or .svelte-kit/cloudflare)")
   end
 
-  if is_worker
-    env_flag = if env then "--env #{env}" elsif has_named_env then '--env=""' else "" end
-    helper.run_system(wrangler_cmd(label, "deploy #{env_flag}".strip))
-  else
-    # Always name the project. Without --project-name, wrangler falls back to whatever it
-    # cached in node_modules/.cache/wrangler/pages.json and prompts interactively when that
-    # cache is absent (fresh clone, reinstalled node_modules) — offering "Create a new
-    # project", which spawns a duplicate alongside the real one.
-    project = target.pages_project_for(helper.app)
-    helper.run_system(wrangler_cmd(label, "pages deploy #{output_dir} --project-name #{project}"))
+  Util.step("Uploading to Cloudflare#{scope}") do
+    if is_worker
+      env_flag = if env then "--env #{env}" elsif has_named_env then '--env=""' else "" end
+      helper.run_system(wrangler_cmd(label, "deploy #{env_flag}".strip))
+    else
+      # Always name the project. Without --project-name, wrangler falls back to whatever it
+      # cached in node_modules/.cache/wrangler/pages.json and prompts interactively when that
+      # cache is absent (fresh clone, reinstalled node_modules) — offering "Create a new
+      # project", which spawns a duplicate alongside the real one.
+      project = target.pages_project_for(helper.app)
+      helper.run_system(wrangler_cmd(label, "pages deploy #{output_dir} --project-name #{project}"))
+    end
   end
 end
+
+# `dev deploy` reads this line to learn the version actually released — it knows the
+# tag that existed BEFORE the release, which is the wrong one whenever the release
+# minted a new one. Same contract as release-scala / release-docker-k8s.
+puts "Full log: #{Util.log_file}" if Util.quiet?
+puts ""
+puts "Release complete: #{helper.app} #{tag}"
+puts ""

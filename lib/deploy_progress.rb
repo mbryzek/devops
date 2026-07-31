@@ -44,9 +44,9 @@ class DeployProgress
   # "Building Docker image... done (15s)" / "... failed (8s)"
   COMPLETE_RE = /\A(.+?)\.\.\. (done|failed) \(([^)]*)\)\z/.freeze
 
-  # release-scala / release-docker-k8s both end with this line. It is the only
-  # reliable source for the version actually released: `dev deploy` knows the
-  # CURRENT tag, but a release with unreleased commits mints a new one.
+  # Every release script ends with this line. It is the only reliable source for
+  # the version actually released: `dev deploy` knows the CURRENT tag, but a
+  # release with unreleased commits mints a new one.
   VERSION_RE = /\ARelease complete: \S+ (\S+)\z/.freeze
 
   Phase = Struct.new(:label, :started_at, :outcome, :text, keyword_init: true)
@@ -219,9 +219,10 @@ class DeployProgress
       st = @apps[name] or next
       # The app's own elapsed time is on the header rather than only on the
       # running stage: a release script that does not narrate itself through
-      # Util.step (the elm / sveltekit / db paths run verbose, not quiet) has no
-      # stages to show, and a name sitting there with no clock is exactly the
-      # "is this alive?" question the display exists to answer.
+      # Util.step (the db path still runs verbose, not quiet) has no stages to
+      # show, and a name sitting there with no clock is exactly the "is this
+      # alive?" question the display exists to answer. The same clock also
+      # covers the gap before the first stage of a script that does narrate.
       lines << "#{INDENT}#{name}  #{duration(st.elapsed)}"
       st.phases.each { |p| lines << "#{PHASE_INDENT}#{p.label}... #{p.outcome} (#{p.text})" }
       if st.current

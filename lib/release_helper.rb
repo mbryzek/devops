@@ -30,13 +30,35 @@ class ReleaseHelper
 
   end
 
+  # Both runners hand off to Util.run in quiet mode. Quiet mode makes this
+  # process's stdout a stage stream — Util.step's "label... done (12s)" lines,
+  # which `dev deploy` parses to drive its live phase display — so a command
+  # that streams its own output onto it is at best noise in the log and at
+  # worst mistaken for a stage event. Util.run appends everything to the
+  # release log instead, and on failure prints its tail plus the log path.
   def run(cmd)
+    return Util.run(cmd) if Util.quiet?
+
     File.open(@log_file, "a") { |o| o << "\n#{cmd}" }
     Util.run(cmd + ">> #{@log_file}")
     puts ""
   end
 
+  # run_system differs from run only in that it keeps the command's output on
+  # the terminal (npm/wrangler narrate themselves). Quiet mode is exactly the
+  # case where we do not want that, so the distinction disappears there.
+  #
+  # Quiet mode also closes stdin. These commands are non-interactive by
+  # construction — a build, or a wrangler deploy that names its project
+  # precisely so it cannot prompt — but "by construction" is not "enforced", and
+  # with stdout redirected to the log a tool that decided to ask something
+  # (wrangler's first-run telemetry question, a Pages project it cannot resolve)
+  # would block forever on a prompt nobody could see. `dev deploy` already runs
+  # every release with a closed stdin; this gives a by-hand release the same
+  # fast, logged failure instead of an invisible hang.
   def run_system(cmd)
+    return Util.run("#{cmd} < /dev/null") if Util.quiet?
+
     puts cmd
     if !system(cmd)
       puts ""
@@ -54,11 +76,11 @@ class ReleaseHelper
     if have_changes?
       run "git commit -a -m 'Release version #{tag}'"
       run "git push"
-      puts ""
-      puts "#{@app} Application Deployed"
+      Util.detail("")
+      Util.detail("#{@app} Application Deployed")
     else
-      puts ""
-      puts "No changes to deploy"
+      Util.detail("")
+      Util.detail("No changes to deploy")
     end
   end
 
