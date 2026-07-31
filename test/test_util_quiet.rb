@@ -99,6 +99,43 @@ class TestUtilQuiet < Minitest::Test
     end
   end
 
+  # Like capture_stdout, but returns what was written even when the block
+  # raises — which is the only interesting case for a stage that aborts.
+  def stdout_through(&block)
+    buf = StringIO.new
+    old = $stdout
+    $stdout = buf
+    begin
+      block.call
+    ensure
+      $stdout = old
+    end
+    buf.string
+  end
+
+  # A stage that aborts must still close its line. Util.run's failure path is a
+  # SystemExit, so without this the release left a dangling "label... " that
+  # both the log and `dev deploy`'s phase display read as still running.
+  def test_step_reports_failure_when_the_block_raises
+    with_quiet do
+      out = stdout_through do
+        assert_raises(RuntimeError) { Util.step("Building") { raise "boom" } }
+      end
+      assert_match(/\ABuilding\.\.\. failed \(\d+s\)\n\z/, out)
+    end
+  end
+
+  def test_step_reports_failure_when_the_block_exits
+    with_quiet do
+      status = nil
+      out = stdout_through do
+        _stderr, status = capture_stderr_and_exit { Util.step("Deploying") { Util.exit_with_error("nope") } }
+      end
+      assert_equal 1, status
+      assert_match(/\ADeploying\.\.\. failed \(\d+s\)\n\z/, out)
+    end
+  end
+
   def test_step_returns_block_value
     with_quiet do
       value = nil
