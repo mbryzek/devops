@@ -1,4 +1,5 @@
 require 'io/console'
+require 'util'
 
 # Live phase display for `dev deploy`.
 #
@@ -59,7 +60,10 @@ class DeployProgress
       @current = nil
       @version = nil
       @started_at = Time.now
-      @buffer = +""
+      # Binary: fed from raw pipe reads, whose chunk boundaries fall wherever
+      # the kernel put them — including the middle of a multi-byte character.
+      # Lines are decoded on the way out of here, once they're whole.
+      @buffer = +"".b
     end
 
     def elapsed
@@ -123,12 +127,12 @@ class DeployProgress
   def feed(app, chunk)
     @mutex.synchronize do
       st = @apps[app] or next
-      st.buffer << chunk
+      st.buffer << chunk.to_s.b
       while (i = st.buffer.index("\n"))
         line = st.buffer.slice!(0..i).chomp
-        handle_line(st, line)
+        handle_line(st, Util.to_utf8(line))
       end
-      handle_partial(st, st.buffer)
+      handle_partial(st, Util.to_utf8(st.buffer))
       redraw
     end
   end
@@ -152,13 +156,16 @@ class DeployProgress
       end
 
       clear_block
-      # Recap where a failure got to. TTY only: the live block that held these
-      # lines is erased on the way out, so without the recap they vanish. In
-      # append mode each one was already printed as it happened.
+      emit("#{INDENT}#{app}  #{ok ? released_label(st) : 'FAILED'} (#{duration(st.elapsed)})")
+      # Recap where a failure got to, UNDER its own header: with concurrent
+      # apps finishing into one stream, a phase list printed above the line it
+      # belongs to reads as belonging to the app that finished before it.
+      # TTY only — the live block that held these lines is erased on the way
+      # out, so without the recap they vanish. In append mode each one was
+      # already printed, prefixed with the app name, as it happened.
       if !ok && @tty
         st.phases.each { |p| emit("#{PHASE_INDENT}#{p.label}... #{p.outcome} (#{p.text})") }
       end
-      emit("#{INDENT}#{app}  #{ok ? released_label(st) : 'FAILED'} (#{duration(st.elapsed)})")
       redraw
     end
   end

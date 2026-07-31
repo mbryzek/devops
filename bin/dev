@@ -4780,7 +4780,7 @@ def run_repo(name, workdir, stack, opts, branch, &announce)
   note.call("reverted #{reverted} no-op (timestamp/whitespace) file(s)") if reverted.positive?
 
   porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
-  porcelain = porcelain.force_encoding(Encoding::UTF_8).scrub
+  porcelain = Util.to_utf8(porcelain)
   return { status: :in_sync } if Codegen::Sync.classify_diff(porcelain) == :in_sync
   return { status: :changed, note: "diff only (dry-run)" } if opts[:dry_run]
 
@@ -4894,7 +4894,7 @@ def spawn_claude(clone, prompt, model: CODEGEN_CLAUDE_MODEL, timeout_secs: CODEG
   status = wait_thr.value
   # Same scrub as run_step: the PR-URL regex below must not crash on a
   # malformed byte in Claude's output.
-  output = output.to_s.force_encoding(Encoding::UTF_8).scrub
+  output = Util.to_utf8(output)
   unless status.success?
     return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{output}" }
   end
@@ -5253,7 +5253,23 @@ def release_one(name, progress)
   # name so the script doesn't have to guess.
   run_release_capturing(env, release_bin, name, dir, progress)
 rescue => e
-  { ok: false, log: "release_one raised: #{e.class}: #{e.message}" }
+  # Whatever the release printed before the crash is the diagnostic — the
+  # exception on its own says nothing about how far the release got. The log
+  # file is already on disk, so hand back its contents plus the backtrace.
+  { ok: false, log: [release_log_excerpt(name),
+                     "release_one raised: #{e.class}: #{e.message}",
+                     Util.indent((e.backtrace || []).first(5).join("\n"))].compact.join("\n") }
+end
+
+# What the release wrote to its log file before something went wrong, or nil if
+# it never got that far. Used when the in-memory buffer is unavailable because
+# the capture path itself raised.
+def release_log_excerpt(name)
+  path = deploy_log_path(name)
+  return nil unless File.exist?(path)
+
+  text = Util.to_utf8(File.binread(path)).strip
+  text.empty? ? nil : text
 end
 
 # Stable path (no timestamp) so `tail -f` can be pointed at it once and keep
@@ -5275,20 +5291,37 @@ end
 # the stage begins and its "done (15s)" half only when it ends, so the running
 # stage is by definition a line with no newline on it yet — `each_line` would
 # hold it back until it was already finished.
+#
+# Bytes stay BINARY end to end — binary log file, binary buffer, decoded to
+# UTF-8 only on the way out. `readpartial` returns ASCII-8BIT, and a text-mode
+# IO transcodes on write, so a single "…" in a release script's output used to
+# abort the release with `Encoding::UndefinedConversionError: "\xE2" from
+# ASCII-8BIT to UTF-8` — reported as the whole failure, with the release's own
+# output discarded (acumen + properties, 2026-07-31).
 def run_release_capturing(env, release_bin, app, dir, progress)
   path = deploy_log_path(app)
   File.delete(path) if File.exist?(path)
-  buffer = +""
+  buffer = +"".b
+  capture_error = nil
   status =
-    File.open(path, "w") do |f|
+    File.open(path, "wb") do |f|
       Open3.popen2e(env, release_bin, "--app", app, chdir: dir) do |_stdin, out_err, wait_thr|
         begin
           loop do
             chunk = out_err.readpartial(4096)
-            f.write(chunk)
-            f.flush
             buffer << chunk
-            progress.feed(app, chunk)
+            # Keep draining the pipe even after a capture bug: a child whose
+            # output nobody reads blocks forever on a full pipe, and the release
+            # itself is still perfectly capable of finishing.
+            next if capture_error
+
+            begin
+              f.write(chunk)
+              f.flush
+              progress.feed(app, chunk)
+            rescue StandardError => e
+              capture_error = "output capture failed after #{buffer.bytesize} bytes: #{e.class}: #{e.message}"
+            end
           end
         rescue EOFError
           # Child closed the pipe: normal end of output.
@@ -5296,7 +5329,13 @@ def run_release_capturing(env, release_bin, app, dir, progress)
         wait_thr.value
       end
     end
-  { ok: status.success?, log: buffer }
+  # A broken display or log file says nothing about whether the release worked
+  # — the exit status does. Report the capture bug, don't let it masquerade as
+  # a failed deploy.
+  progress.message("  #{app}  WARNING: #{capture_error}") if capture_error
+  log = Util.to_utf8(buffer)
+  log = "#{log}\n#{capture_error}\n" if capture_error
+  { ok: status.success?, log: log }
 end
 
 # Libraries release through the same `bin/release` entry point as everything
@@ -5503,6 +5542,12 @@ def run_deploys(pending, concurrency:, errors: [])
     puts ""
     failed.each do |name|
       puts Util.underline(name)
+      # Named per app, not just in the one-time hint at the top: by the time a
+      # summary is read the hint has scrolled away, and a failure whose captured
+      # log is short (or is only a crash message) is exactly when the full file
+      # matters most.
+      log_path = deploy_log_path(name)
+      puts "full log: #{log_path}" if File.exist?(log_path)
       puts results[name][:log]
       puts ""
     end
@@ -5633,7 +5678,7 @@ def run_step(cmd, path, verbose, captured_log)
     out, status = Open3.capture2e(*cmd, chdir: path)
     # Subprocess output can contain arbitrary bytes; scrub so one malformed
     # byte can't crash the regex/string matching every caller does on it.
-    out = out.force_encoding(Encoding::UTF_8).scrub
+    out = Util.to_utf8(out)
     captured_log << out
     [status.success?, out]
   end
@@ -7286,7 +7331,7 @@ def changelog_run_claude(workdir, input_path, version_count)
       out_err.close unless out_err.closed?
     end
   wait_thr.value
-  output.to_s.force_encoding(Encoding::UTF_8).scrub
+  Util.to_utf8(output)
 end
 
 # One batch's input payload for the Claude session, with ISS numbers resolved.
