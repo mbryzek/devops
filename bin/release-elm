@@ -11,9 +11,21 @@ load File.join(dir, "../lib/common.rb")
 
 # Parse args BEFORE anything touches Config: ReleaseHelper's constructor loads the
 # app config, which rebuilds dist/ unless --skip-generate-json has already been seen.
-Args.parse(ARGV)
+args = Args.parse(ARGV)
 
 helper = ReleaseHelper.new("elm")
+
+# Concise by default, like release-scala and release-sveltekit: one
+# "label... done (12s)" line per stage, full command output in the log. `dev deploy`
+# parses that stream to show this app's phases live. --verbose keeps the old
+# fully-streaming output. The log name carries no version — Tag.ask does not run
+# until after the compile.
+Util.quiet!("/tmp/devops-release/#{helper.app}.log") unless args.verbose
+
+puts ""
+puts Util.underline("Releasing #{helper.app}")
+puts "Full log: #{Util.log_file}" if Util.quiet?
+puts ""
 
 # Turn elm.js -> elm.min.js
 def add_suffix(filename, suffix)
@@ -25,13 +37,19 @@ def ensure_elm_review
     Util.exit_with_error("No review.sh script found")
   end
 
-  puts "Running Elm Review"
-  if !system("./review.sh")
-    puts ""
-    puts ""
-    puts "Fix Elm Review Suggestions then release again"
-    puts ""
-    exit(1)
+  Util.step("Running elm-review") do
+    # Quiet mode routes the output to the log and, on failure, prints its tail
+    # plus the log path — which is the same "here is what to fix" the verbose
+    # branch spells out by hand.
+    next Util.run("./review.sh") if Util.quiet?
+
+    if !system("./review.sh")
+      puts ""
+      puts ""
+      puts "Fix Elm Review Suggestions then release again"
+      puts ""
+      exit(1)
+    end
   end
 end
 
@@ -48,7 +66,7 @@ def rewrite_constants(file, rewrites)
 end
 
 def rewrite_version(file, version)
-  puts "rewrite_version #{file} #{version}"
+  Util.detail("rewrite_version #{file} #{version}")
   tmp = []
   version_found = false
   # Append `?v=<version>` to /elm.js and /style.css refs at release time.
@@ -115,15 +133,20 @@ end
 
 elm = elm_binary
 ensure_elm_review
-puts "Compiling"
 a = "elm.js"
-helper.run "#{elm} make src/Main.elm --optimize --output=#{a}"
+Util.step("Compiling") { helper.run "#{elm} make src/Main.elm --optimize --output=#{a}" }
+
+# Tag.ask prompts (unless RELEASE_AUTO_TAG), so it stays outside any Util.step: a
+# stage owns its single line of stdout for the length of its block, and a prompt
+# printed into the middle of it mangles both the prompt and the stage the parent reads.
 tag = Tag.ask
 
-b = rewrite_constants(a, helper.app_config.rewrites)
-c = minify(helper, b)
-helper.run "rm -f #{b}"
-helper.run "mv #{c} elm.js"
+Util.step("Minifying") do
+  b = rewrite_constants(a, helper.app_config.rewrites)
+  c = minify(helper, b)
+  helper.run "rm -f #{b}"
+  helper.run "mv #{c} elm.js"
+end
 
 files = ["index.html"]
 File.readlines("index.html").each do |l|
@@ -135,32 +158,42 @@ File.readlines("index.html").each do |l|
   end
 end
 
-Dir.chdir(helper.release_dir) do |dir|
-  helper.run "rm -rf *"
-  helper.run "git reset --hard"
-  helper.run "git clean -fdx"
-  helper.write_to_file("version.txt", tag)
-  files.each do |f|
-    helper.run "cp #{File.join(helper.pwd, f)} ."
+# Publishing IS the deploy for an elm app: Cloudflare Pages builds whatever lands on
+# the release repo's main. There is no wrangler upload to narrate after this.
+Util.step("Publishing to #{File.basename(helper.release_dir)}") do
+  Dir.chdir(helper.release_dir) do |dir|
+    helper.run "rm -rf *"
+    helper.run "git reset --hard"
+    helper.run "git clean -fdx"
+    helper.write_to_file("version.txt", tag)
+    files.each do |f|
+      helper.run "cp #{File.join(helper.pwd, f)} ."
+    end
+    ni = rewrite_constants("index.html", helper.app_config.rewrites)
+    ni2 = rewrite_version(ni, File.read("version.txt").strip)
+    helper.run "rm -f index.html"
+    helper.run "mv #{ni2} index.html"
+
+    # Write _internal_/version (extensionless, JSON content) so the deployed
+    # static site serves it at /_internal_/version — same path as the Scala /
+    # SvelteKit dynamic endpoints. Content-Type may be octet-stream but the
+    # work-versions client parses the body as JSON regardless.
+    require "json"
+    require "fileutils"
+    FileUtils.mkdir_p("_internal_")
+    File.write(File.join("_internal_", "version"),
+               JSON.generate({ "version" => tag, "released_at" => Time.now.utc.iso8601 }))
+
+    helper.run "git add #{files.join(" ")} version.txt _internal_/version"
+
+    helper.maybe_tag_and_push(tag)
   end
-  ni = rewrite_constants("index.html", helper.app_config.rewrites)
-  ni2 = rewrite_version(ni, File.read("version.txt").strip)
-  helper.run "rm -f index.html"
-  helper.run "mv #{ni2} index.html"
-
-  # Write _internal_/version (extensionless, JSON content) so the deployed
-  # static site serves it at /_internal_/version — same path as the Scala /
-  # SvelteKit dynamic endpoints. Content-Type may be octet-stream but the
-  # work-versions client parses the body as JSON regardless.
-  require "json"
-  require "fileutils"
-  FileUtils.mkdir_p("_internal_")
-  File.write(File.join("_internal_", "version"),
-             JSON.generate({ "version" => tag, "released_at" => Time.now.utc.iso8601 }))
-
-  helper.run "git add #{files.join(" ")} version.txt _internal_/version"
-
-  helper.maybe_tag_and_push(tag)
 end
 
+# `dev deploy` reads this line to learn the version actually released — it knows the
+# tag that existed BEFORE the release, which is the wrong one whenever the release
+# minted a new one. Same contract as release-scala / release-docker-k8s.
+puts "Full log: #{Util.log_file}" if Util.quiet?
+puts ""
+puts "Release complete: #{helper.app} #{tag}"
 puts ""

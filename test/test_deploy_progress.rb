@@ -230,6 +230,51 @@ class TestDeployProgress < Minitest::Test
     assert_includes visible(io), "a  released"
   end
 
+  # --- release shapes ------------------------------------------------------
+
+  # The stream a two-target Cloudflare app (playbook-www, playbook-admin,
+  # playbook-app) now produces: a login check per account, then a build and an
+  # upload per target, each labelled with the target so the repeated stages are
+  # tellable apart. Nothing here is special-cased in the display — this pins the
+  # end-to-end shape release-sveltekit emits, so a relabelling that stops
+  # parsing is caught here rather than during a deploy.
+  def test_multi_target_cloudflare_release
+    io = tty_io
+    p = DeployProgress.new(io: io)
+    p.start("playbook-www")
+    p.feed("playbook-www", <<~OUT)
+      Checking Cloudflare login (personal)... done (2s)
+      Checking Cloudflare login (playbook)... done (1s)
+      Tagging 0.0.43... done (3s)
+      Building (personal)... done (34s)
+      Uploading to Cloudflare (personal)... done (11s)
+      Building (playbook env plybk)... done (21s)
+    OUT
+    p.feed("playbook-www", "Uploading to Cloudflare (playbook env plybk)... ")
+
+    out = visible(io)
+    assert_includes out, "Checking Cloudflare login (personal)... done (2s)"
+    assert_includes out, "Building (personal)... done (34s)"
+    assert_includes out, "Uploading to Cloudflare (personal)... done (11s)"
+    # The second target's upload is the stage in flight: shown, but with a live
+    # clock rather than a completion.
+    assert_includes out, "Uploading to Cloudflare (playbook env plybk)..."
+    refute_includes out, "Uploading to Cloudflare (playbook env plybk)... done"
+    assert_operator out.index("Building (personal)"), :<, out.index("Building (playbook env plybk)")
+  end
+
+  # A Cloudflare release ends the same way a Scala one does, so the collapsed
+  # line reports the version the release actually minted rather than "released".
+  def test_cloudflare_release_reports_its_version
+    io = plain_io
+    p = DeployProgress.new(io: io)
+    p.start("properties")
+    p.feed("properties", "Uploading to Cloudflare... done (9s)\nRelease complete: properties 0.0.51\n")
+    p.finish("properties", ok: true)
+
+    assert_includes io.string, "properties  deployed 0.0.51"
+  end
+
   # --- message -------------------------------------------------------------
 
   def test_message_is_printed_above_the_block
