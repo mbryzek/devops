@@ -15,10 +15,14 @@ apps in parallel; stay in your repo(s) and do not "helpfully" fix theirs.
   what it already excludes. Do NOT reason from the invariant's name. Names drift
   from their predicates, and a name that sounds obvious is how you end up fixing
   the wrong thing.
-- The examples above are a sample, not the population. Re-run the check yourself
-  (`dev invariants check --app <app> --all-examples`) and look at the whole set:
+- The examples above are capped at 100 per invariant by the server, so when the
+  count exceeds that they are a sample and not the population. Compare each
+  invariant's count against how many examples you were given before you
+  generalize, and re-run the check yourself
+  (`dev invariants check --app <app> --all-examples`) when you need them again:
   do the rows share a tenant, a date range, a code path, a deploy boundary? A
-  1-row failure and a 400-row failure usually have different causes.
+  1-row failure and a 400-row failure usually have different causes. Above 100,
+  reconstruct the rest from the app's API rather than reasoning from the sample.
 - Read production state through the app's API and the read-only `dev` commands.
   NEVER connect to the production database, and never write to production.
 - Anything you run locally goes against this session's DB, whose host port is

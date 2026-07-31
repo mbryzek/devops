@@ -90,6 +90,18 @@ def usage_for(command)
   "dev #{INVOCATIONS.fetch(command)}"
 end
 
+# The server's own ceiling on examples per failing invariant (spec: `examples`,
+# default 10, max 100). The CLI always asks for the ceiling rather than taking
+# the default: truncating for the terminal is a display decision made here
+# (--examples / --all-examples), and the investigating session needs as much of
+# the failing population as the server will give it. Before ISS-173 the server
+# returned 10 no matter what, so --all-examples could only ever narrow those 10.
+INVARIANT_EXAMPLES_MAX = 100
+
+def invariant_checks_path(examples: INVARIANT_EXAMPLES_MAX)
+  "/dev/invariant/checks?examples=#{examples}"
+end
+
 USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
@@ -144,13 +156,16 @@ USAGE = <<~USAGE
     #{INVOCATIONS["invariants check"]}
         Check invariants across endpoints. `check` is the default when no
         subcommand is given. Shows up to N examples per failure (default 10),
-        or all with --all-examples.
+        or every example the server returned with --all-examples. The server
+        caps examples at #{INVARIANT_EXAMPLES_MAX} per invariant, which is what this always
+        requests — so --all-examples shows up to #{INVARIANT_EXAMPLES_MAX}, not necessarily every
+        failing row. Compare against the reported count.
 
         When an app has failures with data behind them, hands them to a Claude
         session (Opus 5, 1M context) to investigate. The session gets every
-        example, not just the 10 shown. Nothing is ever handed over for an app
-        the CLI could not reach — that is an auth/infra failure with nothing to
-        investigate. The prompt prose lives in devops/claude-invariants/.
+        example the server returned (up to #{INVARIANT_EXAMPLES_MAX}), not just the 10
+        shown. Nothing is ever handed over for an app the CLI could not reach —
+        that is an auth/infra failure with nothing to investigate. The prompt prose lives in devops/claude-invariants/.
 
         At a terminal you are asked first (--fix skips the question), and the
         terminal is handed to one interactive session: it works a single failing
@@ -1190,10 +1205,11 @@ end
 # untouched on purpose — a summary here would be the CLI pre-diagnosing, which is
 # exactly the thing the body file tells the session not to do.
 #
-# Every failing invariant goes in with ALL its examples (example_limit: nil).
-# The terminal truncates at 10 to stay readable; the session is the one consumer
-# that needs the whole population, since whether 1 row or 400 rows fail is often
-# the difference between two root causes.
+# Every failing invariant goes in with every example the server returned
+# (example_limit: nil — up to INVARIANT_EXAMPLES_MAX). The terminal truncates at
+# 10 to stay readable; the session is the one consumer that needs the whole
+# population, since whether 1 row or 400 rows fail is often the difference
+# between two root causes.
 def invariants_app_prompt(endpoint, result)
   failures = invariant_failure_lines(result, example_limit: nil).join("\n")
   count = (result["non_zero"] || []).length + (result["error"] || []).length
@@ -1446,7 +1462,7 @@ def cmd_invariants_check(args)
   results = endpoints.map do |endpoint|
     Thread.new do
       begin
-        data = ApiClient.request(endpoint, :get, "/dev/invariant/checks")
+        data = ApiClient.request(endpoint, :get, invariant_checks_path)
         { endpoint: endpoint, data: data, error: nil }
       rescue SessionExpired => e
         { endpoint: endpoint, data: nil, error: "session expired - run 'dev auth login'" }

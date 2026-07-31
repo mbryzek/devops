@@ -73,6 +73,29 @@ class TestDevInvariantsFix < Minitest::Test
     assert_equal %w[Acumen Platform], failing_names(invariants_failing_apps(results))
   end
 
+  # ---- invariant_checks_path: what the CLI actually asks the server for ----
+
+  # ISS-173: the endpoint took no parameter and capped examples at 10 server-side,
+  # so --examples/--all-examples could only ever narrow the same 10 rows. The fix
+  # is only real if the request itself carries the cap.
+  def test_checks_path_requests_the_server_example_cap
+    assert_equal "/dev/invariant/checks?examples=#{INVARIANT_EXAMPLES_MAX}", invariant_checks_path
+  end
+
+  # The help text quotes the cap; it must quote the one actually requested.
+  def test_usage_documents_the_cap_that_is_requested
+    assert_includes USAGE, "caps examples at #{INVARIANT_EXAMPLES_MAX} per invariant"
+  end
+
+  # ---- invariant_failure_lines: the terminal truncates, the session does not ----
+
+  def test_terminal_truncates_examples_and_reports_how_many_more
+    lines = invariant_failure_lines(failing_data(count: 30, examples: (1..30).map { |i| "row-#{i}" }))
+    assert_includes lines, "      * row-10"
+    refute_includes lines, "      * row-11"
+    assert_includes lines, "      ... and 20 more"
+  end
+
   # ---- invariants_app_prompt ----
 
   def test_app_prompt_names_the_app_and_its_failure_counts
