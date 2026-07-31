@@ -227,10 +227,10 @@ USAGE = <<~USAGE
         --limit (default 10), filter with --app member|admin.
 
     #{INVOCATIONS["deploy status"]}
-        Print every tracked app, DB repo, and scala library (lib-*) with its
-        latest tag, the version production is running, and a status — the
-        full fleet picture even when everything is up to date. `status` is
-        the default when no subcommand is given.
+        Print every tracked app, DB repo, scala library (lib-*), and devops
+        itself with its latest tag, the version production is running, and a
+        status — the full fleet picture even when everything is up to date.
+        `status` is the default when no subcommand is given.
 
         An item needs a release when origin/main is ahead of the latest tag,
         OR production is running a version other than the latest tag (tagged
@@ -238,8 +238,13 @@ USAGE = <<~USAGE
         or the live k8s image tag; *-postgresql repos, libraries (which
         publish to Maven Central, so their prod column is always `-`), and
         apps with no prod probe are checked on git state only. --app APP
-        matches an app, DB, or library name exactly (e.g. `platform` vs
-        `platform-postgresql` vs `lib-util`).
+        matches an app, DB, library, or `devops` name exactly (e.g. `platform`
+        vs `platform-postgresql` vs `lib-util`).
+
+        devops is the one item with no tag and no artifact: the ~/code/devops
+        checkout IS the deployment, so its tag column is origin/main's sha, its
+        prod column is the local HEAD sha you are running, and it is pending
+        whenever it is behind — a release there is just `git pull`.
 
         If anything is pending, you are prompted to pick which items to
         release — numbers (e.g. 1,3), `all` (the default), or `none` — and
@@ -247,7 +252,7 @@ USAGE = <<~USAGE
         skipped when stdin is not a terminal (pipes, cron), so scripted
         callers just get the table.
     #{INVOCATIONS["deploy all"]}
-        Release every pending item without prompting. Three phases:
+        Release every pending item without prompting. Four phases:
           1. DB repos (*-postgresql) release serially via `release-db`,
              with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1 —
              alongside, in parallel, every app that does NOT depend on a
@@ -262,6 +267,9 @@ USAGE = <<~USAGE
              signing passphrase — so its output is not captured. Without a
              terminal (pipe, cron) pending libraries are skipped, named in
              the summary, and the command exits non-zero.
+          4. devops, alone and last, as a plain `git pull` — its update
+             rewrites the very scripts the phases above shell out to, so it
+             must not run while anything else is mid-release.
         If a DB release fails, the matching app (foo for foo-postgresql)
         is skipped to avoid deploying an app against an unmigrated schema.
         Skips repos not on `main` or with a dirty tree.
@@ -4324,11 +4332,23 @@ def lib_repos
   Dependencies::Updates::APPS.keys.select { |n| lib_repo?(n) }
 end
 
+# devops itself. Nothing builds or ships it: the checkout at ~/code/devops IS
+# the deployment, so "release" is a `git pull` and the version is a commit sha
+# rather than a tag (the repo has none, and a tag here would just be a second
+# source of truth that can drift from the commit actually running).
+DEVOPS_REPO = "devops".freeze
+
+def devops_repo?(name)
+  name == DEVOPS_REPO
+end
+
 def deploy_state_for(name, dir, app: nil, registry: nil)
   return { error: "no checkout at #{dir}" } unless File.directory?(File.join(dir, ".git"))
 
   fetch_err = `git -C #{dir} fetch -q origin 2>&1`
   return { error: "fetch failed: #{fetch_err.strip}" } unless $?.success?
+
+  return devops_deploy_state(dir) if devops_repo?(name)
 
   tag_out, tag_status = Open3.capture2("sem-info", "tag", "latest", chdir: dir)
   tag = tag_status.success? ? tag_out.strip : ""
@@ -4341,6 +4361,25 @@ def deploy_state_for(name, dir, app: nil, registry: nil)
   count = `git -C #{dir} rev-list --count #{tag}..#{ref}`.strip.to_i
   last = `git -C #{dir} log -1 --format=%h\\ %s #{ref}`.strip
   { tag: tag, ahead: count, last: last }.merge(prod_status(registry, app, tag))
+end
+
+# devops' deploy state, in the same shape every other row uses so the table and
+# `needs_deploy?` need no special cases. There is no tag and no prod probe: the
+# released version is origin/main and the running version is the local HEAD that
+# ~/code/devops/bin is executing out of. Pending = commits not yet pulled.
+def devops_deploy_state(dir)
+  ref = `git -C #{dir} rev-parse --short --verify --quiet origin/main`.strip
+  return { error: "no origin/main" } if ref.empty?
+
+  local = `git -C #{dir} rev-parse --short HEAD`.strip
+  count = `git -C #{dir} rev-list --count HEAD..origin/main`.strip.to_i
+  last = `git -C #{dir} log -1 --format=%h\\ %s origin/main`.strip
+  # Pending is "behind origin/main" only. A checkout that DIFFERS for any other
+  # reason — parked on a feature branch, or carrying unpushed commits — is not
+  # something a pull fixes, so it is reported rather than queued for release.
+  branch = git_current_branch(dir)
+  note = "on #{branch || 'detached HEAD'}" unless branch == "main"
+  { tag: ref, prod: local, ahead: count, ahead_noun: "to pull", last: last, note: note }
 end
 
 # Compare the *running* production version against the latest tag. Git state
@@ -4404,6 +4443,9 @@ def deploy_items(registry = Work::Registry.load)
   # Without them a lib change can sit unreleased indefinitely — nothing else
   # reports it.
   lib_repos.each { |lib| items << [lib, File.expand_path("~/code/#{lib}"), nil] }
+  # devops last of the derived entries: it is not in the apps registry (it ships
+  # nothing) but it still falls behind, and nothing else reports that.
+  items << [DEVOPS_REPO, File.expand_path("~/code/#{DEVOPS_REPO}"), nil]
   # Array#uniq keeps the first occurrence, so deployable-app entries win over a
   # DB entry if a name collides. Don't reorder.
   items.uniq { |name, _| name }.sort_by { |name, _| name }
@@ -4428,8 +4470,10 @@ def print_deploy_status_row(name, d, name_w, tag_w, prod_w)
     return
   end
   status = []
-  status << "+#{d[:ahead]} unreleased" if d[:ahead] > 0
+  # ahead_noun: devops is pending a `git pull`, not a release (see devops_deploy_state).
+  status << "+#{d[:ahead]} #{d[:ahead_noun] || 'unreleased'}" if d[:ahead] > 0
   status << "tag #{d[:tag]} not deployed" if d[:prod_stale]
+  status << d[:note] if d[:note]
   # A failed prod probe means we could not verify what production is running —
   # it does NOT mark the app pending, but it must not pass silently either.
   status << "prod check failed: #{d[:prod_error]}" if d[:prod_error]
@@ -4483,7 +4527,7 @@ def cmd_deploy_status(args)
   pending = rows.select { |_, d| needs_deploy?(d) }.map(&:first)
   if pending.empty?
     puts ""
-    puts "Everything tracked is up to date (apps, databases, and libraries)."
+    puts "Everything tracked is up to date (apps, databases, libraries, and devops)."
     return
   end
 
@@ -5240,6 +5284,10 @@ def release_one(name, progress)
   pull_out = `git -C #{dir} pull --ff-only origin main 2>&1`
   return { ok: false, log: "pull --ff-only failed: #{pull_out.strip}" } unless $?.success?
 
+  # For devops the pull above IS the release — there is nothing to build, tag or
+  # ship (see devops_deploy_state).
+  return { ok: true, log: pull_out } if devops_repo?(name)
+
   return release_lib(dir) if lib_repo?(name)
 
   if db_repo?(name)
@@ -5404,9 +5452,10 @@ end
 # DBs still release serially among themselves, and still before the app they
 # gate.
 def run_deploys(pending, concurrency:, errors: [])
-  db_pending  = pending.select { |n| db_repo?(n) }
-  lib_pending = pending.select { |n| lib_repo?(n) }
-  app_pending = pending - db_pending - lib_pending
+  db_pending     = pending.select { |n| db_repo?(n) }
+  lib_pending    = pending.select { |n| lib_repo?(n) }
+  devops_pending = pending.select { |n| devops_repo?(n) }
+  app_pending    = pending - db_pending - lib_pending - devops_pending
 
   gated_apps, free_apps = app_pending.partition { |n| blocking_db_for(n, db_pending) }
 
@@ -5475,6 +5524,16 @@ def run_deploys(pending, concurrency:, errors: [])
         skipped[n] = "library release is interactive - run `release-lib` in #{deploy_item_dir(n)}"
       end
     end
+  end
+
+  # devops goes last and alone. Its pull rewrites bin/release, bin/release-scala,
+  # bin/dev and friends — the exact scripts every other phase shells out to — so
+  # doing it alongside a release would swap those files mid-flight.
+  unless devops_pending.empty?
+    puts ""
+    puts "Phase 4: updating devops (git pull)"
+    puts ""
+    release_serial(devops_pending, results, results_mutex, DeployProgress::Disabled.new)
   end
 
   pending.each do |n|

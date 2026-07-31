@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
 require 'stringio'
+require 'tmpdir'
 require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 load File.expand_path('../lib/tag.rb', __dir__)
@@ -204,6 +205,16 @@ class TestPendingItems < Minitest::Test
   def test_library_path_is_sibling_of_apps
     with_registry([FakeApp.new(name: "platform", stack: :scala)]) do
       assert_equal File.expand_path("~/code/lib-util"), dirs["lib-util"]
+    end
+  end
+
+  # devops is not a registry app either — it ships nothing — but it still falls
+  # behind, and nothing else in the fleet reports that.
+  def test_devops_is_always_included
+    with_registry([FakeApp.new(name: "platform", stack: :scala)]) do
+      assert_includes names, "devops"
+      assert_equal File.expand_path("~/code/devops"), dirs["devops"]
+      refute_includes names, "devops-postgresql"
     end
   end
 
@@ -934,5 +945,284 @@ class TestDevDeployLog < Minitest::Test
     progress.finish(APP, ok: true)
 
     assert_includes io.string, APP
+  end
+end
+
+# devops is the one tracked item with no artifact and no tag: the ~/code/devops
+# checkout IS the deployment, so its version is a commit sha and its release is
+# a `git pull`.
+class TestDeployDevops < Minitest::Test
+  def test_devops_repo_identifies_only_devops
+    assert devops_repo?("devops")
+    refute devops_repo?("platform")
+    refute devops_repo?("lib-util")
+    refute devops_repo?("devops-postgresql")
+  end
+
+  # The three special release paths (DB, library, devops) must stay disjoint, or
+  # run_deploys would put the same item in two phases.
+  def test_devops_is_not_a_db_or_library
+    refute db_repo?("devops")
+    refute lib_repo?("devops")
+    refute_includes lib_repos, "devops"
+  end
+
+  # ---- devops_deploy_state, against real git repos ----
+
+  def with_devops_checkout
+    Dir.mktmpdir do |root|
+      origin = File.join(root, "origin.git")
+      work = File.join(root, "devops")
+      sh("git init -q --bare -b main #{origin}")
+      sh("git clone -q #{origin} #{work}")
+      sh("git -C #{work} config user.email dev@example.com")
+      sh("git -C #{work} config user.name dev")
+      File.write(File.join(work, "README.md"), "one\n")
+      sh("git -C #{work} add -A && git -C #{work} commit -q -m one")
+      sh("git -C #{work} push -q origin main")
+      yield work, origin
+    end
+  end
+
+  # Adds a commit to origin/main that `work` has not pulled. Returns its sha.
+  def push_upstream(work, origin, message)
+    Dir.mktmpdir do |tmp|
+      other = File.join(tmp, "other")
+      sh("git clone -q #{origin} #{other}")
+      sh("git -C #{other} config user.email dev@example.com")
+      sh("git -C #{other} config user.name dev")
+      File.write(File.join(other, "#{message}.txt"), "x\n")
+      sh("git -C #{other} add -A && git -C #{other} commit -q -m #{message}")
+      sh("git -C #{other} push -q origin main")
+    end
+    sh("git -C #{work} fetch -q origin")
+    `git -C #{work} rev-parse --short origin/main`.strip
+  end
+
+  def sh(cmd)
+    out = `#{cmd} 2>&1`
+    raise "command failed: #{cmd}\n#{out}" unless $?.success?
+    out
+  end
+
+  def test_current_checkout_is_not_pending
+    with_devops_checkout do |work, _|
+      d = devops_deploy_state(work)
+      assert_equal 0, d[:ahead]
+      assert_equal d[:tag], d[:prod], "origin/main and HEAD are the same commit"
+      refute needs_deploy?(d)
+      assert_nil d[:note]
+    end
+  end
+
+  def test_behind_checkout_is_pending_with_both_shas
+    with_devops_checkout do |work, origin|
+      local = `git -C #{work} rev-parse --short HEAD`.strip
+      upstream = push_upstream(work, origin, "two")
+
+      d = devops_deploy_state(work)
+      assert_equal 1, d[:ahead]
+      assert_equal upstream, d[:tag], "tag column is what origin/main is at"
+      assert_equal local, d[:prod], "prod column is the sha actually running"
+      assert needs_deploy?(d)
+    end
+  end
+
+  # A checkout parked on a branch is not fixed by a pull, so it is reported
+  # rather than queued for release.
+  def test_feature_branch_is_noted_but_not_pending
+    with_devops_checkout do |work, _|
+      sh("git -C #{work} checkout -q -b wip")
+
+      d = devops_deploy_state(work)
+      assert_equal 0, d[:ahead]
+      assert_equal "on wip", d[:note]
+      refute needs_deploy?(d)
+    end
+  end
+
+  def test_missing_origin_main_is_an_error
+    Dir.mktmpdir do |dir|
+      sh("git init -q -b main #{dir}")
+      assert_equal({ error: "no origin/main" }, devops_deploy_state(dir))
+    end
+  end
+
+  # deploy_state_for routes devops to the sha-based state instead of demanding a
+  # tag — the repo has none, and the generic path errors with "no tag" on that.
+  def test_deploy_state_for_uses_the_sha_path_for_devops
+    with_devops_checkout do |work, _|
+      d = deploy_state_for("devops", work)
+      refute_equal "no tag", d[:error]
+      assert_equal d[:tag], d[:prod]
+    end
+  end
+
+  # ---- release ----
+
+  def test_release_one_for_devops_is_just_a_pull
+    with_devops_checkout do |work, origin|
+      upstream = push_upstream(work, origin, "two")
+
+      original = Object.instance_method(:deploy_item_dir)
+      Object.send(:define_method, :deploy_item_dir) { |_| work }
+      begin
+        result = release_one("devops", DeployProgress::Disabled.new)
+      ensure
+        Object.send(:define_method, :deploy_item_dir, original)
+      end
+
+      assert result[:ok], "expected the pull to succeed: #{result[:log]}"
+      assert_equal upstream, `git -C #{work} rev-parse --short HEAD`.strip,
+                   "the checkout must be at origin/main afterwards"
+    end
+  end
+
+  def test_release_one_for_devops_refuses_a_feature_branch
+    with_devops_checkout do |work, _|
+      sh("git -C #{work} checkout -q -b wip")
+      original = Object.instance_method(:deploy_item_dir)
+      Object.send(:define_method, :deploy_item_dir) { |_| work }
+      begin
+        result = release_one("devops", DeployProgress::Disabled.new)
+      ensure
+        Object.send(:define_method, :deploy_item_dir, original)
+      end
+
+      refute result[:ok]
+      assert_match(/not on main/, result[:log])
+    end
+  end
+
+  # ---- status row ----
+
+  def test_status_row_says_to_pull_not_unreleased
+    out = capture_row("devops", { tag: "abc1234", prod: "def5678", ahead: 3, ahead_noun: "to pull" })
+    assert_match(/\+3 to pull/, out)
+    refute_match(/unreleased/, out)
+  end
+
+  def test_status_row_shows_the_branch_note
+    out = capture_row("devops", { tag: "abc1234", prod: "abc1234", ahead: 0, note: "on wip" })
+    assert_match(/on wip/, out)
+  end
+
+  def test_status_row_keeps_unreleased_wording_for_everything_else
+    out = capture_row("acumen", { tag: "0.0.1", prod: "0.0.1", ahead: 2 })
+    assert_match(/\+2 unreleased/, out)
+  end
+
+  def capture_row(name, d)
+    old = $stdout
+    $stdout = StringIO.new
+    print_deploy_status_row(name, d, name.length, 10, 10)
+    $stdout.string
+  ensure
+    $stdout = old
+  end
+end
+
+# Phase 4: devops updates last and alone, because its pull rewrites the release
+# scripts every other phase shells out to.
+class TestDeployDevopsPhase < Minitest::Test
+  def setup
+    @rows = []
+    @released = []
+    mutex = Mutex.new
+    rows_ref = -> { @rows }
+    released_ref = -> { @released }
+
+    @orig_resolve = Object.instance_method(:resolve_deploy_items)
+    @orig_release = Object.instance_method(:release_one)
+    Object.send(:define_method, :resolve_deploy_items) { |_| rows_ref.call }
+    Object.send(:define_method, :release_one) do |name, _progress|
+      mutex.synchronize { released_ref.call << name }
+      { ok: true, log: "" }
+    end
+  end
+
+  def teardown
+    Object.send(:define_method, :resolve_deploy_items, @orig_resolve)
+    Object.send(:define_method, :release_one, @orig_release)
+  end
+
+  def capture_io
+    old = $stdout
+    $stdout = StringIO.new
+    yield
+    $stdout.string
+  ensure
+    $stdout = old
+  end
+
+  def with_tty(interactive)
+    orig = Object.instance_method(:interactive_terminal?)
+    Object.send(:define_method, :interactive_terminal?) { interactive }
+    yield
+  ensure
+    Object.send(:define_method, :interactive_terminal?, orig)
+  end
+
+  def test_devops_releases_after_apps_dbs_and_libraries
+    @rows = [
+      ["devops",            { tag: "abc1234", prod: "def5678", ahead: 1, ahead_noun: "to pull" }],
+      ["acumen",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["lib-util",          { tag: "0.0.3", ahead: 1, last: "c" }],
+    ]
+    out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
+    assert_equal %w[acumen-postgresql acumen lib-util devops], @released
+    assert_match(/Phase 4: updating devops \(git pull\)/, out)
+  end
+
+  def test_only_devops_pending_runs_no_other_phase
+    @rows = [["devops", { tag: "abc1234", prod: "def5678", ahead: 1, ahead_noun: "to pull" }]]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal ["devops"], @released
+    refute_match(/Phase 1/, out)
+    refute_match(/Phase 2/, out)
+    refute_match(/Phase 3/, out)
+    assert_match(/Phase 4/, out)
+  end
+
+  # devops is never gated on a DB, and a failed DB must not skip it.
+  def test_devops_still_updates_when_a_db_release_fails
+    @rows = [
+      ["devops",            { tag: "abc1234", prod: "def5678", ahead: 1, ahead_noun: "to pull" }],
+      ["acumen-postgresql", { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen",            { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    released = @released
+    mutex = Mutex.new
+    Object.send(:define_method, :release_one) do |name, _progress|
+      mutex.synchronize { released << name }
+      name == "acumen-postgresql" ? { ok: false, log: "boom" } : { ok: true, log: "" }
+    end
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
+    assert_includes @released, "devops", "devops must still update: #{out}"
+    refute_includes @released, "acumen", "the app whose DB failed is still skipped"
+    assert_equal 1, exc&.status
+  end
+
+  def capture_io_with_exit
+    buf = StringIO.new
+    old = $stdout
+    $stdout = buf
+    exc = nil
+    begin
+      yield
+    rescue SystemExit => e
+      exc = e
+    end
+    [buf.string, exc]
+  ensure
+    $stdout = old
+  end
+
+  def test_up_to_date_devops_is_not_pulled
+    @rows = [["devops", { tag: "abc1234", prod: "abc1234", ahead: 0 }]]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_empty @released
+    assert_match(/All apps up to date/, out)
   end
 end
