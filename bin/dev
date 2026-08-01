@@ -74,6 +74,13 @@ INVOCATIONS = {
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
+  "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
+  "autonomy outcome"    => 'autonomy outcome <decision-id> (--applied | --failed "ERROR") [--undo-command CMD] [--localhost]',
+  "autonomy workflows"  => 'autonomy workflows [KEY] [--localhost]',
+  "autonomy decisions"  => 'autonomy decisions [--workflow KEY]... [--status STATUS]... [--disposition D]... [--limit N] [--localhost]',
+  "autonomy run"        => 'autonomy run (start --workflow KEY [--trigger scheduled|manual|event] [--reference REF] | finish <run-id> --status (completed|failed|gave_up) [--summary TEXT] [--error TEXT]) [--localhost]',
+  "autonomy reverts"    => 'autonomy reverts [--localhost]',
+  "autonomy reverted"   => 'autonomy reverted <decision-id> [--failed] [--note TEXT] [--localhost]',
   "features list"       => 'features [list] [--localhost]',
   "features retire"     => 'features retire <subproject> <feature> --app APP [--app APP]... [--localhost]',
   "features status"     => 'features status [--localhost]',
@@ -484,6 +491,61 @@ USAGE = <<~USAGE
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
+    #{INVOCATIONS["autonomy decide"]}
+        Ask the autonomy ledger for permission BEFORE acting, and act only if it
+        says yes. Records the decision with its reasoning either way. EXITS 0 ONLY
+        when the answer is auto_approved, so the shell idiom is:
+
+            dev autonomy decide ... && gh pr merge 1631 --squash
+
+        Every other answer -- pending (the workflow is in propose mode), blocked
+        (outside its declared envelope or over its daily budget), suppressed (dry
+        run or the global kill switch), a validation failure, or an unreachable
+        ledger -- exits non-zero. Doing nothing is the default on anything going
+        wrong, which is the point.
+
+        A workflow key the ledger has never seen registers itself at mode dry_run,
+        so a new loop records what it WOULD do and acts on nothing until a human
+        promotes it. --register-name/--register-description seed that registration.
+
+        --assert supplies the facts the envelope is judged against: --assert
+        repo=platform --assert ci_green=true --assert diff_lines=43. `true`/`false`
+        and integers are sent as booleans and numbers. The ledger does not verify
+        any of them -- they stop a workflow drifting past its boundary, they do not
+        defend against one that reports false facts.
+
+        --idempotency-key defaults to a hash of workflow+action+subject, so a
+        retried run gets its ORIGINAL answer back instead of a fresh evaluation.
+
+    #{INVOCATIONS["autonomy outcome"]}
+        Report what actually happened after acting. Pass --undo-command with the
+        command that would take it back (`gh pr revert 1631 --repo mbryzek/platform`)
+        so the ledger can offer a revert later. Reporting --applied on a decision
+        the ledger never approved marks it `contradicted` and exits non-zero: that
+        is a workflow having acted without permission, not a bookkeeping detail.
+
+    #{INVOCATIONS["autonomy workflows"]}
+        List every registered workflow with its mode and today's counts, or show
+        one workflow's envelope and budgets. Mode, envelope and budgets are edited
+        in the admin UI, not here -- granting autonomy is a deliberate human act.
+
+    #{INVOCATIONS["autonomy decisions"]}
+        The decision feed, filterable by workflow, status and disposition.
+
+    #{INVOCATIONS["autonomy run"]}
+        Open and close a run, so a batch of decisions is grouped under the
+        execution that produced them. `start` prints the run id to pass to
+        `decide --run-id`. Finish it as completed, failed, or gave_up -- gave_up
+        is the one that means decisions were left stranded pending.
+
+    #{INVOCATIONS["autonomy reverts"]}
+        Reverts waiting on an executor: decisions whose undo is a command the
+        platform cannot run itself. Prints the command and the id to report back.
+
+    #{INVOCATIONS["autonomy reverted"]}
+        Report that a command-kind revert was executed. --failed records that it
+        was attempted and did not work, which is not the same as never trying.
+
     #{INVOCATIONS["changelog status"]}
         What platform holds per app: the latest recorded version and how many are still
         awaiting notes.
@@ -572,7 +634,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues changelog features queries claude-usage].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues autonomy changelog features queries claude-usage].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -588,6 +650,7 @@ SUBCOMMANDS = {
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
   "issues"       => %w[create list claim show status snooze reconcile resume],
+  "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
@@ -7536,6 +7599,366 @@ def cmd_changelog_all(args)
   cmd_changelog_build(args.dup)
 end
 
+# ---------- autonomy ----------
+#
+# The autonomy ledger lives on the platform host, so these commands never take
+# --app: there is exactly one ledger.
+#
+# `decide` is the important one, and its EXIT CODE is the interface. It exits 0
+# only when the ledger auto-approved the decision, so a shell script can simply
+# do `dev autonomy decide ... && do_the_thing`. Every other answer -- pending,
+# blocked, suppressed, a validation failure, or an unreachable ledger -- is
+# non-zero, which means the default behaviour on anything going wrong is to do
+# nothing. That is the whole safety property, expressed in one number.
+
+AUTONOMY_REVERSIBILITIES = %w[trivial reversible costly irreversible].freeze
+AUTONOMY_TRIGGERS = %w[scheduled manual event].freeze
+AUTONOMY_RUN_STATUSES = %w[completed failed gave_up].freeze
+
+def autonomy_endpoint(use_localhost)
+  ApiClient.endpoints(use_localhost: use_localhost, app_filter: "platform").first
+end
+
+# `--assert key=value` collected into the JSON object the envelope is evaluated
+# against. `true`/`false` become booleans and digits become numbers, because
+# `ci_green` and `diff_lines` are only meaningful to the ledger as a boolean and
+# a number -- a string "true" is not an assertion that CI is green.
+def autonomy_parse_assertion(raw, problems)
+  key, _, value = raw.partition("=")
+  if key.empty? || value.empty?
+    problems << "--assert expects key=value, got '#{raw}'"
+    return nil
+  end
+  parsed =
+    case value
+    when "true"  then true
+    when "false" then false
+    when /\A-?\d+\z/ then value.to_i
+    else value
+    end
+  [key, parsed]
+end
+
+def autonomy_default_idempotency_key(workflow, action, subject_type, subject_id)
+  require "digest"
+  Digest::SHA256.hexdigest([workflow, action, subject_type, subject_id].join("|"))[0, 32]
+end
+
+def autonomy_print_decision(decision)
+  puts "#{decision['disposition']}: #{decision['action']} #{decision['subject']['label']}"
+  reason = decision["disposition_reason"]
+  puts "  #{reason}" if reason && !reason.empty?
+  puts "  id: #{decision['id']}"
+end
+
+def cmd_autonomy_decide(args)
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  opts = {}
+  assertions = {}
+  problems = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--workflow", "--action", "--subject-type", "--subject-id", "--subject-label",
+         "--subject-url", "--rationale", "--reversibility", "--run-id", "--idempotency-key",
+         "--register-name", "--register-description"
+      value = rest[i + 1]
+      usage_exit("#{a} requires a value", example: usage_for("autonomy decide")) if value.nil?
+      opts[a.delete_prefix("--").tr("-", "_").to_sym] = value
+      i += 2
+    when "--assert"
+      value = rest[i + 1]
+      usage_exit("--assert requires key=value", example: usage_for("autonomy decide")) if value.nil?
+      pair = autonomy_parse_assertion(value, problems)
+      assertions[pair[0]] = pair[1] if pair
+      i += 2
+    else
+      problems << "Unknown argument '#{a}'"
+      i += 1
+    end
+  end
+
+  %i[workflow action subject_type subject_id subject_label rationale reversibility].each do |k|
+    problems << "--#{k.to_s.tr('_', '-')} is required" if opts[k].nil? || opts[k].to_s.empty?
+  end
+  if opts[:reversibility] && !AUTONOMY_REVERSIBILITIES.include?(opts[:reversibility])
+    problems << "--reversibility must be one of #{AUTONOMY_REVERSIBILITIES.join(', ')}"
+  end
+  report_arg_problems("decide", problems, usage_for("autonomy decide"))
+
+  body = {
+    workflow_key: opts[:workflow],
+    idempotency_key: opts[:idempotency_key] ||
+      autonomy_default_idempotency_key(opts[:workflow], opts[:action], opts[:subject_type], opts[:subject_id]),
+    action: opts[:action],
+    subject: {
+      type: opts[:subject_type],
+      id: opts[:subject_id],
+      label: opts[:subject_label],
+    },
+    rationale: opts[:rationale],
+    reversibility: opts[:reversibility],
+    assertions: assertions,
+  }
+  body[:run_id] = opts[:run_id] if opts[:run_id]
+  body[:subject][:url] = opts[:subject_url] if opts[:subject_url]
+  if opts[:register_name]
+    body[:workflow_defaults] = {
+      name: opts[:register_name],
+      description: opts[:register_description] || "",
+    }
+  end
+
+  decision =
+    begin
+      ApiClient.request(autonomy_endpoint(use_localhost), :post, "/autonomy/decisions", body: body)
+    rescue StandardError => e
+      # Fail CLOSED. An unreachable or erroring ledger must never read as permission.
+      warn "autonomy: #{e.message}"
+      warn "autonomy: treating an unanswered request as 'do nothing'"
+      exit 1
+    end
+
+  autonomy_print_decision(decision)
+  exit(decision["disposition"] == "auto_approved" ? 0 : 1)
+end
+
+def cmd_autonomy_outcome(args)
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  applied = nil
+  error = nil
+  undo_command = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--applied"
+      applied = true
+      i += 1
+    when "--failed"
+      applied = false
+      error = rest[i + 1]
+      usage_exit("--failed requires an error message", example: usage_for("autonomy outcome")) if error.nil?
+      i += 2
+    when "--undo-command"
+      undo_command = rest[i + 1]
+      usage_exit("--undo-command requires a value", example: usage_for("autonomy outcome")) if undo_command.nil?
+      i += 2
+    else
+      leftover << a
+      i += 1
+    end
+  end
+
+  problems = []
+  problems << "A decision id is required" if leftover.empty?
+  problems << "Pass exactly one of --applied or --failed" if applied.nil?
+  report_arg_problems("outcome", problems, usage_for("autonomy outcome"))
+
+  body = { applied: applied }
+  body[:error] = error if error
+  body[:undo] = { kind: "command", command: undo_command } if undo_command
+
+  handle_errors do
+    decision = ApiClient.request(autonomy_endpoint(use_localhost), :post,
+                                 "/autonomy/decisions/#{URI.encode_www_form_component(leftover.first)}/outcome",
+                                 body: body)
+    puts "#{decision['status']}: #{decision['action']} #{decision['subject']['label']}"
+    if decision["status"] == "contradicted"
+      warn "autonomy: the ledger never approved this decision. Acting on it was a contract violation."
+      exit 1
+    end
+  end
+end
+
+def cmd_autonomy_workflows(args)
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  endpoint = autonomy_endpoint(use_localhost)
+
+  handle_errors do
+    if rest.empty?
+      rows = ApiClient.request(endpoint, :get, "/autonomy/workflows?limit=100")
+      if rows.empty?
+        puts "No workflows registered yet."
+      else
+        rows.each do |w|
+          stats = w["stats"]
+          puts format("%-28s %-12s decisions today %-4s blocked %-4s pending %s",
+                      w["key"], w["mode"], stats["decisions_today"], stats["blocked_today"], stats["pending"])
+        end
+      end
+    else
+      w = ApiClient.request(endpoint, :get, "/autonomy/workflows/#{URI.encode_www_form_component(rest.first)}")
+      puts "#{w['key']} (#{w['mode']})"
+      puts "  #{w['description']}"
+      env = w["envelope"]
+      puts "  repos:      #{env['allowed_repos'].empty? ? 'unrestricted' : env['allowed_repos'].join(', ')}"
+      puts "  max diff:   #{env['max_diff_lines'] || 'unrestricted'}"
+      puts "  asserts:    #{env['required_assertions'].empty? ? 'none' : env['required_assertions'].join(', ')}"
+      budget = w["budget"]
+      puts "  budget:     #{budget['max_decisions_per_day'] || '-'} decisions/day, #{budget['max_auto_approved_per_day'] || '-'} auto-approved/day"
+    end
+  end
+end
+
+def cmd_autonomy_decisions(args)
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  params = []
+  limit = "25"
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--workflow", "--status", "--disposition"
+      value = rest[i + 1]
+      usage_exit("#{a} requires a value", example: usage_for("autonomy decisions")) if value.nil?
+      key = a == "--workflow" ? "workflow_key" : a.delete_prefix("--")
+      params << "#{key}=#{URI.encode_www_form_component(value)}"
+      i += 2
+    when "--limit"
+      limit = rest[i + 1]
+      usage_exit("--limit requires a value", example: usage_for("autonomy decisions")) if limit.nil?
+      i += 2
+    else
+      usage_exit("Unknown argument '#{a}'", example: usage_for("autonomy decisions"))
+    end
+  end
+  params << "limit=#{limit}"
+
+  handle_errors do
+    rows = ApiClient.request(autonomy_endpoint(use_localhost), :get, "/autonomy/decisions?#{params.join('&')}")
+    if rows.empty?
+      puts "No decisions match."
+    else
+      rows.each do |d|
+        puts format("%-14s %-12s %-24s %s",
+                    d["disposition"], d["status"], d["workflow"]["key"], d["subject"]["label"])
+      end
+    end
+  end
+end
+
+def cmd_autonomy_run(args)
+  sub = args.shift
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  endpoint = autonomy_endpoint(use_localhost)
+
+  case sub
+  when "start"
+    opts = {}
+    i = 0
+    while i < rest.length
+      a = rest[i]
+      case a
+      when "--workflow", "--trigger", "--reference"
+        value = rest[i + 1]
+        usage_exit("#{a} requires a value", example: usage_for("autonomy run")) if value.nil?
+        opts[a.delete_prefix("--").to_sym] = value
+        i += 2
+      else
+        usage_exit("Unknown argument '#{a}'", example: usage_for("autonomy run"))
+      end
+    end
+    problems = []
+    problems << "--workflow is required" if opts[:workflow].nil?
+    trigger = opts[:trigger] || "scheduled"
+    problems << "--trigger must be one of #{AUTONOMY_TRIGGERS.join(', ')}" unless AUTONOMY_TRIGGERS.include?(trigger)
+    report_arg_problems("run start", problems, usage_for("autonomy run"))
+
+    body = { workflow_key: opts[:workflow], trigger_source: trigger }
+    body[:external_reference] = opts[:reference] if opts[:reference]
+    handle_errors do
+      run = ApiClient.request(endpoint, :post, "/autonomy/runs", body: body)
+      puts run["id"]
+    end
+  when "finish"
+    id = rest.shift
+    opts = {}
+    i = 0
+    while i < rest.length
+      a = rest[i]
+      case a
+      when "--status", "--summary", "--error"
+        value = rest[i + 1]
+        usage_exit("#{a} requires a value", example: usage_for("autonomy run")) if value.nil?
+        opts[a.delete_prefix("--").to_sym] = value
+        i += 2
+      else
+        usage_exit("Unknown argument '#{a}'", example: usage_for("autonomy run"))
+      end
+    end
+    problems = []
+    problems << "A run id is required" if id.nil?
+    problems << "--status must be one of #{AUTONOMY_RUN_STATUSES.join(', ')}" unless AUTONOMY_RUN_STATUSES.include?(opts[:status].to_s)
+    report_arg_problems("run finish", problems, usage_for("autonomy run"))
+
+    body = { status: opts[:status] }
+    body[:summary] = opts[:summary] if opts[:summary]
+    body[:error] = opts[:error] if opts[:error]
+    handle_errors do
+      run = ApiClient.request(endpoint, :put, "/autonomy/runs/#{URI.encode_www_form_component(id)}", body: body)
+      puts "#{run['id']}: #{run['status']}"
+    end
+  else
+    usage_exit("autonomy run takes 'start' or 'finish'", example: usage_for("autonomy run"))
+  end
+end
+
+def cmd_autonomy_reverts(args)
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("autonomy reverts", rest)
+
+  handle_errors do
+    rows = ApiClient.request(autonomy_endpoint(use_localhost), :get,
+                             "/autonomy/decisions?status=revert_requested&limit=100")
+    commands = rows.select { |d| d["undo"] && d["undo"]["kind"] == "command" }
+    if commands.empty?
+      puts "No reverts are waiting on an executor."
+    else
+      commands.each do |d|
+        puts "#{d['id']}  #{d['subject']['label']}"
+        puts "  #{d['undo']['command']}"
+        puts "  then: dev autonomy reverted #{d['id']}"
+      end
+    end
+  end
+end
+
+def cmd_autonomy_reverted(args)
+  rest, _app_filter, use_localhost = parse_common_flags(args)
+  succeeded = true
+  note = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--failed"
+      succeeded = false
+      i += 1
+    when "--note"
+      note = rest[i + 1]
+      usage_exit("--note requires a value", example: usage_for("autonomy reverted")) if note.nil?
+      i += 2
+    else
+      leftover << a
+      i += 1
+    end
+  end
+  report_arg_problems("reverted", leftover.empty? ? ["A decision id is required"] : [], usage_for("autonomy reverted"))
+
+  body = { succeeded: succeeded }
+  body[:note] = note if note
+  handle_errors do
+    decision = ApiClient.request(autonomy_endpoint(use_localhost), :post,
+                                 "/autonomy/decisions/#{URI.encode_www_form_component(leftover.first)}/revert/completion",
+                                 body: body)
+    puts "#{decision['id']}: #{decision['status']}"
+  end
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -7664,6 +8087,19 @@ when "issues"
   when "reconcile" then cmd_issues_reconcile(argv)
   when nil         then require_subcommand("issues")
   else               unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
+  end
+when "autonomy"
+  sub = argv.shift
+  case sub
+  when "decide"    then cmd_autonomy_decide(argv)
+  when "outcome"   then cmd_autonomy_outcome(argv)
+  when "workflows" then cmd_autonomy_workflows(argv)
+  when "decisions" then cmd_autonomy_decisions(argv)
+  when "run"       then cmd_autonomy_run(argv)
+  when "reverts"   then cmd_autonomy_reverts(argv)
+  when "reverted"  then cmd_autonomy_reverted(argv)
+  when nil         then require_subcommand("autonomy")
+  else               unknown("autonomy subcommand", sub, SUBCOMMANDS["autonomy"])
   end
 when "features"
   sub = resolve_subcommand(argv, default: "list")
