@@ -39,6 +39,31 @@ echo "[10-schema] Loading journal partition/queue settings..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$DB_NAME" \
     -f /schema/journal-settings.sql
 
+# The baked dump carries the partitions that existed when the image was BUILT, and journal
+# partitions are per-period. An image cut in July has no August partition, so on August 1st every
+# session database cloned from it fails every insert into a journaled table with
+# `no partition of relation "<table>" found for row` -- 2,372 of them in one suite (ISS-203). It
+# reads exactly like a catastrophic regression in whatever branch is checked out, and it is purely
+# an artifact of the image's age. Maintaining here re-bases the partitions on the day the container
+# first starts, which is the day the template every session clones is actually made.
+#
+# The guard is what keeps this app-agnostic: an app with no journal schema has an empty
+# journal-settings.sql and no journal.maintain_partitions, and gets a no-op.
+echo "[10-schema] Creating journal partitions for the current period..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$DB_NAME" <<-'EOSQL'
+    DO $$
+    DECLARE
+      r record;
+    BEGIN
+      IF to_regprocedure('journal.maintain_partitions(text,text)') IS NULL THEN
+        RETURN;
+      END IF;
+      FOR r IN SELECT journal_schema, journal_table FROM journal.settings LOOP
+        PERFORM journal.maintain_partitions(r.journal_schema, r.journal_table);
+      END LOOP;
+    END $$;
+EOSQL
+
 # The role is passed as a custom GUC rather than a psql variable: psql does NOT
 # interpolate :vars inside the dollar-quoted DO block that script is built from,
 # so current_setting() is what makes it parameterisable at all. The -c and the
