@@ -1,0 +1,88 @@
+# Producer registry for `dev agent tick` (design §4.2).
+#
+# Producers CREATE work; the dispatcher DOES work. A producer is a cheap check,
+# never the work itself, and it NEVER spawns Claude — where a check finds
+# something, it files an issue and the expensive part happens as claimed work
+# through the normal queue.
+#
+# This file is the ONLY place a schedule lives. The platform records run history
+# and arbitrates ("has someone already started this run?") but has no notion of
+# "due" — teaching it the grammar would mean a second copy of this registry that
+# drifts from git.
+#
+# Schedule grammar — three spoken forms, no cron expressions:
+#
+#   every <n> <unit>              every 1 hour, every 30 minutes
+#   daily at <time>               daily at 3:00am
+#   weekly on <day> at <time>     weekly on monday at 2:00am
+#
+# `timezone` is declared once, as an IANA zone rather than an abbreviation.
+# "3am EDT" names a fixed offset and would silently drift an hour every winter;
+# America/New_York means 3:00am local year-round across both DST transitions.
+#
+# file_when:
+#   check_fails   file when the check exits 1
+#   always        file unconditionally (for a chore with no cheap check — the
+#                 review IS the work). The only form that may omit `check`.
+#   never         the check acts directly and files nothing. Must not carry an
+#                 `issue` block.
+#
+# CHECK EXIT CODES ARE A CONTRACT:
+#   0  clean, nothing to do
+#   1  findings — file (or increment) the issue
+#   >1 the check itself broke -> recorded as `check_failed`, never as `filed`
+# A crashing check is not evidence of a problem in the thing being checked, and
+# collapsing the two turns a broken producer into a nightly stream of bogus
+# issues.
+#
+# `fingerprint` is the dedup key. A producer does not file while a NON-TERMINAL
+# issue with the same fingerprint exists (anything other than verified or
+# dismissed — `fixed` included, which is what makes "don't re-file while a PR is
+# open" free). Even on a double-fire the server increments occurrence_count
+# instead of creating a duplicate.
+
+timezone: America/New_York
+
+producers:
+  - key: invariants-platform
+    schedule: every 1 hour
+    check: dev invariants check --app platform
+    file_when: check_fails
+    issue:
+      category: infrastructure
+      severity: high
+      title: Run dev invariants and fix as necessary
+      fingerprint: invariants:platform
+
+  - key: codegen-sync
+    schedule: daily at 3:00am
+    check: dev codegen sync --check
+    file_when: check_fails
+    issue:
+      category: infrastructure
+      title: Sync generated code
+      fingerprint: codegen:sync
+
+  # Reconciles directly and files nothing. This is the scheduled backstop for
+  # "the agent died after opening a PR but before recording `fixed`" — the merge
+  # webhook covers the merged case, this covers the rest. Three independent
+  # closing paths, none load-bearing alone (design §4.1.2).
+  - key: issue-reconcile
+    schedule: every 30 minutes
+    check: dev issues reconcile --apply
+    file_when: never
+
+  - key: weekly-review-platform
+    schedule: weekly on monday at 2:00am
+    file_when: always               # no cheap check exists — the review IS the work
+    issue:
+      category: infrastructure
+      title: "Weekly code review: platform"
+      fingerprint: weekly-review:platform
+
+  # Retention is a producer, not a cron, so log purging gets the same history,
+  # visibility and mutual exclusion as everything else on the tick (§4.3.1).
+  - key: agent-gc
+    schedule: daily at 4:00am
+    check: dev agent gc
+    file_when: never

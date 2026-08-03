@@ -383,8 +383,14 @@ class TestDevIssues < Minitest::Test
     end
   end
 
+  # Derived from the filesystem rather than a hand-kept list: issue_body_text's
+  # actual contract is "your own <category>-body.md if there is one, the default
+  # otherwise", and a hard-coded complement silently went stale every time a
+  # category was added (club_backfill, then infrastructure).
   def test_non_pipeline_categories_fall_back_to_the_default_body
-    (ISSUE_CATEGORIES - PIPELINE_CATEGORIES - %w[suggestion]).each do |category|
+    without_own_body = ISSUE_CATEGORIES.reject { |c| File.file?(claude_issues_path("#{c}-body.md")) }
+    refute_empty without_own_body
+    without_own_body.each do |category|
       assert_equal issue_default_body_text, issue_body_text(category), "#{category}: expected default body"
     end
   end
@@ -451,7 +457,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_categories_match_the_spec_enum
-    assert_equal %w[graphs worker insights suggestion feature bug improvement], ISSUE_CATEGORIES
+    assert_equal %w[graphs worker insights club_backfill suggestion feature bug improvement infrastructure], ISSUE_CATEGORIES
   end
 
   def test_graphs_body_orients_to_playbook_app
@@ -668,7 +674,7 @@ class TestDevIssues < Minitest::Test
   def test_claim_rejects_invalid_category
     out, status = capture_stderr_and_exit { cmd_issues_claim(["--category", "bogus"]) }
     assert_equal 1, status
-    assert_match(/--category must be one of: graphs, worker, insights, suggestion, feature, bug, improvement/, out)
+    assert_match(/--category must be one of: #{Regexp.escape(ISSUE_CATEGORIES.join(", "))}/, out)
   end
 
   def test_claim_rejects_category_without_value

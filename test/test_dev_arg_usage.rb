@@ -28,7 +28,7 @@ class TestDevArgUsage < Minitest::Test
   def test_every_dispatched_command_has_subcommands
     # Every command wired to require_subcommand must have a non-empty SUBCOMMANDS
     # entry, or the hint would read "()".
-    %w[config tasks browserslist docker aidirs issues].each do |cmd|
+    %w[config tasks browserslist docker aidirs issues agent].each do |cmd|
       refute_nil SUBCOMMANDS[cmd], "SUBCOMMANDS missing #{cmd}"
       refute_empty SUBCOMMANDS[cmd]
     end
@@ -76,6 +76,12 @@ class TestDevArgUsage < Minitest::Test
       "deploy all bad conc"       => [-> { cmd_deploy_all(["--concurrency", "0"]) }, "dev deploy all"],
       "browserslist stray arg"    => [-> { cmd_browserslist_update(["foo"]) },         "dev browserslist update"],
       "scripts run no name"       => [-> { cmd_scripts_run([]) },                      "dev scripts run <name>"],
+      "agent tick stray arg"      => [-> { cmd_agent_tick(["--nope"]) },               "dev agent tick [--dry-run]"],
+      "agent logs no issue"       => [-> { cmd_agent_logs([]) },                       "dev agent logs <issue>"],
+      "agent runs bad limit"      => [-> { cmd_agent_runs(["--limit", "0"]) },         "dev agent runs"],
+      "agent refresh no issue"    => [-> { cmd_agent_refresh([]) },                    "dev agent refresh <issue>"],
+      "agent release no issue"    => [-> { cmd_agent_release([]) },                    "dev agent release <issue>"],
+      "agent gc stray arg"        => [-> { cmd_agent_gc(["--nope"]) },                 "dev agent gc"],
     }
   end
 
@@ -116,6 +122,11 @@ class TestDevArgUsage < Minitest::Test
       "deploy status"      => -> { cmd_deploy_status(["--typo"]) },
       "config check"       => -> { cmd_config_check(["--typo"]) },
       "config rollout"     => -> { cmd_config_rollout(["--typo"]) },
+      "agent status"       => -> { cmd_agent_status(["--typo"]) },
+      "agent runners"      => -> { cmd_agent_runners(["--typo"]) },
+      "agent producers"    => -> { cmd_agent_producers(["--typo"]) },
+      "agent pause"        => -> { cmd_agent_pause(["--typo"]) },
+      "agent resume"       => -> { cmd_agent_resume(["--typo"]) },
     }.each do |command, callable|
       out, status = capture_stderr_and_exit { callable.call }
       assert_equal 1, status, "#{command}: expected exit 1 on stray flag"

@@ -5,7 +5,20 @@ require 'net/http'
 require 'uri'
 
 class SessionExpired < StandardError; end
-class ApiError < StandardError; end
+
+# `code` carries the HTTP status, because several callers have to BRANCH on it
+# rather than just report it: the agent dispatcher treats 429 on a claim as
+# "fleet daily cap reached, back off" and 409 on a lease heartbeat as "this
+# lease is gone, kill the job". Parsing the status back out of the message would
+# be the same information one layer less reliably.
+class ApiError < StandardError
+  attr_reader :code
+
+  def initialize(msg = nil, code: nil)
+    super(msg)
+    @code = code
+  end
+end
 
 class ApiClient
   ENDPOINTS = [
@@ -164,7 +177,7 @@ class ApiClient
     when 401
       raise SessionExpired, "Session expired or invalid for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
     else
-      raise ApiError, "HTTP #{code} #{method.to_s.upcase} #{path}: #{res.body}"
+      raise ApiError.new("HTTP #{code} #{method.to_s.upcase} #{path}: #{res.body}", code: code)
     end
   end
 end

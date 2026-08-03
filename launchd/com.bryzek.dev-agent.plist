@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Autonomous agent dispatcher: runs `dev agent tick` every 30 seconds.
+
+  A LaunchAgent, NOT a LaunchDaemon. A LaunchDaemon runs as root at boot with no
+  user session: no keychain (so no `gh` auth), no Docker Desktop, no nvm `node`
+  for `claude`. Everything this needs lives in the user session.
+
+  Install:   cp launchd/com.bryzek.dev-agent.plist ~/Library/LaunchAgents/
+             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bryzek.dev-agent.plist
+  Uninstall: launchctl bootout gui/$(id -u)/com.bryzek.dev-agent
+  Verify:    dev agent tick --dry-run     (prints every decision, executes none)
+
+  /bin/zsh -lc supplies the interactive PATH (homebrew, nvm's node for `claude`,
+  sbt, gh); launchd's own environment is nearly empty.
+
+  NO LOCKING AND NO LOGGING IN THIS FILE — both live inside `dev agent tick`.
+  The tick has two phases needing two different locks (vitals must never sit
+  behind the work lock), so a single wrapper here would gate heartbeats behind a
+  slow clone and fake an outage on a healthy machine. And note that the usual
+  `/usr/bin/flock -n` idiom does not exist on macOS: flock(1) ships with
+  util-linux and is in neither the base system nor homebrew, so a plist using it
+  would fail with "command not found" on every fire while launchd recorded only a
+  non-zero exit. The tick uses Ruby's File#flock instead. Logging is likewise the
+  command's job so every path is defined in one place
+  (~/Library/Logs/dev-agent/).
+
+  HOST PREREQUISITES — these are what silently kill an unattended machine:
+
+    Automatic login enabled
+      A LaunchAgent runs only in a logged-in GUI session. After a reboot without
+      auto-login the dispatcher is silently dead, and the queue looks calm either
+      way.
+
+    FileVault stays ON
+      It defeats auto-login, since the disk needs a password at boot. A
+      deliberate tradeoff on a box holding `gh` credentials and the git-crypt'd
+      env repo: use `sudo fdesetup authrestart` for planned reboots and let the
+      runner-offline alert catch the unplanned case.
+
+    Sleep disabled       sudo pmset -a sleep 0 disablesleep 1
+      A sleeping machine claims nothing.
+
+    Docker Desktop starts at login
+      `claude-db` needs it.
+
+    `gh` authenticated, `dev auth ai` token stored
+      Attribution to the AI, and it bootstraps self-registration.
+
+  Not on that list: registering the machine, setting its concurrency, or editing
+  any fleet config. The first tick does all of that itself.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.bryzek.dev-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>~/code/devops/bin/dev agent tick</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>

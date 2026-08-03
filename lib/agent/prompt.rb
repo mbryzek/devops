@@ -1,0 +1,84 @@
+require 'agent/paths'
+
+# The prompt fed to a session on stdin (design §4.3.2). Exactly three parts, in
+# this order:
+#
+#   1. Standing instructions — devops/agent/instructions.md, versioned in git
+#      and reviewed like code. Everything the outcome protocol depends on lives
+#      there, not here.
+#   2. The issue body.
+#   3. EVERY issue comment, oldest first.
+#
+# Part 3 is not optional context — it is how the loops close. A `needs_input`
+# issue returns to `open` when Mike answers as a comment, and the next attempt
+# only works because it reads that comment; review feedback flows identically
+# (§4.4.1). Dropping comments would silently break both loops while everything
+# still looked like it ran.
+#
+# The assignment block between the instructions and the body is executor state
+# the session cannot discover for itself: which directory is its workspace,
+# which branch to use, and whether this is a fresh attempt or a resume.
+module Agent
+  module Prompt
+    module_function
+
+    def instructions
+      path = Agent::Paths.instructions_file
+      raise "standing instructions not found: #{path}" unless File.file?(path)
+      File.read(path)
+    end
+
+    def build(issue:, comments:, slug:, workspace:, resume_repo: nil)
+      [
+        instructions.strip,
+        assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo),
+        issue_section(issue),
+        comments_section(comments),
+      ].join("\n\n---\n\n") + "\n"
+    end
+
+    def assignment(issue:, slug:, workspace:, resume_repo: nil)
+      lines = []
+      lines << "# Your assignment"
+      lines << ""
+      lines << "- Issue: ISS-#{issue['number']} — #{issue['title']}"
+      lines << "- Category: #{issue['category']}   Severity: #{issue['severity'] || 'unset'}"
+      lines << "- Workspace (your ONLY writable working directory): #{workspace}"
+      lines << "- Branch to use in every repo you touch: `#{slug}`"
+      lines << "- PR title MUST start with `ISS-#{issue['number']}: `"
+      lines << ""
+      if resume_repo
+        lines << "**This is a RESUME, not a fresh attempt.** `#{resume_repo}` is already cloned in your"
+        lines << "workspace, checked out on `#{slug}` and rebased onto `origin/main`. An open PR exists"
+        lines << "on that branch. Do NOT open a second PR and do NOT create a new branch: read the"
+        lines << "comments below for what is being asked, address it, rerun codegen, push, and the PR"
+        lines << "updates in place. Close the issue out with `dev issues status` as usual."
+      else
+        lines << "Your workspace is empty. Clone every repo you need into it (`gh repo clone <owner>/<repo>"
+        lines << "#{workspace}/<repo>`), create branch `#{slug}` in each from the latest `origin/main`, and"
+        lines << "work there. Never edit a checkout under ~/code outside this workspace."
+      end
+      lines.join("\n")
+    end
+
+    def issue_section(issue)
+      <<~SECTION.strip
+        # ISS-#{issue['number']}: #{issue['title']}
+
+        #{issue['body'].to_s.strip}
+      SECTION
+    end
+
+    # Oldest first, so the thread reads forward and the most recent instruction
+    # — which is usually the one that re-opened the issue — is last.
+    def comments_section(comments)
+      list = Array(comments).sort_by { |c| c["created_at"].to_s }
+      return "# Issue comments\n\n(none)" if list.empty?
+      body = list.map do |c|
+        author = c.dig("user", "name") || c.dig("user", "id") || c["author"] || "unknown"
+        "## #{c['created_at']} — #{author}\n\n#{c['body'].to_s.strip}"
+      end.join("\n\n")
+      "# Issue comments (oldest first — read all of them)\n\n#{body}"
+    end
+  end
+end
