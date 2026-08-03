@@ -8224,7 +8224,11 @@ def cmd_agent_runners(args)
       gb = r["memory_bytes"] ? (r["memory_bytes"] / (1024.0**3)).round : "?"
       puts "#{r['hostname']}#{mine}"
       puts "  #{r['model']} #{r['cpu_brand']} #{r['cpu_cores']} cores #{gb}G   concurrency #{r['max_concurrency']}"
-      puts "  last seen #{r['last_heartbeat_at']}#{r['paused'] ? '   PAUSED' : ''}#{r['retired_at'] ? '   RETIRED' : ''}"
+      # `is_stale` is the server's own answer, the same predicate behind the
+      # agent_runner_heartbeat_stale invariant. Never recompute it from the
+      # timestamp here — two thresholds that disagree is worse than one.
+      flags = [r["is_stale"] ? "OFFLINE" : nil, r["paused"] ? "PAUSED" : nil, r["retired_at"] ? "RETIRED" : nil].compact
+      puts "  last seen #{r['last_heartbeat_at']}#{flags.empty? ? '' : "   #{flags.join('  ')}"}"
     end
   end
 end
@@ -8282,7 +8286,8 @@ def cmd_agent_runs(args)
 
   handle_errors do
     if issue_number
-      leases = Agent::Api.leases(token: identity.token, use_localhost: use_localhost, issue_number: issue_number)
+      # Every attempt, active and closed: the lease table IS the attempt history.
+      leases = Agent::Api.issue_lease_history(issue_number, token: identity.token, use_localhost: use_localhost)
       puts "ISS-#{issue_number}: #{leases.length} lease attempt(s)"
       leases.each do |l|
         puts "  #{l['created']}  runner #{l['runner_id']}  branch #{l['branch'] || '-'}  " \

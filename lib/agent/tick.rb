@@ -42,10 +42,11 @@ require 'agent/workspace'
 # would be dead on arrival with no obvious symptom.
 module Agent
   class Tick
+    # 10-minute heartbeats against the platform's 3-hour staleness window is an
+    # 18x margin — enough to absorb a reboot, a FileVault unlock, and a brief
+    # network outage without flapping. The window itself is NOT duplicated here:
+    # the server sets `is_stale` from the same predicate the invariant uses.
     RUNNER_HEARTBEAT_SECONDS = 10 * 60
-    # Matches the platform's `agent_runner_heartbeat_stale` invariant, so the CLI
-    # and the invariant never disagree about what "offline" means.
-    RUNNER_STALE_SECONDS = 3 * 3600
 
     # Non-terminal issue statuses, for the producer in-flight check. Kept as the
     # complement of TERMINAL_ISSUE_STATUSES so adding a status to the spec cannot
@@ -194,14 +195,18 @@ module Agent
 
     # The single most important alert in the system: a machine that reboots and
     # never logs back in looks exactly like an empty queue.
+    #
+    # `is_stale` comes from the server, which evaluates the SAME predicate as the
+    # `agent_runner_heartbeat_stale` invariant and the 15-minute health task.
+    # Recomputing it here from `last_heartbeat_at` would be a fourth copy of one
+    # threshold, and the CLI and the invariant would eventually disagree about
+    # what "offline" means.
     def notify_offline_runners(runners, identity)
       runners.each do |runner|
         next if runner["id"] == identity.runner_id
-        next if runner["retired_at"]
-        at = runner["last_heartbeat_at"] && (Time.parse(runner["last_heartbeat_at"]) rescue nil)
-        next if at.nil? || (@now - at) < RUNNER_STALE_SECONDS
+        next unless runner["is_stale"]
         Agent::Notify.once("runner_offline", runner["id"], now: @now) do
-          Agent::Notify.event("dev-agent: runner #{runner['hostname'] || runner['id']} has not checked in since #{at.utc.iso8601}")
+          Agent::Notify.event("dev-agent: runner #{runner['hostname'] || runner['id']} has not checked in since #{runner['last_heartbeat_at']}")
         end
       end
     end
@@ -242,7 +247,7 @@ module Agent
     end
 
     def lease_attempts(number, identity)
-      Agent::Api.leases(token: identity.token, use_localhost: @use_localhost, issue_number: number).length
+      Agent::Api.issue_lease_history(number, token: identity.token, use_localhost: @use_localhost).length
     rescue ApiError
       1
     end
@@ -330,8 +335,10 @@ module Agent
                                           if_no_run_since: last_started,
                                           token: identity.token, use_localhost: @use_localhost)
       if run.nil?
-        # 204: in flight elsewhere, or another machine started one after our
-        # guard timestamp. A compare-and-set, not a scheduler.
+        # An absent `run` in the wrapper: one is in flight elsewhere, or another
+        # machine started one after our guard timestamp. A compare-and-set, not a
+        # scheduler — and the check must NOT run, or two machines would both do
+        # the work the arbitration exists to deduplicate.
         decide("producer", "#{producer.key}: another runner already started this run — skipping")
         return
       end
@@ -421,16 +428,48 @@ module Agent
         lease = begin
           Agent::Api.claim(runner_id: identity.runner_id, token: identity.token, use_localhost: @use_localhost)
         rescue ApiError => e
-          raise unless e.code == 429
-          Agent::Notify.once("cap_reached", @now.strftime("%Y-%m-%d"), now: @now) do
-            Agent::Notify.event("dev-agent: fleet daily claim cap reached — claiming nothing until the window resets")
-          end
-          decide("claim", "fleet daily claim cap reached — backing off")
-          break
+          break if handle_claim_error(e, identity)
+          raise
         end
+        # No lease in the response means the queue had nothing claimable — the
+        # ordinary idle case, and the ONLY quiet one. 429 and 422 above are not
+        # emptiness and never reach here.
         break if lease.nil?
         start_job(lease, identity)
         live += 1
+      end
+    end
+
+    # The two claim failures that are NOT "no work", handled loudly. Returns true
+    # when the caller should stop claiming, false when it should re-raise.
+    #
+    # 429 — the fleet-wide daily cap. Expected, bounded, and self-clearing when
+    # the window resets. Its body is deliberately empty (one body type per status
+    # code registry-wide), so the status code IS the message: do not try to read
+    # a reason out of it.
+    #
+    # 422 — the server does not recognize this runner_id. A client bug, never
+    # "nothing to do": most likely the identity cache outlived its row (a runner
+    # retired, or a restored/rebuilt platform DB). Silently treating it as an
+    # idle queue would leave the machine looking healthy and claiming nothing
+    # forever, which is exactly the failure the unconditional heartbeat exists to
+    # make visible. So it drops the cached identity — the hardware UUID is the
+    # authority, so the next tick re-registers and upserts back onto the same row.
+    def handle_claim_error(error, identity)
+      case error.code
+      when 429
+        Agent::Notify.once("cap_reached", @now.strftime("%Y-%m-%d"), now: @now) do
+          Agent::Notify.event("dev-agent: fleet daily claim cap reached — claiming nothing until the window resets")
+        end
+        decide("claim", "fleet daily claim cap reached — backing off until the window resets")
+        true
+      when 422
+        decide("claim", "REJECTED (422): the platform does not recognize runner #{identity.runner_id} — " \
+                        "clearing #{Agent::Paths.identity_file} so the next tick re-registers on this machine's hardware UUID. #{error.message}")
+        File.delete(Agent::Paths.identity_file) if File.exist?(Agent::Paths.identity_file)
+        true
+      else
+        false
       end
     end
 

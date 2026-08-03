@@ -67,13 +67,20 @@ module Agent
     end
 
     # Compare-and-set, not a scheduler: the server creates the run atomically
-    # unless one is in flight for this key or one started after `if_no_run_since`
-    # — either case is a 204 (nil here) and the tick moves on.
+    # unless one is in flight for this key or one started after
+    # `if_no_run_since`.
+    #
+    # The "nothing happened" answer is a 200 carrying `agent_producer_run_start`
+    # with `run` ABSENT — not a 204. API Builder refuses to let one resource vary
+    # its type across 2xx codes (`cannot have varying response types for 2xx`),
+    # so the emptiness moved from the status line into the body. Unwrapped here
+    # so every caller still just sees "a run, or nil".
     def start_producer_run(key, runner_id:, if_no_run_since:, token:, use_localhost:)
       body = { runner_id: runner_id }
       body[:if_no_run_since] = if_no_run_since.utc.iso8601 if if_no_run_since
-      request(:post, "/agent/producers/#{URI.encode_www_form_component(key)}/runs",
-              token: token, use_localhost: use_localhost, body: body)
+      res = request(:post, "/agent/producers/#{URI.encode_www_form_component(key)}/runs",
+                    token: token, use_localhost: use_localhost, body: body)
+      res && res["run"]
     end
 
     def finish_producer_run(run_id, result:, issue_number: nil, token:, use_localhost:)
@@ -84,20 +91,42 @@ module Agent
 
     # ---- issue leases ----
 
-    def leases(token:, use_localhost:, runner_id: nil, issue_number: nil, is_active: nil, limit: 100, offset: 0)
-      params = { "limit" => limit, "offset" => offset }
+    # `is_active` is REQUIRED on the server with a default of true (API Builder
+    # rejects a defaulted optional parameter), so it is always sent explicitly
+    # rather than left to omission — a filter you cannot see in the URL is a
+    # filter you forget is there.
+    def leases(token:, use_localhost:, is_active: true, runner_id: nil, issue_number: nil, limit: 100, offset: 0)
+      params = { "is_active" => is_active }
       params["runner_id"] = runner_id if runner_id
       params["issue_number"] = issue_number if issue_number
-      params["is_active"] = is_active unless is_active.nil?
+      params.merge!("limit" => limit, "offset" => offset)
       request(:get, "/#{TENANT}/issue/leases?#{URI.encode_www_form(params)}",
               token: token, use_localhost: use_localhost) || []
     end
 
-    # 200 => a lease; 204 (nil) => nothing claimable. A 429 raises ApiError with
-    # code 429, which the tick treats as "fleet daily cap reached — back off".
+    # Every lease an issue has ever had, oldest first. The lease table IS the
+    # attempt history (one row per attempt), so this is what "which attempt is
+    # this" and `dev agent runs --issue N` both read.
+    #
+    # Two calls because `is_active` is a required boolean: there is no "either"
+    # value to ask for. Only the reap path and an explicit history query pay it.
+    def issue_lease_history(issue_number, token:, use_localhost:)
+      [true, false].flat_map do |active|
+        leases(token: token, use_localhost: use_localhost, issue_number: issue_number, is_active: active)
+      end.sort_by { |lease| lease["created"].to_s }
+    end
+
+    # The lease, or nil when nothing is claimable.
+    #
+    # "Nothing claimable" is a 200 carrying `issue_lease_claim` with `lease`
+    # ABSENT, not a 204: API Builder refuses to let a resource vary its type
+    # across 2xx codes. Two error codes are NOT emptiness and must not be
+    # swallowed here — 429 (fleet daily cap, empty body, so the status code is
+    # the whole message) and 422 (an unknown runner_id, i.e. a client bug).
     def claim(runner_id:, token:, use_localhost:)
-      request(:post, "/#{TENANT}/issue/leases", token: token, use_localhost: use_localhost,
-                                                body: { runner_id: runner_id })
+      res = request(:post, "/#{TENANT}/issue/leases", token: token, use_localhost: use_localhost,
+                                                      body: { runner_id: runner_id })
+      res && res["lease"]
     end
 
     # 409 => the lease expired or was reassigned. The job must die.
@@ -105,6 +134,10 @@ module Agent
       request(:post, "/#{TENANT}/issue/leases/#{lease_id}/heartbeat", token: token, use_localhost: use_localhost)
     end
 
+    # Releasing reverts the issue to `open` only if it is still exactly
+    # `claimed`, so a force-release cannot clobber forward progress a session
+    # already made. That is why `dev agent release` needs no status check of its
+    # own.
     def release_lease(lease_id, token:, use_localhost:)
       request(:delete, "/#{TENANT}/issue/leases/#{lease_id}", token: token, use_localhost: use_localhost)
     end

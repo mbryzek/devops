@@ -41,11 +41,14 @@ class TestDevAgentTick < Minitest::Test
     Agent::Paths.write_json(Agent::Paths.identity_file, { "runner_id" => RUNNER_ID, "token" => "tok" }, mode: 0600)
   end
 
-  def fleet_responses(paused: false, max_concurrency: 2, runs: [])
+  def runner_row(id: RUNNER_ID, paused: false, max_concurrency: 2, is_stale: false, hostname: "mini.local")
+    { "id" => id, "hostname" => hostname, "max_concurrency" => max_concurrency, "paused" => paused,
+      "is_stale" => is_stale, "last_heartbeat_at" => Time.now.utc.iso8601 }
+  end
+
+  def fleet_responses(paused: false, max_concurrency: 2, runs: [], runners: nil)
     {
-      "GET /agent/runners" => [{ "id" => RUNNER_ID, "hostname" => "mini.local",
-                                 "max_concurrency" => max_concurrency, "paused" => paused,
-                                 "last_heartbeat_at" => Time.now.utc.iso8601 }],
+      "GET /agent/runners" => runners || [runner_row(paused: paused, max_concurrency: max_concurrency)],
       "GET /agent/producers/runs?limit=100&offset=0" => runs,
     }
   end
@@ -187,6 +190,90 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- the claim contract ----
+  #
+  # API Builder refuses to let a resource vary its type across 2xx codes, so
+  # "nothing claimable" is a 200 whose `lease` is ABSENT rather than a 204. The
+  # tick must read the wrapper, and must keep the two genuine failures — 429 and
+  # 422 — out of that quiet path.
+
+  def claim_with(response)
+    out = nil
+    with_agent_home do
+      register_identity
+      with_stubbed_api({ "POST /playbook/issue/leases" => response }) do
+        out = capture_stdout do
+          tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row)
+        end
+      end
+      yield if block_given?
+    end
+    out
+  end
+
+  def test_an_empty_claim_wrapper_is_the_quiet_idle_case
+    workspaces = nil
+    out = claim_with({}) { workspaces = Dir.children(Agent::Paths.workspace_root) } # 200, `lease` absent
+    refute_match(/cap reached|REJECTED/, out)
+    assert_empty workspaces, "nothing claimable must not materialize a workspace"
+  end
+
+  def test_daily_cap_backs_off_and_does_not_look_like_an_idle_queue
+    # 429's body is empty by design (one body type per status code registry-wide)
+    # so the status code IS the message.
+    out = claim_with(->(_body) { raise ApiError.new("HTTP 429 POST /playbook/issue/leases: ", code: 429) })
+    assert_match(/fleet daily claim cap reached/, out)
+  end
+
+  # An unknown runner_id is a client bug, not "no work". Swallowing it would
+  # leave a machine looking healthy and claiming nothing forever.
+  def test_unknown_runner_is_loud_and_clears_the_identity_cache
+    identity_file = nil
+    out = claim_with(->(_body) { raise ApiError.new("HTTP 422 POST /playbook/issue/leases: unknown runner", code: 422) }) do
+      identity_file = File.exist?(Agent::Paths.identity_file)
+    end
+    assert_match(/REJECTED \(422\)/, out)
+    assert_match(/re-registers/, out)
+    refute identity_file, "a 422 must drop the stale identity cache so the next tick re-registers"
+  end
+
+  def test_an_unexpected_claim_error_is_not_swallowed
+    assert_raises(ApiError) do
+      claim_with(->(_body) { raise ApiError.new("HTTP 500", code: 500) })
+    end
+  end
+
+  # ---- runner staleness comes from the server, never recomputed here ----
+
+  # Restores the real method rather than removing it — Notify.event is a
+  # module_function, so remove_method would delete it for every later test in
+  # the file rather than just undoing the stub.
+  def capturing_events
+    captured = []
+    original = Agent::Notify.method(:event)
+    Agent::Notify.define_singleton_method(:event) { |text| captured << text; true }
+    no_notify = ENV.delete("DEV_AGENT_NO_NOTIFY")
+    yield captured
+    captured
+  ensure
+    Agent::Notify.define_singleton_method(:event, original)
+    ENV["DEV_AGENT_NO_NOTIFY"] = no_notify
+  end
+
+  def test_offline_runner_notification_uses_the_servers_is_stale
+    events = with_agent_home do
+      register_identity
+      capturing_events do
+        fleet = fleet_responses(runners: [runner_row,
+                                          runner_row(id: "rnr-2", hostname: "mini-2.local", is_stale: true),
+                                          runner_row(id: "rnr-3", hostname: "mini-3.local", is_stale: false)])
+        with_stubbed_api(fleet) { capture_stdout { tick.run } }
+      end
+    end
+    assert_equal 1, events.length, "exactly the stale runner should notify"
+    assert_match(/mini-2\.local has not checked in/, events.first)
+  end
+
   # ---- producer execution: check_failed stays distinct from filed ----
 
   def producer(check:, file_when: "check_fails")
@@ -199,7 +286,9 @@ class TestDevAgentTick < Minitest::Test
   def run_producer_with(check, extra_stubs: {}, file_when: "check_fails")
     result = nil
     stubs = {
-      "POST /agent/producers/probe/runs" => { "id" => "run-1" },
+      # agent_producer_run_start wraps the run, same 2xx-varying-type constraint
+      # as the claim: an absent `run` means the compare-and-set did not fire.
+      "POST /agent/producers/probe/runs" => { "run" => { "id" => "run-1" } },
       "PUT /agent/producers/runs/run-1" => ->(body) { result = body[:result]; { "id" => "run-1" } },
     }.merge(extra_stubs)
     with_agent_home do
@@ -254,6 +343,26 @@ class TestDevAgentTick < Minitest::Test
       extra_stubs: { ISSUES_PATH => [{ "fingerprint" => "fp:1", "status" => "fixed" }] },
     )
     assert_equal "skipped_in_flight", result
+  end
+
+  # The compare-and-set did not fire — another runner started this run first.
+  # An absent `run` must skip quietly, and must NOT run the check or report a
+  # result against a run id that does not exist.
+  def test_an_empty_run_wrapper_skips_without_running_the_check
+    out = nil
+    with_agent_home do
+      register_identity
+      # Only the start is stubbed: running the check would write this file, and
+      # reporting a result would hit an unstubbed PUT and flunk.
+      marker = File.join(Agent::Paths.state_dir, "check-ran")
+      with_stubbed_api({ "POST /agent/producers/probe/runs" => {} }) do
+        out = capture_stdout do
+          tick(dry_run: false).run_producer(producer(check: "touch #{marker}"), nil, Agent::Host.cached_identity)
+        end
+      end
+      refute File.exist?(marker), "a skipped producer must not run its check"
+    end
+    assert_match(/another runner already started this run/, out)
   end
 
   def test_file_when_never_acts_directly_and_files_nothing
