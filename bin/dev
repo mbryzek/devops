@@ -34,6 +34,12 @@ require 'codegen/graph'
 require 'codegen/sync'
 require 'dependencies/updates'
 
+# The autonomous dispatcher (`dev agent`). Split into lib/agent/* rather than
+# inlined here because the pieces that decide anything — schedule due-ness,
+# outcome classification, retention — are pure functions that get real tests.
+require 'agent/gc'
+require 'agent/tick'
+
 # Single source of truth for each command's invocation line, keyed by the command
 # path. The same string is interpolated into the USAGE block below and shown
 # inline (via usage_for) on an argument error, so help text and error hints can't
@@ -89,6 +95,17 @@ INVOCATIONS = {
   "changelog capture"   => 'changelog [capture] [--app APP]...',
   "changelog build"     => 'changelog build [--app APP]... [--limit N] [--batch-size N] [--localhost]',
   "changelog status"    => 'changelog status [--localhost]',
+  "agent tick"          => 'agent tick [--dry-run] [--localhost]',
+  "agent status"        => 'agent [status] [--localhost]',
+  "agent logs"          => 'agent logs <issue> [--follow]',
+  "agent pause"         => 'agent pause [--localhost]',
+  "agent resume"        => 'agent resume [--localhost]',
+  "agent runners"       => 'agent runners [--localhost]',
+  "agent producers"     => 'agent producers [--localhost]',
+  "agent runs"          => 'agent runs [KEY] [--issue N] [--limit N] [--localhost]',
+  "agent refresh"       => 'agent refresh <issue> [--comment "TEXT"] [--localhost]',
+  "agent release"       => 'agent release <issue> [--localhost]',
+  "agent gc"            => 'agent gc [--dry-run]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -610,6 +627,58 @@ USAGE = <<~USAGE
         `dev auth login --app playbook` once first. /admin/changelog reads the API
         live, so the page reflects new notes as soon as they are recorded.
 
+    #{INVOCATIONS["agent tick"]}
+        ONE PASS of the autonomous dispatcher: heartbeat, reap finished sessions,
+        run any due producer, and claim the next issue if there is a free slot.
+        launchd runs this every 30 seconds (launchd/com.bryzek.dev-agent.plist);
+        there is no daemon. Two phases with two locks — vitals always run, work is
+        skipped when a previous tick still holds the lock. --dry-run prints every
+        decision and executes none, which is also the provisioning smoke test on a
+        new machine.
+
+    #{INVOCATIONS["agent status"]}
+        This machine: runner identity and concurrency, every live claim with its
+        elapsed time and the last line of its session log, and when the last tick
+        ran. `status` is the default when no subcommand is given.
+
+    #{INVOCATIONS["agent logs"]}
+        The session log for one issue (~/Library/Logs/dev-agent/issues/ISS-<n>/).
+        --follow tails it.
+
+    #{INVOCATIONS["agent pause"]}
+    #{INVOCATIONS["agent resume"]}
+        Kill switch. A paused runner finishes what it is working and claims
+        nothing new; `resume` puts it back in service. Neither kills a running
+        session — use `dev agent release <issue>` for that.
+
+    #{INVOCATIONS["agent runners"]}
+        The fleet: hostname, hardware, max concurrency, paused state, last seen.
+
+    #{INVOCATIONS["agent producers"]}
+        The registry in devops/agent/producers.yml with each producer's schedule,
+        last run and result, and when it is next due. Due-ness is computed here,
+        never by the server.
+
+    #{INVOCATIONS["agent runs"]}
+        Full history: every producer run, and every lease attempt for --issue N.
+        "Did it actually fire, when, and what happened" in one command instead of
+        a log grep.
+
+    #{INVOCATIONS["agent refresh"]}
+        Re-open a `fixed` issue so the fleet resumes its branch — the rebase and
+        review-feedback loop. Sugar for `dev issues status <n> --status open`
+        with a stock comment; the next claim finds the recorded branch, checks it
+        out, rebases onto origin/main, and updates the same PR in place.
+
+    #{INVOCATIONS["agent release"]}
+        Force-release a stuck lease and kill its local session, returning the
+        issue to the queue.
+
+    #{INVOCATIONS["agent gc"]}
+        Apply the retention rules: tick/producer logs 30 days, a terminal issue's
+        logs 14 days, a failed one's 30 (the post-mortem window), agent
+        workspaces 7 days. Runs daily at 4am as a producer.
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -634,7 +703,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues autonomy changelog features queries claude-usage].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -654,6 +723,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
+  "agent"        => %w[tick status logs pause resume runners producers runs refresh release gc],
 }.freeze
 
 def levenshtein(a, b)
@@ -1420,8 +1490,13 @@ end
 # to, and `--dangerously-skip-permissions` because there is no human to answer a
 # permission prompt — without it the session is blocked on its first Bash call
 # and does nothing at all.
-def headless_claude_argv(prompt)
-  ["claude", "--print", "--dangerously-skip-permissions", "--model", INTERACTIVE_CLAUDE_MODEL, prompt]
+#
+# A nil prompt returns the argv WITHOUT one, for the caller that feeds the prompt
+# on stdin instead (`dev agent tick` — a dispatcher prompt carries a whole issue
+# thread, and an argv is the wrong place for it).
+def headless_claude_argv(prompt = nil)
+  argv = ["claude", "--print", "--dangerously-skip-permissions", "--model", INTERACTIVE_CLAUDE_MODEL]
+  prompt.nil? ? argv : argv + [prompt]
 end
 
 # Unattended dispatch: ONE headless session per failing app, detached, running in
@@ -1770,7 +1845,13 @@ ISSUE_STATUSES = %w[open claimed needs_review fixed deployed verified dismissed 
 # `needs_review` rather than a PR. Each is one plan and one session; the durable
 # prompt body is devops/claude-issues/<category>-body.md where a category has
 # its own pipeline, and default-body.md otherwise (see issue_body_text).
-ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement].freeze
+# `infrastructure` is the autonomous dispatcher's category: chores with no
+# deployable version to reconcile against (codegen sync, invariants, weekly
+# reviews). For it the MERGE is the deploy — the reconciler advances a merged
+# infrastructure issue straight to `deployed` and the 7-day auto-verify applies
+# unchanged. What it is excluded from is release metrics and the submitter
+# digest, not the lifecycle.
+ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement infrastructure].freeze
 
 # The categories `dev issues create` offers when filing from the laptop, and the
 # changelog vocabulary they mirror (a `bug` ships as changelog `fix`). A SUBSET
@@ -8010,6 +8091,284 @@ def cmd_autonomy_reverted(args)
   end
 end
 
+# ---------- agent ----------
+#
+# The autonomous dispatcher's surface (design §4.7). Everything that browses
+# WORK is already `dev issues` and playbook-admin's issue pages — there is no
+# separate queue here, which is most of the point. These commands are about the
+# MACHINES: what they are doing right now, what they are scheduled to do, and the
+# two levers (pause, release) that stop them.
+#
+# All of the deciding lives in lib/agent/*; these functions parse args, call it,
+# and format. That split is what makes the tick testable.
+
+# The runner identity this machine registered, or a clear message about what is
+# missing. Every command except `tick` and `gc` needs it — `tick` because it is
+# the thing that creates it, `gc` because it only touches local files.
+def agent_identity!(use_localhost)
+  identity = Agent::Host.cached_identity
+  return identity if identity
+  Util.exit_with_error(
+    "This machine has not registered as a runner yet (no #{Agent::Paths.identity_file}). " \
+    "Run `dev agent tick#{use_localhost ? ' --localhost' : ''}` once — the first tick self-registers."
+  )
+end
+
+def agent_flag_only(command, args, flag)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args(command, [app_filter].compact) if app_filter
+  value = false
+  leftover = []
+  rest.each { |a| a == flag ? value = true : leftover << a }
+  reject_unknown_args(command, leftover)
+  [value, use_localhost]
+end
+
+def agent_issue_number!(command, rest)
+  number = rest.shift
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 120)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{rest.join(', ')}" unless rest.empty?
+  report_arg_problems(command, problems, usage_for(command))
+  number
+end
+
+def cmd_agent_tick(args)
+  dry_run, use_localhost = agent_flag_only("agent tick", args, "--dry-run")
+  handle_errors do
+    Agent::Tick.new(use_localhost: use_localhost,
+                    claude_argv: headless_claude_argv,
+                    dry_run: dry_run,
+                    verbose: $stdout.tty? || dry_run).run
+  end
+end
+
+def cmd_agent_status(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent status", rest + [app_filter].compact)
+  identity = agent_identity!(use_localhost)
+
+  handle_errors do
+    runners = Agent::Api.runners(token: identity.token, use_localhost: use_localhost)
+    me = runners.find { |r| r["id"] == identity.runner_id }
+    puts "Runner #{identity.runner_id}#{me ? " (#{me['hostname']})" : ''}"
+    puts "  concurrency: #{me ? me['max_concurrency'] : '?'}   paused: #{me ? !!me['paused'] : '?'}"
+    puts "  last heartbeat: #{me && me['last_heartbeat_at']}"
+
+    jobs = Agent::Jobs.all
+    if jobs.empty?
+      puts "\nNo live claims."
+    else
+      puts "\nLive claims:"
+      jobs.each { |job| puts agent_job_line(job) }
+    end
+
+    last_tick = Agent::Paths.tick_log(Time.now)
+    tail = File.file?(last_tick) ? File.readlines(last_tick).last&.strip : nil
+    puts "\nLast tick: #{tail || '(nothing logged today)'}"
+  end
+end
+
+def agent_job_line(job)
+  number = job["issue"]
+  alive = Agent::Jobs.alive?(job["pid"])
+  elapsed = ((Time.now - Time.parse(job["started_at"])) / 60).round
+  log = Agent::Paths.claude_log(number)
+  last = File.file?(log) ? File.readlines(log).last&.strip : nil
+  "  ISS-#{number}  #{alive ? 'running' : 'FINISHED (unreaped)'}  #{elapsed}m  branch #{job['branch']}\n" \
+    "      #{last ? last[0, 140] : '(no output yet)'}"
+end
+
+def cmd_agent_logs(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent logs", [app_filter].compact) if app_filter
+  follow = rest.include?("--follow")
+  number = agent_issue_number!("agent logs", rest - ["--follow"])
+
+  log = Agent::Paths.claude_log(number)
+  Util.exit_with_error("No session log for ISS-#{number} (#{log})") unless File.file?(log)
+  exec(*(follow ? ["tail", "-f", log] : ["tail", "-n", "200", log]))
+end
+
+def cmd_agent_pause(args) = agent_set_paused(args, "agent pause", true)
+def cmd_agent_resume(args) = agent_set_paused(args, "agent resume", false)
+
+# The kill switch drains rather than kills: a paused runner finishes what it is
+# working and claims nothing new. Killing live sessions on pause would throw away
+# hours of work to stop the next 30 seconds of it; `dev agent release <issue>` is
+# the per-job hammer.
+def agent_set_paused(args, command, paused)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args(command, rest + [app_filter].compact)
+  identity = agent_identity!(use_localhost)
+  handle_errors do
+    runner = Agent::Api.update_runner(identity.runner_id, { paused: paused },
+                                      token: identity.token, use_localhost: use_localhost)
+    puts "Runner #{identity.runner_id} #{paused ? 'paused — it will finish its live claims and take nothing new' : 'resumed'}."
+    puts "  live claims: #{Agent::Jobs.all.count { |j| Agent::Jobs.alive?(j['pid']) }} / #{runner['max_concurrency']}"
+  end
+end
+
+def cmd_agent_runners(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent runners", rest + [app_filter].compact)
+  identity = agent_identity!(use_localhost)
+  handle_errors do
+    runners = Agent::Api.runners(token: identity.token, use_localhost: use_localhost)
+    if runners.empty?
+      puts "No runners registered."
+      return
+    end
+    runners.each do |r|
+      mine = r["id"] == identity.runner_id ? " (this machine)" : ""
+      gb = r["memory_bytes"] ? (r["memory_bytes"] / (1024.0**3)).round : "?"
+      puts "#{r['hostname']}#{mine}"
+      puts "  #{r['model']} #{r['cpu_brand']} #{r['cpu_cores']} cores #{gb}G   concurrency #{r['max_concurrency']}"
+      puts "  last seen #{r['last_heartbeat_at']}#{r['paused'] ? '   PAUSED' : ''}#{r['retired_at'] ? '   RETIRED' : ''}"
+    end
+  end
+end
+
+def cmd_agent_producers(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent producers", rest + [app_filter].compact)
+  identity = agent_identity!(use_localhost)
+  handle_errors do
+    registry = Agent::Producers.load
+    runs = Agent::Api.producer_runs(token: identity.token, use_localhost: use_localhost)
+    latest = runs.group_by { |r| r["producer_key"] }
+    now = Time.now
+    puts "Registry: #{Agent::Paths.producers_file}   timezone #{registry.fetch(:timezone)}"
+    registry.fetch(:producers).each do |producer|
+      last = (latest[producer.key] || []).max_by { |r| r["started_at"].to_s }
+      last_at = last && (Time.parse(last["started_at"]) rescue nil)
+      due = Agent::Schedule.next_due(producer.schedule, last_run_at: last_at, now: now,
+                                     timezone: registry.fetch(:timezone))
+      puts "#{producer.key}"
+      puts "  #{Agent::Schedule.describe(producer.schedule)}   file_when: #{producer.file_when}"
+      puts "  last run: #{last ? "#{last['started_at']} → #{last['result']}" : 'never'}"
+      puts "  next due: #{due <= now ? 'now' : due}"
+    end
+  end
+end
+
+def cmd_agent_runs(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  issue_number = nil
+  limit = 25
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--issue"
+      issue_number = rest[i + 1]
+      usage_exit("--issue requires a value", example: usage_for("agent runs")) if issue_number.nil?
+      i += 2
+    when "--limit"
+      limit = rest[i + 1].to_i
+      usage_exit("--limit requires a positive integer", example: usage_for("agent runs")) if limit <= 0
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+  key = leftover.shift
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--app is not a valid option here" if app_filter
+  report_arg_problems("agent runs", problems, usage_for("agent runs"))
+  identity = agent_identity!(use_localhost)
+
+  handle_errors do
+    if issue_number
+      leases = Agent::Api.leases(token: identity.token, use_localhost: use_localhost, issue_number: issue_number)
+      puts "ISS-#{issue_number}: #{leases.length} lease attempt(s)"
+      leases.each do |l|
+        puts "  #{l['created']}  runner #{l['runner_id']}  branch #{l['branch'] || '-'}  " \
+             "#{l['released_at'] ? "released #{l['released_at']} (#{l['outcome']})" : "active until #{l['leased_until']}"}"
+      end
+      puts ""
+    end
+    runs = Agent::Api.producer_runs(token: identity.token, use_localhost: use_localhost,
+                                    producer_key: key, limit: limit)
+    puts "#{runs.length} producer run(s)#{key ? " for #{key}" : ''}"
+    runs.each do |r|
+      puts "  #{r['started_at']}  #{r['producer_key']}  #{r['result']}#{r['issue_number'] ? "  ISS-#{r['issue_number']}" : ''}"
+    end
+  end
+end
+
+# Sugar for one transition, and deliberately nothing more: review feedback and a
+# pre-merge rebase are both "more work on this issue", and the queue already
+# models that. Mike can do the same thing from playbook-admin or `dev issues
+# status` — this exists so the common case is one command with a comment that
+# already says the right thing.
+REFRESH_COMMENT = "Re-opened for the fleet: rebase onto the latest `origin/main`, rerun codegen, " \
+                  "and address any review feedback above. Resume the existing branch and PR — do not open a new one.".freeze
+
+def cmd_agent_refresh(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  comment = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    if rest[i] == "--comment"
+      comment = rest[i + 1]
+      usage_exit("--comment requires a value", example: usage_for("agent refresh")) if comment.nil?
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+  usage_exit("agent refresh: unknown argument: --app", example: usage_for("agent refresh")) if app_filter
+  number = agent_issue_number!("agent refresh", leftover)
+
+  handle_errors do
+    issue = Agent::Api.set_status(number, "open", comment: comment || REFRESH_COMMENT, use_localhost: use_localhost)
+    puts "ISS-#{issue['number']}: re-opened. The next claim resumes its recorded branch and updates the PR in place."
+  end
+end
+
+def cmd_agent_release(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  usage_exit("agent release: unknown argument: --app", example: usage_for("agent release")) if app_filter
+  number = agent_issue_number!("agent release", rest)
+  identity = agent_identity!(use_localhost)
+
+  handle_errors do
+    job = Agent::Jobs.find(number)
+    if job && Agent::Jobs.alive?(job["pid"])
+      Agent::Jobs.kill(job["pid"])
+      puts "Killed pid #{job['pid']} (ISS-#{number})."
+    end
+    leases = Agent::Api.leases(token: identity.token, use_localhost: use_localhost,
+                               issue_number: number, is_active: true)
+    if leases.empty?
+      puts "No active lease for ISS-#{number}."
+    else
+      leases.each do |lease|
+        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: use_localhost)
+        puts "Released lease #{lease['id']} — ISS-#{number} is back in the queue."
+      end
+    end
+    Agent::Jobs.delete(number) if job
+  end
+end
+
+def cmd_agent_gc(args)
+  dry_run, _use_localhost = agent_flag_only("agent gc", args, "--dry-run")
+  entries = Agent::Gc.plan
+  if entries.empty?
+    puts "Nothing to collect."
+    return
+  end
+  entries.each { |path, reason| puts "#{dry_run ? 'would remove' : 'removing'} #{path} — #{reason}" }
+  return if dry_run
+  puts "Removed #{Agent::Gc.apply(entries)} path(s)."
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -8161,6 +8520,22 @@ when "features"
   when "reconcile" then cmd_features_reconcile(argv)
   when "cancel"    then cmd_features_cancel(argv)
   else                  unknown("features subcommand", sub, SUBCOMMANDS["features"])
+  end
+when "agent"
+  sub = resolve_subcommand(argv, default: "status")
+  case sub
+  when "tick"      then cmd_agent_tick(argv)
+  when "status"    then cmd_agent_status(argv)
+  when "logs"      then cmd_agent_logs(argv)
+  when "pause"     then cmd_agent_pause(argv)
+  when "resume"    then cmd_agent_resume(argv)
+  when "runners"   then cmd_agent_runners(argv)
+  when "producers" then cmd_agent_producers(argv)
+  when "runs"      then cmd_agent_runs(argv)
+  when "refresh"   then cmd_agent_refresh(argv)
+  when "release"   then cmd_agent_release(argv)
+  when "gc"        then cmd_agent_gc(argv)
+  else                  unknown("agent subcommand", sub, SUBCOMMANDS["agent"])
   end
 when "changelog"
   sub = resolve_subcommand(argv, default: "all")

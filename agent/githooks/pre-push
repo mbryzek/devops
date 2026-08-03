@@ -1,0 +1,55 @@
+#!/bin/sh
+# Autonomous-session push guard (design §4.6).
+#
+# `dev agent tick` spawns every session with
+#   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=<this dir>
+# so this hook runs for EVERY git push the session makes, in every repo, whether
+# or not that repo has hooks of its own.
+#
+# It enforces exactly one rule: a push to ~/code/claude may only touch plans/.
+#
+# ~/code/claude is the standing exception to "never push to main" — its house
+# rule is commit-to-main — and for an autonomous session that exception is
+# narrowed rather than removed. The rest of that repo is CLAUDE.md, skills and
+# rules: instructions every future session loads and obeys, which makes it the
+# one place a prompt-injected session could persist itself. No autonomous job
+# has a reason to touch it, and the prompt saying so is necessary but not
+# sufficient.
+#
+# Every other repo passes through untouched. This hook must never be the reason
+# a legitimate push fails.
+set -e
+
+guarded_repo="${DEV_AGENT_CLAUDE_REPO:-$HOME/code/claude}"
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+# Resolve both sides so a symlinked home (/var vs /private/var on macOS) does not
+# make the comparison silently pass.
+resolve() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+[ -n "$toplevel" ] || exit 0
+[ "$(resolve "$toplevel")" = "$(resolve "$guarded_repo")" ] || exit 0
+
+zero='0000000000000000000000000000000000000000'
+status=0
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue          # a branch deletion touches no files
+
+  if [ "$remote_sha" = "$zero" ]; then
+    range="$local_sha"                             # new ref: diff against its own root
+    files="$(git diff-tree --no-commit-id --name-only -r "$range" 2>/dev/null || true)"
+  else
+    files="$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)"
+  fi
+
+  offending="$(printf '%s\n' "$files" | grep -v '^$' | grep -v '^plans/' || true)"
+  if [ -n "$offending" ]; then
+    echo "pre-push: REFUSED. An autonomous session may only write to plans/ in $guarded_repo." >&2
+    echo "Offending paths:" >&2
+    printf '  %s\n' $offending >&2
+    echo "CLAUDE.md, skills and rules are instructions future sessions obey — they are not agent-writable." >&2
+    status=1
+  fi
+done
+
+exit $status
