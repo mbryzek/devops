@@ -14,6 +14,18 @@
 # A target whose account has no bastion, or whose app has no env files /
 # CONF_DB_PROD_URL yet, is skipped with a loud warning (the playbook side stays
 # in this state until WS2/WS3 of the account split provision it).
+#
+# Output: concise by default, exactly like release-scala / release-sveltekit —
+# one "label... done (12s)" line per stage, with every command's full output in
+# the log. That stream is also what `dev deploy` parses to narrate this release
+# live; before it, a database release was a name and an elapsed clock for its
+# whole duration (the longest single item in a deploy, and the only one that
+# showed nothing). --verbose restores the traditional full streaming output.
+#
+# Prompts (Tag.ask, the tarball overwrite, the apply gate) stay OUTSIDE every
+# Util.step: a stage owns its line of stdout for the length of its block, and a
+# prompt printed into the middle of it mangles both the prompt and the stage the
+# parent is reading.
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 require 'securerandom'
@@ -43,6 +55,10 @@ end
 
 base_app = db_name.sub(/-postgresql$/, '')
 
+# The log name carries no version, unlike release-scala's: a database release
+# does not know its tag until Tag.ask, several lines below.
+Util.quiet!("/tmp/devops-release/#{db_name}.log") unless args.verbose
+
 # Every deployable built from this repo with a database config gets the
 # migrations. Applying to a subset silently strands the other databases on an
 # old schema, so target selection is config-driven, never a flag.
@@ -61,9 +77,11 @@ targets.each do |t|
     db = t.scala.send(args.env).database
     puts "  Target: #{t.name} (account #{t.digital_ocean_account}) -> #{db.name}@#{db.host}:#{db.port}"
 end
+puts "  Full log: #{Util.log_file}" if Util.quiet?
 puts ""
 
 tarball = nil
+released_tag = nil
 
 Dir.chdir(repo_dir) do
     # Step 1: Ask user about creating a new tag
@@ -72,6 +90,7 @@ Dir.chdir(repo_dir) do
     if current_tag.empty?
         Util.exit_with_error("No tag found. Please create a tag first.")
     end
+    released_tag = current_tag
 
     tarball = File.join(repo_dir, "dist", "#{db_name}-#{current_tag}.tar.gz")
 
@@ -86,11 +105,11 @@ Dir.chdir(repo_dir) do
 
     # Create distribution if tarball doesn't exist
     if !File.exist?(tarball)
-        puts ""
-        puts "Creating distribution for #{current_tag}"
-        Util.run("/Users/mbryzek/code/schema-evolution-manager/bin/sem-dist --tag #{current_tag}")
-        if !File.exist?(tarball)
-            Util.exit_with_error("sem-dist failed to create tarball at expected location: #{tarball}")
+        Util.step("Creating distribution #{current_tag}") do
+            Util.run("/Users/mbryzek/code/schema-evolution-manager/bin/sem-dist --tag #{current_tag}")
+            if !File.exist?(tarball)
+                Util.exit_with_error("sem-dist failed to create tarball at expected location: #{tarball}")
+            end
         end
     end
 end
@@ -125,34 +144,46 @@ targets.each do |target|
         next
     end
 
-    puts ""
-    puts Util.underline("#{target.name}: #{db.name}@#{db.host}:#{db.port} via #{node_ip}")
+    Util.detail("")
+    Util.detail(Util.underline("#{target.name}: #{db.name}@#{db.host}:#{db.port} via #{node_ip}"))
 
-    # Copy tarball to this account's bastion
-    puts "Copying #{tarball} to #{node_ip}"
-    puts ""
-    Util.run("scp #{tarball} root@#{node_ip}:~/")
+    # Name the target in the stage labels only when there is more than one to
+    # tell apart — most schema repos apply to a single database, where a bare
+    # "Applying migrations" reads better. Same rule as release-sveltekit.
+    scope = targets.length > 1 ? " (#{target.name})" : ""
 
-    # Create pgpass file locally and copy to node
-    # Format: hostname:port:database:username:password
-    pgpass_content = "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}"
     pgpass_remote = "/tmp/.pgpass-#{SecureRandom.hex(8)}"
 
-    local_pgpass = "/tmp/.pgpass-local-#{$$}"
-    File.write(local_pgpass, pgpass_content)
-    File.chmod(0600, local_pgpass)
+    Util.step("Uploading #{tarball_name}#{scope}") do
+      # Copy tarball to this account's bastion
+      Util.detail("Copying #{tarball} to #{node_ip}")
+      Util.run("scp #{tarball} root@#{node_ip}:~/")
 
-    puts "Copying credentials to #{node_ip}"
-    Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
-    File.delete(local_pgpass)
+      # Create pgpass file locally and copy to node
+      # Format: hostname:port:database:username:password
+      local_pgpass = "/tmp/.pgpass-local-#{$$}"
+      begin
+        File.write(local_pgpass, "#{db.host}:#{db.port}:#{db.name}:#{db.user}:#{password}")
+        File.chmod(0600, local_pgpass)
+
+        Util.detail("Copying credentials to #{node_ip}")
+        Util.run("scp #{local_pgpass} root@#{node_ip}:#{pgpass_remote}", :quiet => true)
+      ensure
+        # A failed scp used to leave the production DB password sitting in /tmp:
+        # Util.run aborts the process, and the delete was the next line.
+        File.delete(local_pgpass) if File.exist?(local_pgpass)
+      end
+    end
 
     begin
-      puts ""
-      puts "Ready to apply migrations on #{node_ip} for #{target.name}"
       proceed = auto_confirm?
-      puts "#{AUTO_CONFIRM_ENV}=1: proceeding with apply" if proceed
-      if proceed || Ask.for_boolean("Continue?")
+      if proceed
+        Util.detail("#{AUTO_CONFIRM_ENV}=1: proceeding with apply on #{node_ip} for #{target.name}")
+      else
         puts ""
+        puts "Ready to apply migrations on #{node_ip} for #{target.name}"
+      end
+      if proceed || Ask.for_boolean("Continue?")
         remote_cmd = [
             "cd ~",
             "tar --warning=no-unknown-keyword -xzf #{tarball_name}",
@@ -162,15 +193,19 @@ targets.each do |target|
             "rm -f #{pgpass_remote}"
         ].join(" && ")
 
-        Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+        Util.step("Applying migrations#{scope}") do
+          Util.run("ssh root@#{node_ip} '#{remote_cmd}'")
+        end
 
         applied << target.name
       else
         skipped << target.name
       end
     ensure
-      puts ""
-      puts "Deleting credentials file"
+      # Not a stage of its own: it runs on the failure path too, where the stage
+      # that just failed is the diagnostic and a trailing "Deleting credentials
+      # file... done" only buries it.
+      Util.detail("Deleting credentials file")
       Util.run("ssh root@#{node_ip} 'rm -f #{pgpass_remote}'")
     end
 end
@@ -215,20 +250,21 @@ if applied.include?(base_app)
       # AND stderr to a log file so the release console stays readable; the log
       # is surfaced (tail + path) only when the build itself fails.
       build_log = "/tmp/#{app.database}-image-build-#{tag}.log"
-      puts "Building and pushing #{app.database} Docker image for schema tag #{tag}..."
-      puts "  (dev-only build output -> #{build_log}; shown here only on failure)"
-      Util.registry_login
-      cmd = "#{Shellwords.shellescape(build_cmd)} build " \
-            "--app #{Shellwords.shellescape(base_app)} " \
-            "--tag #{Shellwords.shellescape(tag)} " \
-            "--repo-dir #{Shellwords.shellescape(repo_dir)} --push " \
-            "> #{Shellwords.shellescape(build_log)} 2>&1"
-      unless system(cmd)
-        build_failed = true
-        raise "db-image build exited non-zero for tag #{tag} (see #{build_log})"
+      Util.detail("Building and pushing #{app.database} Docker image for schema tag #{tag}...")
+      Util.detail("  (dev-only build output -> #{build_log}; shown here only on failure)")
+      Util.step("Building #{app.database} image #{tag}") do
+        Util.registry_login
+        cmd = "#{Shellwords.shellescape(build_cmd)} build " \
+              "--app #{Shellwords.shellescape(base_app)} " \
+              "--tag #{Shellwords.shellescape(tag)} " \
+              "--repo-dir #{Shellwords.shellescape(repo_dir)} --push " \
+              "> #{Shellwords.shellescape(build_log)} 2>&1"
+        unless system(cmd)
+          build_failed = true
+          raise "db-image build exited non-zero for tag #{tag} (see #{build_log})"
+        end
       end
-      puts "Purging old #{app.database} registry images..."
-      DbImages.purge_old(app)
+      Util.step("Purging old #{app.database} images") { DbImages.purge_old(app) }
     rescue StandardError, SystemExit => e
       manual_cmd = "db-image build --app #{base_app} --tag #{tag || '<tag>'} --push"
       # Only dump the build log when the *build* is what failed. A purge failure
@@ -247,4 +283,18 @@ if applied.include?(base_app)
       )
     end
   end
+end
+
+# `dev deploy` reads this line to learn the version actually released — it knows
+# the tag that existed BEFORE the release, which is the wrong one whenever the
+# release minted a new one. Same contract as release-scala / release-sveltekit.
+#
+# Only when at least one database actually took the migrations: a run whose
+# every target was skipped shipped this tag nowhere, and must not report itself
+# as deployed.
+unless applied.empty?
+  puts "Full log: #{Util.log_file}" if Util.quiet?
+  puts ""
+  puts "Release complete: #{db_name} #{released_tag}"
+  puts ""
 end
