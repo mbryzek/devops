@@ -64,6 +64,7 @@ resolved to, so an inference is never silent.
 ```
 claude-db next-port                        a free host port (5500-9999)
 claude-db start --app APP [--port N]       this session's database; prints CONF_DB_DEV_URL
+claude-db sync --app APP [--repo-dir DIR]  apply the migrations it is missing
 claude-db end [--app APP]                  drop it (all apps by default)
 claude-db status [--app APP]               containers, tags, ports, session databases
 claude-db gc [--app APP]                   reap dead sessions' databases and empty containers
@@ -254,6 +255,52 @@ does not fail the release.
 
 ---
 
+## The template is always behind main — `claude-db sync`
+
+The image tag is the latest **released** schema tag, so the template holds the
+schema as of that release. Every migration merged to main since is missing from a
+brand-new session database, and recreating it does not help: `end` + `start`
+clone the SAME stale template. A branch that adds its own migration is behind by
+that too.
+
+Nothing about this announces itself. The suite fails as though the branch were
+broken — `relation "playbook.person_members" does not exist` for a table main
+added, `null value in column "auto_classification" violates not-null` for a
+column main **dropped**. Both read as a code defect, and the second one is worse
+than the first: the table is there and looks fine. That cost two hours on
+2026-08-03 (ISS-276), on a branch that was in fact green.
+
+`claude-db start` now closes the gap on its own, and `claude-db sync` re-closes
+it after a rebase:
+
+```bash
+claude-db sync --app platform
+claude-db sync --app platform --repo-dir ~/code/ai/<feature>/platform-postgresql
+```
+
+The delta is applied with **`sem-apply`, not generated DDL**. That is what makes
+it correct rather than merely convenient: these are the same scripts in the same
+order production ran, so DROPs and FK ordering come out right; sem-apply connects
+AS the app role to a role-owned database, so new tables are owned by `api` rather
+than `postgres` (hand-applied DDL leaves every table it creates permission-denied
+to the app, which is a false-failure mode of its own); and the tracking rows land,
+so the next sync knows what this one did.
+
+**Two gaps, not one.** Syncing matches the database to the **checkout**, and the
+checkout can itself be behind `origin/main` — measured at 3 commits on the day
+this was written, which would have left the database 3 migrations short while
+reporting "up to date". `sync` warns when it sees that, and names the fresh-clone
+escape hatch. It never fetches: `claude-db` runs against a human's checkout and
+has no business writing to it, so the count comes from the last fetch and can
+only under-report.
+
+`claude-db status` states the same drift per database (`3 MIGRATION(S) BEHIND`),
+so it is visible without running anything.
+
+A database whose `schema_evolution_manager.scripts` table is missing or
+unreadable is an **error**, never "nothing applied" — that reading would replay
+the entire 800-script history against a full schema.
+
 ## Migration authoring in a session DB
 
 `sem-apply` against a session database applies only scripts not already recorded
@@ -283,4 +330,6 @@ database — always pass `--url` in a session.
 | `claude-db start` says a port is required | No container exists yet for this app + schema tag | `claude-db start --app APP --port "$(claude-db next-port)"` |
 | Recipe change not showing up | The image tag is the bare schema tag, so the cached image is reused | Bump the schema tag — see "Image tag = schema tag" |
 | `<database>_sess_*` databases accumulating | Sessions ended without `claude-db end` | `claude-db gc` |
+| A wall of `relation "x" does not exist`, or a not-null violation on a column main dropped | The session DB predates migrations that are on main — the template is the last RELEASE | `claude-db sync --app APP` (see above). `claude-db status` shows the count |
+| `sync` says "up to date" but the suite still fails on a missing relation | The checkout is behind `origin/main`; sync matched the DB to it | Pull the checkout, or `sync --repo-dir <fresh clone>` |
 | `db-image baseline` cannot find a snapshot | No recent production backup downloaded | Put one at `~/Downloads/<database>.sql` or pass `--snapshot` |
