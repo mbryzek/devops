@@ -144,4 +144,95 @@ class TestDbApps < Minitest::Test
       assert_match(/db-image baseline --app x/, stderr)
     end
   end
+
+  # ── resolving an app from where the command was run ───────────────────────
+
+  # A schema repo is recognised by what it contains, not by living under ~/code:
+  # the same inference has to work in a feature clone under ~/code/ai.
+  def schema_repo(parent, name)
+    dir = File.join(parent, name)
+    FileUtils.mkdir_p(File.join(dir, "scripts"))
+    dir
+  end
+
+  def test_cwd_repo_dir_is_the_schema_repo_the_command_was_run_from
+    Dir.mktmpdir do |parent|
+      assert_equal schema_repo(parent, "platform-postgresql"),
+                   DbApp.cwd_repo_dir(schema_repo(parent, "platform-postgresql"))
+      # Released checkouts carry a version suffix.
+      assert_equal schema_repo(parent, "acumen-postgresql-15.1.0"),
+                   DbApp.cwd_repo_dir(schema_repo(parent, "acumen-postgresql-15.1.0"))
+    end
+  end
+
+  # The app repo names the app but holds no schema, and an empty directory that
+  # merely looks like a schema repo would send pg_dump at nothing.
+  def test_cwd_repo_dir_is_nil_outside_a_schema_repo
+    Dir.mktmpdir do |parent|
+      FileUtils.mkdir_p(File.join(parent, "platform"))
+      assert_nil DbApp.cwd_repo_dir(File.join(parent, "platform"))
+      FileUtils.mkdir_p(File.join(parent, "platform-postgresql"))
+      assert_nil DbApp.cwd_repo_dir(File.join(parent, "platform-postgresql"))
+    end
+  end
+
+  # Stubbing the cwd -> name step keeps these tests off this box's ~/code and
+  # env/apps; the mapping itself is Args.default_app, which every other command
+  # already relies on.
+  def with_cwd_name(name)
+    stubs = {
+      :cwd_name => lambda { |_dir = nil| name },
+      # Config lookup, which needs this box's env/apps and ~/code checkouts.
+      :load => lambda { |n, repo_dir: nil|
+        DbApp.new(:name => n, :database => "#{n}db", :role => "api",
+                  :repo_dir => repo_dir || "/code/#{n}-postgresql")
+      }
+    }
+    originals = stubs.keys.map { |m| [m, DbApp.method(m)] }
+    stubs.each { |m, impl| DbApp.define_singleton_method(m, impl) }
+    yield
+  ensure
+    originals.each { |m, impl| DbApp.define_singleton_method(m, impl) }
+  end
+
+  def test_resolve_infers_the_app_and_its_checkout_from_the_directory
+    Dir.mktmpdir do |parent|
+      dir = schema_repo(parent, "platform-postgresql")
+      with_cwd_name("platform") do
+        app = DbApp.resolve(:dir => dir)
+        assert_equal "platform", app.name
+        assert_equal dir, app.repo_dir
+      end
+    end
+  end
+
+  # Standing in one app's schema repo must not point another app's build at it.
+  def test_resolve_ignores_the_directory_when_app_names_a_different_app
+    Dir.mktmpdir do |parent|
+      dir = schema_repo(parent, "platform-postgresql")
+      with_cwd_name("platform") do
+        app = DbApp.resolve(:name => "acumen", :dir => dir)
+        assert_equal "acumen", app.name
+        assert_equal "/code/acumen-postgresql", app.repo_dir
+      end
+    end
+  end
+
+  def test_resolve_prefers_an_explicit_repo_dir
+    Dir.mktmpdir do |parent|
+      dir = schema_repo(parent, "platform-postgresql")
+      with_cwd_name("platform") do
+        assert_equal "/elsewhere", DbApp.resolve(:repo_dir => "/elsewhere", :dir => dir).repo_dir
+      end
+    end
+  end
+
+  # Nothing to infer is the one case where --app is genuinely required.
+  def test_resolve_is_nil_when_the_directory_names_no_app
+    Dir.mktmpdir do |dir|
+      with_cwd_name(nil) do
+        assert_nil DbApp.resolve(:dir => dir)
+      end
+    end
+  end
 end

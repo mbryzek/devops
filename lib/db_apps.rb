@@ -77,6 +77,46 @@ class DbApp
     )
   end
 
+  # ── resolving an app from where the command was run ───────────────────────
+
+  # The app the directory names, or nil — "platform" in ~/code/platform-postgresql,
+  # in ~/code/platform, and in a feature clone of either under ~/code/ai. Only
+  # apps that own a schema repo qualify; anything else has no image to build and
+  # is a typo rather than an inference.
+  def DbApp.cwd_name(dir = Dir.pwd)
+    name = Args.default_app(dir)
+    return nil if name.nil?
+    base = DbApp.base_name(name)
+    DbApp.names.include?(base) ? base : nil
+  end
+
+  # The schema repo checkout the command was run from, or nil. Inferring the app
+  # from a feature clone under ~/code/ai and then reading Mike's ~/code checkout
+  # would build a tree the caller never asked about, so the checkout is taken
+  # from the same place the name was.
+  def DbApp.cwd_repo_dir(dir = Dir.pwd)
+    base = File.basename(dir).sub(/\-\d+\.\d+\.\d+\z/, "")
+    return nil unless base.end_with?(POSTGRESQL_SUFFIX)
+    schema_repo = File.exist?(File.join(dir, BASELINE_TAG_FILE)) ||
+                  File.directory?(File.join(dir, "scripts"))
+    schema_repo ? dir : nil
+  end
+
+  # Resolve --app / --repo-dir against the directory the command was run from.
+  # Returns nil when neither the flag nor the directory names an app, which is
+  # the only case where --app is genuinely required.
+  #
+  # The cwd supplies the checkout ONLY when it is the chosen app's own schema
+  # repo: `--app acumen` run from platform-postgresql must not build platform's
+  # tree under acumen's name.
+  def DbApp.resolve(name: nil, repo_dir: nil, dir: Dir.pwd)
+    cwd_name = DbApp.cwd_name(dir)
+    name ||= cwd_name
+    return nil if name.nil?
+    repo_dir ||= DbApp.cwd_repo_dir(dir) if DbApp.base_name(name) == cwd_name
+    DbApp.load(name, :repo_dir => repo_dir)
+  end
+
   # Every app with a scala database config AND a schema repo checked out. The
   # checkout is part of the test because a deployable can share another app's
   # database (playbook-api is built from platform) — only the app that owns the

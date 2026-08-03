@@ -35,15 +35,31 @@ config and a schema repo, cut a baseline, and it appears in `claude-db`,
 ## Commands
 
 ```
-db-image build --app APP [--tag TAG] [--push] [--repo-dir DIR]
+db-image build [--app APP] [--tag TAG] [--push] [--repo-dir DIR]
     Build registry.digitalocean.com/bryzek/<database>:<tag>.
     Default tag: the repo's latest released schema tag.
     Without --push: local, native arch. With --push: multi-arch
     (linux/amd64,linux/arm64) via a docker-container buildx builder.
 
-db-image baseline --app APP [--snapshot FILE] [--keep-data TABLE]... [--repo-dir DIR]
+db-image baseline [--app APP] [--snapshot FILE] [--keep-data TABLE]... [--repo-dir DIR]
     Re-cut the committed baseline from a production snapshot.
 ```
+
+`--app` is inferred from the directory, the way every other devops command
+infers it, so from a schema repo both commands are bare:
+
+```bash
+cd ~/code/platform-postgresql
+db-image build            # == --app platform --repo-dir .
+```
+
+A directory that names an app supplies the app (`platform-postgresql`,
+`platform`, and feature clones of either under `~/code/ai`); a directory that
+*is* that app's schema repo also supplies the checkout, so a build run inside a
+feature clone builds that clone rather than silently reaching for Mike's
+`~/code` one. `--app` naming a different app than the directory does not adopt
+the directory's checkout. Every run prints the app, the database and the repo it
+resolved to, so an inference is never silent.
 
 ```
 claude-db next-port                        a free host port (5500-9999)
@@ -55,10 +71,11 @@ claude-db gc [--app APP]                   reap dead sessions' databases and emp
 verify-db-images [--app APP] [--dry-run]   audit the registry; build+push if the latest tag is missing
 ```
 
-`--app` is required only for `claude-db start`: creating a database means
-choosing which app's schema it holds, and there is no safe default. The
-read-only and reclaiming commands default to every app, so a single
-`claude-db end` cleans up after a session that used more than one.
+Among the `claude-db` commands `--app` is required only for `start`: creating a
+database means choosing which app's schema it holds, and being in some
+directory is not that choice. The read-only and reclaiming commands default to
+every app, so a single `claude-db end` cleans up after a session that used more
+than one.
 
 ---
 

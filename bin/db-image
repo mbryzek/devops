@@ -8,7 +8,9 @@
 # The recipe is generic (devops/db-image/); only the schema artifacts differ, and
 # they live in the schema repo.
 #
-# Usage:
+# Usage (--app is inferred from the directory when it names an app, so from
+# ~/code/acumen-postgresql these are just `db-image build` / `db-image baseline`):
+#
 #   db-image build --app acumen [--tag 0.1.45] [--push] [--repo-dir DIR]
 #       Build registry.digitalocean.com/bryzek/<database>:<tag>.
 #       Default tag is the repo's latest released schema tag.
@@ -48,7 +50,7 @@ SCRATCH_HOST = "127.0.0.1"
 def show_usage
   puts <<~USAGE
 
-    Usage: db-image <command> --app NAME
+    Usage: db-image <command> [--app NAME]
 
     Commands:
       build      Build the image for a schema tag (default: latest released).
@@ -66,6 +68,10 @@ def show_usage
                  --repo-dir DIR       as above
 
     Apps: #{DbApp.names.join(', ')}
+
+    --app is inferred from the directory when it names one — from
+    ~/code/platform-postgresql (or a feature clone of it), `db-image build` is
+    `--app platform --repo-dir .`. Pass it explicitly from anywhere else.
 
   USAGE
   exit 1
@@ -345,6 +351,7 @@ def do_build(app, tag: nil, push: false)
 
   puts ""
   puts Util.underline("db-image build  [app: #{app.name}  db: #{app.database}  tag: #{tag}]")
+  puts "Repo     : #{app.repo_dir}"
   puts ""
 
   Dir.mktmpdir("db-image") do |tmp|
@@ -396,6 +403,7 @@ def do_baseline(app, snapshot: nil, keep_data: [])
 
   puts ""
   puts Util.underline("db-image baseline  [app: #{app.name}  db: #{app.database}]")
+  puts "Repo     : #{app.repo_dir}"
   puts "Snapshot : #{snapshot} (#{File.mtime(snapshot)})"
   puts ""
 
@@ -475,10 +483,18 @@ command = ARGV.shift
 show_usage if ["-h", "--help", "help"].include?(command)
 
 opts = parse_args!(ARGV)
-if opts[:app].nil?
-  Util.exit_with_error("--app is required (one of: #{DbApp.names.join(', ')})")
+# --app is optional when the directory names an app, the way every other devops
+# command already works: `db-image build` from ~/code/platform-postgresql builds
+# platform, from that checkout. Every command prints the app, the database and
+# the checkout it resolved to, so an inference is never silent.
+app = DbApp.resolve(:name => opts[:app], :repo_dir => opts[:repo_dir])
+if app.nil?
+  Util.exit_with_error(
+    "--app is required (one of: #{DbApp.names.join(', ')})\n" \
+    "It is inferred when run from a directory that names one — e.g. " \
+    "~/code/platform-postgresql or ~/code/platform."
+  )
 end
-app = DbApp.load(opts[:app], :repo_dir => opts[:repo_dir])
 
 case command
 when "build"    then do_build(app, :tag => opts[:tag], :push => !!opts[:push])
