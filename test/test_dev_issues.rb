@@ -339,6 +339,24 @@ class TestDevIssues < Minitest::Test
     assert line.length < 120, "summary line should be truncated: #{line.length}"
   end
 
+  # ISS-244: a deferred issue keeps its status, so `open` alone reads as claimable.
+  def test_summary_line_marks_a_snoozed_issue
+    at = Time.now + (7 * 24 * 60 * 60)
+    line = issue_summary_line(graph_issue.merge("status" => "open", "snoozed_until" => at.utc.iso8601), 1)
+    assert_includes line, "open (snoozed until #{at.localtime.strftime('%b %-d')})"
+  end
+
+  # snoozed_until is never cleared — the server just stops honoring it once it is
+  # past — so a stale wake time must not keep marking a claimable issue.
+  def test_summary_line_ignores_an_expired_snooze
+    past = (Time.now - (24 * 60 * 60)).utc.iso8601
+    refute_includes issue_summary_line(graph_issue.merge("snoozed_until" => past), 1), "snoozed"
+  end
+
+  def test_summary_line_has_no_snooze_note_when_never_snoozed
+    refute_includes issue_summary_line(graph_issue, 1), "snoozed"
+  end
+
   def test_summary_line_prefixes_parent_club
     assert_includes issue_summary_line(child_club_issue, 4), "  4. ISS-036 · claimed · Bounce / Baltimore · "
   end
@@ -472,6 +490,19 @@ class TestDevIssues < Minitest::Test
     path = issues_list_path(statuses: "fixed")
     assert_includes path, "statuses=fixed"
     refute_includes path, "categories="
+  end
+
+  # ---- ISS-244: the claim preview must not offer snoozed issues ----
+  # A snoozed issue is still `open`, and `is_snoozed` omitted returns BOTH snoozed
+  # and awake issues — so an unfiltered preview listed work that POST /claims
+  # refuses, and the refusal read as "claimed by another session".
+
+  def test_issues_list_path_omits_is_snoozed_when_not_asked_for
+    refute_includes issues_list_path(statuses: "fixed"), "is_snoozed"
+  end
+
+  def test_issues_list_path_can_filter_to_awake_issues
+    assert_includes issues_list_path(statuses: "open", is_snoozed: false), "is_snoozed=false"
   end
 
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
@@ -711,6 +742,21 @@ class TestDevIssues < Minitest::Test
     assert_equal({ numbers: %w[090] }, issue_claim_scope("graphs", [graphs.first], graphs))
   end
 
+  # ISS-244: typing the numbers that happen to cover the whole category is still a
+  # hand-pick. Collapsing it to the category scope threw away the server's
+  # per-issue rejection reason — the category scope answers with a count only, so
+  # "this one is snoozed" came back as "claimed by another session".
+  def test_claim_scope_stays_by_number_when_a_hand_pick_covers_the_whole_category
+    worker = open_queue.select { |c| c["category"] == "worker" }
+    assert_equal({ numbers: worker.map { |c| c["number"] } },
+                 issue_claim_scope("worker", worker, worker, hand_picked: true))
+  end
+
+  def test_claim_scope_is_by_category_for_a_sweep_of_the_whole_category
+    worker = open_queue.select { |c| c["category"] == "worker" }
+    assert_equal({ category: "worker" }, issue_claim_scope("worker", worker, worker, hand_picked: false))
+  end
+
   # ---- suggestion is swept like every other category ----
 
   def suggestion_queue
@@ -730,7 +776,9 @@ class TestDevIssues < Minitest::Test
     orig = Ask.method(:for_string)
     Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "all" }
     # Enum order: worker (078), suggestion (081), feature (079), improvement (080).
-    assert_equal %w[078 081 079 080], issue_ask_selection(ordered, ordered).map { |c| c["number"] }
+    selected, hand_picked = issue_ask_selection(ordered, ordered)
+    assert_equal %w[078 081 079 080], selected.map { |c| c["number"] }
+    refute hand_picked, "`all` is a sweep, not a hand-pick"
   ensure
     Ask.define_singleton_method(:for_string, orig)
   end
@@ -746,7 +794,9 @@ class TestDevIssues < Minitest::Test
     orig = Ask.method(:for_string)
     # suggestion sorts 2nd in ISSUE_CATEGORIES order: worker, suggestion, feature, improvement.
     Ask.define_singleton_method(:for_string) { |_msg, _opts = {}| "2" }
-    assert_equal %w[081], issue_ask_selection(ordered, []).map { |c| c["number"] }
+    selected, hand_picked = issue_ask_selection(ordered, [])
+    assert_equal %w[081], selected.map { |c| c["number"] }
+    assert hand_picked, "typed numbers are a hand-pick"
   ensure
     Ask.define_singleton_method(:for_string, orig)
   end

@@ -2032,25 +2032,37 @@ end
 # would reprint the list flat and lose the category headings above. `all` is
 # answered with `auto` rather than the whole list, which is just `ordered`: a
 # blanket claim takes everything a sweep sees, `suggestion` included.
+#
+# Returns [selected, hand_picked]. `hand_picked` is what the operator DID, not
+# what they got: typing the numbers that happen to cover the whole queue is still
+# a hand-pick, and only the by-number claim scope reports per-issue reasons back
+# (see issue_claim_scope).
 def issue_ask_selection(ordered, auto)
   loop do
     raw = Ask.for_string("Claim which issues? Enter numbers (e.g. 1,3), `all`, or `none` [all]:", default: "all")
-    return auto if Ask::ALL.include?(raw.to_s.strip.downcase)
+    return [auto, false] if Ask::ALL.include?(raw.to_s.strip.downcase)
     selected = Ask.parse_selection(raw, ordered)
-    return selected if selected
+    return [selected, true] if selected
     puts ""
     puts "Invalid selection. Enter numbers between 1 and #{ordered.length} (e.g. 1,3), `all`, or `none`."
   end
 end
 
-# The claim body for one category's selection. A whole-category selection claims
+# The claim body for one category's selection. Sweeping a whole category claims
 # by category — the server takes whatever is open at claim time, so a racing
-# session simply leaves fewer issues. A partial selection claims by number, which
-# is all-or-nothing: if one of them was just taken, nothing is claimed and the
-# server says which, rather than quietly claiming a different set than the one
-# that was picked.
-def issue_claim_scope(category, selected, category_open)
-  if selected.length == category_open.length
+# session simply leaves fewer issues. A hand-picked selection claims by number,
+# which is all-or-nothing: if one of them cannot be claimed, nothing is claimed
+# and the server says WHY (taken, snoozed, unknown), rather than quietly claiming
+# a different set than the one that was picked.
+#
+# `hand_picked` is the operator's intent, NOT a count. Keying off "selection
+# covers every listed issue" instead collapsed a typed selection to the category
+# scope whenever it happened to name the category's only open issue — and the
+# category scope reports nothing but a count, so a rejection there surfaced as
+# "claimed by another session" no matter the real reason (ISS-244: picking the
+# lone, snoozed improvement issue).
+def issue_claim_scope(category, selected, category_open, hand_picked: false)
+  if !hand_picked && selected.length == category_open.length
     { category: category }
   else
     { numbers: selected.map { |c| c["number"] } }
@@ -2080,9 +2092,15 @@ end
 # `dev issues reconcile`) act on the whole tracker: e.g. offering to "claim 35
 # issues" when only the open ones would actually be claimed server-side. Always
 # name the parameter `statuses` so the filter applies.
-def issues_list_path(statuses:, category: nil, limit: 100)
+#
+# `is_snoozed` is the same shape of trap one level down: omitted, the server
+# returns snoozed AND awake issues. A snoozed issue is still `open`, so anything
+# that offers work to do must pass false — `POST /claims` skips snoozed issues
+# server-side, and a preview that lists them offers work the claim will refuse.
+def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil)
   params = { "statuses" => Array(statuses) }
   params["categories"] = category if category
+  params["is_snoozed"] = is_snoozed unless is_snoozed.nil?
   params["limit"] = limit
   params["offset"] = 0
   issues_path("?#{URI.encode_www_form(params)}")
@@ -2168,13 +2186,31 @@ def issue_author_label(issue)
   by["name"] || by["nickname"] || by["email"] || by["id"] || "?"
 end
 
+# A snoozed issue keeps its status — a deferred issue is still `open` — so the
+# status alone reads as claimable when it is not. Render the deferral next to the
+# status rather than leaving the line to imply work that `dev issues claim` will
+# refuse (ISS-244). Empty for an awake issue, and for a wake time already past:
+# `snoozed_until` is not cleared when it expires, the server just stops honoring
+# it (see InternalIssuesDao.snoozeClause).
+def issue_snooze_note(issue)
+  until_at = issue["snoozed_until"]
+  return "" if until_at.nil? || until_at.to_s.empty?
+  at = begin
+    Time.parse(until_at.to_s)
+  rescue ArgumentError, TypeError
+    return ""
+  end
+  return "" if at <= Time.now
+  " (snoozed until #{at.localtime.strftime('%b %-d')})"
+end
+
 def issue_summary_line(issue, index)
   title = issue["title"].to_s.gsub(/\s+/, " ").strip
   title = "#{title[0, 57]}..." if title.length > 60
   # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
   # No category here: the only caller prints these under a per-category heading.
-  "  #{index}. #{issue_label(issue)} · #{issue['status']} · #{club}#{title}"
+  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)} · #{club}#{title}"
 end
 
 # A timeline comment that moved the issue BACK to `open` from anything else is a
@@ -2940,10 +2976,17 @@ def cmd_issues_claim(args)
     # No --category => one call returns every open issue (grouped below); with a
     # category the server filters to it. `present` is the enum-ordered set of
     # categories we will actually claim.
-    open = ApiClient.request(endpoint, :get, issues_list_path(statuses: "open", category: category)) || []
+    #
+    # is_snoozed: false because a snoozed issue is still `open` — its owner
+    # parked it, and `POST /claims` refuses it. Offering it puts work on the menu
+    # that cannot be ordered.
+    open = ApiClient.request(
+      endpoint, :get, issues_list_path(statuses: "open", category: category, is_snoozed: false)
+    ) || []
     present = issue_categories_present(open)
     if present.empty?
-      puts category ? "No open #{category} issues." : "No open issues."
+      puts category ? "No open #{category} issues to claim." : "No open issues to claim."
+      puts "(Snoozed issues are not offered — `dev issues list` marks them; `dev issues snooze <n> --wake` brings one back.)"
       return
     end
 
@@ -2960,17 +3003,21 @@ def cmd_issues_claim(args)
       puts ""
     end
 
-    selected =
+    selected, hand_picked =
       if requested
         resolved, unknown = issue_resolve_requested(requested, ordered)
         unless unknown.empty?
+          # "not listed" now also covers snoozed — say so, or naming a deferred
+          # issue looks like the number was wrong.
           Util.exit_with_error(
-            "Not open (or not listed above): #{unknown.join(', ')}. On offer: #{ordered.map { |c| c['number'] }.join(', ')}"
+            "Not open, snoozed, or not listed above: #{unknown.join(', ')}. " \
+            "On offer: #{ordered.map { |c| c['number'] }.join(', ')}. " \
+            "Wake a snoozed issue with `dev issues snooze <n> --wake`."
           )
         end
-        resolved
+        [resolved, true]
       elsif assume_yes
-        auto
+        [auto, false]
       else
         # Non-interactive (pipe, cron, subprocess): there is nobody to answer, and
         # defaulting to `all` would claim the whole queue on a run that never asked
@@ -2994,7 +3041,7 @@ def cmd_issues_claim(args)
     present.each do |cat|
       cat_selected = selected.select { |c| c["category"] == cat }
       next if cat_selected.empty?
-      scope = issue_claim_scope(cat, cat_selected, open.select { |c| c["category"] == cat })
+      scope = issue_claim_scope(cat, cat_selected, open.select { |c| c["category"] == cat }, hand_picked: hand_picked)
       claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { scope: scope }) || []
       next if claimed.empty?
       claimed_issues.concat(claimed)
@@ -3004,7 +3051,11 @@ def cmd_issues_claim(args)
     end
 
     if plans.empty?
-      puts "Nothing claimed — the open issue(s) were just claimed by another session. No plan written."
+      # Only the by-category scope can get here: it claims whatever is still open
+      # and unsnoozed at claim time, and reports a count rather than a reason. A
+      # by-number claim fails loudly with the server's per-issue reason instead.
+      puts "Nothing claimed — every issue listed above was taken or deferred between the list and the claim. No plan written."
+      puts "Re-run `dev issues claim` to see the current queue."
       return
     end
 
