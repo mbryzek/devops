@@ -270,8 +270,15 @@ column main **dropped**. Both read as a code defect, and the second one is worse
 than the first: the table is there and looks fine. That cost two hours on
 2026-08-03 (ISS-276), on a branch that was in fact green.
 
-`claude-db start` now closes the gap on its own, and `claude-db sync` re-closes
-it after a rebase:
+**You do not have to notice this.** The platform suite refuses to start against a
+drifted session database (`core.util.SchemaDrift`, run from the same startup
+check that already validates `CONF_DB_DEV_URL`), and prints the missing scripts
+and the one command that applies them. That is the trigger; `sync` is the fix.
+Syncing on `start` alone was not enough — the expensive case is a branch that
+rebases onto a schema change *mid-session*, long after `start` ran.
+
+`claude-db start` closes the gap on its own, and `claude-db sync` re-closes it
+after a rebase:
 
 ```bash
 claude-db sync --app platform
@@ -289,10 +296,19 @@ so the next sync knows what this one did.
 **Two gaps, not one.** Syncing matches the database to the **checkout**, and the
 checkout can itself be behind `origin/main` — measured at 3 commits on the day
 this was written, which would have left the database 3 migrations short while
-reporting "up to date". `sync` warns when it sees that, and names the fresh-clone
-escape hatch. It never fetches: `claude-db` runs against a human's checkout and
-has no business writing to it, so the count comes from the last fetch and can
-only under-report.
+reporting "up to date". `sync` fetches the checkout's `origin` first and warns
+when it sees that, naming the fresh-clone escape hatch. It fetches because the
+count is read from `refs/remotes/origin/main`: an unfetched checkout does not
+report a hedged number, it reports **zero**, and a warning that can silently read
+green is worse than no warning. Fetching touches remote refs only — never the
+working tree, never a local branch. When the fetch fails (offline) the number is
+reported as a floor.
+
+**Which checkout.** Nearest first: the cwd if it is the schema repo, then a clone
+of it beside the cwd (`~/code/ai/<feature>/platform-postgresql` when you are in
+`~/code/ai/<feature>/platform`), then `~/code/<app>-postgresql`. A session that
+has its own clone means to use it — reaching past it to `~/code` is how a branch
+carrying its own migration gets synced to main and silently does not get it.
 
 `claude-db status` states the same drift per database (`3 MIGRATION(S) BEHIND`),
 so it is visible without running anything.

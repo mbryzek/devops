@@ -343,16 +343,17 @@ def do_sync(app)
   # "In sync" only ever means in sync WITH THIS CHECKOUT. A checkout behind main
   # leaves the database behind main by exactly the scripts it has not pulled, and
   # that gap looks identical to the one this command just closed.
+  fetched = app.repo_fetch_origin
   behind = app.repo_behind_origin
   if behind && behind > 0
+    floor = fetched ? "" : "at least "
     Util.warning(
-      "#{app.repo_dir} is at least #{behind} commit(s) behind origin/main.\n" \
+      "#{app.repo_dir} is #{floor}#{behind} commit(s) behind origin/main.\n" \
       "Syncing matches this database to THAT CHECKOUT, so any migration merged to\n" \
       "main since it was last pulled is still missing — the same wall of red, one\n" \
       "level up. Either update the checkout, or sync from a fresh clone:\n\n" \
-      "  claude-db sync --app #{app.name} --repo-dir <fresh-clone-of-#{app.name}-postgresql>\n\n" \
-      "(This count is read from the last fetch — claude-db never writes to your\n" \
-      "checkout — so the real number can be higher.)"
+      "  claude-db sync --app #{app.name} --repo-dir <fresh-clone-of-#{app.name}-postgresql>" \
+      "#{fetched ? '' : "\n\n(The fetch failed, so this count is read from the last one the checkout\ndid — the real number can be higher.)"}"
     )
   end
 
