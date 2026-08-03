@@ -88,8 +88,11 @@ class Args
         valid_apps.sort
     end
 
-    def Args.default_app
-        wd = `pwd`.strip.split("/").last
+    # The app a checkout directory names, or nil. Defaults to the current
+    # directory; `dir` is passed explicitly by callers that resolve --app
+    # themselves (db-image) and by their tests.
+    def Args.default_app(dir_path = Dir.pwd)
+        wd = File.basename(dir_path.to_s.strip)
         # Support directories like 'acumen-postgresql' and 'acumen-postgresql-15.1.0'
         dir = wd.sub(/\-\d+\.\d+\.\d+$/, "").sub(/\-postgresql$/, "")
         valid_apps = Args.list_apps
