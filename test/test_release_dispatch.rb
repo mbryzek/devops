@@ -39,8 +39,8 @@ class TestReleaseDispatch < Minitest::Test
 
   # stdin is closed by capture2e, so any script we dispatch to stops at its first
   # prompt (Ask raises on EOF) rather than releasing anything.
-  def run_release_from(dir)
-    out, _ = Open3.capture2e("ruby", File.join(BIN, "release"), chdir: dir)
+  def run_release_from(dir, *args)
+    out, _ = Open3.capture2e("ruby", File.join(BIN, "release"), *args, chdir: dir)
     out
   end
 
@@ -56,5 +56,20 @@ class TestReleaseDispatch < Minitest::Test
     out = run_release_from(checkout("some-app"))
     assert_includes out, "Missing required argument(s): app"
     refute_includes out, "bin/release-lib"
+  end
+
+  def test_postgresql_checkout_dispatches_to_release_db
+    out = run_release_from(checkout("nosuch-postgresql"))
+    assert_includes out, "bin/release-db",
+      "a -postgresql checkout must release the database"
+  end
+
+  # The db branch runs before Args.parse, so --verbose has to be read off ARGV
+  # by hand. Without this, `release --verbose` from a schema repo silently
+  # dropped the flag and the release stayed in its concise/quiet mode — the one
+  # escape hatch for seeing every command's full output.
+  def test_verbose_is_forwarded_to_release_db
+    out = run_release_from(checkout("nosuch-postgresql"), "--verbose")
+    assert_match(%r{bin/release-db --verbose}, out)
   end
 end

@@ -263,6 +263,46 @@ class TestDeployProgress < Minitest::Test
     assert_operator out.index("Building (personal)"), :<, out.index("Building (playbook env plybk)")
   end
 
+  # The stream a database release produces. Two-target repos (platform-postgresql
+  # applies to BOTH platform and playbook-api) label each stage with the target,
+  # exactly as a multi-target Cloudflare release does. Pins the shape
+  # release-db emits — before it was narrated, a DB release was the longest item
+  # in a deploy and the only one that showed nothing but a clock.
+  def test_database_release_stages
+    io = tty_io
+    p = DeployProgress.new(io: io)
+    p.start("platform-postgresql")
+    p.feed("platform-postgresql", <<~OUT)
+      Creating distribution 0.5.43... done (2s)
+      Uploading platform-postgresql-0.5.43.tar.gz (platform)... done (4s)
+      Applying migrations (platform)... done (18s)
+      Uploading platform-postgresql-0.5.43.tar.gz (playbook-api)... done (4s)
+    OUT
+    p.feed("platform-postgresql", "Applying migrations (playbook-api)... ")
+
+    out = visible(io)
+    assert_includes out, "Creating distribution 0.5.43... done (2s)"
+    assert_includes out, "Applying migrations (platform)... done (18s)"
+    # The second target's apply is the stage in flight: shown, with a live clock
+    # rather than a completion.
+    assert_includes out, "Applying migrations (playbook-api)..."
+    refute_includes out, "Applying migrations (playbook-api)... done"
+  end
+
+  # A database release ends with the same "Release complete" line as every other
+  # release script, so the collapsed line reports the schema version that
+  # actually shipped instead of a bare "released".
+  def test_database_release_reports_its_schema_version
+    io = plain_io
+    p = DeployProgress.new(io: io)
+    p.start("platform-postgresql")
+    p.feed("platform-postgresql",
+           "Applying migrations... done (18s)\nRelease complete: platform-postgresql 0.5.43\n")
+    p.finish("platform-postgresql", ok: true)
+
+    assert_includes io.string, "platform-postgresql  deployed 0.5.43"
+  end
+
   # A Cloudflare release ends the same way a Scala one does, so the collapsed
   # line reports the version the release actually minted rather than "released".
   def test_cloudflare_release_reports_its_version

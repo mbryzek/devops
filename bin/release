@@ -30,7 +30,13 @@ end
 
 pwd = `pwd`.strip
 if pwd.end_with?("-postgresql")
-  Util.run File.join(dir, "release-db")
+  # This branch runs BEFORE Args.parse below, so --verbose is read straight off
+  # ARGV. passthrough: release-db manages its own quiet-mode output (and
+  # prompts for the tag and the apply gate), so its stream must never be
+  # redirected into a parent's log.
+  cmd = File.join(dir, "release-db")
+  cmd += " --verbose" if ARGV.include?("--verbose")
+  Util.run cmd, passthrough: true
   return
 end
 

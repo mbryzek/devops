@@ -235,6 +235,12 @@ module DbImages
   #
   # Inject `now:` for testable age logic.  Pass `dry_run: true` to print
   # what would be purged without deleting anything.
+  #
+  # Per-tag decisions go through Util.detail, not puts: release-db runs this
+  # inside a Util.step, and a stage owns its line of stdout for the length of
+  # its block — one stray puts splices itself into that line and the stage never
+  # reads as finished. Standalone (`db-image purge`, verify-db-images) nothing
+  # is in quiet mode, so detail still prints exactly as before.
   PURGE_AGE_DAYS = 3
 
   def DbImages.purge_old(app, now: Time.now, dry_run: false)
@@ -243,7 +249,7 @@ module DbImages
     out = `doctl registry repository list-tags #{app.image_name} --output json 2>&1`
     unless $?.success?
       if DbImages.repository_missing?(out)
-        puts "purge_old: #{app.image_name} has no registry repository yet — nothing to do"
+        Util.detail("purge_old: #{app.image_name} has no registry repository yet — nothing to do")
         return
       end
       Util.exit_with_error("doctl registry list-tags failed: #{out.strip}")
@@ -251,7 +257,7 @@ module DbImages
 
     entries = JSON.parse(out) || []
     if entries.empty?
-      puts "purge_old: no tags found in #{app.image_name} — nothing to do"
+      Util.detail("purge_old: no tags found in #{app.image_name} — nothing to do")
       return
     end
 
@@ -272,31 +278,31 @@ module DbImages
       # Skip untagged manifests — they have no named tag and cannot be
       # addressed by doctl registry repository delete-tag.
       if tag.nil? || tag.strip.empty?
-        puts "SKIP    (untagged manifest #{entry["manifest_digest"]})"
+        Util.detail("SKIP    (untagged manifest #{entry["manifest_digest"]})")
         next
       end
 
       if tag == retained_tag
-        puts "RETAIN  #{tag}  (current latest tag)"
+        Util.detail("RETAIN  #{tag}  (current latest tag)")
         next
       end
 
       if tag == baseline_tag
-        puts "RETAIN  #{tag}  (baseline anchor)"
+        Util.detail("RETAIN  #{tag}  (baseline anchor)")
         next
       end
 
       if updated_at > cutoff
         age_days = ((now - updated_at) / 86400).round(1)
-        puts "RETAIN  #{tag}  (#{age_days}d old — within #{PURGE_AGE_DAYS}-day window)"
+        Util.detail("RETAIN  #{tag}  (#{age_days}d old — within #{PURGE_AGE_DAYS}-day window)")
         next
       end
 
       age_days = ((now - updated_at) / 86400).round(1)
       if dry_run
-        puts "PURGE   #{tag}  (#{age_days}d old) [dry-run — not deleted]"
+        Util.detail("PURGE   #{tag}  (#{age_days}d old) [dry-run — not deleted]")
       else
-        puts "PURGE   #{tag}  (#{age_days}d old)"
+        Util.detail("PURGE   #{tag}  (#{age_days}d old)")
         Util.run(
           "doctl registry repository delete-tag #{app.image_name} " \
           "#{Shellwords.shellescape(tag)} --force"
