@@ -93,7 +93,36 @@ class TestApiHermetic < Minitest::Test
     end
   end
 
+  # The release publishes AFTER the deploy, so another PR merging mid-deploy
+  # leaves this checkout behind origin/main. That commit is still merged, so it
+  # is still publishable.
+  def test_ensure_publishable_accepts_local_behind_origin
+    with_git_repo(branch: "main", with_origin: true) do |repo|
+      push_commit(repo, "someone-else.txt")
+      git(repo, "reset", "--hard", "HEAD~1")
+      Dir.chdir(repo) { ensure_publishable!(repo) }
+    end
+  end
+
+  def test_ensure_publishable_rejects_diverged_from_origin
+    with_git_repo(branch: "main", with_origin: true) do |repo|
+      push_commit(repo, "someone-else.txt")
+      git(repo, "reset", "--hard", "HEAD~1")
+      File.write(File.join(repo, "mine.txt"), "x")
+      git(repo, "add", ".")
+      git(repo, "commit", "-m", "unpushed local work")
+      Dir.chdir(repo) { assert_raises(SystemExit) { ensure_publishable!(repo) } }
+    end
+  end
+
   private
+
+  def push_commit(repo, name)
+    File.write(File.join(repo, name), "x")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "commit #{name}")
+    git(repo, "push", "origin", "main")
+  end
 
   def import_of(app)
     { "uri" => "https://app.apibuilder.io/bryzek/#{app}/latest/service.json" }

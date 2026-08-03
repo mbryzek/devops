@@ -13,7 +13,9 @@ ReleaseFreshness.ensure!
 # The release IS the publish point: dev `api` runs are hermetic and never write
 # the registry, so `latest` means "what is released" — the specs of the API
 # actually running in prod. ReleaseFreshness.ensure! above already guarantees
-# the clean, current main checkout that `api publish` requires.
+# the clean main checkout that `api publish` requires; this runs after the deploy,
+# so origin/main may have moved on by now — `api publish` only requires HEAD to be
+# merged into it, not to be its tip.
 #
 # Deliberately NOT best-effort: a deployed API whose specs failed to publish is
 # exactly the drift the hermetic design exists to prevent, so a publish failure

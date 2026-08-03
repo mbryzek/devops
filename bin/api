@@ -5,14 +5,15 @@
 # Usage:
 #   api                             # hermetic codegen from local specs (nothing published)
 #   api --profile localhost         # same, with profile
-#   api publish                     # upload + codegen, from a clean main checkout only
+#   api publish                     # upload + codegen, from a clean merged main checkout only
 #
 # Dev runs are HERMETIC: local spec files (plus sibling repos' specs when running
 # under a ~/code/ai/<feature>/ working dir) ride along with the codegen batch as
 # payloads; the server validates and generates from exactly that set and nothing
 # is written to the registry. The registry's `latest` only moves via `api publish`,
-# which is guarded to a clean, up-to-date main checkout — so `latest` always means
-# "what is merged on main" and concurrent sessions cannot clobber each other.
+# which is guarded to a clean main checkout whose HEAD is merged into origin/main —
+# so `latest` always means "code that is merged on main" and concurrent sessions
+# cannot clobber each other.
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
@@ -415,10 +416,18 @@ end
 
 # --- Publish Command ---
 
-# The ONLY path that writes the registry. Guarded so `latest` always equals merged
-# main: a clean checkout of main whose HEAD matches origin/main (fetched fresh).
-# Dev work never needs this — plain `api` is hermetic — so the guard has no
-# escape hatch; if you hit it, merge first or fix your checkout.
+# The ONLY path that writes the registry. Guarded so `latest` always comes from
+# merged main: a clean checkout of main whose HEAD is contained in origin/main
+# (fetched fresh). Dev work never needs this — plain `api` is hermetic — so the
+# guard has no escape hatch; if you hit it, merge first or fix your checkout.
+#
+# Containment, not equality: `release` publishes at the END of the deploy, so the
+# commit it released is routinely several minutes behind origin/main by then —
+# any PR merged during the deploy moves the tip. Demanding HEAD == origin/main
+# failed those releases (platform 0.18.74) for a race that has nothing to do with
+# what was deployed. Publishing the released commit's specs is the correct
+# outcome: `latest` means "the specs of the API running in prod", and the PR that
+# merged mid-deploy publishes its own specs when IT releases.
 def ensure_publishable!(root)
   branch, status = Open3.capture2("git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD")
   Util.exit_with_error("api publish: not a git repository: #{root}") unless status.success?
@@ -440,10 +449,12 @@ def ensure_publishable!(root)
 
   local, _ = Open3.capture2("git", "-C", root, "rev-parse", "HEAD")
   remote, _ = Open3.capture2("git", "-C", root, "rev-parse", "origin/main")
-  if local.strip != remote.strip
+  _, merged_status = Open3.capture2("git", "-C", root, "merge-base", "--is-ancestor", local.strip, remote.strip)
+  if !merged_status.success?
     Util.exit_with_error(
-      "api publish requires HEAD == origin/main (local #{local.strip[0, 8]}, origin #{remote.strip[0, 8]}).\n" \
-      "Pull (or push) main first so the registry reflects exactly what is merged."
+      "api publish requires HEAD to be merged into origin/main " \
+      "(local #{local.strip[0, 8]}, origin #{remote.strip[0, 8]}).\n" \
+      "Push (or merge) main first so the registry only ever reflects merged code."
     )
   end
 end
