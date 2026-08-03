@@ -9,6 +9,25 @@ load File.join(dir, "../lib/common.rb")
 # and only stop if the checkout can't be brought current.
 ReleaseFreshness.ensure!
 
+# Publish this checkout's apibuilder specs to the registry, when it owns any.
+# The release IS the publish point: dev `api` runs are hermetic and never write
+# the registry, so `latest` means "what is released" — the specs of the API
+# actually running in prod. ReleaseFreshness.ensure! above already guarantees
+# the clean, current main checkout that `api publish` requires.
+#
+# Deliberately NOT best-effort: a deployed API whose specs failed to publish is
+# exactly the drift the hermetic design exists to prevent, so a publish failure
+# fails the release (Util.run exits). Recover by fixing the cause and running
+# `api publish` standalone — the deploy itself has already happened.
+def publish_specs_if_owned(dir)
+  config_path = File.join(Dir.pwd, ".api", "config.pkl")
+  return unless File.exist?(config_path)
+  config = ApiConfig.new(config_path)
+  owns_specs = config.blocks.any? { |b| b.applications.any? { |a| File.exist?(File.join(Dir.pwd, a.file_path)) } }
+  return unless owns_specs
+  Util.run File.join(dir, "api") + " publish", quiet: true
+end
+
 pwd = `pwd`.strip
 if pwd.end_with?("-postgresql")
   Util.run File.join(dir, "release-db")
@@ -24,6 +43,8 @@ end
 # must keep the terminal even if a parent enabled quiet mode.
 if File.basename(pwd).start_with?("lib-")
   Util.run File.join(dir, "release-lib"), passthrough: true
+  # lib-ai owns apibuilder specs; the other libs have no .api config and skip.
+  publish_specs_if_owned(dir)
   return
 end
 
@@ -61,6 +82,11 @@ files.each do |file|
   end
   Util.run cmd, quiet: true
 end
+
+# Hard-failing (see publish_specs_if_owned) and therefore ahead of the
+# best-effort hooks below. No-op for repos without local spec files (frontends'
+# .api configs reference registry apps only).
+publish_specs_if_owned(dir)
 
 # Post-release hook: record this app's changelog in platform now that the tag exists.
 # Runs the whole pipeline (capture then build), not just capture: the notes are served
