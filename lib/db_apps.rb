@@ -39,6 +39,11 @@ class DbApp
 
   BASELINE_TAG_FILE = "docker/baseline-tag".freeze
 
+  # schema-evolution-manager's migration scripts, and the table it records the
+  # applied ones in. Both are SEM's own layout, not ours.
+  SCRIPTS_DIR   = "scripts".freeze
+  SEM_SCRIPTS_TABLE = "schema_evolution_manager.scripts".freeze
+
   attr_reader :name, :database, :role, :repo_dir
 
   def initialize(name:, database:, role:, repo_dir:)
@@ -244,6 +249,72 @@ class DbApp
 
   def current_image_ref
     image_ref(DbImages.image_tag(current_schema_tag))
+  end
+
+  # ── schema drift ──────────────────────────────────────────────────────────
+  #
+  # The image tag is the latest RELEASED schema tag, so an image is behind main
+  # by every script merged since that release — and a session's own branch can
+  # add more on top. Both are the same thing to SEM: a file in scripts/ that the
+  # database has no row for.
+
+  # Every migration script the checkout holds, in the order SEM applies them
+  # (filenames are timestamps, so lexical order IS apply order).
+  def repo_scripts
+    require_repo!
+    Dir[File.join(repo_dir, SCRIPTS_DIR, "*.sql")].map { |p| File.basename(p) }.sort
+  end
+
+  # True when `db` carries SEM's tracking table.
+  #
+  # Checked before any drift claim because psql_query swallows errors and hands
+  # back an empty list: without this, a database SEM has never touched reads as
+  # "zero scripts applied", and the caller would cheerfully replay the entire
+  # 800-script history against a full schema. An empty answer must mean empty,
+  # not broken.
+  def sem_tracking?(port, db)
+    DbImages.psql_query(
+      port,
+      "SELECT to_regclass('#{SEM_SCRIPTS_TABLE}') IS NOT NULL",
+      :database => db
+    ) == ["t"]
+  end
+
+  def applied_scripts(port, db)
+    DbImages.psql_query(port, "SELECT filename FROM #{SEM_SCRIPTS_TABLE}", :database => db)
+  end
+
+  # Scripts the checkout has and `db` has not applied, in apply order. Call only
+  # when sem_tracking? is true.
+  def pending_scripts(port, db)
+    applied = applied_scripts(port, db).to_set
+    repo_scripts.reject { |f| applied.include?(f) }
+  end
+
+  # The checkout's HEAD, short — printed alongside a drift count so "up to date"
+  # always says up to date WITH WHAT. A session DB is only ever as current as the
+  # checkout it was synced from, and that checkout can itself be behind origin.
+  def repo_head
+    require_repo!
+    sha = Dir.chdir(repo_dir) { `git rev-parse --short HEAD 2>/dev/null`.strip }
+    sha.empty? ? "unknown" : sha
+  end
+
+  # Commits the checkout is behind its own origin/main, or nil when that cannot
+  # be determined. The SECOND staleness gap, and the one that survives a sync:
+  # syncing makes the database match the CHECKOUT, so a checkout behind main
+  # leaves the database behind main by exactly the migrations it has not pulled.
+  # Measured live on 2026-08-03 at 3 commits / 3 scripts.
+  #
+  # Deliberately never fetches. `claude-db` runs against ~/code/<app>-postgresql,
+  # which is a human's checkout, and a tool that runs on every `start` has no
+  # business writing to it. So this compares against whatever origin/main the
+  # checkout last fetched, which can only UNDER-report — hence "at least" wherever
+  # the number is printed.
+  def repo_behind_origin
+    require_repo!
+    out = Dir.chdir(repo_dir) { `git rev-list --count HEAD..origin/main 2>/dev/null`.strip }
+    out =~ /\A\d+\z/ ? out.to_i : nil
   end
 
   # ── docker / postgres, scoped to this app ─────────────────────────────────

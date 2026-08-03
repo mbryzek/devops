@@ -27,6 +27,19 @@
 #                      its port is reused and re-running without --port works.
 #                      Prints: CONF_DB_DEV_URL=jdbc:postgresql://localhost:<port>/<db>
 #
+#   claude-db sync --app APP [--repo-dir DIR]
+#                      Apply the migrations this session's DB is missing. `start`
+#                      does this for you; run it again after rebasing onto a main
+#                      that carries schema changes, or after adding a script on
+#                      this branch.
+#
+# THE TEMPLATE IS ALWAYS BEHIND MAIN. The image tag is the latest RELEASED schema
+# tag, so every script merged since that release is missing from a brand-new
+# session database, and `end` + `start` re-clones the same stale template. The
+# resulting failures read as code defects, not as a stale database — a missing
+# relation, or a not-null violation on a column main already dropped. That cost
+# two hours on 2026-08-03 (ISS-276). `sync` is why they no longer happen.
+#
 #   claude-db end [--app APP]
 #                      Drop this session's database, from whichever container
 #                      holds it. Without --app, every app is checked.
@@ -69,9 +82,18 @@ def show_usage
 
       start --app APP [--port N]   Ensure the <database>-claude-<schema-tag> container
                                    is running and create a per-session database cloned
-                                   from <database>_template.  --port is required only
-                                   when that container does not exist yet.
+                                   from <database>_template, then sync it (below).
+                                   --port is required only when that container does
+                                   not exist yet.
                                    Prints CONF_DB_DEV_URL for the caller to export.
+
+      sync --app APP               Apply the migrations this session's database is
+           [--repo-dir DIR]        missing, from the schema repo checkout.  Run after
+                                   rebasing onto a main that carries schema changes,
+                                   or after adding a script on this branch.
+                                   The checkout is the one you are standing in when
+                                   that is <app>-postgresql, else
+                                   ~/code/<app>-postgresql; --repo-dir overrides.
 
       end [--app APP]              Drop this session's database(s).
 
@@ -151,7 +173,13 @@ def do_start(app, requested_port)
   # start (both the create and reuse paths). Quiet to suppress the echo.
   DbImages.psql_exec_quiet(port, "ALTER DATABASE #{db} OWNER TO #{app.role}")
 
-  # 3. Print the JDBC URL for the caller to export. The port is per container —
+  # 3. Bring it up to the checkout. The template is only ever as current as the
+  # last schema RELEASE, so a brand-new session database is normally already
+  # behind main — and nothing about that announces itself later. See do_sync.
+  puts ""
+  do_sync(app)
+
+  # 4. Print the JDBC URL for the caller to export. The port is per container —
   # a caller that hardcodes one is talking to somebody else's database.
   url = "jdbc:postgresql://#{DbImages::HOST}:#{port}/#{db}"
   puts ""
@@ -262,6 +290,113 @@ def ensure_image(app, desired_image, schema_tag)
   Util.run("docker pull #{desired_image}")
 end
 
+# ── sync ───────────────────────────────────────────────────────────────────
+#
+# Bring this session's database up to the schema repo checkout.
+#
+# The image tag is the latest RELEASED schema tag, so a freshly cloned session DB
+# is already behind main by every script merged since that release — four of them
+# on platform the day this was written. Recreating the database does not help:
+# `end` + `start` clone the SAME stale template. And a branch that adds its own
+# migration is behind by that too.
+#
+# The delta is applied with sem-apply, not with generated DDL, for three reasons
+# that a hand-patched database gets wrong:
+#   - ordering and DROPs come out right, because these are the same scripts, in
+#     the same order, that production ran;
+#   - the objects end up owned by the app role, because sem-apply connects AS
+#     that role to a role-owned database (hand-applied DDL runs as postgres, and
+#     every table it creates is then permission-denied to the app);
+#   - the tracking rows land, so the next sync knows what this one did.
+def do_sync(app)
+  Util.assert_sem_installed
+  Util.assert_installed("sem-apply", "https://github.com/mbryzek/schema-evolution-manager")
+
+  sid = DbImages.session_id
+  db  = app.session_db_name(sid)
+
+  holder = app.find_container_with_db(db)
+  if holder.nil?
+    Util.exit_with_error(
+      "No session database #{db} in any running #{app.name} container.\n\n" \
+      "  claude-db start --app #{app.name}\n\n" \
+      "creates it (and syncs it)."
+    )
+  end
+  container, port = holder
+
+  unless app.sem_tracking?(port, db)
+    # Bail rather than treat "no tracking table" as "nothing applied": that
+    # reading would replay the entire script history against a full schema.
+    Util.exit_with_error(
+      "#{db} has no #{DbApp::SEM_SCRIPTS_TABLE} table, so there is no way to tell " \
+      "which migrations it already has.\n" \
+      "The image bakes SEM tracking in, so this means the database was not cloned " \
+      "from #{app.template_db} — or the container is not reachable on :#{port}.\n\n" \
+      "Recreate it:  claude-db end --app #{app.name} && claude-db start --app #{app.name}"
+    )
+  end
+
+  pending = app.pending_scripts(port, db)
+  puts "Schema repo : #{app.repo_dir} @ #{app.repo_head}"
+
+  # "In sync" only ever means in sync WITH THIS CHECKOUT. A checkout behind main
+  # leaves the database behind main by exactly the scripts it has not pulled, and
+  # that gap looks identical to the one this command just closed.
+  behind = app.repo_behind_origin
+  if behind && behind > 0
+    Util.warning(
+      "#{app.repo_dir} is at least #{behind} commit(s) behind origin/main.\n" \
+      "Syncing matches this database to THAT CHECKOUT, so any migration merged to\n" \
+      "main since it was last pulled is still missing — the same wall of red, one\n" \
+      "level up. Either update the checkout, or sync from a fresh clone:\n\n" \
+      "  claude-db sync --app #{app.name} --repo-dir <fresh-clone-of-#{app.name}-postgresql>\n\n" \
+      "(This count is read from the last fetch — claude-db never writes to your\n" \
+      "checkout — so the real number can be higher.)"
+    )
+  end
+
+  if pending.empty?
+    puts "Schema      : up to date with the checkout (#{app.repo_scripts.length} scripts applied)."
+    return
+  end
+
+  puts ""
+  puts "#{pending.length} migration(s) in the checkout that #{db} does not have:"
+  pending.each { |f| puts "  #{f}" }
+  puts ""
+
+  # 127.0.0.1, not the HOST constant: `localhost` resolves to ::1 first on this
+  # box, and sem-apply follows that resolution to a refused connection where
+  # plain psql happens to fall back to IPv4.
+  url = "postgresql://#{app.role}@127.0.0.1:#{port}/#{db}"
+  ok = Dir.chdir(app.repo_dir) { system("sem-apply", "--url", url) }
+
+  unless ok
+    Util.exit_with_error(
+      "sem-apply failed against #{db}.\n\n" \
+      "The database is REAL but INCOMPLETE — it is missing the migrations listed " \
+      "above, so a test suite run against it will fail in ways that look like code " \
+      "defects (missing relation, not-null violation on a dropped column).\n\n" \
+      "Retry after fixing the script, from #{app.repo_dir}:\n" \
+      "  sem-apply --url #{url}\n\n" \
+      "Or, if the checkout itself is the problem, pass a different one:\n" \
+      "  claude-db sync --app #{app.name} --repo-dir <path-to-#{app.name}-postgresql>"
+    )
+  end
+
+  still = app.pending_scripts(port, db)
+  unless still.empty?
+    Util.exit_with_error(
+      "sem-apply reported success but #{still.length} script(s) are still unrecorded " \
+      "in #{db}: #{still.join(', ')}"
+    )
+  end
+
+  puts ""
+  puts "Applied #{pending.length} migration(s) to #{db} in #{container}."
+end
+
 # ── end ────────────────────────────────────────────────────────────────────
 
 def do_end(apps)
@@ -350,6 +485,12 @@ def do_status(apps)
         dbs.each do |db|
           flags = [active.include?(db) ? "active" : "idle"]
           flags << "THIS SESSION" if db == current_db
+          # Drift, stated where the database is listed. Measured against THIS
+          # checkout, which is the only schema any of these can be compared to
+          # from here. Silent when in sync — the point is to make behind-ness
+          # visible, not to add a line to every healthy row.
+          behind = app.sem_tracking?(port, db) ? app.pending_scripts(port, db).length : nil
+          flags << "#{behind} MIGRATION(S) BEHIND" if behind && behind > 0
           puts "    #{db}  [#{flags.join(', ')}]"
         end
       end
@@ -454,6 +595,11 @@ def parse_args!(argv)
       Util.exit_with_error("--port requires a value") if opts[:port].nil?
     when /\A--port=(.*)\z/
       opts[:port] = Regexp.last_match(1)
+    when "--repo-dir"
+      opts[:repo_dir] = argv.shift
+      Util.exit_with_error("--repo-dir requires a value") if opts[:repo_dir].nil?
+    when /\A--repo-dir=(.*)\z/
+      opts[:repo_dir] = Regexp.last_match(1)
     else
       Util.exit_with_error("Unknown argument: #{arg}")
     end
@@ -471,22 +617,40 @@ def parse_args!(argv)
   opts
 end
 
-# `start` creates a database, so it must be told which app's schema that database
-# holds — there is no safe default, and inferring one from the cwd is how a
-# session ends up developing against the wrong schema. Every other command either
-# reads or reclaims, and defaults to all apps.
-def require_app(opts)
+# `start` creates a database and `sync` migrates one, so both must be told which
+# app's schema is involved — there is no safe default, and inferring one from the
+# cwd is how a session ends up developing against the wrong schema. Every other
+# command either reads or reclaims, and defaults to all apps.
+def require_app(opts, command: "start")
   if opts[:app].nil?
     Util.exit_with_error(
-      "--app is required for `start` (one of: #{DbApp.names.join(', ')}).\n\n" \
-      "  claude-db start --app platform --port \"$(claude-db next-port)\""
+      "--app is required for `#{command}` (one of: #{DbApp.names.join(', ')}).\n\n" \
+      "  claude-db #{command} --app platform#{command == 'start' ? " --port \"$(claude-db next-port)\"" : ""}"
     )
   end
-  DbApp.load(opts[:app])
+  app_from(opts)
+end
+
+# The app AND the schema checkout its scripts come from.
+#
+# DbApp.resolve adopts the current directory as the checkout when that directory
+# IS this app's schema repo — the db-image convention (#269), and the case that
+# matters here: a session standing in its feature clone of <app>-postgresql is
+# standing in the schema it is developing against, which is exactly what `sync`
+# should apply and what the drift count should be measured from. Anywhere else
+# (a feature dir root, ~/code) nothing is inferred and ~/code/<app>-postgresql is
+# used as before. --repo-dir overrides both.
+def app_from(opts)
+  DbApp.resolve(:name => opts[:app], :repo_dir => opts[:repo_dir])
 end
 
 def apps_for(opts)
-  opts[:app] ? [DbApp.load(opts[:app])] : DbApp.all
+  if opts[:app]
+    [app_from(opts)]
+  else
+    Util.exit_with_error("--repo-dir names one app's schema repo, so it needs --app too") if opts[:repo_dir]
+    DbApp.all
+  end
 end
 
 show_usage if ARGV.empty?
@@ -498,6 +662,7 @@ opts = parse_args!(ARGV)
 
 case subcommand
 when "start"     then do_start(require_app(opts), opts[:port])
+when "sync"      then do_sync(require_app(opts, :command => "sync"))
 when "end"       then do_end(apps_for(opts))
 when "status"    then do_status(apps_for(opts))
 when "gc"        then do_gc(apps_for(opts))

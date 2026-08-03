@@ -235,4 +235,84 @@ class TestDbApps < Minitest::Test
       end
     end
   end
+
+  # ── schema drift ──────────────────────────────────────────────────────────
+  #
+  # The image tag is the latest RELEASED schema tag, so a session database is
+  # normally behind main the moment it is cloned. What it is behind BY is the
+  # difference between the checkout's scripts/ and the rows SEM recorded, and
+  # everything `claude-db sync` does hangs off getting that set right.
+
+  # Run a block with psql answering `responses`, keyed by a substring of the SQL.
+  # Unmatched queries return [] — which is also what the real psql_query does on
+  # error, and is exactly the case the guard below has to survive.
+  def with_psql(responses)
+    orig = DbImages.method(:psql_query)
+    DbImages.define_singleton_method(:psql_query) do |_port, sql, **_kwargs|
+      _key, value = responses.find { |k, _v| sql.include?(k) }
+      value || []
+    end
+    yield
+  ensure
+    DbImages.define_singleton_method(:psql_query, orig)
+  end
+
+  def repo_with_scripts(names)
+    dir = Dir.mktmpdir
+    FileUtils.mkdir_p(File.join(dir, "scripts"))
+    names.each { |n| File.write(File.join(dir, "scripts", n), "-- #{n}\n") }
+    [DbApp.new(:name => "x", :database => "xdb", :role => "api", :repo_dir => dir), dir]
+  end
+
+  # Filenames are timestamps, so lexical order IS apply order — sem-apply runs
+  # them in that order and a set that came back shuffled would reorder migrations.
+  def test_repo_scripts_are_sorted_and_only_sql
+    app, dir = repo_with_scripts(["20260803-190831.sql", "20260801-165150.sql", "README.md"])
+    assert_equal ["20260801-165150.sql", "20260803-190831.sql"], app.repo_scripts
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  def test_pending_scripts_is_what_the_checkout_has_and_the_database_lacks
+    app, dir = repo_with_scripts(["20260801-165150.sql", "20260803-171500.sql", "20260803-190831.sql"])
+    with_psql("SELECT filename" => ["20260801-165150.sql"]) do
+      assert_equal ["20260803-171500.sql", "20260803-190831.sql"], app.pending_scripts(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  def test_pending_scripts_is_empty_when_the_database_has_them_all
+    app, dir = repo_with_scripts(["20260801-165150.sql", "20260803-171500.sql"])
+    with_psql("SELECT filename" => ["20260803-171500.sql", "20260801-165150.sql"]) do
+      assert_empty app.pending_scripts(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  # THE guard. psql_query swallows errors and returns [], so a database whose
+  # tracking table is unreadable looks identical to one with zero scripts
+  # applied. Without this check the caller would replay the entire script history
+  # against an already-full schema.
+  def test_sem_tracking_is_false_when_the_table_is_absent_or_unreadable
+    app, dir = repo_with_scripts([])
+    with_psql({}) do
+      refute app.sem_tracking?(5555, "xdb_sess_a")
+    end
+    with_psql("to_regclass" => ["f"]) do
+      refute app.sem_tracking?(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  def test_sem_tracking_is_true_when_the_table_is_there
+    app, dir = repo_with_scripts([])
+    with_psql("to_regclass" => ["t"]) do
+      assert app.sem_tracking?(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
 end
