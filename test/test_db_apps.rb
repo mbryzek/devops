@@ -227,6 +227,38 @@ class TestDbApps < Minitest::Test
     end
   end
 
+  # The case the drift work exists for: a session runs its suite from
+  # ~/code/ai/<feature>/platform, whose sibling clone carries the branch's own
+  # migration. Reaching past it to ~/code/platform-postgresql syncs the database
+  # to main and silently omits that migration.
+  def test_resolve_adopts_a_sibling_schema_clone
+    Dir.mktmpdir do |feature|
+      sibling = schema_repo(feature, "platform-postgresql")
+      app_dir = File.join(feature, "platform")
+      FileUtils.mkdir_p(app_dir)
+      with_cwd_name("platform") do
+        assert_equal sibling, DbApp.resolve(:name => "platform", :dir => app_dir).repo_dir
+        # And from the feature directory itself, where the clone is a child.
+        assert_equal sibling, DbApp.resolve(:name => "platform", :dir => feature).repo_dir
+      end
+    end
+  end
+
+  # A directory that merely shares a parent with the app is not a checkout: only
+  # a real schema repo (scripts/ or a baseline tag) counts, so an empty
+  # placeholder falls through to ~/code rather than sending sem-apply at nothing.
+  def test_resolve_falls_back_when_no_sibling_clone_exists
+    Dir.mktmpdir do |feature|
+      app_dir = File.join(feature, "platform")
+      FileUtils.mkdir_p(app_dir)
+      FileUtils.mkdir_p(File.join(feature, "platform-postgresql"))
+      with_cwd_name("platform") do
+        assert_equal "/code/platform-postgresql",
+                     DbApp.resolve(:name => "platform", :dir => app_dir).repo_dir
+      end
+    end
+  end
+
   # Nothing to infer is the one case where --app is genuinely required.
   def test_resolve_is_nil_when_the_directory_names_no_app
     Dir.mktmpdir do |dir|

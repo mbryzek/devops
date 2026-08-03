@@ -107,18 +107,43 @@ class DbApp
     schema_repo ? dir : nil
   end
 
+  # This app's schema repo checked out ALONGSIDE `dir`, or nil.
+  #
+  # A session works in ~/code/ai/<feature>/ with one clone per repo, and runs its
+  # suite from ~/code/ai/<feature>/<app>. That directory is not itself the schema
+  # repo, so cwd_repo_dir declines it and ~/code/<app>-postgresql was used — which
+  # is exactly wrong for the case the drift work exists to fix: a branch carrying
+  # its OWN migration would sync against main's scripts and silently not get it.
+  # Same hermetic-sibling convention `api` uses for apibuilder specs.
+  #
+  # Both the feature dir itself and a clone inside it qualify, so this resolves
+  # from ~/code/ai/<feature> and from ~/code/ai/<feature>/<app> alike.
+  def DbApp.sibling_repo_dir(base, dir = Dir.pwd)
+    repo = "#{base}#{POSTGRESQL_SUFFIX}"
+    parent = File.dirname(dir)
+    [File.join(dir, repo), File.join(parent, repo)].each do |candidate|
+      found = DbApp.cwd_repo_dir(candidate)
+      return found if found
+    end
+    nil
+  end
+
   # Resolve --app / --repo-dir against the directory the command was run from.
   # Returns nil when neither the flag nor the directory names an app, which is
   # the only case where --app is genuinely required.
   #
   # The cwd supplies the checkout ONLY when it is the chosen app's own schema
   # repo: `--app acumen` run from platform-postgresql must not build platform's
-  # tree under acumen's name.
+  # tree under acumen's name. Failing that, a clone of it next to the cwd does —
+  # see sibling_repo_dir. ~/code/<app>-postgresql is the last resort, not the
+  # first, because a session that has its own clone means to use it.
   def DbApp.resolve(name: nil, repo_dir: nil, dir: Dir.pwd)
     cwd_name = DbApp.cwd_name(dir)
     name ||= cwd_name
     return nil if name.nil?
-    repo_dir ||= DbApp.cwd_repo_dir(dir) if DbApp.base_name(name) == cwd_name
+    base = DbApp.base_name(name)
+    repo_dir ||= DbApp.cwd_repo_dir(dir) if base == cwd_name
+    repo_dir ||= DbApp.sibling_repo_dir(base, dir)
     DbApp.load(name, :repo_dir => repo_dir)
   end
 
@@ -300,17 +325,34 @@ class DbApp
     sha.empty? ? "unknown" : sha
   end
 
+  # Bring refs/remotes/origin/main up to date, so repo_behind_origin measures
+  # against main as it is now. True when the fetch succeeded.
+  #
+  # This USED to refuse to fetch, on the grounds that ~/code/<app>-postgresql is
+  # a human's checkout and a tool running on every `start` has no business
+  # writing to it, and hedged the number with "at least". That reasoning was
+  # wrong in the way that matters: the count is read from refs/remotes/origin/main,
+  # so an unfetched checkout does not report a hedged number, it reports ZERO —
+  # and `sync` then prints "up to date with the checkout" over a database that is
+  # days behind. A warning that can silently read green is worse than none, and
+  # whether it reads green comes down to how recently a human happened to fetch.
+  #
+  # Fetching touches refs/remotes only — never the working tree, never a local
+  # branch — so the objection does not apply to it. Failure (offline, no origin)
+  # leaves the stale-ref reading in place and is reported, not swallowed.
+  def repo_fetch_origin
+    require_repo!
+    Dir.chdir(repo_dir) { system("git", "fetch", "--quiet", "origin", :out => File::NULL, :err => File::NULL) }
+  end
+
   # Commits the checkout is behind its own origin/main, or nil when that cannot
   # be determined. The SECOND staleness gap, and the one that survives a sync:
   # syncing makes the database match the CHECKOUT, so a checkout behind main
   # leaves the database behind main by exactly the migrations it has not pulled.
   # Measured live on 2026-08-03 at 3 commits / 3 scripts.
   #
-  # Deliberately never fetches. `claude-db` runs against ~/code/<app>-postgresql,
-  # which is a human's checkout, and a tool that runs on every `start` has no
-  # business writing to it. So this compares against whatever origin/main the
-  # checkout last fetched, which can only UNDER-report — hence "at least" wherever
-  # the number is printed.
+  # Reads refs/remotes/origin/main, so it is only as current as the last fetch —
+  # call repo_fetch_origin first and report the number as a floor when that failed.
   def repo_behind_origin
     require_repo!
     out = Dir.chdir(repo_dir) { `git rev-list --count HEAD..origin/main 2>/dev/null`.strip }
