@@ -6,7 +6,8 @@
 #   1. Runs sbt dist to build the application
 #   2. Generates a Dockerfile from the scala-play template
 #   3. Extracts the distribution to dist/
-#   4. Builds the Docker image
+#   4. Validates the XML config files in the distribution
+#   5. Builds the Docker image
 #
 # Usage: k8s-build --app <app-name> [--tag <version>]
 #
@@ -51,6 +52,7 @@ class K8sBuild
       build_sbt_dist
       generate_dockerfile
       extract_distribution
+      validate_distribution_xml
       build_docker_image
     end
 
@@ -149,6 +151,21 @@ class K8sBuild
     Util.run("rm -f dist/bin/*.bat")
 
     Util.detail("Distribution extracted to dist/")
+  end
+
+  # See XmlValidation: a malformed conf XML is invisible until logback parses it
+  # at pod startup, which is after the image has already been pushed.
+  def validate_distribution_xml
+    Util.step("Validating XML config") do
+      files = XmlValidation.config_files("dist")
+      errors = XmlValidation.errors_in(files)
+
+      if !errors.empty?
+        Util.exit_with_error("Malformed XML in distribution config:\n  " + errors.join("\n  "))
+      end
+
+      Util.detail("Validated #{files.size} XML config file(s)")
+    end
   end
 
   def build_docker_image
