@@ -54,6 +54,16 @@ producers:
       title: Run dev invariants and fix as necessary
       fingerprint: invariants:platform
 
+  - key: invariants-acumen
+    schedule: every 1 hour
+    check: dev invariants check --app acumen
+    file_when: check_fails
+    issue:
+      category: infrastructure
+      severity: high
+      title: Run dev invariants and fix as necessary
+      fingerprint: invariants:acumen
+
   - key: codegen-sync
     schedule: daily at 3:00am
     check: dev codegen sync --check
