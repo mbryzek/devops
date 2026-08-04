@@ -259,11 +259,27 @@ class TestPendingReleaseOrchestration < Minitest::Test
       released_mutex.synchronize { released_ref.call << name }
       results_ref.call.fetch(name) { { ok: true, log: "ok" } }
     end
+
+    # Reading a DB repo's new migrations means a git checkout, which these
+    # stubbed rows do not have. Default every DB to expanding — the behavior
+    # every test written before ISS-317 assumes — and let a test that cares name
+    # its contracting repos with `contracting!`.
+    @contracting = []
+    @orig_partition = Object.instance_method(:partition_db_releases)
+    contracting_ref = -> { @contracting }
+    Object.send(:define_method, :partition_db_releases) do |db_pending|
+      db_pending.partition { |n| !contracting_ref.call.include?(n) }
+    end
+  end
+
+  def contracting!(*names)
+    @contracting = names
   end
 
   def teardown
     Object.send(:define_method, :resolve_deploy_items, @orig_resolve)
     Object.send(:define_method, :release_one, @orig_release)
+    Object.send(:define_method, :partition_db_releases, @orig_partition)
   end
 
   def capture_io
@@ -537,7 +553,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     ]
     out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
     assert_equal %w[acumen-postgresql acumen lib-util], @released
-    assert_match(/Phase 3: releasing 1 library serially \(interactive\): lib-util/, out)
+    assert_match(/Phase 4: releasing 1 library serially \(interactive\): lib-util/, out)
   end
 
   def test_libraries_release_serially
@@ -564,7 +580,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
     out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
     refute_match(/Phase 1/, out)
     refute_match(/Phase 2/, out)
-    assert_match(/Phase 3/, out)
+    assert_match(/Phase 4/, out)
     assert_equal ["lib-cipher"], @released
   end
 
@@ -588,6 +604,75 @@ class TestPendingReleaseOrchestration < Minitest::Test
     out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
     assert_empty @released
     assert_match(/All apps up to date/, out)
+  end
+
+  # --- ISS-317: contracting migrations release AFTER their app ---------------
+  #
+  # A schema release that DROPs a column or table the live code still selects
+  # took production down twice in two days when it was applied in Phase 1: the
+  # old pods answered `does not exist` for every request touching the object,
+  # for the whole length of the app's build and rollout.
+
+  def test_contracting_db_releases_after_its_app
+    contracting!("platform-postgresql")
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal ["platform", "platform-postgresql"], @released
+    assert_match(/Phase 3: releasing 1 contracting database\(s\) serially, after their apps: platform-postgresql/, out)
+  end
+
+  def test_expanding_db_still_releases_before_its_app
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    capture_io { cmd_deploy_all([]) }
+    assert_equal ["platform-postgresql", "platform"], @released
+  end
+
+  # An app whose own DB is contracting is not gated by it — it goes in the first
+  # wave, alongside the expanding DBs, because the drop is what waits.
+  def test_app_of_a_contracting_db_is_not_held_behind_an_unrelated_expanding_db
+    contracting!("platform-postgresql")
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["acumen-postgresql",   { tag: "0.0.3", ahead: 1, last: "c" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_match(/Phase 1: releasing 1 database\(s\) serially: acumen-postgresql/, out)
+    assert_match(/in parallel with 1 app\(s\).*: platform/, out)
+    assert_operator @released.index("platform"), :<, @released.index("platform-postgresql")
+  end
+
+  # The drop is only safe once the code that stopped using the object is live.
+  # If that release failed, the old code is what production is still running, so
+  # applying the migration would reproduce the incident exactly.
+  def test_contracting_db_is_held_back_when_its_app_fails
+    contracting!("platform-postgresql")
+    @release_results = { "platform" => { ok: false, log: "boom" } }
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
+    assert_equal ["platform"], @released
+    refute_nil exc
+    assert_match(/skipped:\s+platform-postgresql \(contracting migration held back: platform did not release/, out)
+  end
+
+  # Nothing else is pending, so there is no app to wait for and the migration
+  # applies on its own.
+  def test_contracting_db_releases_when_its_app_is_not_pending
+    contracting!("platform-postgresql")
+    @rows = [["platform-postgresql", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal ["platform-postgresql"], @released
+    refute_match(/Phase 1:/, out)
+    assert_match(/Phase 3:/, out)
   end
 end
 
@@ -1254,7 +1339,7 @@ class TestDeployDevopsPhase < Minitest::Test
     ]
     out = with_tty(true) { capture_io { cmd_deploy_all([]) } }
     assert_equal %w[acumen-postgresql acumen lib-util devops], @released
-    assert_match(/Phase 4: updating devops \(git pull\)/, out)
+    assert_match(/Phase 5: updating devops \(git pull\)/, out)
   end
 
   def test_only_devops_pending_runs_no_other_phase
@@ -1264,7 +1349,8 @@ class TestDeployDevopsPhase < Minitest::Test
     refute_match(/Phase 1/, out)
     refute_match(/Phase 2/, out)
     refute_match(/Phase 3/, out)
-    assert_match(/Phase 4/, out)
+    refute_match(/Phase 4/, out)
+    assert_match(/Phase 5/, out)
   end
 
   # devops is never gated on a DB, and a failed DB must not skip it.
