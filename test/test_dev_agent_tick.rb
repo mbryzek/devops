@@ -243,8 +243,8 @@ class TestDevAgentTick < Minitest::Test
   #
   # API Builder refuses to let a resource vary its type across 2xx codes, so
   # "nothing claimable" is a 200 whose `lease` is ABSENT rather than a 204. The
-  # tick must read the wrapper, and must keep the two genuine failures — 429 and
-  # 422 — out of that quiet path.
+  # tick must read the wrapper, and must keep the one genuine failure — 422 —
+  # out of that quiet path.
 
   def claim_with(response)
     out = nil
@@ -263,15 +263,8 @@ class TestDevAgentTick < Minitest::Test
   def test_an_empty_claim_wrapper_is_the_quiet_idle_case
     workspaces = nil
     out = claim_with({}) { workspaces = Dir.children(Agent::Paths.workspace_root) } # 200, `lease` absent
-    refute_match(/cap reached|REJECTED/, out)
+    refute_match(/REJECTED/, out)
     assert_empty workspaces, "nothing claimable must not materialize a workspace"
-  end
-
-  def test_daily_cap_backs_off_and_does_not_look_like_an_idle_queue
-    # 429's body is empty by design (one body type per status code registry-wide)
-    # so the status code IS the message.
-    out = claim_with(->(_body) { raise ApiError.new("HTTP 429 POST /playbook/issue/leases: ", code: 429) })
-    assert_match(/fleet daily claim cap reached/, out)
   end
 
   # An unknown runner_id is a client bug, not "no work". Swallowing it would
@@ -354,6 +347,59 @@ class TestDevAgentTick < Minitest::Test
     result
   end
 
+  # The regression that would have caught the one-shot producer bug: run the real
+  # `run_producers` path against a registry with a producer that ALREADY RAN, and
+  # look at the guard it actually puts on the wire. Sending the previous run's own
+  # `started_at` makes the platform's inclusive `started_at >= if_no_run_since`
+  # match that very row, so the producer declines itself forever.
+  def test_a_producer_that_already_ran_guards_on_the_period_not_on_its_own_last_run
+    ran_at = Time.utc(2026, 8, 4, 16, 57, 29)
+    now    = Time.utc(2026, 8, 4, 17, 36, 0)          # well past the 30-minute interval
+    sent   = nil
+
+    registry = <<~YAML
+      timezone: America/New_York
+      producers:
+        - key: probe
+          schedule: every 30 minutes
+          check: "true"
+          file_when: never
+    YAML
+
+    with_agent_home do
+      register_identity
+      with_producer_registry(registry) do
+        stubs = {
+          "GET /agent/producers/runs?limit=100&offset=0" => [
+            { "producer_key" => "probe", "started_at" => ran_at.iso8601, "finished_at" => ran_at.iso8601 },
+          ],
+          "POST /agent/producers/probe/runs" => lambda do |body|
+            sent = body[:if_no_run_since] || body["if_no_run_since"]
+            { "run" => { "id" => "run-1" } }
+          end,
+          "PUT /agent/producers/runs/run-1" => { "id" => "run-1" },
+        }
+        with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false, now: now).run_producers(Agent::Host.cached_identity) } }
+      end
+    end
+
+    refute_nil sent, "the producer was due and must have attempted a run"
+    assert_equal "2026-08-04T17:27:29Z", sent
+    assert Time.parse(sent) > ran_at,
+           "the guard must be the period boundary, not the previous run's own start time"
+  end
+
+  def with_producer_registry(yaml)
+    file = File.join(Agent::Paths.state_dir, "producers.yml")
+    FileUtils.mkdir_p(File.dirname(file))
+    File.write(file, yaml)
+    original = Agent::Paths.method(:producers_file)
+    Agent::Paths.define_singleton_method(:producers_file) { file }
+    yield
+  ensure
+    Agent::Paths.define_singleton_method(:producers_file, original)
+  end
+
   def test_a_crashing_check_is_check_failed_not_filed
     # Exit 2 and up means the check itself broke. Filing on it would turn a
     # broken producer into a nightly stream of bogus issues.
@@ -411,7 +457,11 @@ class TestDevAgentTick < Minitest::Test
       end
       refute File.exist?(marker), "a skipped producer must not run its check"
     end
-    assert_match(/another runner already started this run/, out)
+    # The message names both causes rather than asserting one. It used to claim
+    # "another runner already started this run", which was wrong in the case that
+    # actually happened in production — a single-runner fleet with nothing in
+    # flight — and sent the investigation looking for a second machine.
+    assert_match(/already in flight or finished/, out)
   end
 
   def test_file_when_never_acts_directly_and_files_nothing

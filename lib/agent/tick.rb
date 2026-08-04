@@ -324,7 +324,16 @@ module Agent
         log("producers: none due")
         return
       end
-      due.each { |producer| run_producer(producer, last[producer.key], identity) }
+      timezone = registry.fetch(:timezone)
+      due.each do |producer|
+        # The guard is the START OF THE CURRENT PERIOD, never the previous run's
+        # own start time — see Agent::Schedule.period_start for why that
+        # distinction is the difference between a working producer and a
+        # permanently wedged one.
+        period_start = Agent::Schedule.period_start(producer.schedule, last_run_at: last[producer.key],
+                                                    now: @now, timezone: timezone)
+        run_producer(producer, period_start, identity)
+      end
     rescue Agent::Producers::ConfigError => e
       log("producers: #{e.message}")
     end
@@ -339,21 +348,26 @@ module Agent
       end
     end
 
-    def run_producer(producer, last_started, identity)
+    def run_producer(producer, period_start, identity)
       if @dry_run
         decide("producer", "#{producer.key} is due (#{Agent::Schedule.describe(producer.schedule)}) — would start a run and #{producer.check ? "run: #{producer.check}" : 'file unconditionally'}")
         return
       end
 
       run = Agent::Api.start_producer_run(producer.key, runner_id: identity.runner_id,
-                                          if_no_run_since: last_started,
+                                          if_no_run_since: period_start,
                                           token: identity.token, use_localhost: @use_localhost)
       if run.nil?
-        # An absent `run` in the wrapper: one is in flight elsewhere, or another
-        # machine started one after our guard timestamp. A compare-and-set, not a
-        # scheduler — and the check must NOT run, or two machines would both do
-        # the work the arbitration exists to deduplicate.
-        decide("producer", "#{producer.key}: another runner already started this run — skipping")
+        # An absent `run` in the wrapper has TWO causes: a run is in flight, or
+        # one already finished within this period. A compare-and-set, not a
+        # scheduler — and the check must NOT run either way, or two machines
+        # would both do the work the arbitration exists to deduplicate.
+        #
+        # The message names both, because it cannot tell them apart from here and
+        # asserting the wrong one sends an investigation in the wrong direction:
+        # this said "another runner already started this run" for 19 consecutive
+        # ticks on a fleet that had exactly one runner and nothing in flight.
+        decide("producer", "#{producer.key}: a run for this period is already in flight or finished — skipping")
         return
       end
 
@@ -446,21 +460,19 @@ module Agent
           raise
         end
         # No lease in the response means the queue had nothing claimable — the
-        # ordinary idle case, and the ONLY quiet one. 429 and 422 above are not
-        # emptiness and never reach here.
+        # ordinary idle case, and the ONLY quiet one. The 422 above is not
+        # emptiness and never reaches here.
         break if lease.nil?
         start_job(lease, identity)
         live += 1
       end
     end
 
-    # The two claim failures that are NOT "no work", handled loudly. Returns true
-    # when the caller should stop claiming, false when it should re-raise.
+    # The claim failure that is NOT "no work", handled loudly. Returns true when
+    # the caller should stop claiming, false when it should re-raise.
     #
-    # 429 — the fleet-wide daily cap. Expected, bounded, and self-clearing when
-    # the window resets. Its body is deliberately empty (one body type per status
-    # code registry-wide), so the status code IS the message: do not try to read
-    # a reason out of it.
+    # Admission control is per-runner concurrency and nothing else — there is no
+    # fleet-wide volume cap, so there is no 429 to handle here.
     #
     # 422 — the server does not recognize this runner_id. A client bug, never
     # "nothing to do": most likely the identity cache outlived its row (a runner
@@ -471,12 +483,6 @@ module Agent
     # authority, so the next tick re-registers and upserts back onto the same row.
     def handle_claim_error(error, identity)
       case error.code
-      when 429
-        Agent::Notify.once("cap_reached", @now.strftime("%Y-%m-%d"), now: @now) do
-          Agent::Notify.event("dev-agent: fleet daily claim cap reached — claiming nothing until the window resets")
-        end
-        decide("claim", "fleet daily claim cap reached — backing off until the window resets")
-        true
       when 422
         decide("claim", "REJECTED (422): the platform does not recognize runner #{identity.runner_id} — " \
                         "clearing #{Agent::Paths.identity_file} so the next tick re-registers on this machine's hardware UUID. #{error.message}")

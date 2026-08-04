@@ -98,6 +98,30 @@ module Agent
       end
     end
 
+    # The start of the period this schedule is currently in — the moment it most
+    # recently BECAME due. nil when it has never run, the one case with no prior
+    # period to sit inside.
+    #
+    # This is the arbitration guard the tick hands the platform (design §4.2):
+    # "has anyone already started a run for the period that is now due?" The
+    # server answers it by looking for a run with `started_at >= guard`, which is
+    # why the guard must be the START OF THE PERIOD and never the previous run's
+    # own `started_at`. A run is always `>=` itself, so passing the latter makes
+    # every producer block itself forever after its first successful run — the
+    # whole producer subsystem silently becomes one-shot.
+    def period_start(schedule, last_run_at:, now: Time.now, timezone: nil)
+      case schedule.fetch(:kind)
+      when :every
+        # No wall-clock boundary exists for an elapsed-time rule, so the period
+        # opened exactly one interval after the last run.
+        last_run_at.nil? ? nil : last_run_at + schedule.fetch(:seconds)
+      when :daily, :weekly
+        previous_occurrence(schedule, now: now, timezone: timezone)
+      else
+        raise ParseError, "unknown schedule kind #{schedule[:kind].inspect}"
+      end
+    end
+
     # The most recent wall-clock occurrence of a daily/weekly schedule at or
     # before `now`, in `timezone`. nil for an `every` schedule (it has none).
     #
