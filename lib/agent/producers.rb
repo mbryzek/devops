@@ -26,9 +26,14 @@ module Agent
     # re-file while a PR is open" fall out with no GitHub call at all.
     TERMINAL_ISSUE_STATUSES = %w[verified dismissed].freeze
 
-    Producer = Struct.new(:key, :schedule, :schedule_text, :check, :file_when, :issue, :command, keyword_init: true) do
+    Producer = Struct.new(:key, :schedule, :schedule_text, :check, :file_when, :issue, :command, :body_file, keyword_init: true) do
       def files_issue? = file_when != "never"
       def fingerprint  = issue && issue["fingerprint"]
+
+      # The playbook this producer ships with its issue, or nil. Read at file
+      # time so an edit to the playbook takes effect on the next run without a
+      # restart — the registry is re-parsed every tick anyway.
+      def body_text = body_file && File.read(body_file).strip
     end
 
     module_function
@@ -88,9 +93,33 @@ module Agent
         check: check&.to_s,
         file_when: file_when,
         issue: issue,
+        body_file: resolve_body_file(issue, key, path),
       )
     rescue Agent::Schedule::ParseError => e
       raise ConfigError, "#{path}: #{entry.is_a?(Hash) ? entry['key'] : '?'}: #{e.message}"
+    end
+
+    # `issue.body_file` names a playbook that ships with the issue, resolved
+    # under `agent/` and read when the issue is filed.
+    #
+    # A file rather than an inline `body:` because the playbooks that need this
+    # are long and shared: every weekly-review producer points at the SAME
+    # playbook, so inlining it would mean one copy per repo, drifting the moment
+    # anyone edits one of them.
+    #
+    # Validated HERE, at parse time, rather than at file time. A producer with a
+    # typo'd path would otherwise stay silent until its schedule came round —
+    # `file_when: always` producers fire weekly, so the mistake would surface at
+    # 2am, a week late, as an issue whose brief is just missing.
+    def resolve_body_file(issue, key, path)
+      return nil unless issue.is_a?(Hash)
+      rel = issue["body_file"].to_s
+      return nil if rel.empty?
+      raise ConfigError, "#{path}: #{key}: issue.body_file must be relative to agent/, not absolute" if rel.start_with?("/")
+
+      resolved = File.expand_path(rel, Agent::Paths.agent_dir)
+      raise ConfigError, "#{path}: #{key}: issue.body_file not found: #{rel}" unless File.file?(resolved)
+      resolved
     end
 
     # Does a non-terminal issue with this fingerprint already exist? One rule
