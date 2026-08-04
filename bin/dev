@@ -370,10 +370,13 @@ USAGE = <<~USAGE
         --verbose to stream full output.
 
     #{INVOCATIONS["codegen sync"]}
-        Regenerate every codegen-consuming repo against the latest generator and
-        registry, opening a review-ready PR per repo that changes. Backends
-        (platform, acumen) upload their specs and regenerate first, serially;
-        consumers regenerate in parallel. `sync` is the default subcommand.
+        Regenerate every codegen-consuming repo against the latest generators and
+        specs, opening a review-ready PR per repo that changes. Every repo is
+        cloned at main into one working dir under ~/code/ai, so a consumer
+        regenerates against the backends' specs AS MERGED, not as last released;
+        nothing is ever published (only `api publish`, from a clean merged main,
+        moves the registry). Backends (platform, acumen) regenerate first,
+        serially; consumers regenerate in parallel. `sync` is the default subcommand.
         --dry-run reports diffs without spawning Claude or opening PRs;
         --regen-only opens draft PRs but skips the review-completion workflow;
         --full-tests runs the full Scala suite instead of Test/compile.
@@ -4159,10 +4162,11 @@ end
 # ---------- scratch workdirs ----------
 #
 # `dev codegen sync` and `dev browserslist update` clone every repo into a
-# timestamped throwaway dir under ~/code (codegen-sync.<run_id>,
-# browserslist.<date>). Each clone drags in its own node_modules — one sweep is
-# ~2-3 GB, largely duplicated 112 MB `workerd` binaries — and nothing ever
-# removed them, so by 2026-07-30 twenty-eight abandoned sweeps held ~48 GB.
+# timestamped throwaway dir: `~/code/ai/cgs.<run_id>` (see CODEGEN_WORKDIR_ROOT
+# for why codegen's has to live under ~/code/ai) and `~/code/browserslist.<date>`.
+# Each clone drags in its own node_modules — one sweep is ~2-3 GB, largely
+# duplicated 112 MB `workerd` binaries — and nothing ever removed them, so by
+# 2026-07-30 twenty-eight abandoned sweeps held ~48 GB.
 #
 # Every run now purges its own older siblings before it clones anything. These
 # dirs are pure scratch: the clones are disposable, any real output is already
@@ -4956,15 +4960,34 @@ end
 # branch from a prior run never blocks or gets clobbered. The gate against
 # duplicate work is an OPEN PR (see open_codegen_pr), not branch existence.
 CODEGEN_BRANCH_PREFIX = "codegen-sync".freeze
-# The scratch dir under ~/code holding a sweep's clones — same stem as the
-# branch, so one run's dir and branch are recognizably a pair, and
-# purge_scratch_workdirs can find prior runs by this prefix.
-CODEGEN_WORKDIR_PREFIX = CODEGEN_BRANCH_PREFIX
+# The scratch dir holding a sweep's clones lives under ~/code/ai, and that is
+# load-bearing rather than cosmetic. `api` is hermetic: it treats a repo's own
+# working-tree specs as authoritative, then a sibling clone's — but ONLY when the
+# clones sit in an `~/code/ai/<dir>/<repo>` layout (sibling_spec_paths in bin/api
+# gates on exactly that shape). Anywhere else every spec a repo does not own
+# resolves from the registry, and the registry means RELEASED, not merged — so a
+# sweep run outside ~/code/ai regenerates each consumer against the last released
+# specs and opens PRs walking its client BACKWARDS whenever a merged spec change
+# has not shipped yet. Cloning into ~/code/ai/<dir> makes each backend clone a
+# sibling of every consumer clone, so consumers regenerate against main.
+CODEGEN_WORKDIR_ROOT = File.join(CODE_ROOT, "ai")
+# Short on purpose: `<prefix>.<run_id>` must stay within the ~19 chars macOS
+# unix-socket paths leave for a feature dir (sbt's
+# `<feature>/<repo>/project/.sbtboot/server/<hash>/sock` caps at 104 bytes), and
+# the sweep runs sbt in every scala clone. purge_scratch_workdirs finds prior
+# runs by this prefix.
+CODEGEN_WORKDIR_PREFIX = "cgs".freeze
 CODEGEN_STACKS = %i[scala elm sveltekit].freeze
 CODEGEN_CLAUDE_TIMEOUT_SECS = 20 * 60
 # The per-repo sessions do mechanical work (fix compile errors, commit, open a
 # PR), so a cheap/fast model is the right default.
 CODEGEN_CLAUDE_MODEL = "haiku".freeze
+
+# The working dir for one sweep: `~/code/ai/cgs.<run_id>`. Its name pairs with the
+# run's branch (`codegen-sync-<run_id>`) through the shared run_id.
+def codegen_workdir(run_id)
+  File.join(CODEGEN_WORKDIR_ROOT, "#{CODEGEN_WORKDIR_PREFIX}.#{run_id}")
+end
 
 def github_origin(repo_slug)
   "git@github.com:#{repo_slug}.git"
@@ -4984,15 +5007,19 @@ rescue SystemExit, StandardError => e
 end
 
 # Which registry apps to clone + parse for this run. A single-consumer `--app`
-# needs nothing else (its own `.api/config.pkl` fully determines its stack and
-# generators). A single-backend `--app` needs every consumer candidate cloned
-# too, so `Codegen::Graph` can compute which consumers actually depend on it
-# (a consumer's dependency on a backend is only knowable by intersecting the
-# consumer's parsed `app_names` with the backend's, which requires cloning the
-# consumer). No `--app` (full sweep) needs everything.
+# needs every BACKEND cloned alongside it: a consumer owns no specs, so the specs
+# it generates against come from the backend clones sitting next to it in the
+# workdir — without them `api` falls back to the registry (released) and the run
+# regenerates the client backwards. A single-backend `--app` needs every consumer
+# candidate cloned, so `Codegen::Graph` can compute which consumers actually
+# depend on it (a consumer's dependency on a backend is only knowable by
+# intersecting the consumer's parsed `app_names` with the backend's, which
+# requires cloning the consumer). No `--app` (full sweep) needs everything.
+# Cloning is not running: `codegen_run_plan` still runs only the target and, for
+# a backend target, its dependent consumers.
 def codegen_clone_set(target, eligible)
   return eligible if target.nil?
-  return [target] if target.stack != :scala
+  return [target] + eligible.select { |a| a.stack == :scala } if target.stack != :scala
   [target] + eligible.reject { |a| a.stack == :scala }
 end
 
@@ -5137,19 +5164,19 @@ def run_repo(name, workdir, stack, opts, branch, &announce)
   wiped = Codegen::Sync.generated_paths(clone).each { |p| File.delete(p) if File.exist?(p) }
   note.call("wiped #{wiped.length} generated file(s)")
 
-  # For a backend, bare `api` uploads specs to the shared registry AND
-  # regenerates — --dry-run must never mutate the shared registry, so it runs
-  # codegen only. For a consumer `api` is already codegen-only, so this is a
-  # no-op change for that case. Run it in every dir with a .api/config.pkl
-  # (root, plus e.g. ./playwright) so all generated files are recreated — the
-  # wipe deleted them all.
-  api_cmd = opts[:dry_run] ? ["api", "codegen"] : ["api"]
+  # Bare `api` is hermetic for every stack: it regenerates from the working-tree
+  # specs of this clone and its siblings in the workdir and publishes NOTHING
+  # (only `api publish`, from a clean merged main, moves the registry's `latest`).
+  # So there is no registry-mutating variant to avoid here and --dry-run runs the
+  # same command — it differs only in never committing, pushing, or opening a PR.
+  # Run it in every dir with a .api/config.pkl (root, plus e.g. ./playwright) so
+  # all generated files are recreated — the wipe deleted them all.
   api_dirs = codegen_api_dirs(clone)
-  base = stack == :scala && !opts[:dry_run] ? "uploading specs + regenerating (backend — can take a few minutes)" : "regenerating client"
+  base = stack == :scala ? "regenerating (backend — can take a few minutes)" : "regenerating client"
   note.call("running api in #{api_dirs.length} config dir(s): #{base}…")
   api_dirs.each do |dir|
     log = +""
-    ok, _ = run_step(api_cmd, dir, false, log)
+    ok, _ = run_step(["api"], dir, false, log)
     rel = dir == clone ? "." : dir.sub("#{clone}#{File::SEPARATOR}", "")
     return { status: :error, error: "api failed in #{rel}: #{log.strip}" } unless ok
   end
@@ -5329,9 +5356,9 @@ def cmd_codegen_sync(argv)
   # name so reruns never collide with a prior run's clones or remote branch.
   run_id = ENV["CODEGEN_SYNC_DATE"] || Time.now.strftime("%Y%m%d-%H%M%S")
   branch = "#{CODEGEN_BRANCH_PREFIX}-#{run_id}"
-  workdir = File.join(CODE_ROOT, "#{CODEGEN_WORKDIR_PREFIX}.#{run_id}")
+  workdir = codegen_workdir(run_id)
   # Before cloning ~2-3 GB of fresh checkouts, reclaim every prior sweep's.
-  purge_scratch_workdirs(CODEGEN_WORKDIR_PREFIX, keep: workdir)
+  purge_scratch_workdirs(CODEGEN_WORKDIR_PREFIX, keep: workdir, root: CODEGEN_WORKDIR_ROOT)
   # No `devops` clone is needed alongside the repo clones: every `.api/config.pkl`
   # amends `modulepath:/api/ApiConfig.pkl`, which `api` resolves from its own
   # checkout (see ApiConfig::BASE_MODULE_URI), not from a sibling directory.
@@ -5395,13 +5422,18 @@ def cmd_codegen_sync(argv)
   unless consumer_names.empty?
     puts Util.underline("Consumers (concurrency=#{opts[:concurrency]})")
     consumer_stacks = registry.apps.each_with_object({}) { |a, h| h[a.name] = a.stack }
-    # A consumer that regenerates against a registry missing a failed backend's
-    # freshly-uploaded specs would be regenerating against stale/incomplete
-    # data — skip it rather than run codegen on a bad premise.
-    # Gate on :error only. A backend ending :needs_attention either already
-    # uploaded its specs (api runs before spawn_claude) or never touched the
-    # registry (pre-existing-branch guard fired before api) — consumers are
-    # safe either way, so do NOT skip them for :needs_attention.
+    # A consumer reads its backends' specs straight out of their sibling clones
+    # in this workdir, so what a backend leg's outcome tells us is whether that
+    # clone is really sitting on fresh main. An :error leg may have died in the
+    # fetch or the branch checkout, before its clone reached origin/main — its
+    # specs are then untrustworthy, so skip the consumers that depend on it
+    # rather than regenerate on a bad premise. (Conservative: an :error raised
+    # later, e.g. by `api` itself, leaves the specs perfectly fine. Cheap to
+    # over-skip, expensive to regenerate a client from the wrong contract.)
+    # Gate on :error only. A backend ending :needs_attention has a clone at main
+    # either way — the open-PR guard fires before anything mutates the clone, and
+    # a Claude handoff happens after the fetch/checkout succeeded — so do NOT
+    # skip its consumers.
     failed_backends = backend_names.select { |b| results[b] && results[b][:status] == :error }.to_set
     results.merge!(run_concurrent(consumer_names, opts[:concurrency]) do |name|
       bad = graph.depends_on(name).select { |d| failed_backends.include?(d) }
