@@ -430,8 +430,22 @@ module Agent
     def producer_body(producer, output)
       header = "Filed automatically by the `#{producer.key}` producer (devops/agent/producers.yml)."
       body = output.to_s.strip
-      return "#{header}\n\n```\n#{producer.check}\n```\n\n#{body}" unless body.empty?
-      "#{header}\n\nNo check output — this producer files on a schedule (`#{producer.schedule_text}`)."
+      evidence =
+        if body.empty?
+          "#{header}\n\nNo check output — this producer files on a schedule (`#{producer.schedule_text}`)."
+        else
+          "#{header}\n\n```\n#{producer.check}\n```\n\n#{body}"
+        end
+
+      # The playbook goes AFTER the evidence, because the evidence is what this
+      # particular run found and the playbook is the standing instruction for
+      # every run. A chore with no cheap check carries no evidence at all, and
+      # for those the playbook IS the brief — without it the claiming session
+      # falls back to the generic default-body triage and does a different job
+      # than the one the producer was written to schedule.
+      playbook = producer.body_text
+      return evidence if playbook.nil? || playbook.empty?
+      "#{evidence}\n\n---\n\n#{playbook}"
     end
 
     # ---- claim ----

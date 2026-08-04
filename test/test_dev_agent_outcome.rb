@@ -244,6 +244,56 @@ class TestDevAgentOutcome < Minitest::Test
     end
   end
 
+  # Every weekly review MUST ship its playbook. Without it the claiming session
+  # falls back to claude-issues/default-body.md and does generic triage instead
+  # of the full-auto review the producer exists to schedule — which is exactly
+  # what happened to ISS-360, the first run after the platform job was ported
+  # over from its openclaw cron without the playbook.
+  def test_every_weekly_review_producer_ships_the_playbook
+    weekly = Agent::Producers.load.fetch(:producers).select { |p| p.key.start_with?("weekly-review-") }
+    refute_empty weekly, "the weekly review producers went missing"
+    weekly.each do |producer|
+      assert producer.body_file, "#{producer.key}: no issue.body_file — would file with the generic brief"
+      assert_match(/full-auto/, producer.body_text, "#{producer.key}: playbook lost its posture section")
+    end
+  end
+
+  # One repo, one review. `clubaid` and `clubaid-app` both redirect to
+  # playbook-app, so the openclaw cron set reviewed it twice a week; collapsing
+  # them was part of the port and a fingerprint collision would undo it.
+  def test_weekly_review_fingerprints_are_one_per_repo
+    weekly = Agent::Producers.load.fetch(:producers).select { |p| p.key.start_with?("weekly-review-") }
+    fingerprints = weekly.map(&:fingerprint)
+    assert_equal fingerprints.uniq.sort, fingerprints.sort, "two producers review the same repo"
+  end
+
+  def test_body_file_is_appended_after_the_evidence
+    producer = Agent::Producers.load.fetch(:producers).find { |p| p.key == "weekly-review-platform" }
+    body = Agent::Tick.allocate.send(:producer_body, producer, "")
+    assert_match(/files on a schedule/, body, "the evidence line must survive")
+    assert_operator body.index("files on a schedule"), :<, body.index("full-auto"),
+                    "the playbook must come AFTER this run's evidence"
+  end
+
+  # Indentation-preserving so the assertion survives the heredoc's dedent.
+  def registry_yaml_with_body_file(value)
+    registry_yaml.sub(/^(\s*)fingerprint: invariants:platform$/) do
+      "#{Regexp.last_match(1)}fingerprint: invariants:platform\n#{Regexp.last_match(1)}body_file: #{value}"
+    end
+  end
+
+  def test_registry_rejects_a_missing_body_file
+    yaml = registry_yaml_with_body_file("bodies/does-not-exist.md")
+    error = assert_raises(Agent::Producers::ConfigError) { Agent::Producers.parse(yaml) }
+    assert_match(/body_file not found/, error.message)
+  end
+
+  def test_registry_rejects_an_absolute_body_file
+    yaml = registry_yaml_with_body_file("/etc/passwd")
+    error = assert_raises(Agent::Producers::ConfigError) { Agent::Producers.parse(yaml) }
+    assert_match(/relative/, error.message)
+  end
+
   def test_registry_rejects_a_timezone_abbreviation
     error = assert_raises(Agent::Producers::ConfigError) do
       Agent::Producers.parse(registry_yaml.sub("America/New_York", "EDT"))

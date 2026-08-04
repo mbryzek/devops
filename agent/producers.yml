@@ -35,6 +35,15 @@
 # collapsing the two turns a broken producer into a nightly stream of bogus
 # issues.
 #
+# `issue.body_file` is an OPTIONAL playbook that ships with the issue, resolved
+# relative to `agent/` and appended to the filed body. Use it wherever the brief
+# is longer than a title — without one the claiming session gets
+# claude-issues/default-body.md and does generic triage. It is a file rather than
+# an inline `body:` because these playbooks are shared: every weekly-review
+# producer points at the same one, and inlining would mean a copy per repo that
+# drifts the moment anyone edits one. Validated at PARSE time, so a typo'd path
+# fails the next tick instead of surfacing a week later as an issue with no brief.
+#
 # `fingerprint` is the dedup key. A producer does not file while a NON-TERMINAL
 # issue with the same fingerprint exists (anything other than verified or
 # dismissed — `fixed` included, which is what makes "don't re-file while a PR is
@@ -82,6 +91,50 @@ producers:
     check: dev issues reconcile --apply
     file_when: never
 
+  # ---- weekly per-repo code review -------------------------------------------
+  #
+  # One producer per repo, each filing an issue whose body IS the review playbook
+  # (agent/bodies/weekly-review.md). `file_when: always` because no cheap check
+  # exists — the review IS the work.
+  #
+  # These replace the openclaw cron jobs `weekly-review-*`, which ran the review
+  # inline at 2am. The schedules below are those cron jobs' schedules, preserved.
+  # The one behavioral difference is WHEN the work happens: a producer files, and
+  # the review runs when a runner claims the issue. That is the point — the run
+  # gets the queue's history, mutual exclusion and retry instead of a fire-and-
+  # forget cron whose failures were invisible.
+  #
+  # `body_file` is what makes the port faithful. Without it the claiming session
+  # falls back to claude-issues/default-body.md and does generic triage — which
+  # is exactly what happened to ISS-360, the first run after the platform job was
+  # ported without its playbook: it filed issues instead of shipping PRs.
+  #
+  # The fingerprint dedup means a repo does not re-file while its previous review
+  # is still open. That is deliberate: reviews should not pile up behind a week
+  # nobody worked.
+  #
+  # `clubaid`, `clubaid-admin`, `clubaid-app` and `clubaid-www` were the old repo
+  # names. `clubaid` and `clubaid-app` BOTH now redirect to playbook-app, so the
+  # old cron set reviewed that one repo twice a week; the two are collapsed here.
+
+  - key: weekly-review-michaelbryzek
+    schedule: weekly on sunday at 2:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: michaelbryzek"
+      fingerprint: weekly-review:michaelbryzek
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-acumen-ui
+    schedule: weekly on sunday at 6:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: acumen-ui"
+      fingerprint: weekly-review:acumen-ui
+      body_file: bodies/weekly-review.md
+
   - key: weekly-review-platform
     schedule: weekly on monday at 2:00am
     file_when: always               # no cheap check exists — the review IS the work
@@ -89,6 +142,88 @@ producers:
       category: infrastructure
       title: "Weekly code review: platform"
       fingerprint: weekly-review:platform
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-playbook-app
+    schedule: weekly on tuesday at 2:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: playbook-app"
+      fingerprint: weekly-review:playbook-app
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-rallyd
+    schedule: weekly on wednesday at 2:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: rallyd"
+      fingerprint: weekly-review:rallyd
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-playbook-admin
+    schedule: weekly on wednesday at 4:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: playbook-admin"
+      fingerprint: weekly-review:playbook-admin
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-apibuilder-ui
+    schedule: weekly on wednesday at 6:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: apibuilder-ui"
+      fingerprint: weekly-review:apibuilder-ui
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-acumen
+    schedule: weekly on thursday at 2:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: acumen"
+      fingerprint: weekly-review:acumen
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-lakeviewsummit-ui
+    schedule: weekly on thursday at 6:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: lakeviewsummit-ui"
+      fingerprint: weekly-review:lakeviewsummit-ui
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-playbook-www
+    schedule: weekly on friday at 2:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: playbook-www"
+      fingerprint: weekly-review:playbook-www
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-hackathon
+    schedule: weekly on friday at 4:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: hackathon"
+      fingerprint: weekly-review:hackathon
+      body_file: bodies/weekly-review.md
+
+  - key: weekly-review-hoa-frontend
+    schedule: weekly on saturday at 2:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: "Weekly code review: hoa-frontend"
+      fingerprint: weekly-review:hoa-frontend
+      body_file: bodies/weekly-review.md
 
   # Retention is a producer, not a cron, so log purging gets the same history,
   # visibility and mutual exclusion as everything else on the tick (§4.3.1).
