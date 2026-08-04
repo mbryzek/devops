@@ -34,7 +34,13 @@ module Agent
       ApiClient.request(endpoint(use_localhost: use_localhost), method, path, body: body, as_token: token)
     end
 
-    # ---- fleet (platform-admin, non-tenant paths) ----
+    # ---- fleet (`agent_fleet` auth, non-tenant paths) ----
+    #
+    # NOT platform-admin, though it was declared that way until ISS-341. Both
+    # tokens below belong to the Otto AI user, which is a `playbook` admin with
+    # no email -- neither the platform-tenant check nor the verified-email
+    # bridge admits it, so every one of these endpoints 401'd in production.
+    # The `agent_fleet` scheme admits the AI actor by id.
 
     # Upsert on hardware_uuid. Returns { "runner" => {...}, "token" => "..." }.
     # The hardware UUID is the authority and this file is only a cache, so a
