@@ -44,6 +44,10 @@ module Agent
     def jobs_dir       = File.join(state_dir, "agent-jobs")
     def heartbeat_file = File.join(state_dir, "agent-heartbeat")
     def notified_file  = File.join(state_dir, "agent-notified.json")
+    # What this machine last told the platform its producer registry was. A
+    # throttle, not a record: the platform holds the report, this only answers
+    # "has anything changed, or has it been long enough to re-report".
+    def registry_report_file = File.join(state_dir, "agent-registry-report.json")
     def work_lock      = File.join(state_dir, "agent-tick.lock")
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
 
@@ -58,9 +62,17 @@ module Agent
 
     def workspace(slug) = File.join(workspace_root, slug)
 
+    # The devops checkout the tick runs out of, and the one it fast-forwards
+    # itself (Agent::Checkout). Everything below hangs off it rather than off
+    # __dir__ so the two can never drift: what a machine READS after a pull has
+    # to be what the pull WROTE.
+    def devops_repo
+      File.expand_path(ENV["DEV_AGENT_DEVOPS_REPO"] || File.expand_path("../..", __dir__))
+    end
+
     # The standing prompt and the producer registry, versioned in git beside the
     # code that reads them.
-    def agent_dir           = File.expand_path("../../agent", __dir__)
+    def agent_dir           = File.join(devops_repo, "agent")
     def instructions_file   = File.join(agent_dir, "instructions.md")
     def producers_file      = File.join(agent_dir, "producers.yml")
     def githooks_dir        = File.join(agent_dir, "githooks")

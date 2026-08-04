@@ -1,3 +1,4 @@
+require 'time'
 require 'yaml'
 require 'agent/paths'
 require 'agent/schedule'
@@ -155,6 +156,33 @@ module Agent
                              last_run_at: last_run_by_key[producer.key],
                              now: now,
                              timezone: registry.fetch(:timezone))
+      end
+    end
+
+    # The registry as this machine reads it, in the shape the platform stores as
+    # REPORTED STATE (`PUT /agent/registry/:runner_id`).
+    #
+    # The arithmetic is the same `Agent::Schedule.next_due` that `dev agent
+    # producers` prints, and it stays HERE for the reason the whole subsystem is
+    # arranged this way: the server does not know the grammar and must not learn
+    # it. What the platform gets is a conclusion, not a schedule to evaluate.
+    #
+    # Reporting it is what makes "should have run and did not" visible at all.
+    # Run history alone cannot show it -- a producer that has stopped firing and
+    # one that simply had nothing to do produce the same silence, and a producer
+    # no live machine schedules anymore produces no rows at all.
+    def report(registry, last_run_by_key:, now: Time.now)
+      timezone = registry.fetch(:timezone)
+      registry.fetch(:producers).map do |producer|
+        next_due = Agent::Schedule.next_due(producer.schedule, last_run_at: last_run_by_key[producer.key],
+                                            now: now, timezone: timezone)
+        {
+          producer_key: producer.key,
+          # The authored text, not the parsed structure: two machines on
+          # different devops shas are meant to be comparable by eye.
+          schedule: producer.schedule_text,
+          next_due_at: (next_due || now).utc.iso8601,
+        }
       end
     end
   end

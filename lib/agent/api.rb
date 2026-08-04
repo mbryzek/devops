@@ -63,6 +63,19 @@ module Agent
       request(:put, "/agent/runners/#{runner_id}", token: token, use_localhost: use_localhost, body: form)
     end
 
+    # Upsert on runner_id: one current report per machine, so re-sending the
+    # same one is a no-op rather than a second row. `producers` is the whole
+    # list every time (full desired state) -- a producer deleted from
+    # producers.yml has to disappear from the report, not linger looking overdue.
+    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:)
+      request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost,
+                                                    body: { devops_sha: devops_sha, producers: producers })
+    end
+
+    def reported_registries(token:, use_localhost:)
+      request(:get, "/agent/registry", token: token, use_localhost: use_localhost) || []
+    end
+
     # ---- producers ----
 
     def producer_runs(token:, use_localhost:, producer_key: nil, limit: 100, offset: 0)
