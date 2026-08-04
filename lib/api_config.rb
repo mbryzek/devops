@@ -12,6 +12,20 @@ class ApiConfig
   # key is an org. Must match `nestedConfigsKey` in devops/api/ApiConfig.pkl.
   NESTED_CONFIGS_KEY = "$nested_configs".freeze
 
+  # The devops checkout that owns the running CLI: this file is devops/lib/api_config.rb,
+  # so its parent is always the devops root, whether that is ~/code/devops or a clone in
+  # a ~/code/ai/<feature>/ workspace.
+  DEVOPS_ROOT = File.expand_path("..", __dir__).freeze
+
+  # Every repo's `.api/config.pkl` amends `modulepath:/api/ApiConfig.pkl`. pkl resolves
+  # that scheme against `--module-path`, which we point at DEVOPS_ROOT — so the shared
+  # DSL is found via the devops checkout the CLI runs from, never via devops happening
+  # to sit next to the repo. The old `amends "../../devops/api/ApiConfig.pkl"` was that
+  # sibling assumption, and it is false in every feature workspace (which is why each
+  # one needed a hand-made `ln -sfn ~/code/devops devops`).
+  BASE_MODULE_RELATIVE_PATH = File.join("api", "ApiConfig.pkl").freeze
+  BASE_MODULE_URI = "modulepath:/#{BASE_MODULE_RELATIVE_PATH}".freeze
+
   attr_reader :blocks
 
   # Directories (relative to this config's repo root) that hold their own
@@ -114,14 +128,34 @@ class ApiConfig
     blocks
   end
 
+  # Fails loudly (non-zero exit) whenever the config cannot be turned into JSON —
+  # a missing shared DSL, a missing pkl, or a pkl error. Nothing here may fall back
+  # to "no blocks": a config that evaluates to nothing looks exactly like a
+  # successful run that generated no code, which is the silent no-op this
+  # resolution scheme exists to kill.
   def evaluate_pkl(path)
+    base_module = File.join(DEVOPS_ROOT, BASE_MODULE_RELATIVE_PATH)
+    if !File.exist?(base_module)
+      Util.exit_with_error(
+        "Shared API Builder config not found at #{base_module}.\n" \
+        "  Every .api/config.pkl amends #{BASE_MODULE_URI}, resolved from the devops\n" \
+        "  checkout running this CLI (#{DEVOPS_ROOT}). That checkout is incomplete."
+      )
+    end
+
     stdout, stderr, status = begin
-                               Open3.capture3("pkl", "eval", "-f", "json", path)
+                               Open3.capture3("pkl", "eval", "-f", "json", "--module-path", DEVOPS_ROOT, path)
                              rescue Errno::ENOENT
                                Util.exit_with_error("pkl executable not found on PATH. Install pkl (https://pkl-lang.org) to evaluate #{path}.")
                              end
     if !status.success?
-      Util.exit_with_error("pkl eval failed for #{path}:\n#{stderr}")
+      hint = if stderr.include?("Cannot find module")
+               "\n  Base config is resolved as #{BASE_MODULE_URI} against #{DEVOPS_ROOT}." \
+               "\n  A config still amending a relative \"../../devops/api/ApiConfig.pkl\" path must be updated."
+             else
+               ""
+             end
+      Util.exit_with_error("pkl eval failed for #{path}:\n#{stderr}#{hint}")
     end
     stdout
   end

@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require 'tmpdir'
+require 'fileutils'
 require_relative '../lib/common'
 require_relative '../lib/api_config'
 
@@ -104,5 +106,68 @@ class TestApiConfig < Minitest::Test
     assert_equal ["bryzek"], config.orgs
     assert_equal 1, config.blocks.size
     assert_equal ["platform"], config.blocks.first.applications.map(&:key)
+  end
+
+  # --- Base config resolution -------------------------------------------------
+  #
+  # Every repo config amends `modulepath:/api/ApiConfig.pkl`, which the CLI
+  # resolves against its OWN devops checkout. These tests pin the two properties
+  # that matter: it works with no `devops` next to the repo (the ~/code/ai/
+  # workspace case, which used to need a hand-made symlink), and it fails
+  # non-zero rather than yielding an empty config when it cannot be resolved.
+
+  def test_config_evaluates_with_no_devops_sibling_anywhere
+    Dir.mktmpdir do |dir|
+      repo = File.join(dir, "some-repo")
+      write_config(repo, <<~PKL)
+        amends "#{ApiConfig::BASE_MODULE_URI}"
+
+        org = "bryzek"
+
+        applications = new Listing<AppGroup> {
+          new { names { "platform-error" }; generators = module.modelOnly() }
+        }
+      PKL
+      refute File.exist?(File.join(dir, "devops")), "fixture must have no devops sibling"
+
+      config = ApiConfig.new(File.join(repo, ".api", "config.pkl"), base_dir: repo)
+      assert_equal ["bryzek"], config.orgs
+      assert_equal ["platform-error"], config.blocks.flat_map { |b| b.applications.map(&:key) }
+    end
+  end
+
+  # The silent no-op this whole scheme exists to kill: an unresolvable base config
+  # must never look like "a run that generated nothing".
+  def test_unresolvable_base_config_exits_non_zero
+    Dir.mktmpdir do |dir|
+      repo = File.join(dir, "some-repo")
+      write_config(repo, %(amends "modulepath:/api/NoSuchBaseConfig.pkl"\n\norg = "bryzek"\n))
+
+      error = assert_raises(SystemExit) do
+        capture_io { ApiConfig.new(File.join(repo, ".api", "config.pkl"), base_dir: repo) }
+      end
+      assert_equal 1, error.status
+    end
+  end
+
+  # A config left on the old relative `../../devops/...` amends is a hard error with
+  # a pointer to the fix, not a mystery "Cannot find module".
+  def test_legacy_relative_amends_fails_with_actionable_message
+    Dir.mktmpdir do |dir|
+      repo = File.join(dir, "some-repo")
+      write_config(repo, %(amends "../../devops/api/ApiConfig.pkl"\n\norg = "bryzek"\n))
+
+      _out, err = capture_io do
+        assert_raises(SystemExit) { ApiConfig.new(File.join(repo, ".api", "config.pkl"), base_dir: repo) }
+      end
+      assert_includes err, ApiConfig::BASE_MODULE_URI
+    end
+  end
+
+  private
+
+  def write_config(repo_dir, contents)
+    FileUtils.mkdir_p(File.join(repo_dir, ".api"))
+    IO.write(File.join(repo_dir, ".api", "config.pkl"), contents)
   end
 end
