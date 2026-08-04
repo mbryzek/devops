@@ -237,12 +237,15 @@ class TestDevIssues < Minitest::Test
     assert_equal issue_render_item(graph_issue, 1), issue_render_item(graph_issue, 1, comments: [])
   end
 
-  def test_plan_markdown_renders_history_for_the_matching_issue_only
-    md = issue_plan_markdown(items: [fixed_issue, child_club_issue], date: "2026-07-10", category: "graphs",
-                             body: "BODY", comments_by_number: { "034" => reopen_comments })
+  def test_plan_markdown_renders_the_issues_history
+    md = claim_plan_markdown(fixed_issue, category: "graphs", comments: reopen_comments)
     assert_includes md, "RE-OPENED"
     assert_includes md, "still broken on mobile"
-    assert_equal 1, md.scan("Comment history").length, "ISS-036 has no history to render"
+    assert_equal 1, md.scan("Comment history").length
+  end
+
+  def test_plan_markdown_without_comments_has_no_history_section
+    refute_includes claim_plan_markdown(child_club_issue, category: "graphs"), "Comment history"
   end
 
   # ---- issue_club_label ----
@@ -260,49 +263,115 @@ class TestDevIssues < Minitest::Test
     assert_equal "?", issue_club_label({})
   end
 
+  # ---- issue plan file names ----
+
+  # The name carries the issue number, so a plans dir full of them is greppable by
+  # the thing you actually search for. Two issues claimed in one sweep can no
+  # longer collide on `<date>-issues-<category>.md` — they differ by number.
+  def test_plan_basename_names_the_issue
+    assert_equal "2026-07-10-issue-034-bars-overflow-the-axis",
+                 issue_plan_basename(graph_issue, "2026-07-10")
+    refute_equal issue_plan_basename(graph_issue, "2026-07-10"),
+                 issue_plan_basename(child_club_issue, "2026-07-10")
+  end
+
+  def test_plan_basename_slug_is_filename_safe_and_bounded
+    issue = { "number" => "007", "title" => "  Export/CSV: bars — overflow the axis on MOBILE (iOS 17) forever  " }
+    base = issue_plan_basename(issue, "2026-07-10")
+    assert_match(/\A2026-07-10-issue-007-[a-z0-9-]+\z/, base)
+    refute_includes base, "--"
+    refute base.end_with?("-"), base
+  end
+
+  def test_plan_basename_survives_a_title_with_nothing_sluggable
+    assert_equal "2026-07-10-issue-007", issue_plan_basename({ "number" => "007", "title" => "!!!" }, "2026-07-10")
+  end
+
+  # Same issue claimed twice in a day (re-opened, re-claimed) must not overwrite
+  # the earlier plan — the first one may be open in a running session.
+  def test_plan_path_suffixes_rather_than_overwriting_an_existing_plan
+    Dir.mktmpdir do |dir|
+      first = issue_plan_path(graph_issue, "2026-07-10", dir)
+      assert_equal File.join(dir, "2026-07-10-issue-034-bars-overflow-the-axis.md"), first
+      File.write(first, "x")
+      second = issue_plan_path(graph_issue, "2026-07-10", dir)
+      assert_equal File.join(dir, "2026-07-10-issue-034-bars-overflow-the-axis-2.md"), second
+    end
+  end
+
   # ---- issue_plan_markdown ----
 
+  # A plan as `dev issues claim` writes it: one issue, claim-flavoured intro.
+  def claim_plan_markdown(issue, category: "graphs", body: "BODY-ORIENTATION", comments: [])
+    issue_plan_markdown(issue: issue, category: category, body: body,
+                        intro: issue_claim_plan_intro(category), comments: comments)
+  end
+
   def test_plan_markdown_structure
-    md = issue_plan_markdown(items: [graph_issue, child_club_issue], date: "2026-07-10", category: "graphs", body: "BODY-ORIENTATION")
-    assert_includes md, "# graphs issues — 2 item(s) claimed 2026-07-10"
+    md = claim_plan_markdown(graph_issue)
+    assert_includes md, "# ISS-034 — Bars overflow the axis"
     assert_includes md, "`dev issues claim --category graphs`"
-    assert_includes md, "## Issues to fix"
-    assert_includes md, "### 1. ISS-034 — Bars overflow the axis"
-    assert_includes md, "### 2. ISS-036 — Bars overflow the axis"
+    assert_includes md, "## The issue to fix"
     assert_includes md, "BODY-ORIENTATION"
-    assert_includes md, "## Closing each issue"
-    assert_includes md, 'dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
-    assert_includes md, 'dev issues status <number> --status fixed --url "<doc URL>"'
-    assert_includes md, "--status needs_input"
-    assert_includes md, "Implement the fixes, open PRs"
+    assert_includes md, "## Closing this issue"
+    assert_includes md, "Implement the fix,"
+  end
+
+  # ONE plan is ONE issue: the title names the issue rather than counting a batch,
+  # and there is no numbered list to be item 2 of. This is the invariant the
+  # subagent fan-out rests on — a plan is what one subagent gets handed.
+  def test_plan_markdown_covers_exactly_one_issue
+    md = claim_plan_markdown(graph_issue)
+    assert_equal ["# ISS-034 — Bars overflow the axis"], md.lines.grep(/^# /).map(&:chomp)
+    refute_includes md, "### 1. ", "no list numbering — there is nothing to number"
+    refute_includes md, "item(s) claimed"
+    refute_includes md, "Closing each issue"
+    refute_includes md, issue_label(child_club_issue), "only the plan's own issue appears"
+  end
+
+  # The H1 already names the issue; issue_render_item's own `###` heading two
+  # lines below it was the same string twice.
+  def test_plan_markdown_does_not_repeat_the_title_as_a_section_heading
+    refute_includes claim_plan_markdown(graph_issue), "### ISS-034"
+  end
+
+  # ...but `dev issues show`, which has no H1 of its own, still gets one.
+  def test_render_item_keeps_its_heading_by_default
+    assert_includes issue_render_item(graph_issue), "### ISS-034 — Bars overflow the axis"
+  end
+
+  # The closing commands name the issue's own number. With one plan per issue
+  # there is no `<number>` left for the session to substitute — and a placeholder
+  # it has to fill in by hand is a placeholder it can get wrong.
+  def test_plan_markdown_closing_uses_the_real_issue_number
+    md = claim_plan_markdown(graph_issue)
+    assert_includes md, 'dev issues status 034 --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
+    assert_includes md, 'dev issues status 034 --status fixed --url "<doc URL>"'
+    assert_includes md, "dev issues status 034 --status needs_input"
+    refute_includes md, "status <number>"
   end
 
   # The plan WRAPPER (not just the body file) has to match the category. A
   # `suggestion` is swept into a claim like everything else since
   # ISSUE_NO_AUTO_CLAIM_CATEGORIES was removed, so if the wrapper still said
-  # "implement the fixes, open PRs" the session would be told to build the very
+  # "implement the fix, open a PR" the session would be told to build the very
   # thing suggestion-body.md forbids it from building.
   def suggestion_plan_markdown
-    issue_plan_markdown(
-      items: [graph_issue.merge("category" => "suggestion")],
-      date: "2026-07-27",
-      category: "suggestion",
-      body: "BODY-ORIENTATION",
-    )
+    claim_plan_markdown(graph_issue.merge("category" => "suggestion"), category: "suggestion")
   end
 
   def test_suggestion_plan_wrapper_never_says_implement_or_open_a_pr
     md = suggestion_plan_markdown
-    refute_includes md, "Implement the fixes, open PRs"
-    refute_includes md, "## Issues to fix"
+    refute_includes md, "Implement the fix,"
+    refute_includes md, "## The issue to fix"
     refute_includes md, "--status fixed"
-    assert_includes md, "## Issues to investigate"
-    assert_includes md, "do not create a branch, do not write code, do not open a"
+    assert_includes md, "## The issue to investigate"
+    assert_includes md, "do not create a branch, do not"
   end
 
   def test_suggestion_plan_offers_needs_review_as_the_closing_move
     md = suggestion_plan_markdown
-    assert_includes md, '`dev issues status <number> --status needs_review --comment "<your findings>"`'
+    assert_includes md, '`dev issues status 034 --status needs_review --comment "<your findings>"`'
     assert_includes md, "--status needs_input"
   end
 
@@ -310,9 +379,9 @@ class TestDevIssues < Minitest::Test
   # on fixed/needs_input exactly as before.
   def test_other_categories_keep_the_implementation_wrapper_unchanged
     (ISSUE_CATEGORIES - %w[suggestion]).each do |category|
-      md = issue_plan_markdown(items: [graph_issue], date: "2026-07-27", category: category, body: "BODY")
-      assert_includes md, "Implement the fixes, open PRs", "#{category}: lost the implementation framing"
-      assert_includes md, "## Issues to fix", "#{category}: lost the fix heading"
+      md = claim_plan_markdown(graph_issue, category: category, body: "BODY")
+      assert_includes md, "Implement the fix,", "#{category}: lost the implementation framing"
+      assert_includes md, "## The issue to fix", "#{category}: lost the fix heading"
       refute_includes md, "--status needs_review", "#{category}: should not offer needs_review"
     end
   end
@@ -590,6 +659,30 @@ class TestDevIssues < Minitest::Test
     assert_includes prompt, "do NOT work the plans yourself"
     assert_includes prompt, "- graphs: /p/g.md"
     assert_includes prompt, "- worker: /p/w.md"
+  end
+
+  # One-subagent-per-plan is the DEFAULT, not the whole rule. Two plans in the
+  # same category that turn out to touch the same feature belong on one branch in
+  # one PR, and only the session can tell — it reads the code, the CLI has a title
+  # and a category. So the prompt has to carry the exception, the category break,
+  # and the tie-break, or the session just fans out blindly.
+  def test_claim_prompt_lets_the_session_bundle_same_category_plans_on_one_feature
+    prompt = issue_claim_prompt([["graphs", "/p/g1.md"], ["graphs", "/p/g2.md"], ["worker", "/p/w.md"]])
+    assert_includes prompt, "read the plans first"
+    assert_includes prompt, "SAME category that touch the same feature"
+    assert_includes prompt, "ONE subagent together"
+    assert_includes prompt, "Never bundle across categories"
+    assert_includes prompt, "When in doubt, keep them separate"
+  end
+
+  # A bundled subagent still has to close EVERY issue it worked. `reconcile` can
+  # adopt only the one issue named in the PR title, so the others move only if the
+  # session moves them by hand — otherwise they sit in `claimed` forever, invisible
+  # no matter how many releases ship the fix.
+  def test_claim_prompt_requires_every_issue_in_a_bundle_to_be_closed_individually
+    prompt = issue_claim_prompt([["graphs", "/p/g1.md"], ["graphs", "/p/g2.md"]])
+    assert_includes prompt, "EVERY issue must be closed with `dev issues status` individually"
+    assert_includes prompt, "pointing them all at the same PR URL"
   end
 
   # Regression: the fan-out prompt used to tell EVERY subagent to "implement the
@@ -1944,24 +2037,39 @@ class TestDevIssues < Minitest::Test
     }
   end
 
+  # A plan as `dev issues create` writes it: same renderer as a claimed one, with
+  # the hand-filed intro and the on-disk attachment paths.
+  def manual_plan_markdown(issue: manual_issue, local_paths: [], body: "PROMPT BODY")
+    issue_plan_markdown(issue: issue, category: issue["category"], body: body,
+                        intro: issue_manual_plan_intro(issue["category"], "2026-07-26"),
+                        local_paths: local_paths)
+  end
+
   def test_manual_plan_lists_local_image_paths
-    md = manual_issue_plan_markdown(
-      issue: manual_issue,
-      date: "2026-07-26",
-      local_paths: ["/Users/mbryzek/shots/a.png"],
-      body: "PROMPT BODY",
-    )
+    md = manual_plan_markdown(local_paths: ["/Users/mbryzek/shots/a.png"])
     assert_match(/ISS-041/, md)
     assert_match(/Export button does nothing/, md)
     assert_match(%r{/Users/mbryzek/shots/a\.png}, md)
     assert_match(/PROMPT BODY/, md)
     # The plan must always tell the session how to close the issue, with its number.
     assert_match(/dev issues status 041 --status fixed/, md)
+    assert_includes md, "Filed 2026-07-26 with `dev issues create`."
   end
 
   def test_manual_plan_omits_the_attachment_section_when_there_are_no_files
-    md = manual_issue_plan_markdown(issue: manual_issue, date: "2026-07-26", local_paths: [], body: "BODY")
-    refute_match(/Attached files/, md)
+    refute_match(/Attached files/, manual_plan_markdown(body: "BODY"))
+  end
+
+  # A hand-filed `suggestion` is still a product call, not a defect. The intro is
+  # keyed on the category, not on how the issue arrived, so `create --category
+  # suggestion` gets the same no-code framing the swept one does — before this
+  # shared the claim renderer, the manual plan told it to open a PR regardless.
+  def test_manual_plan_for_a_suggestion_is_investigate_only
+    md = manual_plan_markdown(issue: manual_issue.merge("category" => "suggestion"))
+    assert_includes md, "do not create a branch, do not"
+    assert_includes md, "## The issue to investigate"
+    refute_includes md, "--status fixed"
+    assert_includes md, "dev issues status 041 --status needs_review"
   end
 
   # The shared prompt body must exist on disk — write_manual_issue_plan reads it.

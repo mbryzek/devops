@@ -13,10 +13,18 @@ decoding guide, and working rules a fix session needs:
 | `default-body.md`    | every other category            | triaging the issue, then the shared working rules       |
 | `manual-body.md`     | `dev issues create` (prepended) | what is specific to a hand-filed issue                  |
 
-**`dev issues claim`** claims a category's open issues and appends `<category>-body.md` to the
-plan it writes under `~/code/claude/plans/<date>-issues-<category>.md`. Categories with their own
-pipeline get their own file; every other category falls back to `default-body.md`. Edit the prose
-here — the command picks it up automatically.
+**`dev issues claim`** claims a category's open issues and writes **one plan per issue** under
+`~/code/claude/plans/<date>-issue-<number>-<slug>.md`, appending `<category>-body.md` to each.
+Categories with their own pipeline get their own file; every other category falls back to
+`default-body.md`. Edit the prose here — the command picks it up automatically.
+
+One plan is one issue because a plan is the unit a subagent gets handed, so it has to be a unit
+of work. Grouping is the spawned session's call, not the CLI's: it reads the plans and gives two
+in the SAME category that touch the same feature to one subagent, so their fixes land on one
+branch instead of colliding in the same files. That judgment needs the code read, and the CLI has
+only a title and a category. Never across categories — those are independent pipelines and repos.
+A bundled subagent still closes each of its issues with `dev issues status`, all pointing at the
+same PR URL, since `dev issues reconcile` can only adopt the one named in the PR title.
 
 Per-issue context is rendered by `bin/dev`, not from these files: each claimed issue carries its
 previous fix PRs and its full comment history into the plan, and a RE-OPENED issue leads with a
