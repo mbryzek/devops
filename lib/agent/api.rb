@@ -126,9 +126,8 @@ module Agent
     #
     # "Nothing claimable" is a 200 carrying `issue_lease_claim` with `lease`
     # ABSENT, not a 204: API Builder refuses to let a resource vary its type
-    # across 2xx codes. Two error codes are NOT emptiness and must not be
-    # swallowed here — 429 (fleet daily cap, empty body, so the status code is
-    # the whole message) and 422 (an unknown runner_id, i.e. a client bug).
+    # across 2xx codes. 422 (an unknown runner_id, i.e. a client bug) is NOT
+    # emptiness and must not be swallowed here.
     def claim(runner_id:, token:, use_localhost:)
       res = request(:post, "/#{TENANT}/issue/leases", token: token, use_localhost: use_localhost,
                                                       body: { runner_id: runner_id })

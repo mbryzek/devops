@@ -155,4 +155,53 @@ class TestDevAgentSchedule < Minitest::Test
       assert_equal text, Agent::Schedule.describe(Agent::Schedule.parse(text))
     end
   end
+
+  # ---- period_start: the arbitration guard ----
+  #
+  # The platform declines a run when one already exists with
+  # `started_at >= if_no_run_since`. That comparison is INCLUSIVE, so the guard
+  # must be the start of the current period and never the previous run's own
+  # `started_at` — a run is always `>=` itself, and passing it made every
+  # producer block itself forever after its first run (one tick claimed and then
+  # `issue-reconcile` was declined on 19 consecutive ticks with nothing in
+  # flight). The single assertion that catches it: strictly AFTER the last run.
+
+  def test_period_start_for_an_interval_is_strictly_after_the_last_run
+    schedule = Agent::Schedule.parse("every 30 minutes")
+    last = Time.utc(2026, 8, 4, 16, 57, 29)
+    boundary = Agent::Schedule.period_start(schedule, last_run_at: last, now: Time.utc(2026, 8, 4, 17, 36, 0))
+
+    assert_equal Time.utc(2026, 8, 4, 17, 27, 29), boundary
+    assert boundary > last, "the guard must never be the previous run's own start time"
+  end
+
+  def test_period_start_is_nil_when_a_producer_has_never_run
+    # No prior period to sit inside; the platform then applies only its
+    # in-flight check, which is what lets a brand new producer run at all.
+    assert_nil Agent::Schedule.period_start(Agent::Schedule.parse("every 1 hour"),
+                                            last_run_at: nil, now: Time.utc(2026, 8, 4, 17, 0, 0))
+  end
+
+  def test_period_start_for_a_wall_clock_schedule_is_the_occurrence_not_the_last_run
+    schedule = Agent::Schedule.parse("daily at 3:00am")
+    now = Time.utc(2026, 8, 4, 12, 0, 0)              # 08:00 America/New_York
+    yesterday = Time.utc(2026, 8, 3, 7, 0, 30)        # yesterday's 03:00 run
+
+    boundary = Agent::Schedule.period_start(schedule, last_run_at: yesterday, now: now, timezone: ZONE)
+
+    assert_equal Time.utc(2026, 8, 4, 7, 0, 0), boundary
+    assert boundary > yesterday, "today's occurrence must not be blocked by yesterday's run"
+  end
+
+  def test_period_start_still_excludes_a_run_already_made_this_period
+    # The guard has to keep doing its actual job: a second machine that already
+    # ran this period's job must still be declined, which is what `>=` gives us
+    # once the boundary is the period start.
+    schedule = Agent::Schedule.parse("every 30 minutes")
+    last = Time.utc(2026, 8, 4, 16, 57, 29)
+    boundary = Agent::Schedule.period_start(schedule, last_run_at: last, now: Time.utc(2026, 8, 4, 17, 30, 0))
+    ran_this_period = Time.utc(2026, 8, 4, 17, 27, 40)
+
+    assert ran_this_period >= boundary, "a run inside the current period must still block a second one"
+  end
 end

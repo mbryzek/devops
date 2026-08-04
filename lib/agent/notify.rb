@@ -3,7 +3,7 @@ require 'time'
 require 'agent/paths'
 
 # Push notifications (design §4.7): openclaw system events on PR ready, gave up,
-# runner offline, and daily cap reached.
+# and runner offline.
 #
 # Deliberately the SHORT list. The design goal is that no routine question needs
 # ssh into a mini; it is not that every tick announces itself. Anything that

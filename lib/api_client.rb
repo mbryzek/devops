@@ -7,10 +7,10 @@ require 'uri'
 class SessionExpired < StandardError; end
 
 # `code` carries the HTTP status, because several callers have to BRANCH on it
-# rather than just report it: the agent dispatcher treats 429 on a claim as
-# "fleet daily cap reached, back off" and 409 on a lease heartbeat as "this
-# lease is gone, kill the job". Parsing the status back out of the message would
-# be the same information one layer less reliably.
+# rather than just report it: the agent dispatcher treats 422 on a claim as "the
+# platform does not know this runner, re-register" and 409 on a lease heartbeat
+# as "this lease is gone, kill the job". Parsing the status back out of the
+# message would be the same information one layer less reliably.
 class ApiError < StandardError
   attr_reader :code
 
