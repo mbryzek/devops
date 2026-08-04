@@ -19,10 +19,16 @@ class TestDevArgUsage < Minitest::Test
   end
 
   def test_single_subcommand_names_it_without_one_of
+    out, status = capture_stderr_and_exit { require_subcommand("docker") }
+    assert_equal 1, status
+    assert_match(/docker requires a subcommand \(prune\)/, out)
+    refute_match(/one of:/, out)
+  end
+
+  def test_tasks_lists_both_subcommands
     out, status = capture_stderr_and_exit { require_subcommand("tasks") }
     assert_equal 1, status
-    assert_match(/tasks requires a subcommand \(requeue\)/, out)
-    refute_match(/one of:/, out)
+    assert_match(/tasks requires a subcommand \(one of: requeue, delete\)/, out)
   end
 
   def test_every_dispatched_command_has_subcommands
