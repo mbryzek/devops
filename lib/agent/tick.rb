@@ -146,6 +146,7 @@ module Agent
           # The lease expired or was reassigned. Another machine may already be
           # working this issue, so this process must die rather than race it.
           decide("lease_lost", "ISS-#{record['issue']} lease #{record['lease_id']} is gone (409) — killing pid #{pid}")
+          Agent::Jobs.mark_killed(record, reason: "lease_lost", now: @now)
           Agent::Jobs.kill(pid)
         end
       end
@@ -164,7 +165,10 @@ module Agent
     def kill_if_timed_out(record)
       return false unless Agent::Jobs.timed_out?(record, now: @now)
       decide("timeout", "ISS-#{record['issue']} exceeded its #{Agent::Jobs::TIMEOUT_SECONDS / 3600}h hard timeout — killing pid #{record['pid']}")
-      Agent::Jobs.kill(record["pid"]) unless @dry_run
+      unless @dry_run
+        Agent::Jobs.mark_killed(record, reason: "timeout", now: @now)
+        Agent::Jobs.kill(record["pid"])
+      end
       true
     end
 
@@ -226,7 +230,14 @@ module Agent
       workspace = Agent::Workspace.path(record.fetch("slug"))
       started = Time.parse(record.fetch("started_at"))
 
-      pr = Agent::Github.open_pr_in_workspace(workspace, branch) || Agent::Github.search_open_pr(branch)
+      # Two lookups, not one, and the reason is ISS-365: the branch is only the
+      # branch the executor ASSIGNED, and a session that named its own branch
+      # instead is invisible to it. The `ISS-<n>: ` title prefix is the second,
+      # independent handle on the same PR — it was already proven as
+      # `dev issues reconcile`'s backstop, so the reap uses it directly rather
+      # than misclassifying now and being corrected hours later.
+      pr = Agent::Github.find_pr_in_workspace(workspace, branch, number) ||
+           Agent::Github.search_pr(branch, number)
       plans = Agent::Github.plans_committed_since?(started)
       attempt = lease_attempts(number, identity)
 
@@ -237,6 +248,7 @@ module Agent
         producer_filed: record["producer_filed"],
         attempt: attempt,
         timed_out: Agent::Jobs.timed_out?(record, now: @now),
+        killed: record["killed"],
       )
       decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status}): #{result.reason}")
       return if @dry_run
@@ -285,6 +297,8 @@ module Agent
       case result.name
       when "ready_pr"
         Agent::Notify.event("dev-agent: ISS-#{number} ready for review — #{result.url}")
+      when "merged_pr"
+        Agent::Notify.event("dev-agent: ISS-#{number} fixed by an already-merged PR — #{result.url}")
       when "gave_up"
         Agent::Notify.event("dev-agent: ISS-#{number} gave up after #{Agent::Outcome::MAX_ATTEMPTS} attempts — needs input")
       end

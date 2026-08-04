@@ -55,6 +55,18 @@ module Agent
       merged
     end
 
+    # Record that the TICK killed this session, before killing it.
+    #
+    # The kill destroys every artifact classification would otherwise read: the
+    # wrapper never reaches `echo $? > exit_code`, and claude.log stops wherever
+    # it stopped. The killer is the only thing that knows, and the reap runs in a
+    # different process minutes later, so the knowledge has to be written down
+    # (ISS-364). Written FIRST, so a tick that dies between the write and the
+    # signal still leaves the truth behind.
+    def mark_killed(record, reason:, now: Time.now)
+      write(record.merge("killed" => { "reason" => reason, "at" => now.utc.iso8601 }))
+    end
+
     def alive?(pid)
       return false if pid.nil?
       Process.kill(0, pid.to_i)
