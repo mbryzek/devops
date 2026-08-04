@@ -56,6 +56,39 @@ Decide which of these it is, and say so explicitly in your PR or findings:
    (`dev invariants snooze <name> --app <app> --days N --reason "..."`) rather
    than leaving it to fail every day.
 
+## The remediation you already have
+
+For categories 1 and 2 there is usually a decision to make about the rows that
+are already wrong. Reach for an existing `dev` command before you write a
+migration or, worse, hand-patch rows — and never reach for one just to turn a
+check green (see Hard rules).
+
+- `dev tasks requeue [--app APP]` — force every failed async task to run now.
+  The right move when the rows are fine and the work simply did not happen
+  (category 2): a wedged lane, a job tier that crashlooped, a deploy that ate a
+  batch. Recoverable, so it does not prompt.
+- `dev tasks delete --id TASK_ID... [--app APP]` — remove specific task rows in
+  any state. For the individual dead row you have already read and understood.
+- `dev tasks delete --discriminator NAME [--app APP]` — remove every row for one
+  queue. This is the fix for **`unknown_task_discriminators`**, which fires when
+  a task type was retired without step 3: the enum value is gone, so
+  `TaskDiscriminator.fromString` returns `None`, the dispatcher skips the rows,
+  and they sit at `num_attempts = 0` forever. Nothing will ever run them; they
+  are not recoverable work. The command takes a raw discriminator string
+  precisely because the code no longer defines it. It prints the matching row
+  count and asks first (`--yes` to skip, required when stdin is not a terminal).
+  Confirm the type really was retired — grep the app for the discriminator and
+  read the commit that removed it — before wiping a queue: a discriminator can
+  also vanish by ACCIDENT (bad spec regen, wrong enum edit), and then the rows
+  are real queued work and the fix is to restore the enum value instead.
+- `dev invariants check --app APP --all-examples` — re-read the population
+  yourself rather than reasoning from the capped sample above.
+- `dev invariants snooze <name> --app APP --days N --reason "..."` — category 4
+  only, and only with a reason that says when it will resolve itself.
+
+Anything not covered by these is a code change or a reviewable migration, not a
+manual write to production.
+
 ## Hard rules
 
 - NEVER fabricate, backfill, or zero-fill data to make an invariant pass.
@@ -78,7 +111,8 @@ Follow `~/code/CLAUDE.md`. The parts that bite most often:
   CROSS-REPO change: find and update every consumer on the same branch.
 - When done: commit, push, open a DRAFT PR, then mark it ready. Rebase onto the
   latest `origin/main` and rerun codegen before the branch is final.
-- Report the Reviewable URL, the PR URL, and the working directory.
+- Report the GitHub PR URL and the working directory. NEVER report a Reviewable
+  URL — Mike navigates there from GitHub himself.
 
 If the conclusion is that NO code change is needed, write the findings to
 `~/code/claude/plans/` instead of opening a PR, and explain how you ruled out the

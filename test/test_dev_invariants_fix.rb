@@ -136,6 +136,31 @@ class TestDevInvariantsFix < Minitest::Test
     assert_includes prompt, "NEVER fabricate, backfill, or zero-fill data"
   end
 
+  # A session that does not know these exist writes a migration, or hand-patches
+  # rows, for something a shipped command already does. Each is named because the
+  # investigating session is the one consumer that never gets to read `dev help`.
+  def test_body_names_the_remediation_commands
+    body = invariants_body_text
+    ["dev tasks requeue", "dev tasks delete --id", "dev tasks delete --discriminator",
+     "dev invariants snooze"].each do |command|
+      assert_includes body, command, "remediation playbook no longer names `#{command}`"
+    end
+  end
+
+  # unknown_task_discriminators is the one failure whose whole remedy is a delete,
+  # and the one where deleting the wrong thing destroys real queued work.
+  def test_body_pairs_the_queue_wipe_with_its_invariant_and_its_caveat
+    body = invariants_body_text
+    assert_includes body, "unknown_task_discriminators"
+    assert_match(/vanish by ACCIDENT/, body)
+  end
+
+  # The standing rule is GitHub only; the body used to tell every investigating
+  # session to hand back a Reviewable URL.
+  def test_body_does_not_ask_for_a_reviewable_url
+    refute_match(/Report the Reviewable URL/, invariants_body_text)
+  end
+
   # The body file is the editable half of the prompt; a rename or a bad path
   # would otherwise only surface when a real failure tried to launch a session.
   def test_body_file_is_readable
