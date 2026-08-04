@@ -43,6 +43,17 @@ module Util
       end
     end
 
+    # Raised by Util.step_failed!: a stage that failed but must not abort the
+    # release. Util.step renders it as "label... failed (3s)" and swallows it.
+    class StepFailed < StandardError; end
+
+    # Mark the enclosing Util.step as failed without aborting the caller. For
+    # best-effort stages (the post-deploy changelog and reconcile hooks), whose
+    # failure is explicitly ignored but must not be reported as "done".
+    def Util.step_failed!
+      raise StepFailed
+    end
+
     # A named stage of a release. Quiet mode: "label... done (12s)" on one
     # line. Verbose mode: the traditional underlined section header. Returns
     # the block's value.
@@ -68,6 +79,8 @@ module Util
           result = yield
           ok = true
           result
+        rescue StepFailed
+          nil
         ensure
           puts "#{ok ? 'done' : 'failed'} (#{(Time.now - started).round}s)"
           $stdout.flush
@@ -75,7 +88,12 @@ module Util
       else
         puts ""
         puts Util.underline(label)
-        yield
+        begin
+          yield
+        rescue StepFailed
+          puts "#{label}: FAILED (ignored)"
+          nil
+        end
       end
     end
     # Sync <app>-config + <app>-secrets from the git-crypt env repo to the
@@ -146,6 +164,9 @@ module Util
     #   :passthrough  - the command is a devops script that manages its own
     #                   quiet-mode output (and may prompt the user); never
     #                   redirect its output to the log
+    #
+    # Returns whether the command succeeded, which is only ever interesting
+    # alongside :ignore_error — every other path aborts on failure.
     def Util.run(cmd, params={})
       quiet = (params.has_key?(:quiet) && params[:quiet]) ? true  : false
       ignore_error = (params.has_key?(:ignore_error) && params[:ignore_error]) ? true : false
@@ -162,7 +183,7 @@ module Util
           $stderr.puts `tail -40 '#{Util.log_file}'`
           Util.exit_with_error("Command failed (full log: #{Util.log_file})")
         end
-        return
+        return ok
       end
 
       if !quiet && !(Util.quiet? && passthrough)
@@ -171,11 +192,11 @@ module Util
           # URL), and a "==> ..." line mixed into it corrupts the consumer.
           $stderr.puts "==> #{cmd}"
       end
-      if !system(cmd)
-        if !ignore_error
-          Util.exit_with_error("Command failed: #{cmd}")
-        end
+      ok = system(cmd) ? true : false
+      if !ok && !ignore_error
+        Util.exit_with_error("Command failed: #{cmd}")
       end
+      ok
     end
 
     def Util.exit_with_error(msg)
