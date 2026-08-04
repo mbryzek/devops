@@ -73,6 +73,73 @@ class TestDevInvariantsFix < Minitest::Test
     assert_equal %w[Acumen Platform], failing_names(invariants_failing_apps(results))
   end
 
+  # ---- invariants_exit_code: the producer contract in agent/producers.yml ----
+  #
+  # ISS-358: an expired session made the check exit 1, so the `invariants-platform`
+  # producer filed a high-severity issue for a check that had fetched nothing. Worse
+  # than the wasted session, that issue then held the `invariants:platform`
+  # fingerprint, and `Agent::Producers.in_flight?` blocks a producer from filing while
+  # a non-terminal issue with its fingerprint exists — so for as long as the session
+  # stayed expired, every REAL platform invariant failure was silently unfilable.
+
+  def clean_data
+    { "success" => [{ "name" => "ok" }], "non_zero" => [], "error" => [] }
+  end
+
+  def test_all_clean_exits_zero
+    assert_equal 0, invariants_exit_code([endpoint_result("Platform", data: clean_data)])
+  end
+
+  def test_real_findings_exit_one
+    assert_equal 1, invariants_exit_code([endpoint_result("Platform", data: failing_data)])
+  end
+
+  # The regression itself: nothing was checked, so this is not a finding.
+  def test_expired_session_exits_two_not_one
+    results = [endpoint_result("Platform", error: "session expired - run 'dev auth login'")]
+    assert_equal 2, invariants_exit_code(results)
+  end
+
+  def test_unreachable_app_exits_two_not_one
+    results = [endpoint_result("Platform", error: "Connection refused")]
+    assert_equal 2, invariants_exit_code(results)
+  end
+
+  # Findings outrank an unreachable sibling. Returning 2 here would send a real data
+  # problem down the tick's `check_failed` path, which files nothing at all.
+  def test_findings_win_over_an_unreachable_app
+    results = [
+      endpoint_result("Platform", data: failing_data),
+      endpoint_result("Acumen", error: "session expired - run 'dev auth login'"),
+    ]
+    assert_equal 1, invariants_exit_code(results)
+  end
+
+  # A passing app does not launder an unreachable one into a clean run: the app that
+  # errored still checked nothing, and 0 would report all-clear on unread data.
+  def test_unreachable_app_alongside_a_passing_one_still_exits_two
+    results = [
+      endpoint_result("Platform", error: "session expired - run 'dev auth login'"),
+      endpoint_result("Acumen", data: clean_data),
+    ]
+    assert_equal 2, invariants_exit_code(results)
+  end
+
+  # An invariant that errored server-side DID run and has data behind it — unlike a
+  # failed request. It stays a finding.
+  def test_an_errored_invariant_is_a_finding_not_an_unchecked_run
+    data = { "success" => [], "non_zero" => [], "error" => [{ "name" => "x", "error" => "boom" }] }
+    assert_equal 1, invariants_exit_code([endpoint_result("Platform", data: data)])
+  end
+
+  # The tick reads `>1`, not `== 2` (lib/agent/tick.rb), and producers.yml documents
+  # the same. Pin the three constants to the contract they encode.
+  def test_exit_constants_match_the_documented_contract
+    assert_equal 0, INVARIANTS_EXIT_CLEAN
+    assert_equal 1, INVARIANTS_EXIT_FINDINGS
+    assert_operator INVARIANTS_EXIT_UNCHECKABLE, :>, 1
+  end
+
   # ---- invariant_checks_path: what the CLI actually asks the server for ----
 
   # ISS-173: the endpoint took no parameter and capped examples at 10 server-side,

@@ -1461,6 +1461,37 @@ def invariants_failing_apps(results)
   end
 end
 
+# The exit codes ARE the producer contract documented in agent/producers.yml.
+# Named here so the two files can be read against each other: `dev invariants
+# check` is a producer check, and a producer check that misreports its own
+# failure as a finding is indistinguishable from a real one. Both failure codes
+# stay nonzero so ordinary callers (cron, CI, `&&` chains) still detect a
+# failure without parsing stdout; only the tick tells 1 and 2 apart.
+INVARIANTS_EXIT_CLEAN       = 0 # nothing to do
+INVARIANTS_EXIT_FINDINGS    = 1 # real data problems — file (or increment) the issue
+INVARIANTS_EXIT_UNCHECKABLE = 2 # the check never ran — recorded as `check_failed`, never filed
+
+# The verdict for a set of per-app results.
+#
+# Findings win over an unreachable app: a real data problem outranks an infra
+# hiccup, and returning UNCHECKABLE would send it down the tick's `check_failed`
+# path, which files nothing.
+#
+# An app whose whole REQUEST failed (session expired, unreachable) checked
+# nothing, so it is UNCHECKABLE rather than a finding — the same distinction
+# `invariants_failing_apps` already draws to decide what deserves a session.
+# Collapsing the two is not merely noisy, it is silencing: the bogus issue takes
+# the `invariants:<app>` fingerprint, and `Agent::Producers.in_flight?` then
+# blocks every REAL invariant failure from filing for as long as it sits
+# non-terminal. An expired session would hide the data problems it never looked
+# for, which is exactly what ISS-358 was.
+def invariants_exit_code(results)
+  return INVARIANTS_EXIT_FINDINGS unless invariants_failing_apps(results).empty?
+  return INVARIANTS_EXIT_UNCHECKABLE if results.any? { |r| r[:error] }
+
+  INVARIANTS_EXIT_CLEAN
+end
+
 # Extra briefing for a session nobody is watching. The interactive session can
 # ask Mike a question; a cron-launched one cannot, so it is told to land on a
 # durable artifact and to announce itself when it is done.
@@ -1673,12 +1704,10 @@ def cmd_invariants_check(args)
   puts " done"
   puts ""
 
-  all_passed = true
   results.sort_by { |r| r[:endpoint][:name] }.each do |r|
     endpoint = r[:endpoint]
     if r[:error]
       puts Util.underline("#{endpoint[:name]}: ERROR - #{r[:error]}")
-      all_passed = false
     else
       result = r[:data] || {}
       success = result["success"] || []
@@ -1692,23 +1721,27 @@ def cmd_invariants_check(args)
       else
         puts Util.underline("#{endpoint[:name]}: #{failure_count} FAILURES (#{total_count} total)")
         print_invariant_failures(result, example_limit: example_limit)
-        all_passed = false
       end
     end
     puts ""
   end
 
-  if all_passed
+  # One verdict, derived once. The printing loop above deliberately keeps no
+  # running flag: the bug this replaced (ISS-358) was the loop and the exit
+  # logic disagreeing about what an unreachable app meant.
+  case invariants_exit_code(results)
+  when INVARIANTS_EXIT_CLEAN
     puts "All invariants passed"
-    exit 0
+    exit INVARIANTS_EXIT_CLEAN
+  when INVARIANTS_EXIT_UNCHECKABLE
+    puts "Some invariants could not be checked"
+    exit INVARIANTS_EXIT_UNCHECKABLE
+  else
+    puts "Some invariants failed"
+    # execs when it launches, so nothing below runs in that case.
+    invariants_offer_investigation(results, auto_fix)
+    exit INVARIANTS_EXIT_FINDINGS
   end
-
-  puts "Some invariants failed"
-  # execs when it launches, so nothing below runs in that case.
-  invariants_offer_investigation(results, auto_fix)
-  # Nonzero so callers (cron, CI, `&&` chains) detect the failure rather than
-  # having to parse stdout for it.
-  exit 1
 end
 
 # Render the `created_by` audit union (from bryzek/audit), keyed off its discriminator:
