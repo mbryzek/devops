@@ -29,10 +29,12 @@ load File.join(File.dirname(__FILE__), '../lib/common.rb')
 $LOAD_PATH.unshift(File.expand_path('~/code/claude/lib'))
 require 'work/registry'
 
+require 'briefing'
 require 'codegen/api_config'
 require 'codegen/graph'
 require 'codegen/sync'
 require 'dependencies/updates'
+require 'depsguard'
 
 # The autonomous dispatcher (`dev agent`). Split into lib/agent/* rather than
 # inlined here because the pieces that decide anything — schedule due-ness,
@@ -70,6 +72,7 @@ INVOCATIONS = {
   "aidirs prune"        => 'aidirs prune [--days N] [--apply]',
   "prune plans"         => 'prune plans [--days N] [--apply]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
+  "depsguard scan"      => 'depsguard [scan]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
@@ -385,6 +388,20 @@ USAGE = <<~USAGE
         runs (a failed run keeps its clones) are deleted first, so at most one
         run's worth of node_modules is ever on disk. Quiet by default; use
         --verbose to stream full output.
+        Writes data/browserslist-status.md in the openclaw workspace, which the
+        morning briefing reads.
+
+    #{INVOCATIONS["depsguard scan"]}
+        Run `depsguard scan` over the supply-chain config files and report the
+        failures worth acting on. One known false positive is suppressed: pnpm's
+        `minimum-release-age` reported "not set" on an npm-only repo (one with a
+        package-lock.json and no pnpm-lock.yaml), where the key is meaningless.
+        Suppressing it here rather than in the fixer is what stopped the endless
+        add/revert churn it caused on apibuilder-ui's .npmrc.
+        The verdict is the exit code — 0 clean, 1 real failures (listed on
+        stdout), 2 the scan itself could not run — for the `depsguard` producer
+        in devops/agent/producers.yml. It fixes nothing; a failing scan files an
+        issue and the fix happens as claimed work.
 
     #{INVOCATIONS["codegen sync"]}
         Regenerate every codegen-consuming repo against the latest generators and
@@ -766,7 +783,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -779,6 +796,7 @@ SUBCOMMANDS = {
   "aidirs"       => %w[prune],
   "prune"        => %w[plans],
   "browserslist" => %w[update],
+  "depsguard"    => %w[scan],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
@@ -4773,6 +4791,21 @@ def parse_docker_prune_args(args)
   opts
 end
 
+# ---------- depsguard ----------
+#
+# The whole command is Depsguard.run plus an exit code: the classification lives
+# in lib/depsguard.rb so it can be unit-tested without a `depsguard` binary.
+def cmd_depsguard_scan(args)
+  if args.include?("-h") || args.include?("--help")
+    puts USAGE
+    exit 0
+  end
+  usage_exit("depsguard scan takes no arguments", example: usage_for("depsguard scan")) unless args.empty?
+  result = Depsguard.run
+  result.lines.each { |line| puts line }
+  exit result.exit_code
+end
+
 def cmd_docker_prune(args)
   opts = parse_docker_prune_args(args)
   apply = opts.apply
@@ -4806,9 +4839,17 @@ def cmd_docker_prune(args)
     puts ""
     puts "==> #{step.label}: #{docker_display_cmd(step.cmd)}"
     ok, freed = run_docker_prune_step(step.cmd)
-    abort("FAILED at step: #{step.label}") unless ok
+    unless ok
+      # Report the failure to the briefing BEFORE aborting: this is the only
+      # channel the job has, and the briefing shows a docker-prune line only when
+      # it says ERROR. Aborting first would make a broken prune look like a
+      # healthy silent one.
+      Briefing.write("docker-prune-status.md", "Last run: #{Briefing.today} — ERROR: failed at step: #{step.label}")
+      abort("FAILED at step: #{step.label}")
+    end
     reclaimed[step.label] = freed
   end
+  Briefing.write("docker-prune-status.md", "Last run: #{Briefing.today} — ok")
   return puts("\nNothing to remove.") if reclaimed.empty?
 
   puts ""
@@ -6700,6 +6741,7 @@ def cmd_aidirs_prune(args)
 
   unless Dir.exist?(AI_ROOT)
     puts "Nothing to prune: #{AI_ROOT} does not exist."
+    write_aidirs_briefing_status([], 0) if apply
     return
   end
 
@@ -6737,6 +6779,7 @@ def cmd_aidirs_prune(args)
   if to_delete.empty?
     puts ""
     puts "Nothing to remove."
+    write_aidirs_briefing_status([], 0) if apply
     return
   end
   unless apply
@@ -6746,6 +6789,8 @@ def cmd_aidirs_prune(args)
   end
 
   deleted = 0
+  removed = []
+  reclaimed_kb = 0
   skipped = []
   to_delete.each do |dir, _, _|
     # Re-check immediately before removing: parallel sessions routinely touch
@@ -6756,8 +6801,10 @@ def cmd_aidirs_prune(args)
       skipped << [File.basename(dir), reason]
       next
     end
+    reclaimed_kb += aidirs_size_kb(dir)
     FileUtils.rm_rf(dir)
     deleted += 1
+    removed << [File.basename(dir), reason]
   end
 
   puts ""
@@ -6767,6 +6814,34 @@ def cmd_aidirs_prune(args)
     puts ""
   end
   puts "Deleted #{deleted} dir(s)."
+  write_aidirs_briefing_status(removed, reclaimed_kb)
+end
+
+# Disk this dir is about to give back, in KB. `du` rather than a Ruby walk
+# because a feature dir holds several full clones plus node_modules — hundreds of
+# thousands of files — and this runs once per deleted dir. Best effort: an
+# unreadable dir reports 0 rather than failing the prune.
+def aidirs_size_kb(dir)
+  out, status = Open3.capture2e("du", "-sk", dir)
+  return 0 unless status.success?
+  out.split(/\s+/).first.to_i
+rescue
+  0
+end
+
+# The morning briefing's "AI Dirs Prune" section (item 19) reads this file and
+# skips it unless `Last run:` is today AND at least one dir was removed. Written
+# by the command rather than by the caller because the producer that replaced the
+# openclaw cron runs the command and nothing else.
+def write_aidirs_briefing_status(removed, reclaimed_kb)
+  body = +"Last run: #{Briefing.today}\n"
+  if removed.empty?
+    body << "Nothing to prune.\n"
+  else
+    removed.each { |name, reason| body << "#{name} (#{reason})\n" }
+    body << "Reclaimed: #{docker_format_size(reclaimed_kb * 1024)}\n"
+  end
+  Briefing.write("aidirs-prune-status.md", body)
 end
 
 # ---------- prune plans ----------
@@ -7155,7 +7230,29 @@ def cmd_browserslist_update(args)
     puts "Kept #{workdir} for inspection (failures present)"
   end
 
+  write_browserslist_briefing_status(updated: updated, no_changes: no_changes, failures: failures, logs: logs)
+
   exit 1 unless failures.empty?
+end
+
+# The morning briefing's "Browserslist Update" section (item 12) reads this file
+# and skips it unless `Last run:` is today AND something was updated or failed.
+# Failure output goes in verbatim: a repo that has been failing to push for three
+# weeks is the whole reason the section exists.
+def write_browserslist_briefing_status(updated:, no_changes:, failures:, logs:)
+  body = +"Last run: #{Briefing.today}\n"
+  if updated.empty? && failures.empty?
+    body << "All #{no_changes.length} projects up to date, no changes.\n"
+  else
+    body << "\n"
+    body << "Updated (pushed to main): #{updated.join(', ')}\n" unless updated.empty?
+    body << "No changes: #{no_changes.length} projects\n" unless no_changes.empty?
+    failures.each do |name|
+      log = logs[name.split(" ").first]
+      body << "Failed: #{name}#{log ? " (#{log.strip})" : ''}\n"
+    end
+  end
+  Briefing.write("browserslist-status.md", body)
 end
 
 # ---------- scripts ----------
@@ -9202,6 +9299,12 @@ when "browserslist"
   when "update" then cmd_browserslist_update(argv)
   when nil      then require_subcommand("browserslist")
   else               unknown("browserslist subcommand", sub, SUBCOMMANDS["browserslist"])
+  end
+when "depsguard"
+  sub = resolve_subcommand(argv, default: "scan")
+  case sub
+  when "scan" then cmd_depsguard_scan(argv)
+  else             unknown("depsguard subcommand", sub, SUBCOMMANDS["depsguard"])
   end
 when "docker"
   sub = argv.shift

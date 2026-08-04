@@ -11,6 +11,7 @@ look. Everything here exists to drain the open issue queue.
 | File | What it is |
 |---|---|
 | `producers.yml` | The schedule registry. The only place a schedule lives — the platform records run history but has no notion of "due". |
+| `bodies/` | The playbooks a producer ships with the issue it files (`issue.body_file`). Without one the claiming session gets `claude-issues/default-body.md` and does generic triage instead of the job the producer was written to schedule. |
 | `instructions.md` | Part 1 of every session's prompt. Outcome protocol, the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. |
 | `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
 

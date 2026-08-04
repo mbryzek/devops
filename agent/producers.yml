@@ -225,6 +225,132 @@ producers:
       fingerprint: weekly-review:hoa-frontend
       body_file: bodies/weekly-review.md
 
+  # ---- machine chores that act directly (ISS-395, ISS-402) --------------------
+  #
+  # Each of these was an openclaw cron whose prompt ran one command and parsed its
+  # stdout into a morning-briefing status file. `file_when: never` is the right
+  # shape — the command IS the work and there is nothing to file — so the status
+  # file moved INTO the command (lib/briefing.rb). The code that knows what
+  # happened now writes what happened, instead of a prose runbook re-deriving it
+  # with a regex.
+  #
+  # Schedules are the crons' schedules, preserved.
+
+  - key: aidirs-prune
+    schedule: daily at 6:00am
+    check: dev aidirs prune --apply
+    file_when: never
+
+  - key: docker-prune
+    schedule: daily at 5:08am
+    check: dev docker prune --days 7 --apply
+    file_when: never
+
+  - key: browserslist-update
+    schedule: weekly on monday at 4:13am
+    check: dev browserslist update
+    file_when: never
+
+  # `api lint` on a fresh clone of every spec-owning repo, opening a PR where it
+  # rewrites a spec. `file_when: never` rather than a detect-then-claim split:
+  # the script is idempotent, already opens a review-ready PR, and a no-drift week
+  # costs one clone and one lint per repo. Making it file an issue instead would
+  # add a session between the check and a PR it already knows how to open.
+  #
+  # `dependency` and `lib-ai` are new here — the cron covered only acumen and
+  # platform, but all four own apibuilder specs and the marginal cost of a clean
+  # repo is a clone.
+  #
+  # Exit codes: 0 handled (clean or PR opened), 2 the script broke. Never 1 —
+  # "findings" here become a PR, not an issue.
+  - key: api-lint
+    schedule: weekly on wednesday at 3:30am
+    check: dev scripts run api-lint-pr
+    file_when: never
+
+  # ---- chores that file for a claiming session --------------------------------
+
+  # The scan is cheap and its verdict is its exit code; the FIX is a session's
+  # work. That split is the whole producer contract, and it replaces the openclaw
+  # cron's fire-and-forget `claude --print` dispatch, which nothing watched.
+  - key: depsguard
+    schedule: weekly on monday at 5:13am
+    check: dev depsguard
+    file_when: check_fails
+    issue:
+      category: infrastructure
+      title: Fix failing supply-chain config checks
+      fingerprint: depsguard:scan
+      body_file: bodies/depsguard-fix.md
+
+  # ---- nightly work that has no cheap check (ISS-397 through ISS-401) ---------
+  #
+  # `file_when: always`, like the weekly reviews: there is no cheap check because
+  # the review IS the work. Each replaces an openclaw cron that launched a
+  # detached `claude --print` and ended its turn — a fire-and-forget process with
+  # a `timeout` as its only safety net. A lease, a heartbeat, a retry and a run
+  # record are exactly what replaces that scaffolding, so none of it is ported.
+  #
+  # The 03:30 collision between slow-query-review and platform-memory-improvement
+  # in the old cron set stops mattering here: producers file, they do not execute,
+  # and the claim path decides what runs when.
+
+  # ISS-397. Not a check: `dev dependencies upgrade` runs for hours, and a
+  # producer's check runs INLINE in the tick with no timeout — putting it there
+  # would hold the work lock for a quarter of a day and starve every other
+  # producer and the claim path behind it. As claimed work it gets the 4h hard
+  # timeout as a real bound, and the pipeline's own self-gating (a repo with an
+  # open dep-upgrade PR is skipped) makes a truncated night harmless.
+  #
+  # Fingerprint dedup means last night's upgrade issue, if still open, suppresses
+  # tonight's. That is deliberate: upgrade runs should not stack behind a night
+  # nobody worked.
+  - key: dependency-upgrade
+    schedule: daily at 3:45am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: Nightly dependency upgrades
+      fingerprint: dependencies:upgrade
+      body_file: bodies/dependency-upgrade.md
+
+  - key: daily-perf-prs
+    schedule: daily at 3:03am
+    file_when: always
+    issue:
+      category: improvement
+      title: Daily slow-route review and fixes
+      fingerprint: perf:daily-routes
+      body_file: bodies/daily-perf-prs.md
+
+  - key: slow-query-review
+    schedule: daily at 3:30am
+    file_when: always
+    issue:
+      category: improvement
+      title: Daily platform slow-query review
+      fingerprint: perf:slow-queries
+      body_file: bodies/slow-query-review.md
+
+  - key: platform-memory-improvement
+    schedule: daily at 3:35am
+    file_when: always
+    issue:
+      category: improvement
+      title: Daily platform memory / OOM improvement
+      fingerprint: perf:platform-memory
+      body_file: bodies/platform-memory-improvement.md
+
+  - key: daily-error-triage
+    schedule: daily at 5:45am
+    file_when: always
+    issue:
+      category: bug
+      severity: high
+      title: Daily production error and stability triage
+      fingerprint: triage:daily-errors
+      body_file: bodies/daily-error-triage.md
+
   # Retention is a producer, not a cron, so log purging gets the same history,
   # visibility and mutual exclusion as everything else on the tick (§4.3.1).
   - key: agent-gc
