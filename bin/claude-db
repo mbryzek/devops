@@ -48,11 +48,14 @@
 #                      Show every claude container — app, schema tag, port, and
 #                      the session databases inside it.
 #
-#   claude-db gc [--app APP]
-#                      Drop session databases with no active backend (dead-session
-#                      orphans), then remove containers left holding none and
-#                      release their ports. Always preserves the current
-#                      session's databases.
+#   claude-db gc [--app APP] [--days N] [--apply]
+#                      Drop session databases older than N days (default 3),
+#                      then remove containers left holding none and
+#                      release their ports. Dry-run unless --apply. Keeps any
+#                      database with a live connection, and this session's own.
+#                      Age, not "nobody is connected right now", is what makes
+#                      this safe to run while other sessions are working — see
+#                      DEFAULT_GC_DAYS.
 #
 # --app is required only for `start`: creating a database means choosing which
 # app's schema it holds, and there is no safe default. The read-only and
@@ -99,9 +102,12 @@ def show_usage
 
       status [--app APP]           Show every claude container and its session databases.
 
-      gc [--app APP]               Drop orphaned session databases (no active backend),
-                                   then remove containers holding none.  Always
-                                   preserves the current session's databases.
+      gc [--app APP]               Drop session databases older than --days
+         [--days N] [--apply]      (default #{DEFAULT_GC_DAYS}), then remove containers left
+                                   holding none.  Keeps anything with a live
+                                   connection, and this session's own databases.
+                                   Dry-run unless --apply.  Needs no session id,
+                                   so it runs from anywhere.
 
     Apps: #{DbApp.names.join(', ')}   (--app is required for `start`, optional elsewhere)
 
@@ -122,8 +128,8 @@ def do_next_port
       "No free port in #{DbPorts::RANGE_MIN}-#{DbPorts::RANGE_MAX}.\n" \
       "Every port in the range is either reserved by a container that still " \
       "exists or bound on this host.\n" \
-      "Run `claude-db gc` to reap containers holding no session databases, " \
-      "which releases their ports."
+      "Run `claude-db gc --apply` to reap old session databases and the " \
+      "containers left holding none, which releases their ports."
     )
   end
   # Stdout is exactly the port and nothing else — this is meant to be used as
@@ -516,15 +522,35 @@ end
 
 # ── gc ─────────────────────────────────────────────────────────────────────
 
-def do_gc(apps)
+# Session databases are reaped on AGE, not on "has no backend connected right
+# now". The old rule dropped every database no other session happened to be
+# querying at that instant, which is the normal state of a session sitting
+# between test runs: on 2026-08-04, 11 live sessions held ~60 databases and
+# pg_stat_activity was empty for every one of them, so a single `gc` would have
+# destroyed all of them.
+#
+# Age is also what lets gc run from anywhere. Reaping "everything but mine"
+# needs to know which database is mine, which is why gc used to require a
+# session id and abort in ~/code; reaping "everything older than N days" does
+# not, because the current session's database is newer than any sane cutoff.
+DEFAULT_GC_DAYS = 3
+
+def do_gc(apps, days, apply)
   puts ""
   puts Util.underline("claude-db gc")
   puts ""
+  puts "Reaping session databases older than #{days} day(s)#{apply ? '' : ' (dry-run — pass --apply to do it)'}."
+  puts ""
 
-  sid = DbImages.session_id
+  cutoff = days * 86_400
+  # Belt-and-braces only: a current session's database is younger than the
+  # cutoff anyway. session_id_or_nil, never session_id — gc must not abort just
+  # because it cannot name the session running it.
+  sid = DbImages.session_id_or_nil
+  total_dropped = 0
 
   apps.each do |app|
-    current_db = app.session_db_name(sid)
+    current_db = sid ? app.session_db_name(sid) : nil
     containers = app.containers
 
     if containers.empty?
@@ -544,36 +570,70 @@ def do_gc(apps)
         next
       end
 
-      dbs     = app.list_session_dbs(port)
-      active  = app.active_session_dbs(port)
-      orphans = dbs.reject { |db| db == current_db || active.include?(db) }
+      dbs    = app.list_session_dbs(port)
+      active = app.active_session_dbs(port)
+      ages   = app.session_db_ages(port)
 
-      if orphans.empty?
-        puts "#{name} (:#{port}): no orphaned session databases."
+      stale = app.reapable_session_dbs(
+        dbs, :active => active, :ages => ages,
+        :cutoff_seconds => cutoff, :current_db => current_db
+      )
+
+      if stale.empty?
+        puts "#{name} (:#{port}): nothing older than #{days} day(s) (#{dbs.length} database(s) kept)."
       else
-        puts "#{name} (:#{port}): dropping #{orphans.length} orphaned database(s)..."
-        orphans.each do |db|
-          # Terminate lingering connections (safety net — should be none for orphans).
+        verb = apply ? "dropping" : "would drop"
+        puts "#{name} (:#{port}): #{verb} #{stale.length} of #{dbs.length} database(s)..."
+        stale.each do |db|
+          age_days = (ages[db] / 86_400.0).round(1)
+          unless apply
+            puts "  would drop #{db} (#{age_days}d)"
+            next
+          end
+          # Terminate lingering connections (safety net — active dbs are kept above).
           DbImages.psql_exec_quiet(
             port,
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
           )
           DbImages.psql_exec(port, "DROP DATABASE #{db}")
-          puts "  dropped #{db}"
+          puts "  dropped #{db} (#{age_days}d)"
         end
+        total_dropped += stale.length
       end
 
-      remaining = app.list_session_dbs(port)
-      next unless remaining.empty?
+      # A container is removed only once it holds no session databases at all —
+      # never on its own age. One container serves a whole schema tag and is
+      # reused by every session on that tag, so its age is the age of the OLDEST
+      # session in it: platformdb-claude-0.5.39 was created 07-31 but still held
+      # a database created 08-02. Reaping containers by age would take the newer
+      # sessions with them.
+      next unless (dbs - stale).empty?
 
-      # Empty container: no session's data can be lost by removing it, and leaving
-      # it would hold its port out of the allocation range forever.
+      # An empty container is only reclaimed once it is itself older than the
+      # cutoff. `claude-db start` creates the container and then the database as
+      # two steps, so a container seconds old with no databases in it is far more
+      # likely to be a session mid-start than an abandoned one — reaping it there
+      # deletes the container out from under a session that is about to use it.
+      # An unreadable age counts as young and is left alone.
+      container_age = DbImages.container_age_seconds(name)
+      if container_age.nil? || container_age < cutoff
+        puts "#{name}: holds no session databases but is only #{container_age ? (container_age / 86_400.0).round(1).to_s + 'd' : 'unknown age'} — keeping (a session may be starting in it)."
+        next
+      end
+
+      unless apply
+        puts "#{name}: would hold no session databases — would remove it and release its port."
+        next
+      end
       puts "#{name}: holds no session databases — removing and releasing its port."
       Util.run("docker rm -f #{Shellwords.shellescape(name)}")
       released = DbPorts.release_container(name)
       puts "  released #{released} port allocation(s) from #{DbPorts::HISTORY_PATH}" if released > 0
     end
   end
+  puts ""
+  puts "Pass --apply to drop them." if !apply
+  puts "Dropped #{total_dropped} database(s)." if apply
   puts ""
 end
 
@@ -601,8 +661,23 @@ def parse_args!(argv)
       Util.exit_with_error("--repo-dir requires a value") if opts[:repo_dir].nil?
     when /\A--repo-dir=(.*)\z/
       opts[:repo_dir] = Regexp.last_match(1)
+    when "--days"
+      opts[:days] = argv.shift
+      Util.exit_with_error("--days requires a value") if opts[:days].nil?
+    when /\A--days=(.*)\z/
+      opts[:days] = Regexp.last_match(1)
+    when "--apply"
+      opts[:apply] = true
     else
       Util.exit_with_error("Unknown argument: #{arg}")
+    end
+  end
+
+  if opts[:days]
+    # 0 is allowed and means "everything not currently in use" — the old
+    # behaviour, still reachable but now only by asking for it explicitly.
+    unless opts[:days] =~ /\A\d+\z/
+      Util.exit_with_error("--days must be a non-negative integer (got: #{opts[:days]})")
     end
   end
 
@@ -666,7 +741,7 @@ when "start"     then do_start(require_app(opts), opts[:port])
 when "sync"      then do_sync(require_app(opts, :command => "sync"))
 when "end"       then do_end(apps_for(opts))
 when "status"    then do_status(apps_for(opts))
-when "gc"        then do_gc(apps_for(opts))
+when "gc"        then do_gc(apps_for(opts), (opts[:days] || DEFAULT_GC_DAYS).to_i, opts[:apply] == true)
 when "next-port" then do_next_port
 else
   $stderr.puts "Unknown command: #{subcommand}"

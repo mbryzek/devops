@@ -393,6 +393,48 @@ class DbApp
     ).to_set
   end
 
+  # Age in seconds of each session database, keyed by database name.
+  #
+  # Postgres stores no creation timestamp for a database, so this reads the mtime
+  # of PG_VERSION — a file written once when the database directory is created
+  # and never touched again, which makes it the creation time in all but name.
+  # Reading it needs the superuser connection psql_query already uses.
+  #
+  # A database whose age cannot be read is simply ABSENT from the result rather
+  # than present with some default. Callers reap on age, so an unreadable age has
+  # to mean "keep"; a default of 0 would keep everything (harmless) but a default
+  # of infinity would silently drop live sessions' data on any query failure.
+  def session_db_ages(port)
+    rows = DbImages.psql_query(
+      port,
+      "SELECT datname || '|' || " \
+      "EXTRACT(EPOCH FROM (now() - (pg_stat_file('base/' || oid || '/PG_VERSION')).modification))::bigint " \
+      "FROM pg_database WHERE datname LIKE '#{sess_prefix}%'"
+    )
+    rows.each_with_object({}) do |row, acc|
+      name, secs = row.split("|", 2)
+      next if name.nil? || secs.nil? || secs.strip.empty?
+      acc[name] = secs.to_i
+    end
+  end
+
+  # Which of `dbs` gc is allowed to drop. Pure, and deliberately separate from
+  # the dropping: this predicate IS gc's safety story, so it has to be testable
+  # without a live container.
+  #
+  # A database survives if ANY of these holds — they are independent guards, not
+  # a ranking:
+  #   * it belongs to the session running gc (current_db)
+  #   * something is connected to it right now (active)
+  #   * it is younger than the cutoff
+  #   * its age could not be read (ages has no entry) — unknown means keep
+  def reapable_session_dbs(dbs, active:, ages:, cutoff_seconds:, current_db: nil)
+    dbs.select do |db|
+      age = ages[db]
+      db != current_db && !active.include?(db) && !age.nil? && age >= cutoff_seconds
+    end
+  end
+
   # The [container, port] holding `db`, or nil when no running container has it.
   def find_container_with_db(db)
     running_containers_with_ports.find { |(_name, port)| DbImages.database_exists?(port, db) }

@@ -1,4 +1,5 @@
 require 'shellwords'
+require 'time'
 
 # Registry, Docker and Postgres mechanics for the session-DB image workflow.
 #
@@ -167,6 +168,17 @@ module DbImages
   def DbImages.container_running?(name)
     out = `docker inspect #{Shellwords.shellescape(name)} --format='{{.State.Running}}' 2>/dev/null`.strip
     out == "true"
+  end
+
+  # Seconds since the named container was created, or nil when that cannot be
+  # read. nil means "age unknown", and every caller must treat that as "too young
+  # to touch" — the same keep-on-doubt rule as DbApp#session_db_ages.
+  def DbImages.container_age_seconds(name)
+    out = `docker inspect #{Shellwords.shellescape(name)} --format='{{.Created}}' 2>/dev/null`.strip
+    return nil if out.empty?
+    (Time.now - Time.parse(out)).to_i
+  rescue ArgumentError
+    nil
   end
 
   # Image the named container was created from (e.g. "registry.…/platformdb:0.3.44").
