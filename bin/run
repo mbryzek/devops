@@ -20,6 +20,16 @@
 
 PROJECT=$(basename "$PWD")
 
+# Never let a Claude session run sbt against the shared :5432 dev database — see
+# lib/session_db.rb. It runs first, before the log file and before sbt, so the
+# refusal costs nothing and the session can fix it in the same turn. Interactive
+# runs are not gated at all (the check keys on CLAUDECODE), and a task that opens
+# no database (compile, scalafmt, a bare `set ...`) is let through either way.
+#
+# Resolved via this script's own path so a checkout under ~/code/ai/<feature>/devops
+# exercises its own copy, the same way $TIMINGS does below.
+"$(dirname "$0")/assert-session-db" "$PROJECT" "$@" || exit 1
+
 # Larger of two integers.
 max() {
   if [ "$1" -ge "$2" ]; then echo "$1"; else echo "$2"; fi

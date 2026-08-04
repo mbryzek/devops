@@ -223,6 +223,22 @@ session databases; nothing removes it by force.
 
 ---
 
+## Connection limit
+
+`claude-db start` runs each container with `-c max_connections=300`. One
+container serves every session on a schema tag, and one session's Play app opens
+up to `hikaricp.maximumPoolSize = 50`, so Postgres's stock 100 is exhausted by
+two concurrent sessions — the third gets `sorry, too many clients already`, which
+reads as a broken branch rather than as a full container.
+
+It is set on `docker run` because `max_connections` is a postmaster GUC: `ALTER
+SYSTEM` needs a full restart (a reload does nothing), and a new schema tag builds
+a new container from the image and is back to 100 anyway. **Containers created
+before this landed keep their old limit** — `claude-db gc` reaps one once it
+holds no session databases, and the next `start` recreates it correctly sized.
+
+---
+
 ## Routing: CONF_DB_DEV_URL
 
 Each app's `conf/devtest.conf` reads it:
@@ -239,6 +255,26 @@ target localhost/127.0.0.1.
 
 Both apps read the *same* variable, so export it in the same shell call as the
 `sbt` run it is for — environment does not persist between calls anyway.
+
+### Forgetting it used to be silent
+
+Nothing about that fallback fails. A session that never exported
+`CONF_DB_DEV_URL` just writes to Postgres.app, and the only symptom is stale-data
+failures that read as code bugs — a 247-failure platform run on 2026-08-04
+(ISS-318) that was green, on the same commit, against a session database.
+
+`bin/run` now refuses instead. Before it hands anything to sbt it calls
+`bin/assert-session-db`, which blocks a `test`/`run` task when `CLAUDECODE` is
+set and `CONF_DB_DEV_URL` is either unset or resolves to `:5432`, and prints the
+`claude-db start` line to fix it. The refusal costs nothing — it happens before
+the compile.
+
+It keys on the **caller**, not the port: `:5432` is Mike's database on purpose,
+so an interactive run sees no check, no prompt and nothing to opt out of. Tasks
+that open no database (`compile`, `scalafmt`, a bare `set …`) are never gated,
+in either case. platform's own startup check (`core.util.DbLocalUrlChecker`) is
+still there as the backstop for anything reaching sbt without going through
+`run.sh`.
 
 ---
 

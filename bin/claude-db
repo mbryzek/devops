@@ -256,11 +256,26 @@ def ensure_container(app, container, desired_image, schema_tag, requested_port)
   requested_port
 end
 
+# Postgres's stock max_connections is 100, sized for one client. A session
+# container is shared by every session on a schema tag, and each session's Play
+# app alone opens up to hikaricp.maximumPoolSize = 50 — so two concurrent
+# sessions can exhaust it and the third gets "sorry, too many clients already",
+# which reads as a broken branch rather than as a full container. 300 leaves room
+# for four or five. Idle slots cost ~400 bytes each; the real cost is per-backend
+# work_mem on active queries, so this is cheap on a dev box.
+#
+# It belongs on `docker run` (everything after the image name is passed to
+# postgres) rather than per container: max_connections is a postmaster GUC, so
+# ALTER SYSTEM needs a restart, and a new schema tag builds a new container from
+# the image and is back to 100 regardless.
+MAX_CONNECTIONS = 300
+
 # Pull (or build+push) the image, then run the container on `port`.
 def start_container(app, container, desired_image, schema_tag, port)
   ensure_image(app, desired_image, schema_tag)
   Util.run(
-    "docker run -d -p #{port}:5432 --name #{Shellwords.shellescape(container)} #{desired_image}"
+    "docker run -d -p #{port}:5432 --name #{Shellwords.shellescape(container)} " \
+      "#{desired_image} -c max_connections=#{MAX_CONNECTIONS}"
   )
   print "Waiting for Postgres on :#{port}..."
   $stdout.flush
