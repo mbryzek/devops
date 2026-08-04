@@ -67,7 +67,8 @@ claude-db start --app APP [--port N]       this session's database; prints CONF_
 claude-db sync --app APP [--repo-dir DIR]  apply the migrations it is missing
 claude-db end [--app APP]                  drop it (all apps by default)
 claude-db status [--app APP]               containers, tags, ports, session databases
-claude-db gc [--app APP]                   reap dead sessions' databases and empty containers
+claude-db gc [--app APP] [--days N]        reap session databases older than N days (default 3)
+                         [--apply]         and the containers left holding none; dry-run without --apply
 
 verify-db-images [--app APP] [--dry-run]   audit the registry; build+push if the latest tag is missing
 ```
@@ -345,7 +346,7 @@ database — always pass `--url` in a session.
 | Schema tag advanced and my session DB is "missing" | Each tag has its OWN container; the database still lives in the container for the tag you started on | Nothing is lost — `claude-db status` shows which container holds it |
 | `claude-db start` says a port is required | No container exists yet for this app + schema tag | `claude-db start --app APP --port "$(claude-db next-port)"` |
 | Recipe change not showing up | The image tag is the bare schema tag, so the cached image is reused | Bump the schema tag — see "Image tag = schema tag" |
-| `<database>_sess_*` databases accumulating | Sessions ended without `claude-db end` | `claude-db gc` |
+| `<database>_sess_*` databases accumulating | Sessions ended without `claude-db end` | `claude-db gc` to preview, `claude-db gc --apply` to reap |
 | A wall of `relation "x" does not exist`, or a not-null violation on a column main dropped | The session DB predates migrations that are on main — the template is the last RELEASE | `claude-db sync --app APP` (see above). `claude-db status` shows the count |
 | `sync` says "up to date" but the suite still fails on a missing relation | The checkout is behind `origin/main`; sync matched the DB to it | Pull the checkout, or `sync --repo-dir <fresh clone>` |
 | `db-image baseline` cannot find a snapshot | No recent production backup downloaded | Put one at `~/Downloads/<database>.sql` or pass `--snapshot` |
