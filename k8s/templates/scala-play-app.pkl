@@ -310,6 +310,10 @@ resources: Listing<K8sResource> = new {
   // terminate before creating the new one, so old and new job servers never
   // run concurrently. The brief job-tier outage this causes on every deploy
   // is accepted — it's a background batch tier with no traffic SLA.
+  //
+  // A StatefulSet (not a Deployment) because deployment.nodes pins the stable
+  // DNS name "\(appName)-job-0.\(appName)-job" in both tiers' JAVA_OPTS; a
+  // Deployment's random pod names would not resolve.
   new StatefulSet {
     metadata {
       name = "\(appName)-job"
@@ -319,6 +323,25 @@ resources: Listing<K8sResource> = new {
     spec {
       serviceName = "\(appName)-job"
       replicas = jobReplicas
+      // Parallel, not the OrderedReady default, purely to keep a crashlooping
+      // pod updatable.
+      //
+      // With OrderedReady the controller returns early from its sync as soon as
+      // it sees a pod that is not Running-and-Ready, before ever reaching the
+      // rolling-update phase that would replace it. A pod that crashloops on
+      // release N therefore never receives N+1, N+2, ... — it sits executing the
+      // original broken image, and no later release can dislodge it. Only
+      // deleting the pod by hand breaks the deadlock. That is what happened to
+      // platform-job-0 on 0.18.83: two subsequent good releases could not
+      // recover it, and it was down ~2.5h. With Parallel the controller skips
+      // that early return and deletes the out-of-date pod regardless of health.
+      //
+      // This does NOT weaken the shutdown-then-start guarantee above. Old and
+      // new never overlap because they are the same pod NAME — Kubernetes
+      // cannot create "\(appName)-job-0" until the previous one is fully gone.
+      // podManagementPolicy only governs ordering ACROSS ordinals, and with
+      // jobReplicas=1 there is a single ordinal.
+      podManagementPolicy = "Parallel"
       selector {
         matchLabels = new {
           ["app"] = appName
