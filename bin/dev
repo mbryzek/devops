@@ -1395,7 +1395,7 @@ def invariants_fanout_prompt(app_prompts)
     stacks with independent repos, so the subagents share nothing.
 
     Report back each app's outcome separately: the classification it landed on, and either its
-    PR/Reviewable URLs or the path to the findings it wrote.
+    GitHub PR URL or the path to the findings it wrote. Never a Reviewable URL.
 
     #{sections}
   PROMPT

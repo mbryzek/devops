@@ -44,7 +44,8 @@ Follow `~/code/CLAUDE.md`. The parts that bite most often:
   CROSS-REPO change: find and update every consumer on the same branch.
 - When done: commit, push, open a DRAFT PR, then mark it ready. Rebase onto the
   latest `origin/main` and rerun codegen before the branch is final.
-- Report the Reviewable URL, the PR URL, and the working directory.
+- Report the GitHub PR URL and the working directory. NEVER report a Reviewable
+  URL — Mike navigates there from GitHub himself.
 
 If the brief is ambiguous, make the most reasonable call, note the assumption,
 and keep going — surface every judgment call at the end rather than stopping to
