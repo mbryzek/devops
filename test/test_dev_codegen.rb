@@ -18,6 +18,7 @@ class TestDevCodegen < Minitest::Test
     refute o[:dry_run]
     refute o[:regen_only]
     refute o[:full_tests]
+    refute o[:check]
   end
 
   def test_parse_codegen_sync_all_flags
@@ -27,6 +28,17 @@ class TestDevCodegen < Minitest::Test
     assert o[:dry_run]
     assert o[:regen_only]
     assert o[:full_tests]
+  end
+
+  def test_parse_codegen_sync_check_implies_dry_run
+    o = parse_codegen_sync_args(%w[--check])
+    assert o[:check]
+    assert o[:dry_run], "--check must never open a PR or spawn Claude"
+  end
+
+  def test_parse_codegen_sync_rejects_check_with_fix_producing_flags
+    assert_raises(SystemExit) { parse_codegen_sync_args(%w[--check --regen-only]) }
+    assert_raises(SystemExit) { parse_codegen_sync_args(%w[--check --full-tests]) }
   end
 
   def test_parse_codegen_sync_rejects_unknown
@@ -432,6 +444,134 @@ class TestFixPrompt < Minitest::Test
     refute_includes p, "npm run check"   # no build step
     refute_includes p.downcase, "code-reviewer agent"
     assert_includes p.downcase, "draft"  # regen-only opens a draft PR
+  end
+end
+
+# `dev codegen sync --check` is the `codegen-sync` producer's check, so these
+# exit codes are the producer contract from agent/producers.yml, not local
+# detail: 0 nothing to do, 1 file the issue, >1 recorded as check_failed.
+class TestCodegenCheckExitCode < Minitest::Test
+  def test_clean_when_every_repo_in_sync
+    results = { "acumen" => { status: :in_sync }, "rallyd" => { status: :in_sync } }
+    assert_equal CODEGEN_EXIT_CLEAN, codegen_check_exit_code(results)
+  end
+
+  def test_findings_when_any_repo_changed
+    results = { "acumen" => { status: :in_sync }, "rallyd" => { status: :changed } }
+    assert_equal CODEGEN_EXIT_FINDINGS, codegen_check_exit_code(results)
+  end
+
+  # A demonstrated diff is a real finding even when a sibling repo failed; exit 2
+  # would drop it until the next nightly run.
+  def test_findings_win_over_a_broken_sibling_repo
+    results = { "acumen" => { status: :error, error: "clone failed" }, "rallyd" => { status: :changed } }
+    assert_equal CODEGEN_EXIT_FINDINGS, codegen_check_exit_code(results)
+  end
+
+  def test_uncheckable_when_a_repo_errored_and_none_drifted
+    results = { "acumen" => { status: :in_sync }, "rallyd" => { status: :error, error: "api failed" } }
+    assert_equal CODEGEN_EXIT_UNCHECKABLE, codegen_check_exit_code(results)
+  end
+
+  def test_uncheckable_when_a_repo_was_skipped
+    results = { "acumen" => { status: :in_sync }, "rallyd" => { status: :skipped, error: "dependency failed" } }
+    assert_equal CODEGEN_EXIT_UNCHECKABLE, codegen_check_exit_code(results)
+  end
+
+  # "Examined nothing" is never evidence that generated code is in sync.
+  def test_uncheckable_when_nothing_ran
+    assert_equal CODEGEN_EXIT_UNCHECKABLE, codegen_check_exit_code({})
+  end
+
+  # Clean requires every repo to have said :in_sync. A status only the
+  # PR-opening path can produce means a check mutated something — never "clean".
+  def test_uncheckable_on_a_status_a_check_should_not_be_able_to_produce
+    assert_equal CODEGEN_EXIT_UNCHECKABLE, codegen_check_exit_code("acumen" => { status: :pr_opened })
+    assert_equal CODEGEN_EXIT_UNCHECKABLE, codegen_check_exit_code("acumen" => { status: :needs_attention })
+  end
+
+  # The verdict is the filed issue's body, so it must name the repos to resync.
+  def test_findings_verdict_names_the_drifted_repos_and_the_fix
+    results = { "acumen" => { status: :in_sync }, "rallyd" => { status: :changed }, "hackathon" => { status: :changed } }
+    verdict = codegen_check_verdict(results, CODEGEN_EXIT_FINDINGS)
+    assert_includes verdict, "rallyd"
+    assert_includes verdict, "hackathon"
+    refute_includes verdict, "acumen"
+    assert_includes verdict, "dev codegen sync"
+  end
+end
+
+# `cmd_codegen_sync` in check mode, with the sweep itself stubbed: what is under
+# test is the translation from a sweep outcome to a process exit code, which no
+# amount of unit-testing `codegen_check_exit_code` covers — the sweep aborts by
+# calling `exit 1`, and 1 is the one code that must NEVER come out of a broken
+# check.
+class TestCodegenCheckCommand < Minitest::Test
+  include DevTestSupport
+
+  # Replaces the sweep with `body` for the duration of the block. Defined on
+  # Object because bin/dev's commands are top-level methods.
+  def stub_sweep(body)
+    Object.send(:alias_method, :__real_run_codegen_sweep, :run_codegen_sweep)
+    Object.send(:define_method, :run_codegen_sweep) { |_opts| body.call }
+    yield
+  ensure
+    Object.send(:alias_method, :run_codegen_sweep, :__real_run_codegen_sweep)
+    Object.send(:remove_method, :__real_run_codegen_sweep)
+  end
+
+  def run_check(sweep)
+    status = nil
+    out = nil
+    stub_sweep(sweep) do
+      out = capture_stdout do
+        begin
+          cmd_codegen_sync(["--check"])
+        rescue SystemExit => e
+          status = e.status
+        end
+      end
+    end
+    [out, status]
+  end
+
+  def test_exits_clean_when_nothing_drifted
+    out, status = run_check(-> { { "acumen" => { status: :in_sync } } })
+    assert_equal CODEGEN_EXIT_CLEAN, status
+    assert_includes out, "in sync"
+  end
+
+  def test_exits_findings_when_a_repo_drifted
+    out, status = run_check(-> { { "rallyd" => { status: :changed } } })
+    assert_equal CODEGEN_EXIT_FINDINGS, status
+    assert_includes out, "rallyd"
+  end
+
+  # The ISS-359 shape: the sweep aborts (bad --app, unclonable backend, failing
+  # git) with `exit 1`. Exit 1 means "file the issue"; a broken check must come
+  # back as check_failed instead.
+  def test_a_hard_abort_inside_the_sweep_is_uncheckable_not_a_finding
+    _out, status = run_check(-> { exit 1 })
+    assert_equal CODEGEN_EXIT_UNCHECKABLE, status
+  end
+end
+
+# The regression this whole flag exists for (ISS-359): the producer invoked a
+# flag `dev codegen` did not have, so the nightly check exited 1 on a usage
+# error every night and filed an issue that said only "unknown option --check".
+class TestCodegenProducerContract < Minitest::Test
+  CHECK = YAML.load_file(File.expand_path('../agent/producers.yml', __dir__))
+              .fetch("producers").find { |p| p["key"] == "codegen-sync" }.fetch("check")
+
+  # Parsed exactly as bin/dev's dispatcher parses it — `dev` and the command are
+  # consumed by the shell/dispatch, then the subcommand, then the flags.
+  def test_producer_check_parses_end_to_end_with_check_mode_on
+    argv = CHECK.split
+    assert_equal %w[dev codegen], argv.shift(2)
+    assert_equal "sync", resolve_subcommand(argv, default: "sync")
+    opts = parse_codegen_sync_args(argv)
+    assert opts[:check]
+    assert opts[:dry_run]
   end
 end
 

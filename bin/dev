@@ -71,7 +71,7 @@ INVOCATIONS = {
   "prune plans"         => 'prune plans [--days N] [--apply]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
-  "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
+  "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
@@ -397,6 +397,9 @@ USAGE = <<~USAGE
         --dry-run reports diffs without spawning Claude or opening PRs;
         --regen-only opens draft PRs but skips the review-completion workflow;
         --full-tests runs the full Scala suite instead of Test/compile.
+        --check is a dry run whose verdict is its exit code — 0 in sync, 1 drift
+        found, 2 the check itself broke — for the `codegen-sync` producer in
+        devops/agent/producers.yml. It never opens a PR or spawns Claude.
 
     #{INVOCATIONS["dependencies check"]}
         Report outdated library dependencies for the scala repos (platform,
@@ -5149,7 +5152,7 @@ def parse_deploy_all_args(args)
 end
 
 def parse_codegen_sync_args(argv)
-  opts = { app: nil, concurrency: 4, dry_run: false, regen_only: false, full_tests: false }
+  opts = { app: nil, concurrency: 4, dry_run: false, regen_only: false, full_tests: false, check: false }
   args = argv.dup
   until args.empty?
     case (a = args.shift)
@@ -5162,8 +5165,17 @@ def parse_codegen_sync_args(argv)
     when "--dry-run"    then opts[:dry_run] = true
     when "--regen-only" then opts[:regen_only] = true
     when "--full-tests" then opts[:full_tests] = true
+    # --check IS a dry run: detect drift, mutate nothing. It adds only the exit
+    # code contract on top, so it sets dry_run rather than teaching run_repo a
+    # second "don't touch anything" flag it could disagree with.
+    when "--check"      then opts[:check] = true; opts[:dry_run] = true
     else usage_exit("unknown option #{a}", example: usage_for("codegen sync"))
     end
+  end
+  # Both of these describe how to PRODUCE the fix, which a check never does.
+  # Accepting them would silently ignore them, so reject instead.
+  if opts[:check] && (opts[:regen_only] || opts[:full_tests])
+    usage_exit("--check cannot be combined with --regen-only or --full-tests", example: usage_for("codegen sync"))
   end
   opts
 end
@@ -5190,6 +5202,13 @@ CODEGEN_WORKDIR_ROOT = File.join(CODE_ROOT, "ai")
 # runs by this prefix.
 CODEGEN_WORKDIR_PREFIX = "cgs".freeze
 CODEGEN_STACKS = %i[scala elm sveltekit].freeze
+# `--check` is the `codegen-sync` producer's check (devops/agent/producers.yml),
+# so its exit codes are the producer contract, not a convenience. 1 means "file
+# the issue", which is why a broken sweep must NOT come back as 1: a check that
+# crashes every night would otherwise become a nightly stream of bogus issues.
+CODEGEN_EXIT_CLEAN       = 0 # every repo regenerated to no diff
+CODEGEN_EXIT_FINDINGS    = 1 # real drift — file (or increment) the issue
+CODEGEN_EXIT_UNCHECKABLE = 2 # the check itself broke — recorded as `check_failed`
 CODEGEN_CLAUDE_TIMEOUT_SECS = 20 * 60
 # The per-repo sessions do mechanical work (fix compile errors, commit, open a
 # PR), so a cheap/fast model is the right default.
@@ -5553,6 +5572,37 @@ end
 # Writes codegen-sync-status.json into workdir: an array of
 # {repo, status, pr_url, error} objects (pr_url/error may be nil) for
 # openclaw's morning briefing to consume.
+# The `--check` verdict, derived once from the same results hash the summary
+# prints. Findings beat uncheckable deliberately: a repo that demonstrably
+# regenerated to a diff is real drift worth filing even when a sibling repo
+# failed to clone, and exit 2 would drop that finding on the floor until the
+# next nightly run. An empty results hash means nothing was examined at all,
+# which is never evidence that generated code is in sync.
+def codegen_check_exit_code(results)
+  return CODEGEN_EXIT_UNCHECKABLE if results.empty?
+  return CODEGEN_EXIT_FINDINGS if results.any? { |_, r| r[:status] == :changed }
+  # Clean is asserted, not inferred: every repo must have said :in_sync. A status
+  # this function does not recognise (a new one, or one only the PR-opening path
+  # can produce) means the sweep did something a check should not have been able
+  # to do — say so, rather than report "in sync" on the strength of not knowing.
+  return CODEGEN_EXIT_CLEAN if results.all? { |_, r| r[:status] == :in_sync }
+
+  CODEGEN_EXIT_UNCHECKABLE
+end
+
+# The check's stdout becomes the filed issue's body, so it has to name the repos
+# to resync rather than just say "drift found".
+def codegen_check_verdict(results, code)
+  case code
+  when CODEGEN_EXIT_CLEAN then "Generated code is in sync in every repo"
+  when CODEGEN_EXIT_FINDINGS
+    drifted = results.select { |_, r| r[:status] == :changed }.keys.sort
+    "Generated code is out of sync in #{drifted.length} repo(s): #{drifted.join(', ')}\n" \
+      "Resync with: dev codegen sync"
+  else "codegen sync --check could not complete — nothing was concluded about generated code"
+  end
+end
+
 def write_codegen_status_json(workdir, results)
   data = results.keys.sort.map do |name|
     r = results[name]
@@ -5563,7 +5613,40 @@ end
 
 def cmd_codegen_sync(argv)
   opts = parse_codegen_sync_args(argv)
+  return run_codegen_sweep(opts) unless opts[:check]
+
+  # Check mode: the sweep is the detector, and its verdict is an exit code.
+  # Every hard abort inside the sweep (an unknown --app, an unclonable backend,
+  # a failing git/api invocation) is `exit 1` via Util.exit_with_error — which
+  # in the producer contract would mean "found drift, file the issue". It means
+  # the opposite: nothing was concluded. Translate it, so a broken sweep is
+  # recorded as check_failed instead of filing a fictional finding.
+  results =
+    begin
+      run_codegen_sweep(opts)
+    rescue SystemExit => e
+      raise if e.success?
+
+      exit CODEGEN_EXIT_UNCHECKABLE
+    end
+  code = codegen_check_exit_code(results)
+  puts ""
+  puts codegen_check_verdict(results, code)
+  exit code
+end
+
+# Clones every eligible repo, regenerates it, classifies the diff, and returns
+# the per-repo results hash. Opens PRs and hands off to Claude unless `opts`
+# says otherwise (--dry-run / --check).
+def run_codegen_sweep(opts)
   registry = Work::Registry.load
+  # Resolve the target BEFORE touching the disk: an unknown --app aborts the
+  # sweep, and it should not first delete the prior sweep's clones (which a
+  # `needs_attention` repo deliberately leaves behind to be inspected).
+  eligible = registry.apps.reject(&:ignored).select { |a| CODEGEN_STACKS.include?(a.stack) }
+  target = resolve_codegen_target(opts[:app], eligible)
+  to_clone = codegen_clone_set(target, eligible)
+
   # One id per sweep, to the second, drives both the workdir and the branch
   # name so reruns never collide with a prior run's clones or remote branch.
   run_id = ENV["CODEGEN_SYNC_DATE"] || Time.now.strftime("%Y%m%d-%H%M%S")
@@ -5575,10 +5658,6 @@ def cmd_codegen_sync(argv)
   # amends `modulepath:/api/ApiConfig.pkl`, which `api` resolves from its own
   # checkout (see ApiConfig::BASE_MODULE_URI), not from a sibling directory.
   FileUtils.mkdir_p(workdir)
-
-  eligible = registry.apps.reject(&:ignored).select { |a| CODEGEN_STACKS.include?(a.stack) }
-  target = resolve_codegen_target(opts[:app], eligible)
-  to_clone = codegen_clone_set(target, eligible)
 
   puts "Working in #{workdir}"
   puts "Cloning #{to_clone.length} repo(s): #{to_clone.map(&:name).sort.join(', ')}"
@@ -5660,6 +5739,7 @@ def cmd_codegen_sync(argv)
 
   print_codegen_summary(results)
   write_codegen_status_json(workdir, results)
+  results
 end
 
 # ---------- dependencies check / upgrade ----------
