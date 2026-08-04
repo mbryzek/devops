@@ -2130,4 +2130,95 @@ class TestDevIssues < Minitest::Test
     assert_match(/dev issues create/, usage_for("issues create"))
     assert_match(/dev issues resume/, usage_for("issues resume"))
   end
+
+  # ---- epics ----
+
+  def epic_issue
+    {
+      "id" => "iss-e",
+      "number" => "140",
+      "category" => "feature",
+      "type" => "epic",
+      "status" => "open",
+      "title" => "Do it for me executors",
+      "occurrence_count" => 1,
+      "created" => { "at" => "2026-08-04T12:00:00Z", "by" => { "id" => "usr-1", "name" => "Mike Bryzek" } },
+    }
+  end
+
+  def child_issue(number: "343", status: "open")
+    {
+      "id" => "iss-c#{number}",
+      "number" => number,
+      "category" => "feature",
+      "type" => "issue",
+      "status" => status,
+      "title" => "implement the real rename_event write",
+      "occurrence_count" => 1,
+      "parent" => { "id" => "iss-e", "number" => "140", "title" => "Do it for me executors", "status" => "open" },
+      "created" => { "at" => "2026-08-04T12:00:00Z", "by" => { "id" => "usr-1", "name" => "Mike Bryzek" } },
+    }
+  end
+
+  def test_parent_is_a_registered_subcommand
+    assert_includes SUBCOMMANDS["issues"], "parent"
+    assert INVOCATIONS.key?("issues parent")
+    assert_match(/dev issues parent/, usage_for("issues parent"))
+  end
+
+  def test_create_usage_documents_epic_and_parent
+    assert_match(/--epic/, usage_for("issues create"))
+    assert_match(/--parent NUMBER/, usage_for("issues create"))
+  end
+
+  def test_list_path_carries_the_parent_number
+    path = issues_list_path(statuses: [], parent_number: "140")
+    assert_match(/parent_number=140/, path)
+  end
+
+  def test_list_path_omits_parent_number_when_absent
+    refute_match(/parent_number/, issues_list_path(statuses: []))
+  end
+
+  # An epic is filed for the queue and never handed to a session: there is nothing
+  # to implement until it has children, so the message has to point at decomposing
+  # it rather than at `dev issues claim`, which the server refuses for an epic.
+  def test_filed_open_tells_an_epic_to_decompose
+    out, = capture_io { issue_filed_open(epic_issue) }
+    assert_match(/EPIC/, out)
+    assert_match(/--parent 140/, out)
+    refute_match(/dev issues claim/, out)
+  end
+
+  def test_filed_open_still_points_a_plain_issue_at_claim
+    out, = capture_io { issue_filed_open(crawl_issue) }
+    assert_match(/dev issues claim/, out)
+    refute_match(/EPIC/, out)
+  end
+
+  # `show` on a child says which epic owns it AND that the child is not the thing
+  # to verify -- the whole point of the feature, stated where somebody looking at
+  # the child would otherwise go verify it.
+  def test_show_tells_a_child_not_to_verify_itself
+    section = issue_family_section(nil, child_issue)
+    assert_match(/Child of EPIC ISS-140/, section)
+    assert_match(/do NOT verify it/, section)
+  end
+
+  def test_show_says_nothing_extra_for_a_standalone_issue
+    assert_equal "", issue_family_section(nil, crawl_issue)
+  end
+
+  def test_child_plan_says_not_to_verify
+    plan = issue_plan_markdown(issue: child_issue, category: "feature",
+                               body: "body", intro: "intro")
+    assert_match(/Part of EPIC ISS-140/, plan)
+    assert_match(/do\n> NOT move it to `verified`/, plan)
+  end
+
+  def test_standalone_plan_has_no_epic_banner
+    plan = issue_plan_markdown(issue: crawl_issue, category: "worker",
+                               body: "body", intro: "intro")
+    refute_match(/EPIC/, plan)
+  end
 end
