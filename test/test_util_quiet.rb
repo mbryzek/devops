@@ -136,6 +136,32 @@ class TestUtilQuiet < Minitest::Test
     end
   end
 
+  # A best-effort stage (the post-deploy changelog and reconcile hooks) must not
+  # abort the release, but reporting it as "done" hides the failure completely —
+  # it used to be a lone `warn` line buried in the release log.
+  def test_step_failed_renders_failed_without_raising
+    with_quiet do
+      out = capture_stdout { Util.step("Reconciling") { Util.step_failed! } }
+      assert_match(/\AReconciling\.\.\. failed \(\d+s\)\n\z/, out)
+    end
+  end
+
+  def test_step_failed_does_not_abort_in_verbose_mode
+    out = capture_stdout { Util.step("Reconciling") { Util.step_failed! } }
+    assert_includes out, "Reconciling: FAILED (ignored)"
+  end
+
+  # Only interesting alongside :ignore_error — every other path aborts — but a
+  # best-effort caller has no other way to tell whether the command worked.
+  def test_run_returns_whether_the_command_succeeded
+    with_quiet do
+      assert_equal true, Util.run("true")
+      assert_equal false, Util.run("false", ignore_error: true)
+    end
+    assert_equal true, Util.run("true", quiet: true)
+    assert_equal false, Util.run("false", quiet: true, ignore_error: true)
+  end
+
   def test_step_returns_block_value
     with_quiet do
       value = nil
