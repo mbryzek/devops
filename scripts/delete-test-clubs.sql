@@ -71,9 +71,6 @@ create unique index on _del_cr_courts (id);
 create temp table _del_credentials on commit drop as
   select id from integrations.credentials where club_id in (select id from _del_clubs);
 create unique index on _del_credentials (id);
-create temp table _del_ai_chats on commit drop as
-  select id from playbook.ai_chats where club_id in (select id from _del_clubs);
-create unique index on _del_ai_chats (id);
 create temp table _del_invocations on commit drop as
   select id from worker.invocations where club_id in (select id from _del_clubs);
 create unique index on _del_invocations (id);
@@ -83,6 +80,18 @@ create unique index on _del_issues (id);
 create temp table _del_checklist_items on commit drop as
   select id from playbook.checklist_items where club_id in (select id from _del_clubs);
 create unique index on _del_checklist_items (id);
+create temp table _del_executions on commit drop as
+  select id from playbook.executions where club_id in (select id from _del_clubs);
+create unique index on _del_executions (id);
+create temp table _del_members on commit drop as
+  select id from playbook.members where club_id in (select id from _del_clubs);
+create unique index on _del_members (id);
+create temp table _del_member_messages on commit drop as
+  select id from playbook.member_messages where club_id in (select id from _del_clubs);
+create unique index on _del_member_messages (id);
+create temp table _del_people on commit drop as
+  select id from playbook.people where club_id in (select id from _del_clubs);
+create unique index on _del_people (id);
 
 do $$ begin raise notice 'Clubs targeted: %', (select count(*) from _del_clubs); end $$;
 
@@ -99,6 +108,20 @@ delete from playbook.checklist_item_insights
   where checklist_item_id in (select id from _del_checklist_items)
      or insight_id in (select id from _del_insights)
      or insight_section_id in (select id from _del_insight_sections);
+-- Checklist cluster. checklist_items hangs off checklist_generations, which hangs off
+-- insights, so the whole chain has to precede the insights delete below. Within it:
+-- member_message_emails -> member_messages -> execution_recipients -> executions ->
+-- checklist_items (member_messages also hangs off execution_recipients, so it goes first).
+delete from playbook.member_message_emails          where message_id in (select id from _del_member_messages);
+delete from playbook.member_messages                where club_id in (select id from _del_clubs);
+delete from playbook.execution_recipients
+  where execution_id in (select id from _del_executions)
+     or member_id in (select id from _del_members);
+delete from playbook.executions                     where club_id in (select id from _del_clubs);
+delete from playbook.checklist_item_checks          where checklist_item_id in (select id from _del_checklist_items);
+delete from playbook.checklist_item_comments        where checklist_item_id in (select id from _del_checklist_items);
+delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
+delete from playbook.checklist_generations          where club_id in (select id from _del_clubs);
 delete from playbook.insight_sections              where insight_id in (select id from _del_insights);
 delete from playbook.insight_reviews               where insight_id in (select id from _del_insights);
 delete from playbook.insight_tool_calls            where insight_run_id in (select id from _del_insight_runs);
@@ -109,19 +132,15 @@ delete from playbook.insight_rule_logs             where club_id in (select id f
 delete from playbook.insights                       where club_id in (select id from _del_clubs);
 delete from playbook.insight_runs                   where club_id in (select id from _del_clubs);
 delete from playbook.revenue_entries               where club_id in (select id from _del_clubs);
+delete from playbook.revenue_daily_totals           where club_id in (select id from _del_clubs);
 delete from playbook.revenue_categories             where club_id in (select id from _del_clubs);
 delete from playbook.club_revenue_targets           where club_id in (select id from _del_clubs);
 delete from playbook.club_insight_settings          where club_id in (select id from _del_clubs);
 delete from playbook.club_memory_facts              where club_id in (select id from _del_clubs);
-delete from playbook.membership_categories          where club_id in (select id from _del_clubs);
 delete from playbook.report_exports                 where club_id in (select id from _del_clubs);
-delete from playbook.checklist_item_comments        where checklist_item_id in (select id from _del_checklist_items);
-delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
 delete from playbook.watermarks                     where club_id in (select id from _del_clubs);
 
 -- ---- playbook ---------------------------------------------------------------
-delete from playbook.ai_messages                     where chat_id in (select id from _del_ai_chats);
-delete from playbook.ai_chats                         where club_id in (select id from _del_clubs);
 delete from playbook.user_club_notification_optouts  where club_id in (select id from _del_clubs);
 delete from playbook.user_clubs                       where club_id in (select id from _del_clubs);
 delete from playbook.user_invitations                where club_id in (select id from _del_clubs);
@@ -181,7 +200,14 @@ delete from playbook.member_engagement_scores       where club_id in (select id 
 delete from playbook.member_segment_transitions     where club_id in (select id from _del_clubs);
 delete from playbook.member_engagement_backfills    where club_id in (select id from _del_clubs);
 delete from playbook.member_membership_intervals    where club_id in (select id from _del_clubs);
+delete from playbook.member_email_optouts           where club_id in (select id from _del_clubs);
+delete from playbook.member_identity_rejections     where club_id in (select id from _del_clubs);
+-- person_members links people <-> members; a row can hang off either side.
+delete from playbook.person_members
+  where member_id in (select id from _del_members)
+     or person_id in (select id from _del_people);
 delete from playbook.members                        where club_id in (select id from _del_clubs);
+delete from playbook.people                         where club_id in (select id from _del_clubs);
 
 -- ---- playbook coaches ------------------------------------------------------
 -- court_reserve.reservations.coach_id references coaches, so this must run after
@@ -192,6 +218,8 @@ delete from playbook.coaches                        where club_id in (select id 
 -- log_review_tickets FK-references issues.issues, and a Court Reserve finding scoped to a
 -- single club carries that club_id — so its ticket must go before the issue it points at.
 delete from court_reserve.log_review_tickets        where issue_id in (select id from _del_issues);
+delete from agent.agent_producer_runs               where issue_id in (select id from _del_issues);
+delete from issues.issue_leases                     where issue_id in (select id from _del_issues);
 delete from issues.issue_apps                       where issue_id in (select id from _del_issues);
 delete from issues.issue_attachments                where issue_id in (select id from _del_issues);
 delete from issues.issue_comments                   where issue_id in (select id from _del_issues);
