@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require 'tmpdir'
 require_relative 'test_helper'
 load File.expand_path('../bin/dev', __dir__)
 
@@ -69,7 +70,7 @@ class TestAgentCronMigration < Minitest::Test
   # The chores that act directly must NOT carry an issue block: they are the work,
   # and filing an issue for a completed chore is queue noise.
   def test_the_direct_chores_file_nothing
-    %w[aidirs-prune docker-prune browserslist-update api-lint].each do |key|
+    %w[aidirs-prune docker-prune browserslist-update].each do |key|
       assert_equal "never", producer(key).file_when, "#{key}: acts directly, so it must file nothing"
       refute_nil producer(key).check, "#{key}: file_when never needs a check to run"
     end
@@ -84,10 +85,91 @@ class TestAgentCronMigration < Minitest::Test
     assert_equal "depsguard:scan", p.fingerprint
   end
 
+  # Every fingerprint the registry can file, epics and children included. A
+  # collision here is invisible in production: the second issue is never filed,
+  # it just silently increments the first one's occurrence count.
   def test_fingerprints_are_unique_across_the_whole_registry
-    fingerprints = producers.select(&:files_issue?).map(&:fingerprint)
+    fingerprints = producers.select(&:files_issue?).flat_map do |p|
+      [p.fingerprint] + p.children.map(&:fingerprint)
+    end
     dupes = fingerprints.tally.select { |_, n| n > 1 }.keys
     assert_empty dupes, "two producers would dedup each other: #{dupes.join(', ')}"
+  end
+
+  # ---- ISS-397: the nightly upgrade is an epic with one child per repo -------
+
+  def test_the_dependency_upgrade_producer_files_an_epic_per_repo
+    p = producer("dependency-upgrade")
+    assert p.epic?, "the nightly upgrade files an epic, not one issue for six repos"
+    assert_equal Dependencies::Updates::APPS.keys.sort, p.children.map(&:name).sort,
+                 "children must be exactly the repos `dev dependencies upgrade` watches — " \
+                 "a repo in one list and not the other is a repo that never gets upgraded"
+  end
+
+  # The epic reaches `deployed` when its children are terminal and then waits for
+  # Mike to verify. `deployed` is non-terminal for producer dedup, so an undated
+  # epic fingerprint would stop the NIGHTLY producer filing until he clicked
+  # verify. The children carry the real dedup instead.
+  def test_the_epic_fingerprint_is_dated_and_the_children_are_not
+    p = producer("dependency-upgrade")
+    assert_includes p.fingerprint, Agent::Producers::DATE_TOKEN
+    assert_equal "dependencies:upgrade:2026-08-05", p.fingerprint_at(Time.utc(2026, 8, 5, 7, 45))
+    p.children.each do |child|
+      refute_includes child.fingerprint, Agent::Producers::DATE_TOKEN,
+                      "#{child.name}: an unfinished repo must suppress tonight's re-file"
+      assert_equal "dependencies:upgrade:#{child.name}", child.fingerprint
+    end
+  end
+
+  # Each child runs ONE repo. A playbook that told the session to run the whole
+  # pipeline would have all six children upgrading all six repos.
+  def test_each_child_playbook_names_its_own_repo_and_only_its_own
+    producer("dependency-upgrade").children.each do |child|
+      assert_includes child.body_text, "--app #{child.name}",
+                      "#{child.name}: the playbook must scope the run to this repo"
+      refute_includes child.body_text, Agent::Producers::CHILD_TOKEN,
+                      "#{child.name}: an unsubstituted {child} reached the filed body"
+    end
+  end
+
+  # The briefing reads the newest dep-up workdir's status file. Six children
+  # writing six workdirs would leave it reporting one repo and dropping five.
+  def test_the_dependency_children_share_one_days_status_file
+    child = producer("dependency-upgrade").children.first
+    assert_includes child.body_text, "dependencies-status.json",
+                    "the playbook must name the file the briefing reads"
+
+    Dir.mktmpdir do |dir|
+      write_dependencies_status_json(dir, { "platform" => { status: :ok, pr_url: "https://pr/1" } })
+      write_dependencies_status_json(dir, { "acumen" => { status: :in_sync } })
+      rows = JSON.parse(File.read(File.join(dir, "dependencies-status.json")))
+      assert_equal %w[acumen platform], rows.map { |r| r["repo"] },
+                   "a second repo's run overwrote the first — the briefing would report one repo of six"
+      assert_equal "https://pr/1", rows.find { |r| r["repo"] == "platform" }["pr_url"]
+    end
+  end
+
+  # ---- ISS-402: api-lint files work, it does not do it -----------------------
+
+  # It used to be a shell script that cloned, linted, pushed and opened PRs from
+  # inside the producer check. A producer creates work; it does not do it — and a
+  # push that failed in there looked exactly like a week with no drift.
+  def test_api_lint_files_an_issue_instead_of_opening_prs_itself
+    p = producer("api-lint")
+    assert_equal "always", p.file_when
+    assert_nil p.check, "a producer check must not clone repos and open PRs"
+    assert_equal "api-lint:weekly", p.fingerprint
+    assert_includes p.body_text, "api lint"
+    refute File.exist?(File.expand_path("../scripts/api-lint-pr.sh", __dir__)),
+           "the script did the work the claiming session now does"
+  end
+
+  # The repos the retired cron covered, plus the two that also own specs.
+  def test_the_api_lint_playbook_covers_every_spec_owning_repo
+    text = producer("api-lint").body_text
+    %w[platform acumen dependency lib-ai].each do |repo|
+      assert_includes text, repo, "api-lint playbook does not mention #{repo}"
+    end
   end
 
   # Schedules are the retired crons' schedules, preserved. A migration that
@@ -163,21 +245,14 @@ class TestAgentCronMigration < Minitest::Test
     end
   end
 
-  # The api-lint script is the `api-lint` producer's whole implementation, and
-  # `dev scripts run` resolves it by name.
-  def test_api_lint_script_is_discoverable_and_executable
-    path = File.expand_path("../scripts/api-lint-pr.sh", __dir__)
-    assert File.executable?(path), "scripts/api-lint-pr.sh must be executable for `dev scripts run`"
-    assert_includes producer("api-lint").check, "api-lint-pr"
-  end
-
   # CLAUDE.md: never `--base` (it is how stacked PRs happen), never a shallow
-  # clone. The openclaw original did both.
-  def test_api_lint_script_follows_the_pr_conventions
-    src = File.read(File.expand_path("../scripts/api-lint-pr.sh", __dir__))
-    refute_match(/gh pr create[^\n]*--base/, src, "never pass --base to gh pr create")
-    refute_match(/git clone[^\n]*--depth/, src, "no shallow clones")
-    assert_includes src, "--draft", "PRs open as drafts, then go ready"
+  # clone. The retired openclaw script did both, and the playbook that replaced
+  # it is where that guidance now has to live.
+  def test_playbooks_that_open_prs_carry_the_pr_conventions
+    text = producer("api-lint").body_text
+    refute_match(/gh pr create[^\n]*--base/, text, "never pass --base to gh pr create")
+    refute_match(/git clone[^\n]*--depth/, text, "no shallow clones")
+    assert_includes text, "--draft", "PRs open as drafts, then go ready"
   end
 
   # One scheduler per job. The dependency pipeline had three at once — an openclaw

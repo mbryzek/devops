@@ -485,6 +485,7 @@ module Agent
 
     def file_issue(producer, output)
       existing = Agent::Api.issues(statuses: NON_TERMINAL_STATUSES, use_localhost: @use_localhost)
+      return file_epic(producer, output, existing) if producer.epic?
       return ["skipped_in_flight", nil] if Agent::Producers.in_flight?(existing, producer.fingerprint)
 
       spec = producer.issue
@@ -503,6 +504,73 @@ module Agent
       issue = Agent::Api.create_issue(form, use_localhost: @use_localhost)
       result = issue["occurrence_count"].to_i > 1 ? "recurrence" : "filed"
       [result, issue["number"]]
+    end
+
+    # An epic and one child per name (ISS-397). The children are the units of
+    # work — each gets its own lease, its own retry and its own PR — and the
+    # epic is the single thing Mike verifies once they have all landed.
+    #
+    # ORDER MATTERS: the children are filtered BEFORE the epic is created, so a
+    # night where every repo still has last night's issue open files nothing at
+    # all rather than leaving an empty container in the queue. Filing the epic
+    # first and discovering that afterwards is not recoverable — there is no
+    # delete, only `dismissed`.
+    def file_epic(producer, output, existing)
+      children = producer.children.reject { |child| Agent::Producers.in_flight?(existing, child.fingerprint) }
+      if children.empty?
+        log("#{producer.key}: every child is still in flight — filing nothing")
+        return ["skipped_in_flight", nil]
+      end
+      fingerprint = producer.fingerprint_at(@now)
+      return ["skipped_in_flight", nil] if Agent::Producers.in_flight?(existing, fingerprint)
+
+      spec = producer.issue
+      epic = Agent::Api.create_issue(
+        {
+          type: "epic",
+          title: spec.fetch("title"),
+          category: spec.fetch("category"),
+          fingerprint: fingerprint,
+          body: epic_body(producer, output, children),
+          claim_on_create: false,
+        },
+        use_localhost: @use_localhost,
+      )
+      number = epic["number"]
+
+      children.each do |child|
+        form = {
+          title: child.title,
+          category: child.category,
+          fingerprint: child.fingerprint,
+          # A STRING on the wire: issue_form.parent_number is typed `string`,
+          # and an integer here is a 400 the producer would only find at 3:45am.
+          parent_number: number.to_s,
+          body: child_body(producer, child),
+          claim_on_create: false,
+        }
+        form[:severity] = child.severity if child.severity
+        filed = Agent::Api.create_issue(form, use_localhost: @use_localhost)
+        log("#{producer.key}: ISS-#{filed['number']} #{child.name} → epic ISS-#{number}")
+      end
+
+      result = epic["occurrence_count"].to_i > 1 ? "recurrence" : "filed"
+      [result, number]
+    end
+
+    def epic_body(producer, output, children)
+      roster = children.map { |child| "- #{child.title}" }.join("\n")
+      skipped = producer.children.length - children.length
+      note = skipped.zero? ? "" : "\n\n#{skipped} child(ren) were skipped: a previous run's issue for them is still open."
+      "#{producer_body(producer, output)}\n\nThis run filed #{children.length} child issue(s):\n\n#{roster}#{note}"
+    end
+
+    def child_body(producer, child)
+      header = "Filed automatically by the `#{producer.key}` producer (devops/agent/producers.yml) " \
+               "as one child of this run's epic."
+      playbook = child.body_text
+      return header if playbook.nil? || playbook.empty?
+      "#{header}\n\n---\n\n#{playbook}"
     end
 
     def producer_body(producer, output)

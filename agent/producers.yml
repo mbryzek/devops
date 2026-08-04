@@ -44,6 +44,33 @@
 # drifts the moment anyone edits one. Validated at PARSE time, so a typo'd path
 # fails the next tick instead of surfacing a week later as an issue with no brief.
 #
+# `issue.type` is `issue` (the default) or `epic`. An epic files a CONTAINER plus
+# one child per name in `issue.children`, and the CHILDREN are what a session
+# claims and works:
+#
+#   issue:
+#     type: epic
+#     fingerprint: "thing:{date}"
+#     children:
+#       names: [platform, acumen]
+#       category: infrastructure
+#       title: "Thing: {child}"          # {child} is required in title
+#       fingerprint: "thing:{child}"     # and in fingerprint
+#       body_file: bodies/thing-one.md   # {child} is substituted here too
+#
+# Use it where one scheduled run is really N independent runs — N clones, N
+# suites, N PRs. As one issue they share a lease, a 4-hour budget and a single
+# outcome, so one slow target takes the whole run with it and a late failure
+# hides the earlier successes. As children each target gets its own lease, retry
+# and visible result, and the epic is the one thing Mike verifies at the end.
+#
+# The children carry the dedup (per-target, undated). An epic's own fingerprint
+# should be dated with `{date}`: an epic sits at `deployed` until a human
+# verifies it, `deployed` is non-terminal here, and an undated epic fingerprint
+# would therefore stop a nightly producer until someone clicked verify. If every
+# child is already in flight the epic is not filed at all — an empty container
+# cannot be worked and cannot be deleted.
+#
 # `fingerprint` is the dedup key. A producer does not file while a NON-TERMINAL
 # issue with the same fingerprint exists (anything other than verified or
 # dismissed — `fixed` included, which is what makes "don't re-file while a PR is
@@ -225,7 +252,7 @@ producers:
       fingerprint: weekly-review:hoa-frontend
       body_file: bodies/weekly-review.md
 
-  # ---- machine chores that act directly (ISS-395, ISS-402) --------------------
+  # ---- machine chores that act directly (ISS-395) -----------------------------
   #
   # Each of these was an openclaw cron whose prompt ran one command and parsed its
   # stdout into a morning-briefing status file. `file_when: never` is the right
@@ -251,24 +278,31 @@ producers:
     check: dev browserslist update
     file_when: never
 
-  # `api lint` on a fresh clone of every spec-owning repo, opening a PR where it
-  # rewrites a spec. `file_when: never` rather than a detect-then-claim split:
-  # the script is idempotent, already opens a review-ready PR, and a no-drift week
-  # costs one clone and one lint per repo. Making it file an issue instead would
-  # add a session between the check and a PR it already knows how to open.
+  # ---- chores that file for a claiming session --------------------------------
+
+  # ISS-402. `api lint` across the spec-owning repos, FILED rather than run.
   #
-  # `dependency` and `lib-ai` are new here — the cron covered only acumen and
-  # platform, but all four own apibuilder specs and the marginal cost of a clean
-  # repo is a clone.
+  # This was a shell script that cloned, linted, branched, committed, pushed and
+  # opened a PR, all inside a producer check. It worked, and it was still the
+  # wrong half of the contract: a producer creates work, it does not do it. A
+  # script opening PRs from inside the tick has no lease, no retry and no run to
+  # look at — a week where the push failed looked exactly like a week with no
+  # drift. As a filed issue it is a session that lints, judges what the linter
+  # rewrote, and opens a PR per repo the normal way.
   #
-  # Exit codes: 0 handled (clean or PR opened), 2 the script broke. Never 1 —
-  # "findings" here become a PR, not an issue.
+  # `file_when: always`, not `check_fails`: "is there drift?" is not a cheap
+  # question here. Answering it means a clone and a lint per repo — the whole
+  # job — so a check would do the work twice and hold the tick's work lock while
+  # it did. A quiet week costs one issue that closes itself out as "nothing to
+  # do", which is the cheaper of the two.
   - key: api-lint
     schedule: weekly on wednesday at 3:30am
-    check: dev scripts run api-lint-pr
-    file_when: never
-
-  # ---- chores that file for a claiming session --------------------------------
+    file_when: always
+    issue:
+      category: infrastructure
+      title: Weekly api lint cleanup across the spec-owning repos
+      fingerprint: api-lint:weekly
+      body_file: bodies/api-lint.md
 
   # The scan is cheap and its verdict is its exit code; the FIX is a session's
   # work. That split is the whole producer contract, and it replaces the openclaw
@@ -298,21 +332,39 @@ producers:
   # ISS-397. Not a check: `dev dependencies upgrade` runs for hours, and a
   # producer's check runs INLINE in the tick with no timeout — putting it there
   # would hold the work lock for a quarter of a day and starve every other
-  # producer and the claim path behind it. As claimed work it gets the 4h hard
-  # timeout as a real bound, and the pipeline's own self-gating (a repo with an
-  # open dep-upgrade PR is skipped) makes a truncated night harmless.
+  # producer and the claim path behind it.
   #
-  # Fingerprint dedup means last night's upgrade issue, if still open, suppresses
-  # tonight's. That is deliberate: upgrade runs should not stack behind a night
-  # nobody worked.
+  # AN EPIC WITH ONE CHILD PER REPO, not one issue for the night. The run is
+  # really six independent runs — six clones, six suites, six PRs — and as a
+  # single issue one wedged repo took the whole night with it and there was one
+  # lease and one 4h budget covering all of them. As children each repo gets its
+  # own lease, its own retry, its own 4h budget and its own visible outcome, and
+  # the epic is the one thing Mike verifies when they have all landed.
+  #
+  # `children.names` MUST stay equal to Dependencies::Updates::APPS — asserted by
+  # test/test_agent_cron_migration.rb, so a repo added to the pipeline without a
+  # child here fails the suite instead of silently never being upgraded.
+  #
+  # Dedup lives on the CHILDREN (`dependencies:upgrade:<repo>`, undated): a repo
+  # whose last issue is still open is not re-filed, and the other five still run.
+  # The epic's fingerprint is dated because an epic awaiting Mike's verification
+  # is non-terminal, and an undated one would stop the nightly producer until he
+  # clicked verify.
   - key: dependency-upgrade
     schedule: daily at 3:45am
     file_when: always
     issue:
+      type: epic
       category: infrastructure
       title: Nightly dependency upgrades
-      fingerprint: dependencies:upgrade
+      fingerprint: dependencies:upgrade:{date}
       body_file: bodies/dependency-upgrade.md
+      children:
+        names: [platform, acumen, lib-util, lib-query, lib-cipher, lib-ai]
+        category: infrastructure
+        title: "Dependency upgrades: {child}"
+        fingerprint: dependencies:upgrade:{child}
+        body_file: bodies/dependency-upgrade-app.md
 
   - key: daily-perf-prs
     schedule: daily at 3:03am
