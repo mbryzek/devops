@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+# assert-session-db — refuse an agent-driven sbt run that would fall back to the
+# shared :5432 dev database. Invoked by bin/run before it hands anything to sbt;
+# not a command anyone types.
+#
+# Usage:
+#   assert-session-db <app> [sbt args...]
+#
+# Exits 0 when the run may proceed, 1 with the reason (and the fix) on stderr
+# when it may not. See lib/session_db.rb for what is checked and why.
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+app = ARGV.first.to_s
+app = "<app>" if app.empty?
+
+reason = SessionDb.blocking_reason(:sbt_args => ARGV.drop(1))
+exit 0 if reason.nil?
+
+warn SessionDb.message(
+  :app => app,
+  :reason => reason,
+  :url => ENV[SessionDb::SESSION_URL]
+)
+exit 1
