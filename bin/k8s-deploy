@@ -163,6 +163,20 @@ end
 # below), so per-tier timing is detail for the log rather than its own line —
 # two stages cannot be in flight at once in the parent's phase display, and the
 # pair finishes together anyway.
+# Current pods as [{name:, image:, ready:}]. One kubectl call, parsed from a
+# delimited jsonpath so the diagnosis and the log dump agree on what "failing"
+# means instead of each running its own selector.
+def pods_for(namespace, selector)
+  jsonpath = '{range .items[*]}{.metadata.name}{"\t"}' \
+             '{.spec.containers[0].image}{"\t"}' \
+             '{.status.containerStatuses[0].ready}{"\n"}{end}'
+  raw = `kubectl get pods -n #{namespace} -l #{selector} -o jsonpath='#{jsonpath}' 2>/dev/null`
+  raw.strip.split("\n").reject(&:empty?).map do |line|
+    name, image, ready = line.split("\t")
+    {name: name, image: image, ready: ready == "true"}
+  end
+end
+
 def wait_for_rollout(label, rollout_cmd)
   started = Time.now
   if Util.quiet?
@@ -256,9 +270,35 @@ else
   system("kubectl get events -n #{K8S_NAMESPACE} --sort-by='.lastTimestamp' --field-selector involvedObject.name=#{deployment_name} 2>/dev/null | tail -10")
   puts ""
 
-  # Show pod logs for any failing pods
+  # Why the rollout did not finish. Printed before the logs: a deadlocked
+  # rollout and a broken image produce identical-looking pod logs (the SAME
+  # logs, in fact — the stuck pod is still running the old image), so the logs
+  # alone actively mislead.
+  diagnosis = []
+  {deployment_name => "deployment", statefulset_name => "statefulset"}.each do |name, kind|
+    desired = `kubectl get #{kind}/#{name} -n #{K8S_NAMESPACE} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null`.strip
+    next if desired.empty?
+    pods = pods_for(K8S_NAMESPACE, "app=#{args.app},tier=#{kind == "deployment" ? "web" : "job"}")
+    lines = RolloutDiagnosis.explain(workload: name, desired_image: desired, pods: pods)
+    diagnosis += ([""] + lines) unless lines.empty?
+  end
+
+  if !diagnosis.empty?
+    puts "Diagnosis:"
+    puts "-" * 60
+    diagnosis.each { |l| puts l }
+    puts ""
+  end
+
+  # Show pod logs for any failing pods.
+  #
+  # Selecting on phase misses the case that matters: a CrashLoopBackOff pod has
+  # phase "Running" (the pod is running, its container is not ready), so the old
+  # `phase!="Running"` filter silently found nothing and printed no logs at all
+  # on the one failure it existed to explain. Select on container readiness.
   puts "Checking for failing pods..."
-  failing_pods = `kubectl get pods -n #{K8S_NAMESPACE} -l app=#{args.app} -o jsonpath='{range .items[?(@.status.phase!="Running")]}{.metadata.name}{"\\n"}{end}' 2>/dev/null`.strip.split("\n").reject(&:empty?)
+  failing_pods = pods_for(K8S_NAMESPACE, "app=#{args.app}").reject { |p| p[:ready] }.map { |p| p[:name] }
+  puts "  (none — every pod is ready)" if failing_pods.empty?
 
   failing_pods.each do |pod|
     puts ""
