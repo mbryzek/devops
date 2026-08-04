@@ -39,6 +39,37 @@ def auto_confirm?
   %w[1 true yes].include?(ENV[AUTO_CONFIRM_ENV].to_s.downcase)
 end
 
+# Stop a hand-run release from dropping something the deployed code still uses.
+#
+# `dev deploy all` already gets this right — a contracting schema release is
+# scheduled after the apps it migrates (Phase 3), so by the time release-db runs
+# under RELEASE_DB_AUTO_CONFIRM the code has shipped and there is nothing left to
+# ask. This is the backstop for the other path: release-db invoked directly, out
+# of order, which is how production got 11 `column re.business_line_id does not
+# exist` on 2026-08-03 and 37 `relation "playbook.membership_categories" does not
+# exist` on 2026-08-04 (ISS-317).
+#
+def confirm_contracting_release!(repo_dir, tag)
+  previous = SchemaScripts.previous_tag(repo_dir, tag)
+  return if previous.nil?
+
+  contracting = SchemaScripts.contracting(repo_dir, previous, tag)
+  return if contracting.empty?
+
+  puts ""
+  puts SchemaScripts.contracting_warning(tag, contracting)
+
+  if auto_confirm?
+    # The caller (dev deploy all) has already put this release behind its apps.
+    puts "#{AUTO_CONFIRM_ENV}=1: proceeding — the caller is responsible for the ordering"
+    return
+  end
+
+  return if Ask.for_boolean("Have the apps that stopped using these objects already been deployed?")
+
+  Util.exit_with_error("Aborted: deploy the app first, then re-run release-db (or use `dev deploy all`)")
+end
+
 args = Args.parse(ARGV, ["app"])
 
 # Determine the postgresql repo directory
@@ -91,6 +122,8 @@ Dir.chdir(repo_dir) do
         Util.exit_with_error("No tag found. Please create a tag first.")
     end
     released_tag = current_tag
+
+    confirm_contracting_release!(repo_dir, current_tag)
 
     tarball = File.join(repo_dir, "dist", "#{db_name}-#{current_tag}.tar.gz")
 

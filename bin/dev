@@ -276,27 +276,37 @@ USAGE = <<~USAGE
         skipped when stdin is not a terminal (pipes, cron), so scripted
         callers just get the table.
     #{INVOCATIONS["deploy all"]}
-        Release every pending item without prompting. Four phases:
-          1. DB repos (*-postgresql) release serially via `release-db`,
-             with RELEASE_AUTO_TAG=1 and RELEASE_DB_AUTO_CONFIRM=1 —
-             alongside, in parallel, every app that does NOT depend on a
-             pending DB (acumen does not wait on platform-postgresql).
-          2. Apps that DO depend on a pending DB (foo on foo-postgresql)
-             release in parallel (concurrency defaults to 10) via
-             `release` with RELEASE_AUTO_TAG=1, once their DB is done.
-             With no DB pending, all apps release here.
-          3. Libraries (lib-*) release serially via `release`, which
+        Release every pending item without prompting. Five phases:
+          1. EXPANDING DB repos (*-postgresql) release serially via
+             `release-db`, with RELEASE_AUTO_TAG=1 and
+             RELEASE_DB_AUTO_CONFIRM=1 — alongside, in parallel, every app
+             that does NOT depend on one of them (acumen does not wait on
+             platform-postgresql, and neither does an app whose own DB is
+             contracting, since that one waits on IT).
+          2. Apps that DO depend on a pending expanding DB (foo on
+             foo-postgresql) release in parallel (concurrency defaults to
+             10) via `release` with RELEASE_AUTO_TAG=1, once their DB is
+             done. With no expanding DB pending, all apps release here.
+          3. CONTRACTING DB repos — those whose new migrations DROP or
+             RENAME a table, column, view, sequence, type or function —
+             release serially here, AFTER their apps. Dropping something
+             the live code still selects is a 500 on every request that
+             touches it for the whole length of a rollout, not a slow
+             migration (ISS-317). A contracting DB is skipped when its app
+             did not release, because the code that still uses the dropped
+             objects is then the code in production.
+          4. Libraries (lib-*) release serially via `release`, which
              dispatches a lib- checkout to `release-lib`. That stays
              interactive — it confirms the tag and GPG asks for the
              signing passphrase — so its output is not captured. Without a
              terminal (pipe, cron) pending libraries are skipped, named in
              the summary, and the command exits non-zero.
-          4. devops, alone and last, as a plain `git pull` — its update
+          5. devops, alone and last, as a plain `git pull` — its update
              rewrites the very scripts the phases above shell out to, so it
              must not run while anything else is mid-release.
-        If a DB release fails, the matching app (foo for foo-postgresql)
-        is skipped to avoid deploying an app against an unmigrated schema.
-        Skips repos not on `main` or with a dirty tree.
+        If an expanding DB release fails, the matching app (foo for
+        foo-postgresql) is skipped to avoid deploying an app against an
+        unmigrated schema. Skips repos not on `main` or with a dirty tree.
 
     #{INVOCATIONS["config check"]}
         Diff live ConfigMap in cluster against env/apps/<app>/env/production.env.
@@ -5657,9 +5667,38 @@ end
 # The dependency is the naming convention: `foo` runs against `foo-postgresql`.
 # An app with no pending DB of its own (acumen while only platform-postgresql
 # is pending) is NOT gated — it releases alongside the DB phase.
+#
+# Only an EXPANDING database gates its app. A contracting one is the reverse
+# dependency — it waits for the app — so passing `db_pending` already narrowed
+# to the expanding ones is what makes both orderings fall out of the same rule.
 def blocking_db_for(app, db_pending)
   db = "#{app}-postgresql"
   db_pending.include?(db) ? db : nil
+end
+
+# The app a DB repo migrates, by the same naming convention.
+def app_for_db(db)
+  db.sub(/-postgresql$/, "")
+end
+
+# Splits pending DB repos into [expanding, contracting].
+#
+# A release is contracting when any migration it adds DROPs or RENAMEs a schema
+# object (see SchemaScripts) — the running code still names those, so the drop
+# has to land after the app that stops naming them, not before it. Everything
+# else is expanding and keeps the DB-before-app ordering it has always had.
+#
+# The range is "the latest released tag .. origin/main", which is exactly what
+# made the repo pending in the first place. A repo we cannot read that range for
+# is treated as expanding: that is the historical behavior, and guessing
+# "contracting" would defer a migration the new code may need.
+def partition_db_releases(db_pending)
+  db_pending.partition do |name|
+    dir = deploy_item_dir(name)
+    tag_out, tag_status = Open3.capture2("sem-info", "tag", "latest", chdir: dir)
+    next true unless tag_status.success?
+    SchemaScripts.contracting(dir, tag_out.strip, "origin/main").empty?
+  end
 end
 
 # Phase banner for an app release. A single app releases serially, so the
@@ -5684,14 +5723,19 @@ end
 # else releases concurrently with it: a serial DB phase used to stall the whole
 # fleet behind one unrelated migration (acumen sat behind platform-postgresql).
 # DBs still release serially among themselves, and still before the app they
-# gate.
+# gate — unless the release is contracting, which inverts that one dependency
+# and moves the DB behind its app (see partition_db_releases).
 def run_deploys(pending, concurrency:, errors: [])
   db_pending     = pending.select { |n| db_repo?(n) }
   lib_pending    = pending.select { |n| lib_repo?(n) }
   devops_pending = pending.select { |n| devops_repo?(n) }
   app_pending    = pending - db_pending - lib_pending - devops_pending
 
-  gated_apps, free_apps = app_pending.partition { |n| blocking_db_for(n, db_pending) }
+  expanding_dbs, contracting_dbs = partition_db_releases(db_pending)
+
+  # Gating is computed against the EXPANDING databases only. An app whose own
+  # database is contracting has to go FIRST, so it belongs with the free apps.
+  gated_apps, free_apps = app_pending.partition { |n| blocking_db_for(n, expanding_dbs) }
 
   results_mutex = Mutex.new
   results = {}
@@ -5707,13 +5751,13 @@ def run_deploys(pending, concurrency:, errors: [])
   # excluded on purpose: release-lib inherits the terminal to prompt for a GPG
   # passphrase, and nothing may be redrawing over a prompt.
   DeployProgress.for.run do |progress|
-    unless db_pending.empty?
-      progress.message("Phase 1: releasing #{db_pending.length} database(s) serially: #{db_pending.join(', ')}")
+    unless expanding_dbs.empty?
+      progress.message("Phase 1: releasing #{expanding_dbs.length} database(s) serially: #{expanding_dbs.join(', ')}")
       unless free_apps.empty?
         progress.message("         in parallel with #{free_apps.length} app(s) that depend on none of them: #{free_apps.join(', ')}")
       end
       progress.message("")
-      db_thread = Thread.new { release_serial(db_pending, results, results_mutex, progress) }
+      db_thread = Thread.new { release_serial(expanding_dbs, results, results_mutex, progress) }
       release_concurrent(free_apps, concurrency, results, results_mutex, progress)
       db_thread.join
       progress.message("")
@@ -5722,9 +5766,9 @@ def run_deploys(pending, concurrency:, errors: [])
     # Skip an app whose own DB just failed: deploying an app against an
     # unmigrated schema is exactly the failure mode the DB-first ordering is
     # meant to prevent.
-    phase2_apps = db_pending.empty? ? app_pending : gated_apps
+    phase2_apps = expanding_dbs.empty? ? app_pending : gated_apps
     to_run = phase2_apps.reject do |n|
-      db = blocking_db_for(n, db_pending)
+      db = blocking_db_for(n, expanding_dbs)
       if db && !(results[db] && results[db][:ok])
         skipped[n] = "db release failed (#{db})"
         true
@@ -5741,6 +5785,35 @@ def run_deploys(pending, concurrency:, errors: [])
       progress.message("")
       release_concurrent(to_run, concurrency, results, results_mutex, progress)
     end
+
+    # Contracting databases go here, after every app has rolled out. Dropping a
+    # column or table the live code still selects is not a slow migration, it is
+    # a 500 on every request that touches it for the length of the rollout —
+    # production wore that twice in two days (ISS-317). Skipped, never forced,
+    # when the app that stops using the object did not actually ship: the old
+    # code is still serving, so the drop would break exactly what it broke then.
+    #
+    # The hold-back is keyed on the conventional app name, the same convention
+    # blocking_db_for uses. A schema repo that feeds a second deployable (the
+    # playbook-api copy of platform-postgresql) is still covered by the PHASE
+    # ordering — every app in Phase 2 has rolled out by the time this runs — and
+    # only by the failure check for its primary app.
+    contracting_to_run = contracting_dbs.reject do |db|
+      app = app_for_db(db)
+      if pending.include?(app) && !(results[app] && results[app][:ok])
+        skipped[db] = "contracting migration held back: #{app} did not release, so the code that still uses the dropped objects is live"
+        true
+      else
+        false
+      end
+    end
+
+    unless contracting_to_run.empty?
+      progress.message("Phase 3: releasing #{contracting_to_run.length} contracting database(s) serially, after their apps: #{contracting_to_run.join(', ')}")
+      progress.message("")
+      release_serial(contracting_to_run, results, results_mutex, progress)
+      progress.message("")
+    end
   end
 
   # Libraries go last and one at a time: `release-lib` owns the terminal while
@@ -5750,7 +5823,7 @@ def run_deploys(pending, concurrency:, errors: [])
   unless lib_pending.empty?
     if interactive_terminal?
       puts ""
-      puts "Phase 3: releasing #{lib_pending.length} librar#{lib_pending.length == 1 ? 'y' : 'ies'} serially (interactive): #{lib_pending.join(', ')}"
+      puts "Phase 4: releasing #{lib_pending.length} librar#{lib_pending.length == 1 ? 'y' : 'ies'} serially (interactive): #{lib_pending.join(', ')}"
       puts ""
       release_serial(lib_pending, results, results_mutex, DeployProgress::Disabled.new)
     else
@@ -5765,7 +5838,7 @@ def run_deploys(pending, concurrency:, errors: [])
   # doing it alongside a release would swap those files mid-flight.
   unless devops_pending.empty?
     puts ""
-    puts "Phase 4: updating devops (git pull)"
+    puts "Phase 5: updating devops (git pull)"
     puts ""
     release_serial(devops_pending, results, results_mutex, DeployProgress::Disabled.new)
   end
