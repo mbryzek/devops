@@ -74,8 +74,9 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
-  "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--localhost]',
+  "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
@@ -476,8 +477,18 @@ USAGE = <<~USAGE
         just those (e.g. --status open --status claimed), and/or --category to
         scope to one category. Use this to check whether work is already
         tracked before filing a new issue — unlike `issues claim`, this never
-        claims anything. Authenticates with your persisted playbook session —
+        claims anything. Pass --epic NUMBER to list just that epic's children.
+        Authenticates with your persisted playbook session —
         run `dev auth login --app playbook` once first.
+
+    #{INVOCATIONS["issues parent"]}
+        Adopt an existing issue onto an epic, or detach it. An effort is often
+        recognised as one AFTER its pieces are already in the queue (the four
+        ISS-314 CourtReserve write follow-ups were), so this is the path that
+        makes under-calling an epic cheap: one command later, rather than
+        filing a container speculatively up front. A child stops appearing in
+        the awaiting-verification queue on its own — its epic becomes the one
+        item verified once the whole effort has shipped.
 
     #{INVOCATIONS["issues show"]}
         Print one issue and its full comment history, oldest first, with the status
@@ -768,7 +779,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list claim show status snooze reconcile resume],
+  "issues"       => %w[create list parent claim show status snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -2385,9 +2396,10 @@ end
 # returns snoozed AND awake issues. A snoozed issue is still `open`, so anything
 # that offers work to do must pass false — `POST /claims` skips snoozed issues
 # server-side, and a preview that lists them offers work the claim will refuse.
-def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil)
+def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil)
   params = { "statuses" => Array(statuses) }
   params["categories"] = category if category
+  params["parent_number"] = parent_number if parent_number
   params["is_snoozed"] = is_snoozed unless is_snoozed.nil?
   params["limit"] = limit
   params["offset"] = 0
@@ -2757,6 +2769,7 @@ def issue_plan_markdown(issue:, category:, body:, intro:, comments: [], local_pa
     # #{issue_label(issue)} — #{issue['title']}
 
     #{intro}
+    #{issue_plan_epic_note(issue)}
 
     #{heading}
 
@@ -2772,6 +2785,25 @@ def issue_plan_markdown(issue:, category:, body:, intro:, comments: [], local_pa
 
     #{issue_plan_closing(category, issue['number'])}
   PLAN
+end
+
+# The banner a child issue's plan carries. A session working a child would
+# otherwise close it out the way it closes any issue -- and verifying it is the
+# one thing it must not do, because the epic is what gets verified and a child
+# verified on its own is a piece of the effort nobody ever looked at. Empty for a
+# standalone issue, which is every issue that has no parent.
+def issue_plan_epic_note(issue)
+  parent = issue["parent"]
+  return "" if parent.nil?
+
+  <<~NOTE.strip
+    \n> **Part of EPIC ISS-#{parent.fetch('number')} — #{parent.fetch('title')}.**
+    > Close this issue out normally when your fix ships (`--status fixed`), but do
+    > NOT move it to `verified`: ISS-#{parent.fetch('number')} advances to `deployed` on its own once
+    > every child has landed, and Mike verifies the epic once for the whole effort.
+    > A finding you notice that is NOT part of this epic is filed WITHOUT --parent,
+    > at `--status open`.
+  NOTE
 end
 
 # `<date>-issue-<number>-<slug>` — the file name names the issue, because the file
@@ -2887,6 +2919,8 @@ def cmd_issues_create(args)
   status = nil
   body = nil
   images = []
+  is_epic = false
+  parent = nil
   spawn_session = true
   leftover = []
   i = 0
@@ -2918,6 +2952,13 @@ def cmd_issues_create(args)
       usage_exit("--image requires a path", example: usage_for("issues create")) if path.nil?
       images << path
       i += 2
+    when "--epic"
+      is_epic = true
+      i += 1
+    when "--parent"
+      parent = rest[i + 1]
+      usage_exit("--parent requires an issue number", example: usage_for("issues create")) if parent.nil?
+      i += 2
     when "--no-spawn"
       spawn_session = false
       i += 1
@@ -2929,6 +2970,9 @@ def cmd_issues_create(args)
 
   problems = []
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  # The server refuses this too; catching it here saves a round trip and says it
+  # in the vocabulary the caller typed.
+  problems << "--epic and --parent are mutually exclusive: an epic cannot belong to another epic" if is_epic && parent
   if category && !category.empty? && !ISSUE_MANUAL_CATEGORIES.include?(category)
     problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')} " \
                 "(#{(ISSUE_CATEGORIES - ISSUE_MANUAL_CATEGORIES).join('/')} are filed automatically " \
@@ -2962,7 +3006,13 @@ def cmd_issues_create(args)
   end
   category ||= Ask.select_from_list("Category", ISSUE_MANUAL_CATEGORIES)
 
-  status = issue_create_status(status)
+  # An epic is a container: there is nothing to implement until it has been
+  # decomposed into children, so it is filed for the queue and no session is
+  # started. Both are forced rather than validated -- rejecting `--epic --status
+  # claimed` would only make the caller type the combination that was going to be
+  # substituted anyway.
+  status = is_epic ? "open" : issue_create_status(status)
+  spawn_session = false if is_epic
   # Filing something as the queue's work and then opening a session to work it
   # are contradictory instructions. The status is the one the caller stated, so
   # the session is what gives way.
@@ -2993,6 +3043,8 @@ def cmd_issues_create(args)
     # No title unless one was given: the server files a placeholder and queues a
     # summarization of the body, so nothing is lost if that model call fails.
     form = { category: category }
+    form[:type] = "epic" if is_epic
+    form[:parent_number] = parent if parent
     form[:title] = title if title && !title.empty?
     form[:body] = brief unless brief.empty?
     form[:source_url] = source_url if source_url
@@ -3107,11 +3159,86 @@ end
 # filer to close — so print how it gets picked up rather than how it gets closed.
 def issue_filed_open(issue)
   number = issue.fetch("number")
+  # An epic is never claimable, so telling its filer to claim it would be advice
+  # the server refuses. What it needs is children.
+  if issue["type"] == "epic"
+    puts "Filed #{issue_label(issue)} as an EPIC — it holds no work of its own."
+    puts ""
+    puts "Decompose it. File each separately verifiable piece as a child:"
+    puts "  dev issues create --category <cat> --status claimed --parent #{number} --title \"...\" --no-spawn"
+    puts ""
+    puts "Close each child out individually. Do NOT verify them: this epic advances to"
+    puts "deployed on its own once the last child lands, and IT is what gets verified."
+    return issue
+  end
   puts "Left #{issue_label(issue)} open — nobody is working it."
   puts ""
   puts "Pick it up later with:"
   puts "  dev issues claim --issues #{number}"
   issue
+end
+
+# Adopt an existing issue onto an epic, or detach it. The four ISS-314 follow-ups
+# were filed long before epics existed, so "file it as a child" is not the only
+# path that has to work -- an effort is often recognised as one AFTER its pieces
+# are already in the queue. Deliberately the escape hatch that makes
+# under-calling an epic cheap: one command later, rather than a container filed
+# speculatively up front.
+def cmd_issues_parent(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  number = rest.shift
+  epic = nil
+  detach = false
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--epic"
+      epic = rest[i + 1]
+      usage_exit("--epic requires an issue number", example: usage_for("issues parent")) if epic.nil?
+      i += 2
+    when "--detach"
+      detach = true
+      i += 1
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 343)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "pass exactly one of --epic NUMBER or --detach" unless (epic && !detach) || (detach && !epic)
+  report_arg_problems("issues parent", problems, usage_for("issues parent"))
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    # The update endpoint replaces every editable field, so the issue is read
+    # first and its own values are sent back unchanged alongside the new parent.
+    # Sending a partial form here would silently clear severity, body and club.
+    issue = ApiClient.request(endpoint, :get, issues_path("/#{number}"))
+    form = {
+      category: issue.fetch("category"),
+      type: issue.fetch("type"),
+      title: issue.fetch("title"),
+    }
+    form[:body] = issue["body"] if issue["body"]
+    form[:severity] = issue["severity"] if issue["severity"]
+    form[:club_id] = issue.dig("club", "id") if issue["club"]
+    form[:apps] = issue["apps"] if issue["apps"]
+    form[:parent_number] = epic unless detach
+
+    updated = ApiClient.request(endpoint, :put, issues_path("/#{number}"), body: form)
+    if detach
+      puts "Detached #{issue_label(updated)} from its epic."
+    else
+      puts "#{issue_label(updated)} is now a child of ISS-#{epic}."
+      puts "It will not appear in the awaiting-verification queue on its own — ISS-#{epic} is what gets verified."
+    end
+  end
 end
 
 # Read-only. Unlike `issues claim`, which lists open issues but also claims
@@ -3121,6 +3248,7 @@ end
 def cmd_issues_list(args)
   rest, _app, use_localhost = parse_common_flags(args)
   category = nil
+  epic = nil
   # Empty = no statuses param at all on the wire, which the server reads as "every
   # status" (see issues_list_path) — the default is everything, not just open/claimed.
   statuses = []
@@ -3137,6 +3265,10 @@ def cmd_issues_list(args)
       v = rest[i + 1]
       usage_exit("--status requires a value", example: usage_for("issues list")) if v.nil?
       statuses << v
+      i += 2
+    when "--epic"
+      epic = rest[i + 1]
+      usage_exit("--epic requires an issue number", example: usage_for("issues list")) if epic.nil?
       i += 2
     else
       leftover << a
@@ -3159,7 +3291,9 @@ def cmd_issues_list(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
-    issues = ApiClient.request(endpoint, :get, issues_list_path(statuses: statuses, category: category)) || []
+    issues = ApiClient.request(
+      endpoint, :get, issues_list_path(statuses: statuses, category: category, parent_number: epic)
+    ) || []
     if issues.empty?
       puts "No issues found."
     else
@@ -3189,6 +3323,34 @@ def cmd_issues_show(args)
     endpoint = issue_endpoint(use_localhost)
     issue = issue_fetch(endpoint, number)
     puts issue_render_item(issue, comments: issue_fetch_comments(endpoint, number))
+    puts issue_family_section(endpoint, issue)
+  end
+end
+
+# The epic/child context an issue's own record does not carry: an epic's children
+# with their statuses, or a child's link back up. Printed after the timeline
+# because it is orientation, not history -- but printed at all because "which
+# other issues am I part of?" is the first thing an epic makes you ask, and
+# without it the answer is a trip to playbook-admin.
+def issue_family_section(endpoint, issue)
+  number = issue.fetch("number")
+  if issue["type"] == "epic"
+    children = ApiClient.request(
+      endpoint, :get, issues_list_path(statuses: [], parent_number: number, limit: 100)
+    ) || []
+    return "\nEPIC with no children yet. Decompose it:\n" \
+           "  dev issues create --category <cat> --status claimed --parent #{number} --title \"...\" --no-spawn\n" if children.empty?
+
+    done = children.count { |c| %w[deployed verified dismissed].include?(c["status"]) }
+    lines = children.map { |c| issue_summary_line(c, children.index(c) + 1) }
+    "\nEPIC — #{done} of #{children.length} children done:\n#{lines.join("\n")}\n" \
+      "\nThis epic advances to deployed on its own once every child is done; verifying it closes them all out.\n"
+  elsif issue["parent"]
+    parent = issue.fetch("parent")
+    "\nChild of EPIC ISS-#{parent.fetch('number')} — #{parent.fetch('title')} (#{parent.fetch('status')}).\n" \
+      "Close this issue out normally, but do NOT verify it: its epic is what gets verified.\n"
+  else
+    ""
   end
 end
 
@@ -9019,6 +9181,7 @@ when "issues"
   case sub
   when "create"    then cmd_issues_create(argv)
   when "list"      then cmd_issues_list(argv)
+  when "parent"    then cmd_issues_parent(argv)
   when "show"      then cmd_issues_show(argv)
   when "resume"    then cmd_issues_resume(argv)
   when "claim"     then cmd_issues_claim(argv)
