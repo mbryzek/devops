@@ -4952,7 +4952,6 @@ def parse_codegen_sync_args(argv)
   opts
 end
 
-CODEGEN_DEVOPS_REPO = "mbryzek/devops".freeze
 # Every sweep uses a fresh, unique branch (`<prefix>-<run_id>`) so a leftover
 # branch from a prior run never blocks or gets clobbered. The gate against
 # duplicate work is an OPEN PR (see open_codegen_pr), not branch existence.
@@ -4969,25 +4968,6 @@ CODEGEN_CLAUDE_MODEL = "haiku".freeze
 
 def github_origin(repo_slug)
   "git@github.com:#{repo_slug}.git"
-end
-
-# Every repo's `.api/config.pkl` does `amends "../../devops/..."`, resolved
-# relative to the file's own path two directories up. That's the shape of a
-# normal checkout (`~/code/<repo>/.api/config.pkl`, with `devops` a sibling of
-# `<repo>` under `~/code`). A scratch clone at `<workdir>/<repo>/.api/config.pkl`
-# needs the same shape one level in: `devops` cloned as a sibling of every repo
-# clone, i.e. at `<workdir>/devops` — NOT the real `~/code/devops` (verified via
-# `pkl eval`: the amends is a plain relative-path resolution against the config
-# file's own location, so a workdir nested under `~/code` does not reach the
-# real `~/code/devops`). Cloned fresh from GitHub main every run — including a
-# same-date rerun that reuses `workdir` — so the sweep never drives codegen off
-# a stale sibling left over from a prior run; `clone_repo` wipes any existing
-# dir before cloning.
-def ensure_codegen_devops(workdir)
-  captured = +""
-  clone_path = clone_repo(github_origin(CODEGEN_DEVOPS_REPO), "devops", workdir, false, captured)
-  Util.exit_with_error("codegen sync: failed to clone devops into #{workdir}:\n#{captured}") unless clone_path
-  clone_path
 end
 
 # `Codegen::ApiConfig.load` runs `pkl eval` under the hood (via the top-level
@@ -5352,8 +5332,10 @@ def cmd_codegen_sync(argv)
   workdir = File.join(CODE_ROOT, "#{CODEGEN_WORKDIR_PREFIX}.#{run_id}")
   # Before cloning ~2-3 GB of fresh checkouts, reclaim every prior sweep's.
   purge_scratch_workdirs(CODEGEN_WORKDIR_PREFIX, keep: workdir)
+  # No `devops` clone is needed alongside the repo clones: every `.api/config.pkl`
+  # amends `modulepath:/api/ApiConfig.pkl`, which `api` resolves from its own
+  # checkout (see ApiConfig::BASE_MODULE_URI), not from a sibling directory.
   FileUtils.mkdir_p(workdir)
-  ensure_codegen_devops(workdir)
 
   eligible = registry.apps.reject(&:ignored).select { |a| CODEGEN_STACKS.include?(a.stack) }
   target = resolve_codegen_target(opts[:app], eligible)

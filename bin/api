@@ -232,11 +232,11 @@ def write_local_config(org_key, languages)
     Util.exit_with_error("Unknown language for init: #{language}")
   end
 
-  devops_path = File.expand_path(File.join(File.dirname(__FILE__), "..", "api", "ApiConfig.pkl"))
-  relative_path = Pathname.new(devops_path).relative_path_from(Pathname.new(local_config_dir)).to_s
-
+  # Location-independent: the CLI resolves this URI against its own devops checkout
+  # (see ApiConfig::BASE_MODULE_URI), so the config works from ~/code/<repo> and from
+  # a ~/code/ai/<feature>/ workspace alike, with no devops sibling.
   content = <<~PKL
-    amends "#{relative_path}"
+    amends "#{ApiConfig::BASE_MODULE_URI}"
 
     org = "#{org_key}"
 

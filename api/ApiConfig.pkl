@@ -1,5 +1,15 @@
 /// Shared API Builder config DSL.
-/// Consumers amend this module from `<repo>/.api/config.pkl`.
+/// Consumers amend this module from `<repo>/.api/config.pkl` as:
+///
+///     amends "modulepath:/api/ApiConfig.pkl"
+///
+/// The `modulepath:` scheme is resolved by the `api` CLI, which passes
+/// `--module-path <its own devops checkout>` to every `pkl eval` (see
+/// `devops/lib/api_config.rb`). So a repo config never depends on where it is
+/// checked out or on `devops` sitting next to it — which it does not in any
+/// `~/code/ai/<feature>/` workspace. Evaluating a config by hand needs the same
+/// flag: `pkl eval -f json --module-path ~/code/devops .api/config.pkl`.
+///
 /// The evaluated output matches the flat block structure the Ruby `api` CLI
 /// reads from the legacy YAML format.
 ///
