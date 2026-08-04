@@ -175,6 +175,55 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ISS-364 #2. The killer is the only thing that knows a kill happened: it
+  # destroys the exit_code file the reap would otherwise read. So it writes what
+  # it did onto the job record, BEFORE signalling, and the reap reads it back.
+  def test_a_timeout_kill_is_recorded_on_the_job_record
+    with_agent_home do
+      register_identity
+      pid = Process.spawn("sleep", "60", pgroup: true)
+      Process.detach(pid)
+      Agent::Jobs.write("issue" => 120, "pid" => pid, "slug" => "i120_abc", "branch" => "i120_abc",
+                        "lease_id" => "lease-1", "started_at" => (Time.now - 5 * 3600).utc.iso8601,
+                        "timeout_at" => (Time.now - 3600).utc.iso8601)
+      with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).enforce_timeouts } }
+      assert_equal "timeout", Agent::Jobs.find(120).dig("killed", "reason")
+    ensure
+      Process.kill("KILL", pid) rescue nil
+    end
+  end
+
+  # A 409 on the lease heartbeat means the lease expired or was reassigned, so
+  # this process must die rather than race another machine. It was then reaped as
+  # "session completed with nothing to do" — the reap reporting a completion for
+  # a session the tick had killed five seconds earlier.
+  def test_a_lost_lease_kill_is_recorded_and_classifies_as_a_kill
+    with_agent_home do
+      register_identity
+      pid = Process.spawn("sleep", "60", pgroup: true)
+      Process.detach(pid)
+      record = Agent::Jobs.write("issue" => 121, "pid" => pid, "slug" => "i121_abc", "branch" => "i121_abc",
+                                 "lease_id" => "lease-9", "started_at" => Time.now.utc.iso8601,
+                                 "timeout_at" => (Time.now + 3600).utc.iso8601)
+      gone = { "POST /playbook/issue/leases/lease-9/heartbeat" => ->(_body) { raise ApiError.new("HTTP 409", code: 409) } }
+      out = with_stubbed_api(fleet_responses.merge(gone)) do
+        capture_stdout { tick(dry_run: false).heartbeat_leases(Agent::Host.cached_identity) }
+      end
+      assert_match(/lease_lost/, out)
+      assert_equal "lease_lost", Agent::Jobs.find(121).dig("killed", "reason")
+
+      # ...and that record is what stops the reap from calling it a completion.
+      result = Agent::Outcome.classify(pr: nil, plans_committed: false, exit_code: nil, producer_filed: false,
+                                       killed: Agent::Jobs.find(121)["killed"])
+      assert_equal "open", result.status, "a killed attempt returns to the queue, it does not park for a human"
+      assert_match(/KILLED by the tick/, result.reason)
+      refute_match(/completed/, result.reason)
+      assert_equal record["issue"], 121
+    ensure
+      Process.kill("KILL", pid) rescue nil
+    end
+  end
+
   def test_timed_out_job_is_only_reported_in_a_dry_run
     with_agent_home do
       register_identity

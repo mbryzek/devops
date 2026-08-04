@@ -11,15 +11,44 @@ load File.expand_path('../bin/dev', __dir__)
 class TestDevAgentOutcome < Minitest::Test
   include DevTestSupport
 
-  READY_PR = { "url" => "https://github.com/mbryzek/platform/pull/9", "isDraft" => false }.freeze
-  DRAFT_PR = { "url" => "https://github.com/mbryzek/platform/pull/9", "isDraft" => true }.freeze
+  URL = "https://github.com/mbryzek/platform/pull/9".freeze
+  READY_PR = { "url" => URL, "isDraft" => false, "state" => "OPEN", "number" => 9 }.freeze
+  DRAFT_PR = { "url" => URL, "isDraft" => true, "state" => "OPEN", "number" => 9 }.freeze
+  MERGED_PR = { "url" => URL, "isDraft" => false, "state" => "MERGED", "number" => 9 }.freeze
+  CLOSED_PR = { "url" => URL, "isDraft" => false, "state" => "CLOSED", "number" => 9 }.freeze
 
   def classify(**overrides)
-    Agent::Outcome.classify(**{ pr: nil, plans_committed: false, exit_code: 0,
-                                producer_filed: false, attempt: 1, timed_out: false }.merge(overrides))
+    Agent::Outcome.classify(**{ pr: nil, plans_committed: false, exit_code: 0, producer_filed: false,
+                                attempt: 1, timed_out: false, killed: nil }.merge(overrides))
   end
 
   # ---- outcome classification ----
+
+  # ISS-364 #1. A PR merged before the reap ran was invisible to a lookup that
+  # asked only for OPEN PRs, so the strongest possible evidence of success --
+  # the fix is on main -- was the one case that classified as failure, and a
+  # producer-filed issue got DISMISSED with its fix merged.
+  def test_merged_pr_is_fixed_and_outranks_every_other_signal
+    result = classify(pr: MERGED_PR)
+    assert_equal "merged_pr", result.name
+    assert_equal "fixed", result.status
+    assert_equal URL, result.url
+    assert_equal "succeeded", result.lease_outcome
+
+    assert_equal "merged_pr", classify(pr: MERGED_PR, exit_code: 2).name
+    assert_equal "merged_pr", classify(pr: MERGED_PR, exit_code: nil, timed_out: true).name
+    assert_equal "merged_pr", classify(pr: MERGED_PR, plans_committed: true).name
+    assert_equal "merged_pr", classify(pr: MERGED_PR, killed: { "reason" => "lease_lost" }).name
+    assert Agent::Outcome.success?(classify(pr: MERGED_PR)), "a merged PR must release the workspace"
+  end
+
+  # A closed-unmerged PR is a rejected attempt, not a delivery. It must not read
+  # as success, and it must not read as a draft left open either.
+  def test_closed_unmerged_pr_is_not_a_result
+    result = classify(pr: CLOSED_PR, producer_filed: true)
+    assert_equal "nothing_to_do", result.name
+    refute_match(/never marked ready/, result.reason)
+  end
 
   def test_ready_pr_is_fixed_and_carries_the_url
     result = classify(pr: READY_PR)
@@ -75,6 +104,72 @@ class TestDevAgentOutcome < Minitest::Test
     result = classify(exit_code: nil, timed_out: true, producer_filed: true)
     assert_equal "failed", result.name
     assert_equal "open", result.status
+  end
+
+  # ISS-364, the part `timed_out` was hiding: `nil.to_i` is 0, so an absent
+  # exit_code file on its own read as a CLEAN exit. The wrapper writes that file
+  # as its last act, so its absence means the process died without finishing.
+  def test_absent_exit_code_alone_is_a_failure_even_with_no_timeout
+    result = classify(exit_code: nil, producer_filed: true)
+    assert_equal "failed", result.name
+    assert_equal "open", result.status
+    assert_match(/no exit code/, result.reason)
+  end
+
+  # ISS-364 #2. The tick killed the session five seconds before the reap and then
+  # reported that it "completed without opening a PR", parking a human-filed
+  # issue at needs_input. Nothing needs a human — it needs re-running.
+  def test_a_killed_session_is_reported_as_killed_and_returns_to_the_queue
+    result = classify(killed: { "reason" => "lease_lost" }, exit_code: nil)
+    assert_equal "failed", result.name
+    assert_equal "open", result.status
+    assert_match(/KILLED by the tick/, result.reason)
+    assert_match(/lease/, result.reason)
+    refute_match(/completed/, result.reason)
+  end
+
+  # The kill outranks the exit code and the draft-PR message, both of which
+  # describe a session that chose to stop. It never outranks delivered work.
+  def test_kill_beats_the_artifacts_the_kill_prevented
+    assert_match(/KILLED/, classify(killed: { "reason" => "timeout" }, exit_code: 0).reason)
+    assert_match(/KILLED/, classify(killed: { "reason" => "lease_lost" }, pr: DRAFT_PR).reason)
+    assert_equal URL, classify(killed: { "reason" => "lease_lost" }, pr: DRAFT_PR).url
+    assert_equal "design_document", classify(killed: { "reason" => "lease_lost" }, plans_committed: true).name
+  end
+
+  def test_an_unrecognized_kill_reason_still_reports_a_kill
+    assert_match(/KILLED by the tick \(sigsegv\)/, classify(killed: { "reason" => "sigsegv" }).reason)
+    assert_match(/reason not recorded/, classify(killed: {}).reason)
+  end
+
+  # A human-filed issue that was killed must never land on needs_input while
+  # attempts remain: `needs_input` means "a human must decide something".
+  def test_a_killed_human_filed_issue_is_not_parked_for_a_human
+    assert_equal "open", classify(killed: { "reason" => "lease_lost" }, producer_filed: false).status
+    gave_up = classify(killed: { "reason" => "lease_lost" }, attempt: Agent::Outcome::MAX_ATTEMPTS)
+    assert_equal "gave_up", gave_up.name
+  end
+
+  # ---- PR state predicates and ranking (ISS-364 / ISS-365) ----
+
+  def test_pr_state_predicates_are_case_insensitive
+    # `gh pr list` returns MERGED; `gh search prs` returns merged.
+    assert Agent::Github.merged?("state" => "merged")
+    assert Agent::Github.merged?("state" => "MERGED")
+    refute Agent::Github.merged?(nil)
+    assert Agent::Github.ready?(READY_PR)
+    refute Agent::Github.ready?(DRAFT_PR)
+    refute Agent::Github.ready?(MERGED_PR), "a merged PR is not an open ready PR"
+    assert Agent::Github.draft?(DRAFT_PR)
+    refute Agent::Github.draft?(CLOSED_PR)
+  end
+
+  def test_best_pr_prefers_merged_then_open_then_closed
+    assert_equal "MERGED", Agent::Github.best_pr([CLOSED_PR, MERGED_PR, READY_PR])["state"]
+    assert_equal "OPEN", Agent::Github.best_pr([CLOSED_PR, READY_PR])["state"]
+    assert_nil Agent::Github.best_pr([])
+    newer = READY_PR.merge("number" => 10)
+    assert_equal 10, Agent::Github.best_pr([READY_PR, newer])["number"]
   end
 
   def test_success_predicate_drives_workspace_cleanup

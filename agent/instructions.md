@@ -43,9 +43,10 @@ nobody learns anything from it.
    `playbook-app`, `playbook-www`, `workers`).
 
 **The PR title MUST start with `ISS-<n>: `.** That prefix is load-bearing, not
-decorative: the merge webhook and `dev issues reconcile` both find your PR by it,
-and they are two of the three independent paths that close this issue. Without
-it, a merged fix leaves the issue invisible forever.
+decorative: the executor's own reap, the merge webhook, and
+`dev issues reconcile` all find your PR by it, and they are the independent paths
+that close this issue. Without it, a merged fix leaves the issue invisible
+forever.
 
 Nothing merges automatically. The worst case of any run here is a PR nobody
 merges, and that is the safety design working, not a failure.
@@ -110,13 +111,29 @@ action never happens, and no artifact substitutes for not doing it.
 Your assignment block names your workspace directory and your branch. Both were
 assigned by the executor; do not rename either.
 
+> **This OVERRIDES CLAUDE.md's branch-naming rule, and it is not a style
+> preference.** CLAUDE.md tells you to name your feature dir and branch after the
+> feature — "`cr-backfill-coord` not `cr-backfill-coordinator`". That rule is for
+> interactive sessions, where a human picks the name. **It does not apply to
+> you.** Your branch name is `i<issue>_<suffix>` and it was chosen before you
+> started, because the executor RECORDED it on your lease and classifies your
+> outcome by looking it up. A descriptive branch name is not a nicer version of
+> the assigned one; it is a branch the executor cannot find. That has already
+> happened once (ISS-365): the session did the work, opened a good PR, and the
+> issue was classified as if the session had done nothing. The ≤19-char ceiling
+> CLAUDE.md gives you is already satisfied — you have nothing to shorten, rename,
+> or improve.
+>
+> The one thing you may not do is rename. Everything else about the branch —
+> what you commit to it, how you rebase it — is ordinary work.
+
 - Clone every repo you need **into your workspace**:
   `gh repo clone mbryzek/<repo> <workspace>/<repo>`.
-- Use the **same branch name in every repo** you touch, branched off the latest
-  `origin/main` (`git fetch origin` first — never off another feature branch, and
-  never a stacked PR; these repos squash-merge).
+- Use **the assigned branch name, verbatim, in every repo** you touch, branched
+  off the latest `origin/main` (`git fetch origin` first — never off another
+  feature branch, and never a stacked PR; these repos squash-merge).
 - Feature dir and branch are already ≤19 chars because sbt's unix-socket paths
-  cap at 104 bytes. Do not lengthen them.
+  cap at 104 bytes. Do not lengthen them and do not shorten them.
 - **Database:** every Scala test run needs an isolated session DB.
   `claude-db start --app platform --port "$(claude-db next-port)"` prints a final
   `CONF_DB_DEV_URL=jdbc:...` line. Export it **in the same shell call as sbt** —

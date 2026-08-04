@@ -44,8 +44,18 @@ module Agent
       lines << "- Issue: ISS-#{issue['number']} — #{issue['title']}"
       lines << "- Category: #{issue['category']}   Severity: #{issue['severity'] || 'unset'}"
       lines << "- Workspace (your ONLY writable working directory): #{workspace}"
-      lines << "- Branch to use in every repo you touch: `#{slug}`"
+      lines << "- Branch to use in every repo you touch: `#{slug}` — **verbatim**"
       lines << "- PR title MUST start with `ISS-#{issue['number']}: `"
+      lines << ""
+      # Restated here, next to the name itself, because CLAUDE.md independently
+      # tells every session to name its branch after the feature and a session
+      # reading both was choosing between two rules — which is exactly how
+      # ISS-354 opened its PR on `exp-rpt-notif-inv` and classified as if it had
+      # done nothing (ISS-365).
+      lines << "**Do not rename the branch.** CLAUDE.md tells interactive sessions to name a branch"
+      lines << "after the feature; that rule does not apply to you. `#{slug}` is recorded on your lease"
+      lines << "and the executor classifies your outcome by looking it up — a descriptively-named"
+      lines << "branch is one the executor cannot find, and good work on it reads as no work at all."
       lines << ""
       if resume_repo
         lines << "**This is a RESUME, not a fresh attempt.** `#{resume_repo}` is already cloned in your"
