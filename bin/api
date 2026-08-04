@@ -7,13 +7,15 @@
 #   api --profile localhost         # same, with profile
 #   api publish                     # upload + codegen, from a clean merged main checkout only
 #
-# Dev runs are HERMETIC: local spec files (plus sibling repos' specs when running
-# under a ~/code/ai/<feature>/ working dir) ride along with the codegen batch as
-# payloads; the server validates and generates from exactly that set and nothing
-# is written to the registry. The registry's `latest` only moves via `api publish`,
-# which is guarded to a clean main checkout whose HEAD is merged into origin/main —
-# so `latest` always means "code that is merged on main" and concurrent sessions
-# cannot clobber each other.
+# Dev runs are HERMETIC: the spec for every application rides along with the codegen
+# batch as a payload, and the server validates and generates from exactly that set;
+# nothing is written to the registry. Specs are resolved, in order, from this repo's
+# working tree, sibling clones in the same ~/code/ai/<feature>/ dir, the producer
+# checkouts under ~/code at origin/main (read through `git show`, never their working
+# trees), and finally the registry. Every run prints which source each application
+# came from. The registry's `latest` only moves via `api publish`, which is guarded to
+# a clean main checkout whose HEAD is merged into origin/main — so `latest` always
+# means "code that is released" and concurrent sessions cannot clobber each other.
 
 load File.join(File.dirname(__FILE__), '../lib/common.rb')
 
@@ -28,10 +30,12 @@ USAGE = <<~TEXT
          api [--profile PROFILE] result [--dry-run]
 
   Commands:
-    (none)            Hermetic codegen: local spec files (and sibling repos' specs when
-                      running under ~/code/ai/<feature>/) are sent with the batch as
-                      payloads; the server validates the whole set together and
-                      generates from exactly those specs. Nothing is published.
+    (none)            Hermetic codegen: every application's spec is sent with the batch
+                      as a payload and the server generates from exactly that set —
+                      nothing is published. Specs resolve from this repo, then sibling
+                      clones under ~/code/ai/<feature>/, then the producer checkouts
+                      (~/code/platform, ~/code/acumen, ~/code/lib-ai) at origin/main,
+                      then the registry. The chosen source is printed per application.
     publish           Upload specs to the registry AND generate code. Guarded: requires
                       a clean checkout of main matching origin/main. This is the ONLY
                       way the registry's `latest` moves — run after a merge (or let CI).
@@ -80,7 +84,11 @@ TEXT
 def read_project_from_build_sbt(project_root = Dir.pwd)
   path = File.join(project_root, "build.sbt")
   return nil unless File.exist?(path)
-  IO.foreach(path) do |line|
+  parse_project_name(IO.read(path))
+end
+
+def parse_project_name(build_sbt_contents)
+  build_sbt_contents.each_line do |line|
     if line =~ /^name\s*:=\s*"([^"]+)"/
       name = $1.strip
       return name if !name.empty?
@@ -275,10 +283,9 @@ end
 # Collects every (org, app_key) pair from blocks that bind `play_controller`.
 # Only those specs participate in ApiResult derivation — third-party clients
 # (clientOnly), model-only specs, and DAO spec_glob blocks are excluded.
-# Hermetic: each ref carries its working-tree spec as `original` when the file
-# exists here (or in a sibling repo), so ApiResult derivation sees the same specs
-# the codegen batch does — not the registry's copy.
-def collect_result_applications(config, project_root, sibling_specs)
+# Hermetic: each ref carries its resolved spec as `original`, so ApiResult
+# derivation sees the same specs the codegen batch does — not the registry's copy.
+def collect_result_applications(config, sources)
   apps = []
   seen = {}
   config.blocks.each do |block|
@@ -288,10 +295,7 @@ def collect_result_applications(config, project_root, sibling_specs)
       next if seen[key]
       seen[key] = true
       entry = { "organization_key" => block.org, "application_key" => app.key }
-      file_path = File.join(project_root, app.file_path)
-      if File.exist?(file_path)
-        entry["original"] = read_payload({ path: file_path, root: project_root })
-      elsif source = sibling_specs[key]
+      if source = sources[key]
         entry["original"] = read_payload(source)
       end
       apps << entry
@@ -384,8 +388,8 @@ def run_result(profile, dry_run)
   Util.exit_with_error("Config file not found: #{config_path}") unless File.exist?(config_path)
   config = ApiConfig.new(config_path)
 
-  sibling_specs = sibling_spec_paths(Dir.pwd)
-  applications = collect_result_applications(config, Dir.pwd, sibling_specs)
+  sources = build_spec_sources(config, Dir.pwd)
+  applications = collect_result_applications(config, sources)
   if applications.empty?
     Util.exit_with_error("No applications in #{config_path} bind the play_controller generator")
   end
@@ -394,8 +398,8 @@ def run_result(profile, dry_run)
 
   # Imports of the payload specs that this session may also have edited ride along as
   # context: they participate in import resolution but are not passed to the generator.
-  available = sibling_specs.merge(local_spec_paths(config, Dir.pwd))
-  context = payload_context_entries(applications, available)
+  context = payload_context_entries(applications, sources)
+  sources.announce
 
   body = { "applications" => applications }
   body["context"] = context if context.any?
@@ -650,19 +654,77 @@ end
 
 # --- Hermetic payload gathering ---
 #
-# Dev codegen is hermetic: every spec the session has locally rides along with the
+# Dev codegen is hermetic: every spec the session can reach rides along with the
 # batch as an `original` payload, and the server validates + generates from exactly
-# that set (imports resolve payload-first, registry fallback). Three payload sources,
+# that set (imports resolve payload-first, registry fallback). Four payload sources,
 # in precedence order:
 #   1. this repo's own spec files (from .api/config.pkl)
 #   2. sibling repos in the same ~/code/ai/<feature>/ working dir (their .api configs)
-#   3. the registry — which, since only `api publish` writes it, means "merged main"
+#   3. the producer checkouts under ~/code at origin/main, read through `git show`
+#      (see lib/api_producers.rb) — i.e. MERGED main, for producers this session
+#      has no clone of. This is what makes a bare `api` in a consumer checkout
+#      correct instead of silently backwards.
+#   4. the registry — RELEASED code, one or more deploys behind merged main.
+#
+# Which source each application came from is recorded and printed (SpecSources
+# below): the failure this whole chain exists to prevent is not resolving from
+# the wrong source, it is resolving from the wrong source *silently*.
 
 IMPORT_URI_RE = %r{/([^/]+)/([^/]+)/[^/]+/service\.json\z}
 
 def parse_import_key(uri)
   md = uri.to_s.match(IMPORT_URI_RE)
   md ? [md[1], md[2]] : nil
+end
+
+# The resolution chain, and the record of what it decided. Every lookup goes
+# through here so that nothing can resolve a spec without its source being
+# announced — including the transitive import context, where a registry
+# fallback is just as consequential and even easier to miss.
+class SpecSources
+  REGISTRY_LABEL = "registry (RELEASED — behind merged main)".freeze
+
+  attr_reader :resolutions
+
+  def initialize(local:, siblings:, producers:)
+    @tiers = [local, siblings, producers]
+    @resolutions = {}
+  end
+
+  def [](key)
+    source = @tiers.filter_map { |tier| tier[key] }.first
+    @resolutions[key] = source ? source[:label] : REGISTRY_LABEL
+    source
+  end
+
+  def announce
+    return if @resolutions.empty?
+    puts "==> Spec sources:"
+    grouped = @resolutions.group_by { |_key, label| label }
+    # Registry last: it is the one worth reading, so it should sit next to
+    # whatever the command prints afterward.
+    grouped.sort_by { |label, _| [label == REGISTRY_LABEL ? 1 : 0, label] }.each do |label, pairs|
+      apps = pairs.map { |(_org, app_key), _| app_key }.sort
+      puts "      #{label} — #{apps.size}"
+      wrap_names(apps).each { |line| puts "        #{line}" }
+    end
+  end
+
+  private
+
+  def wrap_names(names, width: 92)
+    lines = [+""]
+    names.each do |name|
+      if lines.last.empty?
+        lines.last << name
+      elsif lines.last.length + 2 + name.length <= width
+        lines.last << ", " << name
+      else
+        lines << (+"").concat(name)
+      end
+    end
+    lines
+  end
 end
 
 # Scans sibling repos in the same ~/code/ai/<feature>/ dir for spec files. Returns
@@ -679,12 +741,13 @@ def sibling_spec_paths(project_root)
   Dir.glob(File.join(feature_dir, "*", ".api", "config.pkl")).sort.each do |cfg_path|
     repo_dir = File.dirname(File.dirname(cfg_path))
     next if File.realpath(repo_dir) == root
+    label = "sibling clone #{File.basename(repo_dir)} (working tree)"
     begin
       config = ApiConfig.new(cfg_path, base_dir: repo_dir)
       config.blocks.each do |block|
         block.applications.each do |app|
           fp = File.join(repo_dir, app.file_path)
-          paths[[block.org, app.key]] ||= { path: fp, root: repo_dir } if File.exist?(fp)
+          paths[[block.org, app.key]] ||= { path: fp, root: repo_dir, label: label } if File.exist?(fp)
         end
       end
     rescue SystemExit, StandardError => e
@@ -694,33 +757,71 @@ def sibling_spec_paths(project_root)
   paths
 end
 
+# The repo names this session already holds as a working tree: this repo plus any
+# sibling clones. Those producers are dropped from the ~/code fallback so a repo
+# is never resolved half from its own branch and half from origin/main.
+def local_repo_names(project_root, sibling_specs)
+  names = [File.basename(File.realpath(project_root))]
+  names += sibling_specs.values.map { |s| File.basename(s[:root]) }
+  names.uniq
+end
+
 def read_payload(source)
-  original = JSON.parse(IO.read(source[:path]))
+  original = JSON.parse(spec_contents(source))
   # Prefer the producing repo's build.sbt for the project attribute; fall back to the
   # invoking repo's (the pre-hermetic behavior for nested roots without their own).
-  project = read_project_from_build_sbt(source[:root]) || read_project_from_build_sbt
+  project = source_project_name(source) || read_project_from_build_sbt
   inject_project_attribute!(original, project)
   original
+end
+
+def spec_contents(source)
+  if source[:git]
+    ApiProducers.show(source[:dir], source[:ref], source[:path]) ||
+      Util.exit_with_error("#{source[:path]} vanished from #{source[:dir]} at #{source[:ref]}")
+  else
+    IO.read(source[:path])
+  end
+end
+
+def source_project_name(source)
+  if source[:git]
+    content = ApiProducers.show(source[:dir], source[:ref], "build.sbt")
+    content && parse_project_name(content)
+  else
+    read_project_from_build_sbt(source[:root])
+  end
 end
 
 # Payload sources for THIS repo's own specs (all apps in the config, ignoring
 # --app/--group filters: a filtered-out app can still be needed as import context).
 def local_spec_paths(config, project_root)
+  label = "working tree (#{project_root == Dir.pwd ? '.' : project_root})"
   paths = {}
   config.blocks.each do |block|
     block.applications.each do |app|
       fp = File.join(project_root, app.file_path)
-      paths[[block.org, app.key]] ||= { path: fp, root: project_root } if File.exist?(fp)
+      paths[[block.org, app.key]] ||= { path: fp, root: project_root, label: label } if File.exist?(fp)
     end
   end
   paths
 end
 
+# The full resolution chain for one codegen root.
+def build_spec_sources(config, project_root)
+  siblings = sibling_spec_paths(project_root)
+  SpecSources.new(
+    local: local_spec_paths(config, project_root),
+    siblings: siblings,
+    producers: ApiProducers.new(exclude: local_repo_names(project_root, siblings)),
+  )
+end
+
 # Closes the payload set under imports: for every import of every payload already in
-# `applications`, if the imported spec is available locally or in a sibling and not
-# already present, returns a payload-only entry (original, no generators) so the
-# server can resolve the import from the session's working tree instead of the
-# registry. Transitive. Specs with no local payload fall back to the registry (main).
+# `applications`, if the imported spec is reachable through the resolution chain and
+# not already present, returns a payload-only entry (original, no generators) so the
+# server resolves the import from that source instead of the registry. Transitive.
+# Specs no source can produce fall back to the registry (released).
 def payload_context_entries(applications, available)
   present = {}
   applications.each { |a| present[[a["organization_key"], a["application_key"]]] = true }
@@ -744,7 +845,7 @@ end
 
 # --- Batch Operations ---
 
-def build_batch_form(config, org, operations, app_filter, group_filter, project_root, sibling_specs)
+def build_batch_form(config, org, operations, app_filter, group_filter, project_root, sources)
   blocks = config.blocks_for_org(org)
   blocks = blocks.select { |b| b.group == group_filter } if group_filter
 
@@ -779,13 +880,10 @@ def build_batch_form(config, org, operations, app_filter, group_filter, project_
       inject_project_attribute!(original, read_project_from_build_sbt)
       entry["original"] = original
     else
-      # Hermetic codegen: attach the working-tree spec when we have it (this repo
-      # first, then siblings). Absent both, the app resolves from the registry —
-      # merged main — which is the right baseline for specs this session left alone.
-      file_path = File.join(project_root, data[:file_path])
-      if File.exist?(file_path)
-        entry["original"] = read_payload({ path: file_path, root: project_root })
-      elsif source = sibling_specs[[org, app_key]]
+      # Hermetic codegen: attach the best spec the chain can reach — this repo,
+      # then siblings, then the producer checkouts at origin/main. Absent all
+      # three the app resolves from the registry (released), which is announced.
+      if source = sources[[org, app_key]]
         entry["original"] = read_payload(source)
       end
     end
@@ -798,8 +896,7 @@ def build_batch_form(config, org, operations, app_filter, group_filter, project_
   end
 
   if !operations.include?("upload")
-    available = sibling_specs.merge(local_spec_paths(config, project_root))
-    applications += payload_context_entries(applications, available)
+    applications += payload_context_entries(applications, sources)
   end
 
   {
@@ -926,17 +1023,19 @@ def run_batch(profile, operations, app_filter, group_filter)
 
   validate_filters(roots.map { |config, _| config }, app_filter, group_filter)
 
-  sibling_specs = operations.include?("upload") ? {} : sibling_spec_paths(Dir.pwd)
   roots.each do |config, project_root|
-    run_batch_for_config(profile, operations.dup, app_filter, group_filter, config, project_root, sibling_specs)
+    run_batch_for_config(profile, operations.dup, app_filter, group_filter, config, project_root)
   end
 end
 
-def run_batch_for_config(profile, operations, app_filter, group_filter, config, project_root, sibling_specs)
+def run_batch_for_config(profile, operations, app_filter, group_filter, config, project_root)
   if operations.empty?
     operations = ["codegen"]
     puts "==> Hermetic codegen (working-tree specs ride along; nothing is published)"
   end
+
+  # Publish uploads only what is in this checkout — no chain, no announcement.
+  sources = operations.include?("upload") ? nil : build_spec_sources(config, project_root)
 
   client = ApibuilderClient.new(profile)
   batch_client = ApiBatchClient.new(client)
@@ -944,9 +1043,16 @@ def run_batch_for_config(profile, operations, app_filter, group_filter, config, 
   num_orgs = config.orgs.size
   puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
 
-  config.orgs.each do |org|
+  # Every form is built (and therefore every spec resolved) before the first
+  # batch goes out, so the source announcement is one block covering the whole
+  # run rather than a line here and there between batch progress output.
+  forms = config.orgs.map do |org|
     puts "==> Building batch for #{org}"
-    form = build_batch_form(config, org, operations, app_filter, group_filter, project_root, sibling_specs)
+    [org, build_batch_form(config, org, operations, app_filter, group_filter, project_root, sources)]
+  end
+  sources&.announce
+
+  forms.each do |org, form|
     next if form["applications"].empty?
 
     num_apps = form["applications"].size
