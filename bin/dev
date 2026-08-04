@@ -68,6 +68,7 @@ INVOCATIONS = {
   "config rollout"      => 'config rollout [--app APP]',
   "docker prune"        => 'docker prune [--days N] [--keep-tags N] [--apply] [--keep-named-volumes]',
   "aidirs prune"        => 'aidirs prune [--days N] [--apply]',
+  "prune plans"         => 'prune plans [--days N] [--apply]',
   "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--dry-run] [--regen-only] [--full-tests]',
@@ -357,6 +358,21 @@ USAGE = <<~USAGE
         so a landed merged/closed PR still lets a recent dir be deleted). Dry-run by
         default: prints the keep/delete split and removes nothing. Pass --apply to
         delete.
+
+    #{INVOCATIONS["prune plans"]}
+        `git rm` plan files under ~/code/claude/plans whose last commit is more
+        than N days old (default 14). Plans go stale fast and a flat directory of
+        thousands makes the live ones unfindable — worse, a months-old plan reads
+        exactly like a current one. Nothing is lost: the content stays in git
+        history, so `git log`/`git show` recovers any file.
+        Only top-level files are considered; subdirectories are curated
+        collections and are never touched. A file that is untracked or has
+        uncommitted changes is always kept — its content is NOT in history yet,
+        so removing it would destroy it.
+        The removal runs in a throwaway git worktree and pushes straight to main,
+        so a parallel session's work-in-progress in the shared ~/code/claude
+        checkout is never disturbed; that checkout picks the deletions up on its
+        next pull. Dry-run by default. Pass --apply to remove.
 
     #{INVOCATIONS["browserslist update"]}
         Shallow-clone every ~/code/* repo with a package.json into
@@ -736,7 +752,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs browserslist scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -747,6 +763,7 @@ SUBCOMMANDS = {
   "config"       => %w[check rollout],
   "docker"       => %w[prune],
   "aidirs"       => %w[prune],
+  "prune"        => %w[plans],
   "browserslist" => %w[update],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
@@ -6477,6 +6494,237 @@ def cmd_aidirs_prune(args)
   puts "Deleted #{deleted} dir(s)."
 end
 
+# ---------- prune plans ----------
+#
+# ~/code/claude/plans is append-only in practice: ~90% of the files there were
+# written in one commit and never touched again, and the directory grows by
+# hundreds a month. Old plans have no value in the working tree — nothing indexes
+# them, nothing links them, and a flat directory of thousands makes the live ones
+# unfindable. The real cost is worse than clutter: a months-old plan reads exactly
+# like a current one, so a session can pick up a stale snapshot as present-tense
+# truth.
+#
+# So we `git rm` anything whose last commit is past the window. This is safe
+# precisely because it is a git repo — the content stays in history and
+# `git show <sha>:plans/<file>` recovers it. That safety is also the one hard
+# invariant: a file whose current content is NOT in history (untracked, or tracked
+# with uncommitted changes) is ALWAYS kept, because for those "it's in git" is
+# false and removal would be permanent.
+
+CLAUDE_ROOT = File.expand_path("~/code/claude")
+PLANS_RELPATH = "plans"
+
+# Commit timestamps come back on their own lines, marked so a filename can never
+# be mistaken for one (git paths in this repo never start with "@@").
+PLANS_LOG_FORMAT = "@@%ct"
+
+# [ok, combined_output] for one command. Output is scrubbed to UTF-8 because it
+# is only ever shown in an error message, and one malformed byte from git should
+# not crash the reporting path.
+def prune_run(cmd)
+  out, status = Open3.capture2e(*cmd)
+  [status.success?, Util.to_utf8(out).strip]
+end
+
+# path (repo-relative) => epoch seconds of the most recent commit touching it,
+# for every file under plans/. One `git log` walk rather than a call per file:
+# at ~1300 files the per-file form takes minutes.
+def plans_last_commit_times(repo)
+  out, status = Open3.capture2(
+    "git", "-C", repo, "log", "--format=#{PLANS_LOG_FORMAT}", "--name-only", "--", PLANS_RELPATH
+  )
+  return {} unless status.success?
+
+  times = {}
+  current = nil
+  out.each_line do |line|
+    line = line.chomp
+    next if line.empty?
+    if line.start_with?("@@")
+      current = line[2..].to_i
+    else
+      # First sighting wins: `git log` is newest-first, so that is the most
+      # recent commit to touch the path.
+      times[line] ||= current
+    end
+  end
+  times
+end
+
+# Repo-relative paths under plans/ whose working-tree content differs from HEAD
+# (modified, staged, or untracked). Read from the SHARED checkout, since that is
+# where a parallel session's in-flight edits live.
+def plans_dirty_paths(repo)
+  out, status = Open3.capture2("git", "-C", repo, "status", "--porcelain", "--", PLANS_RELPATH)
+  return nil unless status.success?
+  out.each_line.map { |line|
+    # "XY <path>", with renames as "orig -> new". Take the live path.
+    path = line[3..].to_s.chomp.split(" -> ").last.to_s
+    path.delete_prefix('"').delete_suffix('"')
+  }.reject(&:empty?).to_set
+end
+
+# Keep or delete one plan file, and why. Pure so the policy is testable without
+# a repo: the three keep reasons are the whole safety story.
+def classify_plan_file(path, last_commit_time:, dirty:, cutoff_time:)
+  return [:keep, "untracked — content is not in git history"] if last_commit_time.nil?
+  return [:keep, "uncommitted changes — content is not in git history"] if dirty
+  return [:keep, "committed within window"] if last_commit_time >= cutoff_time.to_i
+  [:delete, nil]
+end
+
+# Repo-relative paths currently tracked under plans/. This — not the git log — is
+# the candidate universe: `git log` also lists paths a PREVIOUS prune already
+# removed, which are still in history and would otherwise be re-offered for
+# deletion on every run, inflating the count and the commit message.
+def plans_tracked_files(repo)
+  out, status = Open3.capture2("git", "-C", repo, "ls-files", "--", PLANS_RELPATH)
+  return nil unless status.success?
+  out.each_line.map(&:chomp).reject(&:empty?)
+end
+
+# Top-level plan files only. Subdirectories under plans/ (specs/, prompts/,
+# superpowers/, per-app collections) are curated groupings rather than the dated
+# write-once stream this reaps, so they are left alone entirely.
+def plans_top_level_candidates(paths)
+  paths.select { |p|
+    p.start_with?("#{PLANS_RELPATH}/") && !p.delete_prefix("#{PLANS_RELPATH}/").include?("/")
+  }.sort
+end
+
+# Run the removal in a detached worktree off origin/main and push HEAD:main.
+# ~/code/claude is a single checkout shared by every concurrent session, so
+# staging 700 deletions in it would collide with whatever else is mid-edit there.
+# The worktree touches none of that; the shared checkout sees the removals on its
+# next pull. Returns true on success.
+def prune_plans_apply(repo, paths, days)
+  ok, _ = prune_run(["git", "-C", repo, "fetch", "--quiet", "origin", "main"])
+  return false unless ok
+
+  worktree = File.join(Dir.tmpdir, "dev-prune-plans-#{Process.pid}")
+  FileUtils.rm_rf(worktree)
+  ok, err = prune_run(["git", "-C", repo, "worktree", "add", "--quiet", "--detach", worktree, "origin/main"])
+  unless ok
+    warn "Could not create worktree: #{err}"
+    return false
+  end
+
+  begin
+    # --ignore-unmatch: origin/main can lack a file the local HEAD has (another
+    # session's push is not required to be visible here), and that is not an error.
+    paths.each_slice(500) do |batch|
+      ok, err = prune_run(["git", "-C", worktree, "rm", "--quiet", "--ignore-unmatch", "--", *batch])
+      unless ok
+        warn "git rm failed: #{err}"
+        return false
+      end
+    end
+
+    _, staged = prune_run(["git", "-C", worktree, "diff", "--cached", "--name-only"])
+    if staged.empty?
+      puts "Nothing to remove on origin/main (already pruned)."
+      return true
+    end
+
+    message = "Prune #{paths.length} plan(s) not committed in #{days} day(s)\n\n" \
+              "Recover any of these with `git show <sha>:<path>`."
+    ok, err = prune_run(["git", "-C", worktree, "commit", "--quiet", "-m", message])
+    unless ok
+      warn "git commit failed: #{err}"
+      return false
+    end
+
+    ok, err = prune_run(["git", "-C", worktree, "push", "--quiet", "origin", "HEAD:main"])
+    unless ok
+      warn "git push failed: #{err}"
+      return false
+    end
+    true
+  ensure
+    prune_run(["git", "-C", repo, "worktree", "remove", "--force", worktree])
+    FileUtils.rm_rf(worktree)
+  end
+end
+
+def cmd_prune_plans(args)
+  days = 14
+  apply = false
+  while (arg = args.shift)
+    case arg
+    when "--days"
+      raw = args.shift or usage_exit("--days requires a value", example: usage_for("prune plans"))
+      days = Integer(raw) rescue usage_exit("--days must be an integer", example: usage_for("prune plans"))
+    when "--apply" then apply = true
+    when "-h", "--help" then puts USAGE; exit 0
+    else usage_exit("Unknown flag: #{arg}", example: usage_for("prune plans"))
+    end
+  end
+  usage_exit("--days must be >= 0", example: usage_for("prune plans")) if days < 0
+
+  plans_dir = File.join(CLAUDE_ROOT, PLANS_RELPATH)
+  unless Dir.exist?(plans_dir)
+    puts "Nothing to prune: #{plans_dir} does not exist."
+    return
+  end
+
+  dirty = plans_dirty_paths(CLAUDE_ROOT)
+  if dirty.nil?
+    warn "Could not read git status in #{CLAUDE_ROOT}."
+    exit 1
+  end
+
+  tracked = plans_tracked_files(CLAUDE_ROOT)
+  if tracked.nil?
+    warn "Could not list tracked files in #{CLAUDE_ROOT}."
+    exit 1
+  end
+
+  cutoff = Time.now - days * 24 * 60 * 60
+  times = plans_last_commit_times(CLAUDE_ROOT)
+  candidates = plans_top_level_candidates(tracked)
+
+  keep = []
+  to_delete = []
+  candidates.each do |path|
+    action, reason = classify_plan_file(
+      path, last_commit_time: times[path], dirty: dirty.include?(path), cutoff_time: cutoff
+    )
+    (action == :keep ? keep : to_delete) << [path, reason]
+  end
+
+  puts "Scanned #{candidates.length} top-level plan file(s) in #{plans_dir}."
+  puts "Removing any file whose last commit is more than #{days} day(s) old; content stays recoverable from git history."
+  puts "Keeping #{keep.length} (recent, or holding content not yet in history)."
+  puts ""
+
+  if to_delete.empty?
+    puts "Nothing to remove."
+    return
+  end
+
+  puts "Remove #{to_delete.length}:"
+  to_delete.first(20).each { |path, _| puts "  #{File.basename(path)}" }
+  puts "  … and #{to_delete.length - 20} more" if to_delete.length > 20
+
+  protected_now = keep.reject { |_, reason| reason == "committed within window" }
+  unless protected_now.empty?
+    puts ""
+    puts "Protected #{protected_now.length} despite age (content not in git history):"
+    protected_now.each { |path, reason| puts "  #{File.basename(path)}  (#{reason})" }
+  end
+
+  unless apply
+    puts ""
+    puts "(dry-run — pass --apply to remove these)"
+    return
+  end
+
+  puts ""
+  exit 1 unless prune_plans_apply(CLAUDE_ROOT, to_delete.map(&:first), days)
+  puts "Removed #{to_delete.length} plan(s) and pushed to main."
+  puts "#{CLAUDE_ROOT} picks the deletions up on its next pull."
+end
+
 # Shared shallow-clone-into-workdir idiom used by both `browserslist update`
 # and `codegen sync`: wipe any stale directory left from a prior run, then
 # `git clone --depth=1 --quiet`. Returns the clone path on success, nil on
@@ -8693,6 +8941,13 @@ when "aidirs"
   when "prune" then cmd_aidirs_prune(argv)
   when nil     then require_subcommand("aidirs")
   else              unknown("aidirs subcommand", sub, SUBCOMMANDS["aidirs"])
+  end
+when "prune"
+  sub = argv.shift
+  case sub
+  when "plans" then cmd_prune_plans(argv)
+  when nil     then require_subcommand("prune")
+  else              unknown("prune subcommand", sub, SUBCOMMANDS["prune"])
   end
 when "codegen"
   sub = resolve_subcommand(argv, default: "sync")

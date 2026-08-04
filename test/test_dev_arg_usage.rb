@@ -34,7 +34,7 @@ class TestDevArgUsage < Minitest::Test
   def test_every_dispatched_command_has_subcommands
     # Every command wired to require_subcommand must have a non-empty SUBCOMMANDS
     # entry, or the hint would read "()".
-    %w[config tasks browserslist docker aidirs issues agent].each do |cmd|
+    %w[config tasks browserslist docker aidirs prune issues agent].each do |cmd|
       refute_nil SUBCOMMANDS[cmd], "SUBCOMMANDS missing #{cmd}"
       refute_empty SUBCOMMANDS[cmd]
     end
