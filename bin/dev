@@ -464,8 +464,9 @@ USAGE = <<~USAGE
         the CLI. It lists them grouped by category, numbered 1..N across the whole
         list, and asks which to claim: numbers (`1,3`), `all` (the default — just
         press enter), or `none`. It then atomically claims the selection and writes
-        ONE plan per category claimed to
-        ~/code/claude/plans/<date>-issues-<category>.md. Pass --issues 078,080 to
+        ONE plan per ISSUE claimed to
+        ~/code/claude/plans/<date>-issue-<number>-<slug>.md — a plan is what one
+        subagent gets handed, so it is one unit of work. Pass --issues 078,080 to
         select by issue number without the prompt, --yes to take everything a sweep
         takes, or --category CATEGORY to scope to a single category. `suggestion` is
         swept like every other category, but its plan runs as an INVESTIGATION, not
@@ -478,8 +479,12 @@ USAGE = <<~USAGE
         picked issues was just taken by another session, nothing is claimed and the
         error says which. It then hands the terminal to an interactive Claude
         session (Opus 5, 1M context — the `ccd` model): one plan → it implements
-        the plan directly; several → it dispatches one subagent per plan and works
-        them in parallel. Pass --no-spawn to just write the plan(s) and print their
+        the plan directly; several → it fans out subagents and works them in
+        parallel, one subagent per plan EXCEPT that plans in the same category
+        that turn out to touch the same feature go to one subagent together (that
+        judgment needs the code read, so the session makes it, not this CLI).
+        Never across categories — those are independent pipelines and repos. Pass
+        --no-spawn to just write the plans and print their
         paths. Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first (the issues API requires a playbook
         admin, not the platform `dev auth login`).
@@ -2022,23 +2027,39 @@ def issue_session_prompt(category, path)
   end
 end
 
-# The prompt when several categories were claimed at once (one plan each). A
-# single session can only take one TTY (we `exec`), so the parallelism moves
-# INSIDE it: the session fans out one subagent per plan. Categories are
-# independent pipelines/repos, so the subagents share no state.
+# The prompt when several plans were claimed at once (one per issue). A single
+# session can only take one TTY (we `exec`), so the parallelism moves INSIDE it:
+# the session fans out subagents.
+#
+# The default is one subagent per plan, but the session — not this CLI — decides
+# whether two plans in the SAME category should go to one subagent together. That
+# call needs the code read to answer ("do these touch the same feature?"), and the
+# CLI has only a title, a body and a category. A keyword guess here is wrong in
+# both directions: bundle unrelated issues and one branch carries fixes that have
+# nothing to do with each other, split related ones and two branches collide in the
+# same files at rebase. So we hand over the rule and let the session apply it after
+# it has looked. The category break is hard either way — categories are independent
+# pipelines/repos, so a cross-category bundle is never right.
 def issue_fanout_prompt(plans)
   listed = plans.map { |category, path|
     suffix = issue_investigate_only?(category) ? " (INVESTIGATE ONLY — no branch, no code, no PR)" : ""
     "- #{category}: #{path}#{suffix}"
   }.join("\n")
-  "#{plans.length} issue plans have been claimed, one per category. Dispatch ONE " \
-    "subagent per plan and work them in parallel — do NOT work the plans " \
-    "yourself in this session. Give each subagent its plan path and tell it to read " \
-    "the plan and follow it exactly, including the plan's own closing instructions: " \
-    "an implementation plan ends in merged PRs and `dev issues status --status fixed`, " \
-    "while an INVESTIGATE ONLY plan writes no code and ends in " \
-    "`dev issues status --status needs_review` with its findings. Every issue must be " \
-    "closed with `dev issues status`. Plans:\n#{listed}"
+  "#{plans.length} issue plans have been claimed, one per issue, grouped by category " \
+    "below. Work them with subagents in parallel — do NOT work the plans yourself in " \
+    "this session.\n\n" \
+    "How to group them: read the plans first, then dispatch ONE subagent per plan, " \
+    "EXCEPT that two or more plans in the SAME category that touch the same feature or " \
+    "the same code go to ONE subagent together, so their fixes land on one branch in " \
+    "one PR instead of colliding in the same files. Never bundle across categories — " \
+    "they are independent pipelines and repos. When in doubt, keep them separate.\n\n" \
+    "Give each subagent its plan path(s) and tell it to read them and follow them " \
+    "exactly, including each plan's own closing instructions: an implementation plan " \
+    "ends in merged PRs and `dev issues status --status fixed`, while an INVESTIGATE " \
+    "ONLY plan writes no code and ends in `dev issues status --status needs_review` " \
+    "with its findings. EVERY issue must be closed with `dev issues status` " \
+    "individually, including each one in a bundle — a subagent working several plans " \
+    "closes each of its issues, pointing them all at the same PR URL. Plans:\n#{listed}"
 end
 
 # The prompt for the spawned session, keyed on how many category plans were
@@ -2376,11 +2397,14 @@ end
 # unit-testable without any network calls. `comments` is the issue's timeline:
 # absent for a freshly filed issue, load-bearing for a re-opened one. `index`
 # numbers it within a plan's list; nil for `dev issues show`, which renders one
-# issue with nothing to count it against.
-def issue_render_item(issue, index = nil, comments: [])
+# issue with nothing to count it against. `heading:` is false for a plan, whose
+# own H1 already names the issue — repeating it two lines down is pure noise.
+def issue_render_item(issue, index = nil, comments: [], heading: true)
   lines = []
-  lines << "### #{index ? "#{index}. " : ''}#{issue_label(issue)} — #{issue['title']}"
-  lines << ""
+  if heading
+    lines << "### #{index ? "#{index}. " : ''}#{issue_label(issue)} — #{issue['title']}"
+    lines << ""
+  end
   if issue_reopened?(comments)
     lines << issue_reopen_callout(issue, comments)
     lines << ""
@@ -2464,36 +2488,52 @@ def issue_investigate_only?(category)
   ISSUE_INVESTIGATE_ONLY_CATEGORIES.include?(category)
 end
 
-# The wrapper prose above the issue list: what this session is FOR.
-def issue_plan_intro(category)
+# The wrapper prose above the issue: what this session is FOR. `origin` is the one
+# sentence naming where the plan came from (a sweep vs a hand-filed issue);
+# everything else is keyed on the category, so a hand-filed `suggestion` gets the
+# same no-code framing a swept one does.
+def issue_plan_intro(category, origin)
+  # `origin` gets its own line: it varies in length, so inlining it would drag the
+  # wrap points of every line after it around with it.
   if issue_investigate_only?(category)
     <<~INTRO.strip
-      Generated by `dev issues claim --category #{category}`. These issues are CLAIMED
-      (status `claimed`) and waiting for you. This is an INVESTIGATION, not an
-      implementation session: do not create a branch, do not write code, do not open a
-      PR. Hand back findings with `dev issues status` (below) so nothing stays stuck in
-      `claimed`.
+      #{origin}
+      This issue is CLAIMED (status `claimed`) and waiting for you. This is an
+      INVESTIGATION, not an implementation session: do not create a branch, do not
+      write code, do not open a PR. Hand back findings with `dev issues status`
+      (below) so it does not stay stuck in `claimed`.
     INTRO
   else
     <<~INTRO.strip
-      Generated by `dev issues claim --category #{category}`. These issues are CLAIMED
-      (status `claimed`) and waiting for you. Implement the fixes, open PRs, and close
-      each issue with `dev issues status` (below) so nothing stays stuck in `claimed`.
+      #{origin}
+      This issue is CLAIMED (status `claimed`) and waiting for you. Implement the fix,
+      open a PR, and close the issue with `dev issues status` (below) so it does not
+      stay stuck in `claimed`.
     INTRO
   end
 end
 
+def issue_claim_plan_intro(category)
+  issue_plan_intro(category, "Generated by `dev issues claim --category #{category}`.")
+end
+
+def issue_manual_plan_intro(category, date)
+  issue_plan_intro(category, "Filed #{date} with `dev issues create`.")
+end
+
 # The closing menu: the statuses this session is allowed to end on. An
 # investigate-only session has no `fixed` to offer — its move is `needs_review`.
-def issue_plan_closing(category)
+# `number` is the issue's own number rather than a `<number>` placeholder: one
+# plan is one issue, so there is nothing left for the session to substitute.
+def issue_plan_closing(category, number)
   if issue_investigate_only?(category)
     <<~CLOSING.strip
       - Findings ready for a human to decide on →
-        `dev issues status <number> --status needs_review --comment "<your findings>"`
+        `dev issues status #{number} --status needs_review --comment "<your findings>"`
         (the recommendation itself goes in --comment; a human reclassifies it into
         feature/bug/improvement, or dismisses it, from playbook-admin)
       - Blocked on something only a human can answer →
-        `dev issues status <number> --status needs_input --comment "<question>"`
+        `dev issues status #{number} --status needs_input --comment "<question>"`
 
       Every comment you write is an INTERNAL note to the team — never a reply
       addressed to the member who filed the suggestion. Say what needs deciding or
@@ -2501,15 +2541,15 @@ def issue_plan_closing(category)
     CLOSING
   else
     <<~CLOSING.strip
-      - Fixed in a merged PR → `dev issues status <number> --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
+      - Fixed in a merged PR → `dev issues status #{number} --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
         (--app + --baseline-version let `dev issues reconcile` flip the issue to `deployed`
         once that app releases past the baseline. `dev deploy status` lists the deployable
         app names and their live release tags — read the tag BEFORE your fix ships.)
       - Fixed by a document (process/manual fix, e.g. a Google Doc) →
-        `dev issues status <number> --status fixed --url "<doc URL>"`
+        `dev issues status #{number} --status fixed --url "<doc URL>"`
         (no app/baseline: nothing to detect, so `deployed` is set by hand later)
       - Needs a human decision, or not actionable / already fixed →
-        `dev issues status <number> --status needs_input --comment "<question or reason>"`
+        `dev issues status #{number} --status needs_input --comment "<question or reason>"`
         (every comment you write is an INTERNAL note to the team — never a reply
         addressed to the club that filed the issue. Say what needs deciding or
         asking; Mike writes any customer-facing reply from playbook-admin.)
@@ -2517,55 +2557,18 @@ def issue_plan_closing(category)
   end
 end
 
-def issue_plan_markdown(items:, date:, category:, body:, comments_by_number: {})
-  rendered = items.each_with_index.map do |c, i|
-    issue_render_item(c, i + 1, comments: comments_by_number[c["number"]] || [])
-  end.join("\n\n")
-  heading = issue_investigate_only?(category) ? "## Issues to investigate" : "## Issues to fix"
-  <<~PLAN
-    # #{category} issues — #{items.length} item(s) claimed #{date}
-
-    #{issue_plan_intro(category)}
-
-    #{heading}
-
-    #{rendered}
-
-    ---
-
-    #{body.strip}
-
-    ## Closing each issue (do this — issues must not stay `claimed`)
-
-    Run from anywhere (re-authenticates from ~/code/env each call). `<number>` is the
-    issue number shown above (e.g. `034`; unpadded `34` works too):
-
-    #{issue_plan_closing(category)}
-  PLAN
-end
-
-def write_issue_plan(items, category, comments_by_number = {})
-  date = Time.now.strftime("%Y-%m-%d")
-  dir = File.expand_path("~/code/claude/plans")
-  FileUtils.mkdir_p(dir)
-  base = "#{date}-issues-#{category}"
-  path = File.join(dir, "#{base}.md")
-  n = 2
-  while File.exist?(path)
-    path = File.join(dir, "#{base}-#{n}.md")
-    n += 1
-  end
-  File.write(path, issue_plan_markdown(items: items, date: date, category: category,
-                                       body: issue_body_text(category),
-                                       comments_by_number: comments_by_number))
-  path
-end
-
-# Plan for a single hand-filed issue. Reuses issue_render_item so a manual issue
-# renders identically to a batch-claimed one, then adds the LOCAL file paths of
-# any attachments: the session reads them straight off disk, exactly like
-# dropping the images into a Claude Code terminal.
-def manual_issue_plan_markdown(issue:, date:, local_paths:, body:)
+# ONE plan = ONE issue, whether it was swept up by `issues claim` or hand-filed by
+# `issues create`. A plan is the unit a session (or a subagent) is handed, so it
+# has to be the unit of work: bundling several issues into one plan puts unrelated
+# fixes on one branch, and a PR title carries only one `ISS-<n>:` prefix — so
+# `dev issues reconcile` can adopt only one of them and the rest sit in `claimed`
+# forever, invisible no matter how many releases ship the fix.
+#
+# `comments` is the issue's timeline (load-bearing for a re-opened issue).
+# `local_paths` are the on-disk attachments a hand-filed issue carries: the
+# session reads them straight off disk, exactly like dropping the images into a
+# Claude Code terminal.
+def issue_plan_markdown(issue:, category:, body:, intro:, comments: [], local_paths: [])
   attachments =
     if local_paths.empty?
       ""
@@ -2573,15 +2576,15 @@ def manual_issue_plan_markdown(issue:, date:, local_paths:, body:)
       listed = local_paths.map { |p| "- `#{p}`" }.join("\n")
       "\n## Attached files (read these directly)\n\n#{listed}\n"
     end
+  heading = issue_investigate_only?(category) ? "## The issue to investigate" : "## The issue to fix"
   <<~PLAN
     # #{issue_label(issue)} — #{issue['title']}
 
-    Filed #{date} with `dev issues create` and already CLAIMED. Work it, open a PR,
-    then close it with `dev issues status` (below) so it does not stay `claimed`.
+    #{intro}
 
-    ## The issue
+    #{heading}
 
-    #{issue_render_item(issue, 1)}
+    #{issue_render_item(issue, comments: comments, heading: false)}
     #{attachments}
     ---
 
@@ -2589,33 +2592,51 @@ def manual_issue_plan_markdown(issue:, date:, local_paths:, body:)
 
     ## Closing this issue (do this — it must not stay `claimed`)
 
-    - Fixed in a merged PR → `dev issues status #{issue['number']} --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
-      (--app + --baseline-version let `dev issues reconcile` flip it to `deployed` once
-      that app releases past the baseline; `dev deploy status` lists the app names and
-      their live tags — read the tag BEFORE your fix ships.)
-    - Fixed by a document (process/manual fix) →
-      `dev issues status #{issue['number']} --status fixed --url "<doc URL>"`
-    - Blocked on a human answer →
-      `dev issues status #{issue['number']} --status needs_input --comment "<question>"`
-      (an INTERNAL note to the team, not a reply to the club — Mike writes any
-      customer-facing reply from playbook-admin.)
+    Run from anywhere (re-authenticates from ~/code/env each call):
+
+    #{issue_plan_closing(category, issue['number'])}
   PLAN
 end
 
-def write_manual_issue_plan(issue, local_paths)
-  date = Time.now.strftime("%Y-%m-%d")
-  dir = File.expand_path("~/code/claude/plans")
+# `<date>-issue-<number>-<slug>` — the file name names the issue, because the file
+# IS the issue. Pure, so the naming is testable without touching the plans dir.
+def issue_plan_basename(issue, date)
+  slug = issue["title"].to_s.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/\A-+|-+\z/, "")[0, 40].to_s
+  "#{date}-issue-#{issue['number']}#{slug.empty? ? '' : "-#{slug}"}"
+end
+
+# The de-duplicated path to write that plan at. Shared by both plan writers so a
+# swept issue and a hand-filed one land under the same naming.
+def issue_plan_path(issue, date, dir = File.expand_path("~/code/claude/plans"))
   FileUtils.mkdir_p(dir)
-  slug = issue["title"].to_s.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/\A-+|-+\z/, "")[0, 40]
-  base = "#{date}-issue-#{issue['number']}#{slug.empty? ? '' : "-#{slug}"}"
+  base = issue_plan_basename(issue, date)
   path = File.join(dir, "#{base}.md")
   n = 2
   while File.exist?(path)
     path = File.join(dir, "#{base}-#{n}.md")
     n += 1
   end
-  body = issue_manual_body_text
-  File.write(path, manual_issue_plan_markdown(issue: issue, date: date, local_paths: local_paths, body: body))
+  path
+end
+
+def write_issue_plan(issue, category, comments = [])
+  date = Time.now.strftime("%Y-%m-%d")
+  path = issue_plan_path(issue, date)
+  File.write(path, issue_plan_markdown(issue: issue, category: category,
+                                       body: issue_body_text(category),
+                                       intro: issue_claim_plan_intro(category),
+                                       comments: comments))
+  path
+end
+
+def write_manual_issue_plan(issue, local_paths)
+  date = Time.now.strftime("%Y-%m-%d")
+  category = issue["category"]
+  path = issue_plan_path(issue, date)
+  File.write(path, issue_plan_markdown(issue: issue, category: category,
+                                       body: issue_manual_body_text,
+                                       intro: issue_manual_plan_intro(category, date),
+                                       local_paths: local_paths))
   path
 end
 
@@ -3124,9 +3145,10 @@ def cmd_issues_claim(args)
       return
     end
 
-    # Claim server-side one category at a time and write one plan per category
-    # actually claimed. A category the race just lost (nothing claimed) is
-    # dropped with no plan.
+    # Claim server-side one category at a time (that is the scope the claims
+    # endpoint takes), then write one plan per ISSUE actually claimed — a plan is
+    # what a subagent is handed, so it has to be one unit of work. A category the
+    # race just lost (nothing claimed) is dropped with no plans.
     plans = []
     claimed_issues = []
     present.each do |cat|
@@ -3136,9 +3158,12 @@ def cmd_issues_claim(args)
       claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { scope: scope }) || []
       next if claimed.empty?
       claimed_issues.concat(claimed)
-      path = write_issue_plan(claimed, cat, issue_comments_by_number(endpoint, claimed))
-      plans << [cat, path]
-      puts "Claimed #{claimed.length} #{cat} issue(s) → #{path}"
+      comments_by_number = issue_comments_by_number(endpoint, claimed)
+      claimed.each do |issue|
+        path = write_issue_plan(issue, cat, comments_by_number[issue["number"]] || [])
+        plans << [cat, path]
+        puts "Claimed #{issue_label(issue)} (#{cat}) → #{path}"
+      end
     end
 
     if plans.empty?
@@ -3150,14 +3175,15 @@ def cmd_issues_claim(args)
       return
     end
 
+    categories = plans.map(&:first).uniq.length
     puts ""
-    puts "Claimed #{claimed_issues.length} issue(s) across #{plans.length} categor#{plans.length == 1 ? 'y' : 'ies'}."
+    puts "Claimed #{claimed_issues.length} issue(s) across #{categories} categor#{categories == 1 ? 'y' : 'ies'} — one plan each."
 
     unless spawn_session
       if plans.length == 1
         puts "Hand it to a session with:  claude \"#{issue_prompt_with_tab_title(claimed_issues, issue_claim_prompt(plans))}\""
       else
-        puts "Start a session and dispatch one subagent per plan:"
+        puts "Start a session and fan out subagents (one per plan; same-category plans on the same feature can share one):"
         plans.each { |cat, p| puts "  #{cat}: #{p}" }
       end
       return
@@ -3165,11 +3191,11 @@ def cmd_issues_claim(args)
 
     # Hand the terminal directly to an interactive Claude session (Opus 5, 1M
     # context) so it starts immediately. One plan → it works the plan; several →
-    # it fans out one subagent per plan. exec replaces this process, so the
-    # session inherits the TTY and this is the last thing we do.
+    # it fans out subagents over them. exec replaces this process, so the session
+    # inherits the TTY and this is the last thing we do.
     puts plans.length == 1 ?
       "Starting Claude session (Opus 5, 1M context) to implement the plan..." :
-      "Starting Claude session (Opus 5, 1M context) to dispatch one subagent per category plan..."
+      "Starting Claude session (Opus 5, 1M context) to fan out subagents over #{plans.length} issue plans..."
     puts "  (re-run with --no-spawn to just write the plan(s))"
     puts ""
     prompt = issue_prompt_with_tab_title(claimed_issues, issue_claim_prompt(plans))
