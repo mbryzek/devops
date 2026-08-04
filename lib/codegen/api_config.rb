@@ -9,7 +9,7 @@ module Codegen
   # spec_glob and group).
   #
   # It deliberately does NOT classify generators as client vs server. A repo's
-  # role (a backend that uploads specs vs a frontend that only regenerates a
+  # role (a backend that owns spec files vs a frontend that only regenerates a
   # client) is decided by its STACK in Codegen::Graph. That keeps the whole
   # feature independent of generator-key names — whose source of truth lives in
   # platform's GeneratorsService — so a new/renamed generator can never silently

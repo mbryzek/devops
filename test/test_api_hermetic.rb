@@ -65,6 +65,37 @@ class TestApiHermetic < Minitest::Test
     end
   end
 
+  # The positive half: inside `ai/<feature>/`, a sibling clone's spec files are
+  # what the batch resolves from — no registry, therefore no "released, not
+  # merged" gap. `dev codegen sync` clones into exactly this layout so its
+  # consumer repos regenerate against the backend clones on main; if this gate
+  # stops matching, the sweep silently regenerates every consumer backwards.
+  def test_sibling_spec_paths_finds_specs_inside_feature_dir
+    Dir.mktmpdir do |dir|
+      feature = File.join(dir, "ai", "cgs.20260804-153000")
+      repo = File.join(feature, "consumer")
+      FileUtils.mkdir_p(repo)
+      # Realpath: the scan runs off File.realpath(project_root), and a macOS
+      # temp dir is reached through a /var -> /private/var symlink.
+      producer = File.realpath(make_spec_repo(feature, "producer", "sibling-api"))
+
+      found = sibling_spec_paths(repo)
+
+      assert_equal [["bryzek", "sibling-api"]], found.keys
+      assert_equal File.join(producer, "spec", "sibling-api.json"), found[["bryzek", "sibling-api"]][:path]
+      assert_equal producer, found[["bryzek", "sibling-api"]][:root]
+    end
+  end
+
+  # A repo is never its own sibling — its specs come from the local-spec path.
+  def test_sibling_spec_paths_excludes_self
+    Dir.mktmpdir do |dir|
+      feature = File.join(dir, "ai", "cgs.20260804-153000")
+      repo = make_spec_repo(feature, "producer", "sibling-api")
+      assert_empty sibling_spec_paths(repo)
+    end
+  end
+
   def test_ensure_publishable_rejects_non_main_branch
     with_git_repo(branch: "feature-x") do |repo|
       Dir.chdir(repo) { assert_raises(SystemExit) { ensure_publishable!(repo) } }
@@ -116,6 +147,30 @@ class TestApiHermetic < Minitest::Test
   end
 
   private
+
+  # A repo clone the way `api` expects to find one: `.api/config.pkl` naming a
+  # single app, plus that app's spec file. Same `modulepath:` amends every real
+  # repo uses — ApiConfig points pkl's --module-path at the devops checkout the
+  # CLI runs from, so this resolves from a temp dir with no devops sibling.
+  def make_spec_repo(parent, name, app_key)
+    repo = File.join(parent, name)
+    FileUtils.mkdir_p(File.join(repo, ".api"))
+    FileUtils.mkdir_p(File.join(repo, "spec"))
+    File.write(File.join(repo, ".api", "config.pkl"), <<~PKL)
+      amends "#{ApiConfig::BASE_MODULE_URI}"
+
+      org = "bryzek"
+
+      applications = new Listing<AppGroup> {
+        new {
+          names { "#{app_key}" }
+          generators = module.modelOnly()
+        }
+      }
+    PKL
+    write_spec(File.join(repo, "spec"), "#{app_key}.json", { "name" => app_key })
+    repo
+  end
 
   def push_commit(repo, name)
     File.write(File.join(repo, name), "x")

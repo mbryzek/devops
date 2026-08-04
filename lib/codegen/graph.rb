@@ -15,9 +15,9 @@ module Codegen
     end
 
     # Roles come from STACK, not generator keys: scala repos are backends (they
-    # upload specs to the shared registry), everything else is a consumer that
-    # only regenerates a client. A consumer depends on a backend when their
-    # configs share an apibuilder app name — i.e. the consumer regenerates a
+    # OWN the spec files other repos generate clients from), everything else is
+    # a consumer that only regenerates a client. A consumer depends on a backend
+    # when their configs share an apibuilder app name — i.e. the consumer regenerates a
     # client for something the backend declares. This is a conservative superset
     # (if two backends ever declared the same app name, a consumer of it would
     # depend on both): it only ever ADDS an ordering/gating edge, never drops

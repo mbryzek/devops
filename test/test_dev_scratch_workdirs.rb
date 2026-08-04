@@ -11,7 +11,7 @@ load File.expand_path('../bin/dev', __dir__)
 # and a dir modified inside SCRATCH_ACTIVE_WINDOW_SECS is left alone because it
 # may belong to a sweep that is still running.
 class TestDevScratchWorkdirs < Minitest::Test
-  PREFIX = "codegen-sync".freeze
+  PREFIX = CODEGEN_WORKDIR_PREFIX
 
   def setup
     @root = Dir.mktmpdir("scratch-root")
@@ -96,7 +96,7 @@ class TestDevScratchWorkdirs < Minitest::Test
   def test_purge_reports_what_it_removed
     stale_dir("#{PREFIX}.20260701-010101", bytes: 4096)
     out, _ = capture_io { purge_scratch_workdirs(PREFIX, root: @root) }
-    assert_includes out, "codegen-sync.20260701-010101"
+    assert_includes out, "#{PREFIX}.20260701-010101"
     assert_includes out, "Reclaimed"
   end
 

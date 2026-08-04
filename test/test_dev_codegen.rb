@@ -42,6 +42,42 @@ class TestDevCodegen < Minitest::Test
   end
 end
 
+# The sweep's working dir is a contract with two other pieces of the system, so
+# both halves are pinned here rather than left to a comment.
+class TestCodegenWorkdir < Minitest::Test
+  RUN_ID = "20260804-153000".freeze
+
+  # bin/api's sibling_spec_paths only treats sibling clones' specs as
+  # authoritative under `~/code/ai/<dir>/<repo>`. Clone the sweep anywhere else
+  # and every backend spec a consumer needs resolves from the registry — which
+  # means RELEASED — so the sweep would regenerate consumers against last
+  # released specs and open PRs walking their clients backwards. This layout is
+  # the whole reason consumers see main. (See test_api_hermetic.rb for the
+  # matching assertion on the bin/api side.)
+  def test_workdir_is_a_feature_dir_under_code_ai
+    clone = File.join(codegen_workdir(RUN_ID), "platform")
+    # The exact walk sibling_spec_paths does from a clone: dirname twice, and the
+    # result must be named "ai".
+    assert_equal "ai", File.basename(File.dirname(File.dirname(clone)))
+    assert_equal File.expand_path("~/code/ai"), File.dirname(File.dirname(clone))
+  end
+
+  # macOS caps unix-socket paths at 104 bytes and the sweep runs sbt (whose
+  # server socket lives at <feature>/<repo>/project/.sbtboot/server/<hash>/sock)
+  # in every scala clone, so the dir name gets the same <=19 char budget every
+  # feature dir has.
+  def test_workdir_name_fits_the_socket_path_budget
+    assert_operator File.basename(codegen_workdir(RUN_ID)).length, :<=, 19
+  end
+
+  # One run_id drives both, so a dir and a branch from the same sweep are
+  # recognizably a pair.
+  def test_workdir_and_branch_share_the_run_id
+    assert_includes File.basename(codegen_workdir(RUN_ID)), RUN_ID
+    assert_includes "#{CODEGEN_BRANCH_PREFIX}-#{RUN_ID}", RUN_ID
+  end
+end
+
 class TestCodegenApiConfig < Minitest::Test
   def gen(key, target) = ApiConfig::Generator.new(key: key, target: target, attributes: {})
   def app(key) = ApiConfig::Application.new(key: key, file_path: nil)
@@ -499,6 +535,41 @@ class TestCodegenRunPlan < Minitest::Test
     assert_empty plan[:backends]
     assert_empty plan[:consumers]
     assert_empty plan[:run_names]
+  end
+end
+
+# What gets CLONED is a different question from what gets RUN: a repo can be in
+# the workdir purely so its specs (backend) or its parsed config (consumer) are
+# available to the repos that do run.
+class TestCodegenCloneSet < Minitest::Test
+  App = Struct.new(:name, :stack, :ignored, keyword_init: true)
+
+  ELIGIBLE = [
+    App.new(name: "platform",  stack: :scala,     ignored: false),
+    App.new(name: "acumen",    stack: :scala,     ignored: false),
+    App.new(name: "rallyd",    stack: :sveltekit, ignored: false),
+    App.new(name: "acumen-ui", stack: :elm,       ignored: false),
+  ].freeze
+
+  def names(target) = codegen_clone_set(target, ELIGIBLE).map(&:name).sort
+
+  def test_full_sweep_clones_everything
+    assert_equal %w[acumen acumen-ui platform rallyd], names(nil)
+  end
+
+  # A consumer owns no spec files, so its regen resolves every app from the
+  # backend clones beside it in the workdir. Skip the backends and `api` falls
+  # back to the registry — released, not merged — and the run rewrites the
+  # client backwards. The backends are cloned as spec providers only; they do
+  # not run (see codegen_run_plan).
+  def test_consumer_target_clones_every_backend_alongside_it
+    assert_equal %w[acumen platform rallyd], names(ELIGIBLE.find { |a| a.name == "rallyd" })
+  end
+
+  # A backend owns its specs, so it needs no other backend — but every consumer
+  # candidate must be cloned for Graph to discover which ones depend on it.
+  def test_backend_target_clones_every_consumer_candidate
+    assert_equal %w[acumen-ui platform rallyd], names(ELIGIBLE.find { |a| a.name == "platform" })
   end
 end
 
