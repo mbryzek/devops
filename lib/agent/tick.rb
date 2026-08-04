@@ -1,6 +1,7 @@
 require 'open3'
 require 'time'
 require 'agent/api'
+require 'agent/checkout'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/host'
@@ -81,14 +82,91 @@ module Agent
     # ---------------- Phase A: vitals ----------------
 
     def phase_a
+      # FIRST, and deliberately before anything that touches the platform: this
+      # is the one thing in the tick that works with the platform down, and the
+      # sha it lands on is what the registry report below claims.
+      update_checkout
       identity = ensure_identity
       heartbeat_runner(identity) if identity
       heartbeat_leases(identity)
+      report_registry(identity) if identity
     rescue SessionExpired, ApiError => e
       # Vitals must not abort the tick: the hard-timeout enforcement below is
       # precisely what has to keep working when the platform is unreachable.
       log("vitals: platform error (#{e.message})")
       enforce_timeouts
+    end
+
+    # One push to devops reaches the whole fleet: rather than logging into every
+    # machine to pull, the tick pulls its own checkout. See Agent::Checkout for
+    # why this is --ff-only, why it reports instead of raising, and why Phase A
+    # (never mid-job, never behind the work lock) is the only safe place for it.
+    #
+    # The pull takes effect NEXT tick. `dev agent tick` is one shot, so the
+    # process now running has already loaded every file it will use; new code
+    # runs when launchd fires again 30 seconds later.
+    def update_checkout
+      return log("would pull #{Agent::Checkout.devops_repo} (--ff-only origin main)") if @dry_run
+
+      # Under the vitals lock so two overlapping ticks cannot run `git pull` in
+      # the same working tree and collide on index.lock.
+      with_lock(Agent::Paths.vitals_lock) do |acquired|
+        next unless acquired
+        result = Agent::Checkout.pull
+        if result.ok?
+          log("devops checkout: #{result.message}") if result.changed?
+        else
+          # NEVER fatal. A machine that cannot pull keeps running the code it
+          # has; the sha it reports is what makes that visible in admin rather
+          # than leaving it silently stale.
+          decide("checkout", "devops pull failed (#{result.message}) — staying on #{Agent::Checkout.short(Agent::Checkout.head_sha)}")
+        end
+      end
+    end
+
+    # What this machine reads producers.yml to be: every producer, its cadence,
+    # and the next-due moment THIS runner computed, plus the devops sha it all
+    # came from.
+    #
+    # Reported state, not a definition. The server still never evaluates a
+    # schedule — but run history alone cannot show "should have run and did
+    # not", because a dead producer and a quiet one are the same silence, and a
+    # producer nobody schedules anymore leaves no rows at all. Comparing reports
+    # across machines is also the only way sha skew is visible: no single runner
+    # can see that it is the one on the old checkout.
+    #
+    # Rate: on a devops sha change (so a push shows up the tick after it lands),
+    # otherwise on the heartbeat cadence — next_due_at moves every time a
+    # producer runs, so a sha-only trigger would leave it stale for days.
+    def report_registry(identity)
+      sha = Agent::Checkout.head_sha
+      return log("registry: #{Agent::Checkout.devops_repo} is not a git checkout — not reporting") if sha.nil?
+      return unless registry_report_due?(sha)
+
+      registry = Agent::Producers.load
+      producers = Agent::Producers.report(registry, last_run_by_key: last_run_by_key(identity), now: @now)
+      if @dry_run
+        log("would PUT /agent/registry/#{identity.runner_id} (#{producers.length} producers @ #{Agent::Checkout.short(sha)})")
+        return
+      end
+
+      Agent::Api.report_registry(identity.runner_id, devops_sha: sha, producers: producers,
+                                 token: identity.token, use_localhost: @use_localhost)
+      Agent::Paths.write_json(Agent::Paths.registry_report_file,
+                              { "devops_sha" => sha, "at" => @now.utc.iso8601 }, mode: 0600)
+      log("registry reported: #{producers.length} producers @ #{Agent::Checkout.short(sha)}")
+    rescue Agent::Producers::ConfigError => e
+      # A registry this machine cannot parse is a real problem, but it is the
+      # producer path's problem to report — it must not cost the machine its
+      # heartbeat.
+      log("registry: #{e.message}")
+    end
+
+    def registry_report_due?(sha)
+      last = Agent::Paths.read_json(Agent::Paths.registry_report_file)
+      return true if last.nil? || last["devops_sha"] != sha
+      at = Time.parse(last["at"].to_s) rescue nil
+      at.nil? || (@now - at) >= RUNNER_HEARTBEAT_SECONDS
     end
 
     def ensure_identity

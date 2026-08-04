@@ -24,8 +24,15 @@ class TestDevAgentTick < Minitest::Test
         "DEV_AGENT_LOG_ROOT" => File.join(root, "logs"),
         "DEV_AGENT_WORKSPACE_ROOT" => File.join(root, "ai"),
         "DEV_AGENT_CLAUDE_REPO" => File.join(root, "claude"),
+        # A stand-in devops checkout: it carries a real copy of `agent/` (so
+        # producers.yml and the githooks resolve) but is NOT a git repo, so no
+        # test can reach out and `git pull` the developer's own checkout. The
+        # tests that exercise the pull point this at a throwaway clone instead.
+        "DEV_AGENT_DEVOPS_REPO" => File.join(root, "devops"),
         "DEV_AGENT_NO_NOTIFY" => "1",
       }
+      FileUtils.mkdir_p(File.join(root, "devops"))
+      FileUtils.cp_r(File.expand_path("../agent", __dir__), File.join(root, "devops"))
       original = overrides.keys.to_h { |k| [k, ENV[k]] }
       overrides.each { |k, v| ENV[k] = v }
       FileUtils.mkdir_p(ENV["DEV_AGENT_WORKSPACE_ROOT"])
@@ -514,6 +521,127 @@ class TestDevAgentTick < Minitest::Test
       _out, status = run_hook(repo, "refs/heads/main #{head} refs/heads/main #{base}",
                               guarded: File.join(root, "claude"))
       assert status.success?, "the hook must never be the reason a normal push fails"
+    end
+  end
+
+  # ---- ISS-393: the tick pulls its own devops checkout ----
+  #
+  # One push to devops has to reach the whole fleet. Before this, a producer
+  # schedule change meant logging into every machine, so "producers.yml in git is
+  # the registry" was true only of the file, never of what a machine was running.
+
+  # An `origin` with one commit, and a clone of it pointed at by
+  # DEV_AGENT_DEVOPS_REPO. Returns [origin, checkout].
+  def with_devops_clone(root)
+    origin = File.join(root, "devops-origin")
+    init_repo(origin)
+    write_commit(origin, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n")
+    checkout = File.join(root, "devops-checkout")
+    system("git", "clone", "-q", origin, checkout, out: File::NULL, err: File::NULL)
+    previous = ENV["DEV_AGENT_DEVOPS_REPO"]
+    ENV["DEV_AGENT_DEVOPS_REPO"] = checkout
+    yield origin, checkout
+  ensure
+    ENV["DEV_AGENT_DEVOPS_REPO"] = previous
+  end
+
+  def head_of(dir) = `git -C #{dir} rev-parse HEAD`.strip
+
+  def test_the_tick_fast_forwards_its_devops_checkout
+    with_agent_home do |root|
+      with_devops_clone(root) do |origin, checkout|
+        write_commit(origin, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n# newer\n")
+        register_identity
+        with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
+        assert_equal head_of(origin), head_of(checkout), "one push to devops must reach the machine"
+      end
+    end
+  end
+
+  # A diverged checkout must STOP, not merge: merging here would invent a
+  # fleet-wide code state that exists in no repo and in no review. And the
+  # failure must never be fatal — the machine keeps running the code it has.
+  def test_a_diverged_checkout_is_refused_and_never_crashes_the_tick
+    with_agent_home do |root|
+      with_devops_clone(root) do |origin, checkout|
+        write_commit(origin, "agent/producers.yml", "# theirs\n")
+        write_commit(checkout, "agent/producers.yml", "# ours\n")
+        local = head_of(checkout)
+        register_identity
+        out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
+        assert_match(/devops pull failed/, out)
+        assert_equal local, head_of(checkout), "--ff-only must leave a diverged checkout exactly where it was"
+      end
+    end
+  end
+
+  def test_a_dry_run_never_pulls
+    with_agent_home do |root|
+      with_devops_clone(root) do |origin, checkout|
+        write_commit(origin, "agent/producers.yml", "# newer\n")
+        before = head_of(checkout)
+        out = capture_stdout { tick.update_checkout }
+        assert_match(/would pull/, out)
+        assert_equal before, head_of(checkout), "a dry run must not move the checkout"
+      end
+    end
+  end
+
+  # ---- ISS-392: the registry each runner reports ----
+
+  def test_the_runner_reports_its_registry_with_the_devops_sha
+    reported = nil
+    with_agent_home do |root|
+      with_devops_clone(root) do |_origin, checkout|
+        write_commit(checkout, "agent/producers.yml", <<~YML)
+          timezone: America/New_York
+          producers:
+            - key: probe
+              schedule: every 1 hour
+              check: "true"
+              file_when: check_fails
+              issue:
+                category: infrastructure
+                title: t
+                fingerprint: fp:1
+        YML
+        register_identity
+        stubs = fleet_responses.merge(
+          "PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} },
+        )
+        with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false).report_registry(Agent::Host.cached_identity) } }
+
+        assert_equal head_of(checkout), reported[:devops_sha],
+                     "the reported sha is what makes a machine stuck on an old checkout visible"
+        assert_equal ["probe"], reported[:producers].map { |p| p[:producer_key] }
+        assert_equal "every 1 hour", reported[:producers].first[:schedule]
+        refute_nil reported[:producers].first[:next_due_at]
+      end
+    end
+  end
+
+  # The throttle is what keeps a 30-second tick from PUTting 2,880 times a day.
+  # It is keyed on the sha as well as on time, so a push converges the fleet on
+  # the next tick rather than up to ten minutes later.
+  def test_a_second_report_is_skipped_until_the_sha_moves
+    with_agent_home do |root|
+      with_devops_clone(root) do |_origin, checkout|
+        register_identity
+        calls = 0
+        stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(_body) { calls += 1; {} })
+        with_stubbed_api(stubs) do
+          capture_stdout do
+            runner = tick(dry_run: false)
+            runner.report_registry(Agent::Host.cached_identity)
+            runner.report_registry(Agent::Host.cached_identity)
+            assert_equal 1, calls, "an unchanged registry must not be re-sent every 30 seconds"
+
+            write_commit(checkout, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n# moved\n")
+            tick(dry_run: false).report_registry(Agent::Host.cached_identity)
+          end
+        end
+        assert_equal 2, calls, "a new devops sha must be reported on the next tick"
+      end
     end
   end
 

@@ -204,4 +204,46 @@ class TestDevAgentSchedule < Minitest::Test
 
     assert ran_this_period >= boundary, "a run inside the current period must still block a second one"
   end
+  # ---- the reported registry (ISS-392) ----
+  #
+  # `Agent::Producers.report` is the whole reason the platform can show "should
+  # have run and did not" without ever learning the schedule grammar: the
+  # arithmetic happens here and only a conclusion crosses the wire.
+
+  def registry(*producers)
+    entries = producers.map do |key, schedule|
+      { "key" => key, "schedule" => schedule, "check" => "true", "file_when" => "check_fails",
+        "issue" => { "title" => key, "category" => "infrastructure", "fingerprint" => "fp:#{key}" } }
+    end
+    Agent::Producers.parse({ "timezone" => ZONE, "producers" => entries }.to_yaml)
+  end
+
+  def test_report_carries_the_authored_schedule_text_and_a_computed_next_due
+    now = Time.utc(2026, 8, 4, 12, 0, 0)
+    last = { "hourly" => Time.utc(2026, 8, 4, 11, 30, 0) }
+
+    entry = Agent::Producers.report(registry(["hourly", "every 1 hour"]), last_run_by_key: last, now: now).first
+
+    assert_equal "hourly", entry[:producer_key]
+    # The text as authored, not a re-rendering of the parsed form: two runners on
+    # different devops shas are meant to be comparable by eye.
+    assert_equal "every 1 hour", entry[:schedule]
+    assert_equal "2026-08-04T12:30:00Z", entry[:next_due_at]
+  end
+
+  # A producer that has never run is due NOW, not at the next wall-clock
+  # occurrence — the same rule `due?` uses, so admin cannot disagree with the
+  # tick about what is overdue.
+  def test_report_marks_a_producer_that_has_never_run_as_due_now
+    now = Time.utc(2026, 8, 4, 12, 0, 0)
+    entry = Agent::Producers.report(registry(["nightly", "daily at 3:00am"]), last_run_by_key: {}, now: now).first
+    assert_equal "2026-08-04T12:00:00Z", entry[:next_due_at]
+  end
+
+  def test_report_covers_every_producer_in_registry_order
+    now = Time.utc(2026, 8, 4, 12, 0, 0)
+    entries = Agent::Producers.report(registry(["a", "every 1 hour"], ["b", "daily at 3:00am"]),
+                                      last_run_by_key: {}, now: now)
+    assert_equal %w[a b], entries.map { |e| e[:producer_key] }
+  end
 end

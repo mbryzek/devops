@@ -10,7 +10,7 @@ look. Everything here exists to drain the open issue queue.
 
 | File | What it is |
 |---|---|
-| `producers.yml` | The schedule registry. The only place a schedule lives — the platform records run history but has no notion of "due". |
+| `producers.yml` | The schedule registry. The only place a schedule lives — the platform records run history but has no notion of "due". The tick pulls this checkout itself, so one push reaches every machine. |
 | `bodies/` | The playbooks a producer ships with the issue it files (`issue.body_file`). Without one the claiming session gets `claude-issues/default-body.md` and does generic triage instead of the job the producer was written to schedule. |
 | `instructions.md` | Part 1 of every session's prompt. Outcome protocol, the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. |
 | `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
@@ -77,11 +77,33 @@ Retention (`dev agent gc`, daily at 4:00am as a producer): tick and producer log
 30 days; a terminal issue's directory 14 days; a failed or gave-up one 30 days —
 the post-mortem window; workspaces deleted on success and after 7 days otherwise.
 
+## One push reaches the fleet
+
+Phase A runs `git pull --ff-only origin main` in this checkout before it does
+anything else, so changing a producer's schedule is a devops PR and nothing more —
+no logging into each machine. `--ff-only` because a diverged checkout must stop
+rather than merge, and a failed pull is reported, never fatal: the machine keeps
+running the code it has. A pull that changes tick code takes effect on the NEXT
+tick, which is safe precisely because the tick is one shot.
+
+A machine whose pull is failing is otherwise indistinguishable from a healthy
+one — same heartbeat, same runs — which is why each runner also reports what it
+reads: every producer, its cadence, the next-due moment it computed, and the
+devops sha it all came from (`PUT /agent/registry/:runner_id`). Git stays the
+system of record; the platform holds *reports about* git and never evaluates a
+schedule. Comparing those reports is what makes three things visible that run
+history alone cannot show: a producer that is **overdue**, runners on **different
+devops shas**, and a producer **no live runner schedules** at all. `/admin/agents`
+renders all three. Reported on a sha change (so a push shows the tick after it
+lands) and otherwise on the heartbeat cadence, since next-due moves as producers
+run.
+
 ## Two phases, two locks
 
-Phase A is **vitals** — runner heartbeat, lease heartbeats, and the 4-hour hard
-timeout — and it always runs. Phase B is **work** — reap, producers, claim — and
-it is skipped entirely when a previous tick still holds the lock.
+Phase A is **vitals** — the devops self-update, the runner heartbeat, lease
+heartbeats, the registry report, and the 4-hour hard timeout — and it always
+runs. Phase B is **work** — reap, producers, claim — and it is skipped entirely
+when a previous tick still holds the lock.
 
 Putting both under one lock inverts the system's own alarm: a slow Phase B would
 block heartbeats on a perfectly healthy machine, tripping the offline invariant
