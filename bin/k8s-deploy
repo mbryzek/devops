@@ -174,10 +174,38 @@ def wait_for_rollout(label, rollout_cmd)
   success
 end
 
+# podManagementPolicy is immutable. Once the template changed it to Parallel,
+# `kubectl apply` against a StatefulSet still carrying the OrderedReady default
+# is rejected outright:
+#
+#   Forbidden: updates to statefulset spec for fields other than 'replicas',
+#   'ordinals', 'template', 'updateStrategy', ... are forbidden
+#
+# which would fail every deploy of every scala-play app until someone migrated
+# by hand. The migration is to delete the StatefulSet object while ORPHANING its
+# pods (--cascade=orphan): the running pod is untouched, and the recreated
+# StatefulSet adopts it by label selector. No downtime, and the pod is then
+# rolled normally by the deploy that follows.
+#
+# Idempotent by construction — it only fires while the live object disagrees
+# with the manifest, so it is a no-op on every subsequent deploy.
+def adopt_statefulset_for_immutable_change(namespace, name, manifest_file)
+  live = `kubectl get statefulset/#{name} -n #{namespace} -o jsonpath='{.spec.podManagementPolicy}' 2>/dev/null`.strip
+  return if live.empty? # not created yet; the apply below creates it correctly
+
+  desired = File.read(manifest_file)[/podManagementPolicy:\s*(\w+)/, 1] || "OrderedReady"
+  return if live == desired
+
+  Util.detail("  Migrating #{name}: podManagementPolicy #{live} -> #{desired} (immutable field)")
+  Util.detail("  Deleting the StatefulSet with --cascade=orphan; pods keep running and are re-adopted.")
+  Util.run("kubectl delete statefulset/#{name} -n #{namespace} --cascade=orphan")
+end
+
 # Step 2: Apply web Deployment + job StatefulSet, wait for both in parallel
 Util.detail("")
 Util.detail("  [2/2] Applying Deployment #{deployment_name} and StatefulSet #{statefulset_name}...")
 Util.run("kubectl apply -f #{manifest_file} -l tier=web")
+adopt_statefulset_for_immutable_change(K8S_NAMESPACE, statefulset_name, manifest_file)
 Util.run("kubectl apply -f #{manifest_file} -l tier=job")
 
 deployment_success = false
