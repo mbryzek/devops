@@ -2432,9 +2432,15 @@ end
 # returns snoozed AND awake issues. A snoozed issue is still `open`, so anything
 # that offers work to do must pass false — `POST /claims` skips snoozed issues
 # server-side, and a preview that lists them offers work the claim will refuse.
-def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil, duplicate_of_number: nil)
+#
+# `types` is the third of the same shape: omitted, the server returns epics
+# alongside units of work. An epic is a container that `POST /claims` refuses
+# (`type != epic` in InternalIssuesDao.claimOpen), so anything offering work to
+# do must pass "issue".
+def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil, duplicate_of_number: nil, types: nil)
   params = { "statuses" => Array(statuses) }
   params["categories"] = category if category
+  params["types"] = Array(types) if types
   params["parent_number"] = parent_number if parent_number
   params["duplicate_of_number"] = duplicate_of_number if duplicate_of_number
   params["is_snoozed"] = is_snoozed unless is_snoozed.nil?
@@ -3496,13 +3502,21 @@ def cmd_issues_claim(args)
     # is_snoozed: false because a snoozed issue is still `open` — its owner
     # parked it, and `POST /claims` refuses it. Offering it puts work on the menu
     # that cannot be ordered.
+    #
+    # types: issue for the same reason one level over. An epic is a container,
+    # never a unit of work, and `POST /claims` skips it server-side — so an
+    # unfiltered preview listed epics, and claiming the "all" it offered came
+    # back with nothing claimed and no explanation (an epic-only improvement
+    # queue read as "every issue listed was taken or deferred").
     open = ApiClient.request(
-      endpoint, :get, issues_list_path(statuses: "open", category: category, is_snoozed: false)
+      endpoint,
+      :get,
+      issues_list_path(statuses: "open", category: category, is_snoozed: false, types: "issue"),
     ) || []
     present = issue_categories_present(open)
     if present.empty?
       puts category ? "No open #{category} issues to claim." : "No open issues to claim."
-      puts "(Snoozed issues are not offered — `dev issues list` marks them; `dev issues snooze <n> --wake` brings one back.)"
+      puts "(Snoozed issues and epics are not offered — `dev issues list` shows them; `dev issues snooze <n> --wake` brings a snoozed one back, and an epic is worked through its children.)"
       return
     end
 
@@ -3523,12 +3537,13 @@ def cmd_issues_claim(args)
       if requested
         resolved, unknown = issue_resolve_requested(requested, ordered)
         unless unknown.empty?
-          # "not listed" now also covers snoozed — say so, or naming a deferred
-          # issue looks like the number was wrong.
+          # "not listed" also covers snoozed and epics — say so, or naming a
+          # deferred issue (or a container) looks like the number was wrong.
           Util.exit_with_error(
-            "Not open, snoozed, or not listed above: #{unknown.join(', ')}. " \
+            "Not open, snoozed, an epic, or not listed above: #{unknown.join(', ')}. " \
             "On offer: #{ordered.map { |c| c['number'] }.join(', ')}. " \
-            "Wake a snoozed issue with `dev issues snooze <n> --wake`."
+            "Wake a snoozed issue with `dev issues snooze <n> --wake`; an epic is never " \
+            "claimed — claim its children (`dev issues list --epic <n>`)."
           )
         end
         [resolved, true]
