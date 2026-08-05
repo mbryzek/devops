@@ -49,14 +49,13 @@ moved past it walks it BACKWARD, and the server now refuses that write. One swee
 recording second PRs the old way un-verified ten issues in eleven seconds on
 2026-08-05 and destroyed three human verifications, which nothing can restore
 (ISS-536). Do not fall back to a bare `--comment` either — a url in prose is
-invisible to `dev issues reconcile`, to the merge webhook and to `dev issues show`,
-so the fix stops being findable at all. `dev issues fix` takes the same
+invisible to `dev issues reconcile` and to `dev issues show`, so the fix stops
+being findable at all. `dev issues fix` takes the same
 `--app`/`--baseline-version` pair and leaves the status alone.
 
 **The PR title MUST start with `ISS-<n>: `.** That prefix is load-bearing, not
-decorative: the executor's own reap, the merge webhook, and
-`dev issues reconcile` all find your PR by it, and they are the independent paths
-that close this issue. Without it, a merged fix leaves the issue invisible
+decorative: the executor's own reap and `dev issues reconcile` both find your PR
+by it, and they are the independent paths that close this issue. Without it, a merged fix leaves the issue invisible
 forever.
 
 Nothing merges automatically. The worst case of any run here is a PR nobody
