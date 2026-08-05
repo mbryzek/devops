@@ -79,7 +79,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
   "issues block"        => 'issues block <number> --on NUMBER [--remove] [--localhost]',
@@ -89,7 +89,7 @@ INVOCATIONS = {
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--duplicate-of NUMBER] [--app APP --baseline-version VERSION] [--localhost]',
   "issues fix"          => 'issues fix <number> --url URL [--comment "TEXT"] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
-  "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
+  "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
@@ -508,6 +508,16 @@ USAGE = <<~USAGE
         attach files explicitly: each is uploaded to the issue AND handed to the
         session as a local path, so it can read the file directly.
 
+        Repeat --repo NAME for every repository the work is in — bare GitHub
+        repo names under mbryzek (platform, platform-postgresql, devops, …), not
+        owner/repo slugs. It is not a label: the agent executor clones each named
+        repo into the attempt's workspace and creates the attempt's branch in it,
+        so an autonomous session opens into a checkout instead of cloning for
+        itself and picking its own branch name — the ISS-365 failure, where good
+        work landed on a branch the executor could not find. An issue with no
+        repos still works; its session just clones for itself. An unknown name is
+        rejected here, with the full list.
+
         --status says who the issue belongs to. `claimed` is yours to work now;
         `open` hands it to the queue and starts no session. From a terminal it
         defaults to `claimed` — that is what filing from the laptop means. Off a
@@ -688,7 +698,9 @@ USAGE = <<~USAGE
         recurs onto the same issue instead of filing a second one. --from is the
         issue the session was working; it is recorded in the new issue's body and
         as a comment on that issue's timeline, so the link reads in both
-        directions.
+        directions. Repeat --repo NAME for the repositories the fix would touch,
+        exactly as on `issues create` — a finding filed with them is one whose
+        session opens into a checkout.
 
     #{INVOCATIONS["issues snooze"]}
         Defer an issue for --days N: it drops out of the queue, out of
@@ -2242,6 +2254,60 @@ ISSUE_SEVERITIES = %w[low medium high].freeze
 # phantom claim does not just mislabel the issue, it makes it unpickupable.
 ISSUE_CREATE_STATUSES = %w[open claimed].freeze
 
+# The GitHub owner every repo an issue can name lives under, and the shape a name
+# has to have. Both are what the agent executor interpolates into
+# `gh repo clone mbryzek/<name>` (Agent::Workspace::OWNER), so a slug, a URL or a
+# path is not a name it can use.
+ISSUE_REPO_OWNER = "mbryzek".freeze
+ISSUE_REPO_NAME_RE = /\A[A-Za-z0-9._-]+\z/
+
+# Trimmed, blanks dropped, deduped — what actually goes on the form. The server
+# normalizes the same way; doing it here too keeps what the caller is told about
+# (below) identical to what is filed.
+def issue_normalize_repos(repos)
+  repos.map { |r| r.to_s.strip }.reject(&:empty?).uniq
+end
+
+# Every repository under the owner, or nil when GitHub cannot be asked (no `gh`,
+# not authenticated, offline). Memoized: `create` validates once per run.
+#
+# nil is deliberately NOT an error. Validation exists to catch a typo at the
+# terminal, and refusing to file an issue because the network is down would trade
+# a caught typo for a lost finding — the same trade `noteOverlaps` refuses on the
+# server. A name that survives a skipped check simply fails to clone later, which
+# costs the session a clone it would have done itself anyway.
+def issue_github_repo_names
+  return @issue_github_repo_names if defined?(@issue_github_repo_names)
+  out, status = Open3.capture2e("gh", "repo", "list", ISSUE_REPO_OWNER, "--limit", "500", "--json", "name")
+  @issue_github_repo_names = status.success? ? JSON.parse(out).map { |r| r["name"] } : nil
+rescue StandardError
+  @issue_github_repo_names = nil
+end
+
+# Problems with the `--repo` values, in the vocabulary the caller typed. Unknown
+# names are listed WITH the full list of what exists, because the answer to "I
+# typed the wrong repo name" is the right one, not a rejection.
+def issue_repo_problems(repos)
+  names = issue_normalize_repos(repos)
+  return [] if names.empty?
+
+  problems = names.reject { |n| ISSUE_REPO_NAME_RE.match?(n) }.map do |n|
+    "--repo #{n}: not a repository name. Pass the bare name under #{ISSUE_REPO_OWNER} " \
+      "(e.g. --repo platform), not an owner/repo slug, url or path"
+  end
+  return problems unless problems.empty?
+
+  known = issue_github_repo_names
+  return problems if known.nil?
+
+  unknown = names.reject { |n| known.include?(n) }
+  return problems if unknown.empty?
+
+  problems << "--repo #{unknown.join(', ')}: no such repository under #{ISSUE_REPO_OWNER}. " \
+              "Known: #{known.sort.join(', ')}"
+  problems
+end
+
 # Extensions the platform storage file_type enum accepts, mapped to the MIME type
 # the data_url upload needs. Anything not listed is rejected locally, before any
 # network call, so a bad path never leaves an orphan issue behind.
@@ -2858,6 +2924,12 @@ def issue_render_item(issue, index = nil, comments: [], heading: true)
   lines << "- Club: #{issue_club_label(issue)} (`#{issue.dig('club', 'id')}`)" if issue["club"]
   lines << "- Created: #{issue.dig('created', 'at')} by #{issue_author_label(issue)}"
   lines << "- Occurrences: #{issue['occurrence_count'] || 1}"
+  # The repos the work is in, which the agent executor clones and branches before
+  # a session starts. Shown even though nothing about the record depends on it:
+  # an issue that names none is one whose session clones for itself, and that is
+  # worth seeing HERE rather than discovering from the session's transcript.
+  repositories = issue["repositories"] || []
+  lines << "- Repos: #{repositories.join(', ')}" unless repositories.empty?
   lines << "- Fingerprint: `#{issue['fingerprint']}`" if issue["fingerprint"] && !issue["fingerprint"].empty?
   # ISS-553. Printed only when set, because it is set on almost nothing — and when
   # it IS set it changes what a reader can do with the issue: the work is about one
@@ -3190,6 +3262,7 @@ def cmd_issues_create(args)
   status = nil
   body = nil
   images = []
+  repos = []
   is_epic = false
   parent = nil
   spawn_session = true
@@ -3222,6 +3295,11 @@ def cmd_issues_create(args)
       path = rest[i + 1]
       usage_exit("--image requires a path", example: usage_for("issues create")) if path.nil?
       images << path
+      i += 2
+    when "--repo"
+      repo = rest[i + 1]
+      usage_exit("--repo requires a repository name", example: usage_for("issues create")) if repo.nil?
+      repos << repo
       i += 2
     when "--epic"
       is_epic = true
@@ -3262,6 +3340,7 @@ def cmd_issues_create(args)
       problems << "--image #{p}: unsupported file type (allowed: #{ISSUE_FILE_TYPES.keys.sort.join(', ')})"
     end
   end
+  problems.concat(issue_repo_problems(repos))
   report_arg_problems("issues create", problems, usage_for("issues create"))
 
   require_playbook_session!(use_localhost)
@@ -3320,6 +3399,7 @@ def cmd_issues_create(args)
     form[:body] = brief unless brief.empty?
     form[:source_url] = source_url if source_url
     form[:severity] = severity if severity
+    form[:repositories] = issue_normalize_repos(repos) unless repos.empty?
     form[:attachments] = attachments unless attachments.empty?
 
     issue_file_and_start(
@@ -3507,6 +3587,7 @@ def cmd_issues_workaround(args)
   body = nil
   category = nil
   severity = nil
+  repos = []
   leftover = []
   i = 0
   while i < rest.length
@@ -3535,6 +3616,11 @@ def cmd_issues_workaround(args)
       severity = rest[i + 1]
       usage_exit("--severity requires a value", example: usage_for("issues workaround")) if severity.nil?
       i += 2
+    when "--repo"
+      repo = rest[i + 1]
+      usage_exit("--repo requires a repository name", example: usage_for("issues workaround")) if repo.nil?
+      repos << repo
+      i += 2
     else
       leftover << rest[i]
       i += 1
@@ -3547,6 +3633,7 @@ def cmd_issues_workaround(args)
   category = "bug" if category.nil? || category.empty?
   problems = workaround_problems(from: from, key: key, title: title, body: body,
                                  category: category, severity: severity, leftover: leftover)
+  problems.concat(issue_repo_problems(repos))
   report_arg_problems("issues workaround", problems, usage_for("issues workaround"))
 
   require_playbook_session!(use_localhost)
@@ -3560,6 +3647,7 @@ def cmd_issues_workaround(args)
     claim_on_create: false,
   }
   form[:severity] = severity if severity
+  form[:repositories] = issue_normalize_repos(repos) unless repos.empty?
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)

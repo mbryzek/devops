@@ -717,9 +717,14 @@ module Agent
       resume_repo = resume_branch && !resume_branch.empty? ? Agent::Workspace.resume(slug, resume_branch) : nil
       slug = Agent::Workspace.slug(number) if resume_branch && resume_repo.nil?
       workspace = Agent::Workspace.create(slug)
+      # The repos the issue names, cloned with the branch already created, so the
+      # session opens into a checkout (ISS-562). Best-effort: whatever did not
+      # prepare is simply absent from the prompt and the session clones it itself.
+      prepared = Agent::Workspace.prepare(slug, issue["repositories"], branch: slug, already_prepared: resume_repo)
 
       prompt = Agent::Prompt.build(issue: issue, comments: comments, slug: slug,
-                                   workspace: workspace, resume_repo: resume_repo, playbook: playbook)
+                                   workspace: workspace, resume_repo: resume_repo,
+                                   prepared_repos: prepared, playbook: playbook)
       pid = Agent::Jobs.spawn_session(argv: @claude_argv, prompt: prompt, workspace: workspace,
                                       number: number, env: child_env)
       Agent::Jobs.write(
