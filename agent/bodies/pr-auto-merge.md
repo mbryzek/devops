@@ -71,9 +71,11 @@ Skip, without a decision:
 - **PRs whose title does not start with `ISS-<n>: `** — the prefix is what ties
   a merge back to a tracked issue, and a PR without one has nothing the deploy
   reconcilers can follow;
-- **PRs that are not mergeable** (conflicts) — resolving someone else's conflict
-  is judgment, not mechanics;
 - **anything already approved-and-merged, closed, or from a fork.**
+
+PRs that have conflicts:
+— resolve the conflicts to the best of your abilities.
+- If you are truly stuck, add a comment on the PR describing why you are stuck.
 
 ## 4. Compute the facts, one PR at a time
 
@@ -117,9 +119,6 @@ to merge.
   SAME Bash call as sbt. Never `:5432` — that is Mike's local database.
 - **`sbt -batch` exits 0 even on compile failure.** Read the output for
   `[error]`; do not trust the exit code.
-- A rebase conflict, a failing suite, or a verification you could not run is a
-  **skip**, not a judgment call to work around. Never edit the PR's code to make
-  a check pass.
 
 ## 5. Classify reversibility from what you computed
 
@@ -130,7 +129,7 @@ From `changed_paths`, not from what the PR says about itself:
 | `irreversible` | any `platform-postgresql/scripts/*.sql` or other migration; a DAO spec change that regenerates schema; any column drop |
 | `costly` | an apibuilder `spec/*.json` change with downstream consumers; any `lib-*` release; a consumer regen whose producer has not deployed |
 | `reversible` | ordinary application code, config, tests |
-| `trivial` | docs, comments, formatting, dead-code removal |
+| `trivial` | docs, comments, formatting, dead-code removal, infrastructure updates, standard dependency updated |
 
 Two of these are counterintuitive and both are deliberate:
 
