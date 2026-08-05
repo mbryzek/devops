@@ -1249,6 +1249,120 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- ISS-531: a missing host binary has to be LOUD ----
+  #
+  # The bug: `depsguard` was never installed on the runner, so the weekly
+  # supply-chain scan exited 2, the producer recorded `check_failed`, and
+  # `check_failed` is deliberately indistinguishable from a clean week. The
+  # producer had run once in its entire history and filed nothing, and from
+  # inside any single tick that reads as a producer with nothing to say.
+
+  # A result with `missing` absent from the agent's PATH and everything else
+  # present, without depending on what is installed on the box running the suite.
+  def toolchain_result(missing:, now: Time.now)
+    found = Agent::Toolchain::TOOLS.map do |tool|
+      present = !missing.include?(tool.name)
+      Agent::Toolchain::Found.new(tool: tool, path: present ? "/stub/bin/#{tool.name}" : nil, version: nil)
+    end
+    Agent::Toolchain::Result.new(at: now, path: "/stub/bin", found: found)
+  end
+
+  # Built eagerly: stub_singleton rebinds the block to the module, so anything
+  # the lambda calls on the test instance is gone by the time the tick runs it.
+  def with_toolchain(missing:, &block)
+    result = toolchain_result(missing: missing)
+    stub_singleton(Agent::Toolchain, :check, ->(**_opts) { result }, &block)
+  end
+
+  def test_a_missing_required_binary_files_an_issue_naming_the_producers_it_blocks
+    filed = nil
+    with_agent_home do
+      register_identity
+      with_toolchain(missing: %w[depsguard]) do
+        stub_singleton(Agent::Api, :create_issue, ->(form, **_opts) { filed = form; { "number" => 1 } }) do
+          with_ai_token { capture_stdout { tick(dry_run: false).check_toolchain } }
+        end
+      end
+    end
+    refute_nil filed, "a producer that cannot run on this machine has to reach a human somehow"
+    assert_includes filed[:title], "depsguard"
+    assert_includes filed[:body], "brew install depsguard"
+    assert_includes filed[:body], "`depsguard`"
+    assert_equal false, filed[:claim_on_create]
+  end
+
+  # A healthy machine files nothing. Anything that fires on a healthy idle box
+  # trains Mike to ignore the channel, which costs the alerts that matter — the
+  # same reasoning Agent::Notify is built on.
+  def test_a_complete_toolchain_files_nothing
+    with_agent_home do
+      register_identity
+      with_toolchain(missing: []) do
+        # No create_issue stub: reaching the platform at all would flunk on the
+        # unstubbed-request guard, which is the assertion.
+        with_stubbed_api({}) { capture_stdout { tick(dry_run: false).check_toolchain } }
+      end
+      assert_equal [], Agent::Toolchain.state["missing"]
+    end
+  end
+
+  # `openclaw` is best-effort by construction, so its absence is reported and
+  # never escalated. An optional tool that filed would make the required ones
+  # unreadable.
+  def test_a_missing_optional_tool_is_recorded_and_not_filed
+    with_agent_home do
+      register_identity
+      with_toolchain(missing: %w[openclaw]) do
+        with_stubbed_api({}) { capture_stdout { tick(dry_run: false).check_toolchain } }
+      end
+      assert_equal [], Agent::Toolchain.state["missing"]
+      assert_equal %w[openclaw], Agent::Toolchain.state["missing_optional"]
+    end
+  end
+
+  # The daily marker is what stops a permanently-broken machine filing every 30
+  # seconds. It is written on the FAILING path too — a check that only stamped
+  # its marker on success would re-probe and re-notify on every tick forever.
+  def test_the_check_is_throttled_after_it_files
+    with_agent_home do
+      register_identity
+      calls = 0
+      with_toolchain(missing: %w[depsguard]) do
+        stub_singleton(Agent::Api, :create_issue, ->(_form, **_opts) { calls += 1; { "number" => 1 } }) do
+          with_ai_token do
+            capture_stdout { tick(dry_run: false).check_toolchain }
+            capture_stdout { tick(dry_run: false).check_toolchain }
+          end
+        end
+      end
+      assert_equal 1, calls, "a machine that is missing a tool today is missing it 30 seconds from now"
+    end
+  end
+
+  # An unregistered machine is the one MOST likely to be missing tools, which is
+  # why this runs before the identity check — the same placement, for the same
+  # reason, as ISS-520's housekeeping.
+  def test_the_toolchain_is_checked_on_a_machine_the_platform_has_never_heard_of
+    with_agent_home do
+      with_toolchain(missing: []) do
+        out = with_stubbed_api({}) { capture_stdout { tick(dry_run: false).phase_b } }
+        assert_match(/no runner identity yet/, out)
+      end
+      refute_nil Agent::Toolchain.last_check_at
+    end
+  end
+
+  def test_a_dry_run_says_what_it_would_file_and_files_nothing
+    with_agent_home do
+      register_identity
+      with_toolchain(missing: %w[depsguard]) do
+        out = with_stubbed_api({}) { capture_stdout { tick.check_toolchain } }
+        assert_match(/toolchain: MISSING depsguard — would file an issue/, out)
+      end
+      assert_nil Agent::Toolchain.last_check_at, "a dry run must not stamp the marker either"
+    end
+  end
+
   # ---- ISS-392: the registry each runner reports ----
 
   def test_the_runner_reports_its_registry_with_the_devops_sha

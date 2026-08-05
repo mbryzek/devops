@@ -14,6 +14,7 @@ require 'agent/paths'
 require 'agent/playbook'
 require 'agent/producers'
 require 'agent/prompt'
+require 'agent/toolchain'
 require 'agent/workspace'
 
 # `dev agent tick` — one shot, run by launchd every 30 seconds. THERE IS NO
@@ -408,6 +409,7 @@ module Agent
     # down.
     def phase_b
       run_maintenance
+      check_toolchain
       identity = Agent::Host.cached_identity
       if identity.nil?
         log("no runner identity yet — skipping work phase")
@@ -468,6 +470,65 @@ module Agent
                  "Run it by hand on that machine to see the failure directly: `dev agent maintenance --dry-run` " \
                  "for what it would do, then the command above.",
       )
+    end
+
+    # ---- toolchain (ISS-531) ----
+    #
+    # Runner-local, like maintenance and for the same reason: whether THIS box
+    # has `depsguard` is a fact about this box, and a fleet-wide daily lock would
+    # have checked one machine and left the rest.
+    #
+    # NOT `record_failure`. That path debounces at ERROR_ESCALATE_AT because a
+    # docker prune or a git fetch can fail transiently and a single blip is not
+    # worth an issue. A missing binary has no transient mode — it is installed or
+    # it is not — so three strikes at a daily cadence would only mean three days
+    # of a producer that still cannot run. It files on the first detection
+    # instead, and the SERVER's fingerprint dedup is what stops it re-filing: the
+    # key carries the machine and the exact set of missing tools, so a partially
+    # provisioned box files an accurate second issue and a fully provisioned one
+    # files nothing.
+    #
+    # Before the identity check on purpose. A machine that has not registered yet
+    # is the machine most likely to be missing tools, and this is the report that
+    # says so.
+    def check_toolchain
+      return unless Agent::Toolchain.due?(now: @now)
+
+      result = Agent::Toolchain.check(now: @now)
+      summary = result.ok? ? "all required tools present" : "MISSING #{result.missing_required.map(&:name).join(', ')}"
+      if @dry_run
+        decide("toolchain", "#{summary} — would #{result.ok? ? 'record the check' : 'file an issue'}")
+        return
+      end
+
+      Agent::Toolchain.record(result)
+      decide("toolchain", summary)
+      return if result.ok?
+
+      file_toolchain_issue(result)
+    end
+
+    # Best-effort in the same sense the rest of Phase B's platform calls are: a
+    # box that cannot reach the platform has a bigger problem than an unfiled
+    # issue, and the marker is already written so the next cadence retries.
+    def file_toolchain_issue(result)
+      host = hostname
+      Agent::Notify.once("toolchain", "#{host}:#{Agent::Toolchain.missing_key(result)}", now: @now) do
+        Agent::Notify.event("dev-agent: #{host} is missing #{result.missing_required.map(&:name).join(', ')} " \
+                            "— #{result.blocked_producers.join(', ')} cannot run there")
+      end
+      Agent::Api.create_issue(
+        {
+          title: Agent::Toolchain.issue_title(result, host),
+          category: "bug",
+          fingerprint: Agent::Toolchain.issue_fingerprint(result, host),
+          body: Agent::Toolchain.issue_body(result, host),
+          claim_on_create: false,
+        },
+        use_localhost: @use_localhost,
+      )
+    rescue SessionExpired, ApiError => e
+      log("toolchain: could not file an issue (#{e.message})")
     end
 
     def self_runner(identity)

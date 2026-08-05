@@ -62,6 +62,13 @@ module Agent
     # report — which is how "this machine stopped pruning" becomes visible
     # somewhere other than the machine that stopped.
     def maintenance_file = File.join(state_dir, "agent-maintenance.json")
+    # When this machine last compared itself to Agent::Toolchain::TOOLS, and what
+    # was missing (ISS-531). A throttle in exactly the sense maintenance_file is:
+    # the check costs a `zsh -lc` and a toolchain does not change between ticks,
+    # so it runs on a cadence — but a machine that has never checked is due
+    # immediately, which is what gives a freshly provisioned runner its answer on
+    # the first tick instead of a day later.
+    def toolchain_file = File.join(state_dir, "agent-toolchain.json")
     def work_lock      = File.join(state_dir, "agent-tick.lock")
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
 

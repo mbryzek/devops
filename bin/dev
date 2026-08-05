@@ -42,6 +42,7 @@ require 'depsguard'
 require 'agent/gc'
 require 'agent/maintenance'
 require 'agent/tick'
+require 'agent/toolchain'
 
 # Single source of truth for each command's invocation line, keyed by the command
 # path. The same string is interpolated into the USAGE block below and shown
@@ -117,6 +118,7 @@ INVOCATIONS = {
   "agent release"       => 'agent release <issue> [--localhost]',
   "agent gc"            => 'agent gc [--dry-run]',
   "agent maintenance"   => 'agent maintenance [--dry-run] [--force]',
+  "agent doctor"        => 'agent doctor',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -849,6 +851,15 @@ USAGE = <<~USAGE
         Prints when it last ran, this machine's headroom, and whether a run is
         due. --dry-run says what it would do; --force runs regardless of cadence.
 
+    #{INVOCATIONS["agent doctor"]}
+        Compare this machine to the host prerequisites in Agent::Toolchain::TOOLS
+        and print what is missing, what it blocks, and the command that installs
+        it. Exits 1 if any REQUIRED tool is absent — run it after provisioning a
+        runner and before trusting one. Resolution uses the PATH launchd gives
+        the tick (`/bin/zsh -lc`), NOT your interactive shell's, so a tool that
+        only nvm/rbenv/asdf provides reads as missing here exactly as it does to
+        the agent (ISS-531).
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -895,7 +906,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs pause resume runners producers runs refresh release gc maintenance],
+  "agent"        => %w[tick status logs pause resume runners producers runs refresh release gc maintenance doctor],
 }.freeze
 
 def levenshtein(a, b)
@@ -10181,6 +10192,63 @@ def cmd_agent_maintenance(args)
   exit 1 unless result.outcomes.all?(&:ok)
 end
 
+# The executable form of the HOST PREREQUISITES comment in
+# launchd/com.bryzek.dev-agent.plist (ISS-531).
+#
+# That comment was accurate and never once compared to a machine, which is how
+# this fleet ran for its whole history with `depsguard` absent and its weekly
+# supply-chain scan therefore never executing — silently, because a check that
+# cannot run records `check_failed` and a `check_failed` is deliberately
+# indistinguishable from a clean run. Provisioning gets a command it can fail on.
+#
+# The exit code is the contract: 0 every required tool resolves, 1 something
+# does not. Optional tools are reported and never affect it.
+def cmd_agent_doctor(args)
+  reject_unknown_args("agent doctor", args)
+
+  result = Agent::Toolchain.check
+  puts "PATH (as `/bin/zsh -lc` gives it to the tick):"
+  result.path.split(File::PATH_SEPARATOR).reject(&:empty?).uniq.each { |dir| puts "  #{dir}" }
+  puts
+
+  width = result.found.map { |f| f.tool.name.length }.max
+  result.found.each do |f|
+    status = if f.present? then "ok  "
+             elsif f.tool.optional? then "--  "
+             else "MISS"
+             end
+    detail = f.present? ? (f.version || f.path) : "not on the agent's PATH"
+    puts "  #{status} #{f.tool.name.ljust(width)}  #{detail}"
+  end
+
+  missing = result.missing_required
+  optional = result.missing_optional
+  unless optional.empty?
+    puts
+    optional.each { |t| puts "Optional, absent: #{t.name} — #{t.required_by} (`#{t.install}`)" }
+  end
+
+  if missing.empty?
+    puts
+    puts "All #{result.found.count { |f| f.tool.required? }} required tool(s) present."
+    return
+  end
+
+  puts
+  missing.each do |tool|
+    puts "MISSING #{tool.name} — #{tool.required_by}"
+    puts "  install: #{tool.install}"
+    puts "  blocks producer(s): #{tool.producers.join(', ')}" unless tool.producers.empty?
+  end
+  blocked = result.blocked_producers
+  unless blocked.empty?
+    puts
+    puts "Producer(s) that cannot run on this machine: #{blocked.join(', ')}"
+    puts "They record `check_failed`, file nothing, and look exactly like a quiet week."
+  end
+  exit 1
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -10366,6 +10434,7 @@ when "agent"
   when "release"   then cmd_agent_release(argv)
   when "gc"          then cmd_agent_gc(argv)
   when "maintenance" then cmd_agent_maintenance(argv)
+  when "doctor"      then cmd_agent_doctor(argv)
   else                  unknown("agent subcommand", sub, SUBCOMMANDS["agent"])
   end
 when "changelog"

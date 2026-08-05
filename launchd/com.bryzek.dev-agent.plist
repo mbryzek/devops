@@ -7,13 +7,23 @@
   user session: no keychain (so no `gh` auth), no Docker Desktop, no nvm `node`
   for `claude`. Everything this needs lives in the user session.
 
-  Install:   cp launchd/com.bryzek.dev-agent.plist ~/Library/LaunchAgents/
+  Install:   dev agent doctor            (MUST exit 0 — see HOST PREREQUISITES)
+             cp launchd/com.bryzek.dev-agent.plist ~/Library/LaunchAgents/
              launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bryzek.dev-agent.plist
   Uninstall: launchctl bootout gui/$(id -u)/com.bryzek.dev-agent
   Verify:    dev agent tick --dry-run     (prints every decision, executes none)
 
-  /bin/zsh -lc supplies the interactive PATH (homebrew, nvm's node for `claude`,
-  sbt, gh); launchd's own environment is nearly empty.
+  /bin/zsh -lc supplies the LOGIN shell's PATH (homebrew, sbt, gh); launchd's own
+  environment is nearly empty.
+
+  IT DOES NOT SUPPLY nvm's node, AND THIS COMMENT USED TO CLAIM IT DID. `-lc` is
+  a login, NON-INTERACTIVE shell: it sources .zprofile and never .zshrc, and nvm
+  is loaded from .zshrc. So every node nvm manages is on PATH in a human's
+  terminal and on no PATH the agent has ever had — which is why `dev browserslist
+  update` failed with `npx: No such file or directory` on a box where `node
+  --version` answered fine by hand (ISS-531). Install anything the agent shells
+  out to via homebrew, where the login PATH can see it, rather than teaching
+  launchd about a version manager.
 
   NO LOCKING AND NO LOGGING IN THIS FILE — both live inside `dev agent tick`.
   The tick has two phases needing two different locks (vitals must never sit
@@ -26,7 +36,20 @@
   command's job so every path is defined in one place
   (~/Library/Logs/dev-agent/).
 
-  HOST PREREQUISITES — these are what silently kill an unattended machine:
+  HOST PREREQUISITES — these are what silently kill an unattended machine.
+
+  THE TOOLCHAIN HALF OF THIS LIST IS NOW CODE, NOT PROSE: Agent::Toolchain::TOOLS
+  in lib/agent/toolchain.rb, checked by `dev agent doctor` (exit 1 if anything
+  required is absent) and re-checked by the tick once a day, which files an issue
+  naming the machine and the producers it blocks. Run the doctor BEFORE loading
+  this plist. Everything below is what a command cannot check for itself.
+
+  The reason that moved: `depsguard` was documented here, never installed on the
+  runner, and the weekly supply-chain scan therefore never ran once in the
+  producer's entire history — silently, because a check that cannot run exits 2,
+  which the producer contract records as `check_failed`, which is deliberately
+  indistinguishable in the queue from a clean week (ISS-531). A prerequisite
+  nothing executes is a prerequisite nothing enforces.
 
     Automatic login enabled
       A LaunchAgent runs only in a logged-in GUI session. After a reboot without
