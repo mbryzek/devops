@@ -107,18 +107,6 @@ module Agent
         producers: [],
         install: "see https://claude.com/claude-code",
       ),
-      # Best-effort BY DESIGN (see Agent::Notify), so its absence must not fail
-      # provisioning or file an issue. It is still reported, because what it
-      # costs is silent: the runner-offline push is the one alert the design
-      # calls load-bearing, and a missing `openclaw` turns it into a no-op that
-      # looks exactly like a healthy fleet.
-      Tool.new(
-        name: "openclaw",
-        required_by: "push notifications (Agent::Notify) — PR ready, gave up, runner offline",
-        producers: [],
-        install: "install openclaw (notifications are best-effort; nothing else breaks)",
-        required: false,
-      ),
     ].freeze
 
     # Once a day, matching Agent::Maintenance. A toolchain does not change

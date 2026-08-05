@@ -1338,8 +1338,8 @@ class TestDevAgentTick < Minitest::Test
 
   # A result with `missing` absent from the agent's PATH and everything else
   # present, without depending on what is installed on the box running the suite.
-  def toolchain_result(missing:, now: Time.now)
-    found = Agent::Toolchain::TOOLS.map do |tool|
+  def toolchain_result(missing:, now: Time.now, tools: Agent::Toolchain::TOOLS)
+    found = tools.map do |tool|
       present = !missing.include?(tool.name)
       Agent::Toolchain::Found.new(tool: tool, path: present ? "/stub/bin/#{tool.name}" : nil, version: nil)
     end
@@ -1348,8 +1348,8 @@ class TestDevAgentTick < Minitest::Test
 
   # Built eagerly: stub_singleton rebinds the block to the module, so anything
   # the lambda calls on the test instance is gone by the time the tick runs it.
-  def with_toolchain(missing:, &block)
-    result = toolchain_result(missing: missing)
+  def with_toolchain(missing:, tools: Agent::Toolchain::TOOLS, &block)
+    result = toolchain_result(missing: missing, tools: tools)
     stub_singleton(Agent::Toolchain, :check, ->(**_opts) { result }, &block)
   end
 
@@ -1385,17 +1385,24 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
-  # `openclaw` is best-effort by construction, so its absence is reported and
-  # never escalated. An optional tool that filed would make the required ones
-  # unreadable.
+  # An optional tool is best-effort by construction, so its absence is reported
+  # and never escalated. An optional tool that filed would make the required
+  # ones unreadable. `TOOLS` currently ships no optional entry (see
+  # toolchain.rb — `openclaw` was the only one and doctor no longer tracks
+  # it), so this exercises the tick against a synthetic optional tool rather
+  # than depending on production TOOLS shipping one.
   def test_a_missing_optional_tool_is_recorded_and_not_filed
+    optional_tool = Agent::Toolchain::Tool.new(
+      name: "optional-thing", required_by: "nothing load-bearing", producers: [],
+      install: "brew install optional-thing", required: false,
+    )
     with_agent_home do
       register_identity
-      with_toolchain(missing: %w[openclaw]) do
+      with_toolchain(missing: %w[optional-thing], tools: [optional_tool]) do
         with_stubbed_api({}) { capture_stdout { tick(dry_run: false).check_toolchain } }
       end
       assert_equal [], Agent::Toolchain.state["missing"]
-      assert_equal %w[openclaw], Agent::Toolchain.state["missing_optional"]
+      assert_equal %w[optional-thing], Agent::Toolchain.state["missing_optional"]
     end
   end
 
