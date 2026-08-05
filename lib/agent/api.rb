@@ -56,18 +56,19 @@ module Agent
     end
 
     # Liveness, the machine's job census, its local error log, AND its housekeeping vitals, in one
-    # call. Every one of them is the whole value every time (full desired state), for the same
-    # reason report_registry sends every producer: the platform stores what it is told wholesale, so
-    # a session that has finished has to DISAPPEAR from the report rather than linger looking live
-    # forever, and a source that recovered has to disappear rather than show a failure that is over.
+    # call. Every one of them is the whole value every time (full desired state): the platform stores
+    # what it is told wholesale, so a session that has finished has to DISAPPEAR from the report
+    # rather than linger looking live forever, and a source that recovered has to disappear rather
+    # than show a failure that is over.
     #
-    # `errors` rides the HEARTBEAT and not the registry report (ISS-527) because it is about the
-    # MACHINE. The reported registry exists only to detect that runners disagree about the schedule,
-    # and it goes away entirely once scheduling moves server-side (ISS-526) — the machine does not.
+    # `errors` rides the HEARTBEAT and not the runner's since-deleted registry report (ISS-527)
+    # because it is about the MACHINE. The reported registry existed only to detect that runners
+    # disagreed about the schedule, and it went away with server-side scheduling (ISS-526) — the
+    # machine did not, which is exactly why the error channel had to be moved off it first.
     #
     # `maintenance` is Agent::Maintenance.report (ISS-528): last_maintenance_at,
     # maintenance_reclaimed_bytes, disk_free_bytes, disk_total_bytes. Same noun for the same reason
-    # as `errors`, and it started on the registry report for the same wrong one. Merged rather than
+    # as `errors`, and it started on the since-deleted registry report for the same wrong one. Merged rather than
     # nested so each is a column the staleness invariant can query directly, and OMITTED when
     # unknown — a machine that has never pruned has no last_maintenance_at, and that absence is
     # exactly what the invariant reads.
@@ -82,53 +83,48 @@ module Agent
 
     # Upsert on runner_id: one current report per machine, so re-sending the
     # same one is a no-op rather than a second row. `producers` is the whole
-    # list every time (full desired state) -- a producer deleted from
-    # producers.yml has to disappear from the report, not linger looking overdue.
-    #
-    # Deliberately carries NEITHER the error log (ISS-527) nor the maintenance
-    # vitals (ISS-528): both moved to runner_heartbeat, because both are about the
-    # MACHINE and this noun is deleted outright once scheduling is server-side.
-    # See runner_heartbeat's comment for why. What is left here is exactly what
-    # this endpoint is for — the producer schedule as one checkout reads it.
-    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:)
-      request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost,
-                                                    body: { devops_sha: devops_sha, producers: producers })
-    end
+    # ---- playbooks ----
 
-    def reported_registries(token:, use_localhost:)
-      request(:get, "/agent/registry", token: token, use_localhost: use_localhost) || []
+    # The CURRENT version of one playbook, or nil when the key has never existed.
+    #
+    # This is the whole of what a runner does with a producer now (ISS-526): it
+    # does not evaluate a schedule, run a check or file an issue, but the issue it
+    # CLAIMS names a procedure, and this is where that procedure lives. Resolved at
+    # claim time on purpose — an issue filed on Friday and claimed on Tuesday gets
+    # Tuesday's runbook (ISS-505).
+    #
+    # nil rather than an exception on 404, because "no such playbook" is a
+    # decision Agent::Playbook makes (it is a hard stop for the claim) and not a
+    # transport failure.
+    def playbook(key, token:, use_localhost:)
+      request(:get, "/agent/playbooks/#{URI.encode_www_form_component(key)}",
+              token: token, use_localhost: use_localhost)
+    rescue ApiError => e
+      raise unless e.message.include?("404")
+      nil
     end
 
     # ---- producers ----
+    #
+    # READ ONLY, both of them. Producers are scheduled, checked and filed entirely
+    # by the platform as of ISS-526: a runner does not evaluate a schedule, start a
+    # run, or hold a copy of the registry. What is left is looking at what the
+    # platform decided, for `dev agent producers` and `dev agent runs`.
+
+    # THE registry -- the same rows /admin/agents edits, each carrying the
+    # `next_due_at` the platform computed. One answer, from the one place that
+    # schedules, which is what makes it trustworthy: it used to be arithmetic every
+    # runner did against its own checkout, so "next due" meant "next due according
+    # to this machine" and the dashboard had to pick whose to believe (ISS-498).
+    def producers(token:, use_localhost:)
+      request(:get, "/agent/producers", token: token, use_localhost: use_localhost) || []
+    end
 
     def producer_runs(token:, use_localhost:, producer_key: nil, limit: 100, offset: 0)
       params = { "limit" => limit, "offset" => offset }
       params["producer_key"] = producer_key if producer_key
       request(:get, "/agent/producers/runs?#{URI.encode_www_form(params)}",
               token: token, use_localhost: use_localhost) || []
-    end
-
-    # Compare-and-set, not a scheduler: the server creates the run atomically
-    # unless one is in flight for this key or one started after
-    # `if_no_run_since`.
-    #
-    # The "nothing happened" answer is a 200 carrying `agent_producer_run_start`
-    # with `run` ABSENT — not a 204. API Builder refuses to let one resource vary
-    # its type across 2xx codes (`cannot have varying response types for 2xx`),
-    # so the emptiness moved from the status line into the body. Unwrapped here
-    # so every caller still just sees "a run, or nil".
-    def start_producer_run(key, runner_id:, if_no_run_since:, token:, use_localhost:)
-      body = { runner_id: runner_id }
-      body[:if_no_run_since] = if_no_run_since.utc.iso8601 if if_no_run_since
-      res = request(:post, "/agent/producers/#{URI.encode_www_form_component(key)}/runs",
-                    token: token, use_localhost: use_localhost, body: body)
-      res && res["run"]
-    end
-
-    def finish_producer_run(run_id, result:, issue_number: nil, token:, use_localhost:)
-      body = { result: result }
-      body[:issue_number] = issue_number if issue_number
-      request(:put, "/agent/producers/runs/#{run_id}", token: token, use_localhost: use_localhost, body: body)
     end
 
     # ---- issue leases ----

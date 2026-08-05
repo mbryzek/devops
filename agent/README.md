@@ -10,9 +10,7 @@ look. Everything here exists to drain the open issue queue.
 
 | File | What it is |
 |---|---|
-| `producers.yml` | The schedule registry. The only place a schedule lives — the platform records run history but has no notion of "due". The tick pulls this checkout itself, so one push reaches every machine. |
-| `bodies/` | The playbooks a producer's issue POINTS AT (`issue.body_file`) — see "One copy of the plan" below. Without one the claiming session gets `claude-issues/default-body.md` and does generic triage instead of the job the producer was written to schedule. A `type: epic` producer shares one playbook across its children, with `{child}` substituted per child. |
-| `instructions.md` | Part 1 of every session's prompt. Outcome protocol (including the close-out contract: a session files what it WORKED AROUND before it closes out), the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. It is also why a playbook in `bodies/` never restates any of that — reaching every session, including the next playbook's, is what this file is for. |
+| `instructions.md` | Part 1 of every session's prompt. Outcome protocol (including the close-out contract: a session files what it WORKED AROUND before it closes out), the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. It is also why a playbook never restates any of that — reaching every session, including the next playbook's, is what this file is for. |
 | `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
 
 ## The commands
@@ -23,7 +21,7 @@ dev agent status                  this machine: identity, live jobs, last tick
 dev agent logs <issue> [--follow] tail one session's claude.log
 dev agent pause | resume          kill switch — drains, claims nothing new
 dev agent runners                 the fleet: capabilities, concurrency, last seen
-dev agent producers               registry, last run, result, next due
+dev agent producers               the platform's registry: schedule, last run, next due
 dev agent runs [<key>] [--issue N] producer run history and lease attempts
 dev agent refresh <issue>         re-open a fixed issue for rebase / review feedback
 dev agent release <issue>         force-release a stuck lease
@@ -34,8 +32,9 @@ dev agent doctor                  does this box have the binaries its jobs shell
 
 `dev agent tick --dry-run` prints every decision a real tick would make and
 executes none of them. It doubles as the provisioning smoke test on a new
-machine: if it registers a runner, reads the producer registry, and reports its
-capacity, the box is wired up.
+machine: if it registers a runner, reports its capacity and says what it would
+claim, the box is wired up. There is **no producer phase** in that output, and
+there has not been one since ISS-526.
 
 ## Provisioning a machine
 
@@ -81,7 +80,6 @@ One root, `~/Library/Logs/dev-agent/`. Nothing writes anywhere else.
 
 ```
 tick/YYYY-MM-DD.log        one line per decision: phase, claims, reaps, timings
-producers/YYYY-MM-DD.log   each producer run: key, result, duration
 issues/ISS-<n>/
   prompt.md                exactly what was fed to the session on stdin
   claude.log               the session's full stdout
@@ -98,7 +96,7 @@ minutes.
 `agent-maintenance` joins that list: when this machine last ran its own
 housekeeping, and how it went.
 
-Retention (`dev agent gc`): tick and producer logs 30 days; a terminal issue's
+Retention (`dev agent gc`): tick logs 30 days; a terminal issue's
 directory 14 days; a failed or gave-up one 30 days — the post-mortem window;
 workspaces deleted on success and after 7 days otherwise.
 
@@ -131,8 +129,9 @@ existing error channel (`Agent::Errors`, sources `agent_gc` / `aidirs_prune` /
 `docker_prune`, escalating at 3 in a row), and the runner heartbeat carries
 `last_maintenance_at` plus this machine's headroom — because an error log can
 only report a run that broke, never one that never happened. Both ride the
-HEARTBEAT rather than the registry report: they describe the machine, and the
-reported registry is deleted at the server-side-scheduling cutover. The
+HEARTBEAT rather than the runner's since-deleted registry report: they describe
+the machine, and that report went away with the server-side-scheduling cutover
+(ISS-526) — which is exactly why they were moved off it first. The
 `agent_runner_maintenance_stale` invariant is what files a single issue naming
 any live, unpaused runner that has gone quiet or is out of headroom; the same
 numbers reach `/admin/agents` per machine as `is_maintenance_stale` /
@@ -142,87 +141,75 @@ board and the check cannot disagree.
 ## One push reaches the fleet
 
 Phase A runs `git pull --ff-only origin main` in this checkout before it does
-anything else, so changing a producer's schedule is a devops PR and nothing more —
-no logging into each machine. `--ff-only` because a diverged checkout must stop
-rather than merge, and a failed pull is reported, never fatal: the machine keeps
-running the code it has. A pull that changes tick code takes effect on the NEXT
-tick, which is safe precisely because the tick is one shot.
+anything else, so a change to the standing prompt or the tick itself is a devops
+PR and nothing more — no logging into each machine. `--ff-only` because a
+diverged checkout must stop rather than merge, and a failed pull is reported,
+never fatal: the machine keeps running the code it has. A pull that changes tick
+code takes effect on the NEXT tick, which is safe precisely because the tick is
+one shot.
 
-A machine whose pull is failing is otherwise indistinguishable from a healthy
-one — same heartbeat, same runs — which is why each runner also reports what it
-reads: every producer, its cadence, the next-due moment it computed, and the
-devops sha it all came from (`PUT /agent/registry/:runner_id`). Git stays the
-system of record; the platform holds *reports about* git and never evaluates a
-schedule. Comparing those reports is what would make three things visible that
-run history alone cannot show: a producer that is **overdue**, runners on
-**different devops shas**, and a producer **no live runner schedules** at all.
-Reported on a sha change (so a push shows the tick after it lands) and otherwise
-on the heartbeat cadence, since next-due moves as producers run.
-
-**What actually alarms today, as of ISS-505.** The report is stored and nothing
-compares it: `AgentInvariants` covers heartbeat staleness only, there is no
-sha-skew invariant, and there is no `/admin/agents` page (an earlier version of
-this file claimed there was; ISS-521 builds one). What does alarm is the CAUSE
-rather than the symptom — a runner only falls behind because its
-`git pull --ff-only` stopped landing:
+**A stale checkout no longer changes what work happens.** It used to: the
+schedule and the playbooks lived in this directory, so a machine on an old sha
+ran an old schedule and handed sessions an old runbook — and the only way to see
+that was to compare what every runner REPORTED reading (`PUT /agent/registry/:runner_id`)
+and notice one was the odd one out. ISS-526 deleted that whole surface, because
+the thing it watched no longer exists: there is one schedule, it is a set of rows
+in the platform, and the playbooks are resolved from the platform at claim time.
+A machine behind on devops now runs old *tick code*, which is a much smaller and
+much louder problem:
 
 | Why the checkout is stale | What reports it |
 |---|---|
 | Pull fails repeatedly (network, credentials, diverged) | `Agent::Errors` counts consecutive failures; the third notifies and files a bug issue (ISS-511) |
-| Working tree dirty, or on a branch other than `main` | Nothing — a benign skip, deliberately left alone. On an unattended mini it is silent forever, so a claim that resolves a playbook says so **on that issue** (`Tick#checkout_staleness_reason`) |
+| Working tree dirty, or on a branch other than `main` | Nothing — a benign skip, deliberately left alone, because it means a human is working in that checkout |
 | Machine is dark | `agent_runner_heartbeat_stale` |
-
-What remains unbuilt is the cross-fleet comparison — one runner cannot see that
-it is the odd one out. Worth building on `agent_runner` rather than on
-`agent_reported_registry`, which ISS-526 deletes.
 
 ## One copy of the plan, and it is the current one
 
-A producer files a **pointer** to its playbook, never a copy of it (ISS-505). The
-filed body carries the playbook's heading and opening paragraph, a ``Playbook:
-`agent/bodies/x.md` `` line and a permalink; the claiming runner reads the
-procedure off its own checkout and hands it to the session.
+A producer's issue carries a **pointer** to its playbook, never a copy of it
+(ISS-505). The filed body carries the playbook's abstract and a ``Playbook: `key` ``
+line; the claiming runner resolves that key against `GET /agent/playbooks/:key`
+and hands the text to the session.
 
 Copying froze it. An issue filed on Friday and claimed on Tuesday ran Friday's
-procedure, and every improvement pushed to `bodies/` in between applied to
-nothing already in the queue — which defeats the reason these are nightly
-producers at all. Resolution happens at CLAIM time, not file time: pinning a sha
-when the issue is filed would recreate the snapshot with extra steps.
+procedure, and every improvement made in between applied to nothing already in
+the queue — which defeats the reason these are nightly producers at all.
+Resolution happens at CLAIM time, not file time.
+
+The playbooks themselves are **append-only rows in the platform** (ISS-523), not
+files in this repo — `agent/bodies/` was deleted by ISS-526. Editing one INSERTS
+a new version and `created_at` is the version; nothing is ever updated in place
+and nothing is ever deleted. Manage them at `/admin/agents/playbooks`.
 
 Three things fall out of that and none of them is optional:
 
-- **The runner records what it read** — `Playbook: agent/bodies/x.md @ <sha>`
-  plus the permalink, as the issue's first comment. That is what keeps a run
-  reproducible after the file changes, and it is the audit trail for the failure
-  this design invites: a runner on a stale checkout reading last month's
-  playbook. When this machine's own `git pull --ff-only` is failing, the comment
-  says so outright rather than leaving the skew to be spotted by comparing
-  runners in `agent_reported_registry`.
+- **The runner records what it read** — `Playbook: <key> @ <created_at>`, as the
+  issue's first comment. Copy-on-write is what makes that worth recording: the
+  version it names is still there, and still readable, after any number of later
+  edits. A git sha only gave us that while the file was still in git.
 - **A pointer that does not resolve is a hard stop** — no session, and the issue
   goes to `needs_input`. Never a fallback: ISS-360 is a week of a producer doing
-  generic triage because its playbook was missing and nothing said so.
-- **Check output stays inline.** A `file_when: check_fails` producer's stdout is
-  what *this run* found, not a standing procedure. It never moves.
+  generic triage because its playbook was missing and nothing said so. An
+  unreachable platform lands here too, for the same reason: better no session
+  than a session doing a different job.
+- **Check output stays inline.** A `check_fails` producer's evidence is what
+  *this run* found, not a standing procedure. It never moves.
 
-Every playbook therefore opens `# Heading`, blank line, paragraph — that opening
-is the abstract the filed issue renders, and `producers.yml` validates it at
-parse time along with the path.
-
-**A check that needs a machine belongs in the playbook, not in `producers.yml`**
-(ISS-525). A `check` runs inline in the tick, on whichever machine won the run,
-under the work lock and with no timeout — so one that clones repos, installs
-packages or reads a developer box's own config is the work wearing a check's
-clothes. Those producers set `file_when: always` and their playbook runs the
-check as its FIRST step, closing the issue `dismissed` when it comes back clean.
+**A check that needs a machine belongs in the playbook, not in the registry**
+(ISS-525). A registry `check` is a key out of a closed set the platform runs in
+process — there is no shell and no checkout on that side — so a check that clones
+repos, installs packages or reads a developer box's own config cannot be one.
+Those producers file unconditionally and their playbook runs the check as its
+FIRST step, closing the issue `dismissed` when it comes back clean.
 `codegen-sync`, `depsguard` and `browserslist-update` are the three, and they
 were the last reason a producer needed a runner at all.
 
 ## Two phases, two locks
 
 Phase A is **vitals** — the devops self-update, the runner heartbeat, lease
-heartbeats, the registry report, and the 4-hour hard timeout — and it always
-runs. Phase B is **work** — reap, producers, claim — and it is skipped entirely
-when a previous tick still holds the lock.
+heartbeats, and the 4-hour hard timeout — and it always runs. Phase B is
+**work** — maintenance, the toolchain check, reap, claim — and it is skipped
+entirely when a previous tick still holds the lock.
 
 Putting both under one lock inverts the system's own alarm: a slow Phase B would
 block heartbeats on a perfectly healthy machine, tripping the offline invariant

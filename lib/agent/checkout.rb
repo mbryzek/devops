@@ -7,7 +7,7 @@ require 'agent/paths'
 # producer's schedule meant logging into every agent machine to pull, so the
 # registry in git was the system of record in name only -- what a machine
 # actually ran was whatever it had last been hand-pulled to. The tick now pulls
-# its own checkout, which is what makes "producers.yml in git is the only
+# its own checkout, which is what makes "the standing prompt in git is the only
 # registry" true in practice rather than aspirationally.
 #
 # THREE PROPERTIES MAKE THIS SAFE, and none of them is optional:
@@ -67,8 +67,8 @@ module Agent
 
     module_function
 
-    # The repo this very file lives in — Agent::Paths owns the resolution, so
-    # producers.yml and the githooks move with whatever this pulls. Deliberately
+    # The repo this very file lives in — Agent::Paths owns the resolution, so the
+    # standing prompt and the githooks move with whatever this pulls. Deliberately
     # derived from the running code's own location rather than from a configured
     # ~/code/devops: the tick must update the checkout it is RUNNING.
     def devops_repo = Agent::Paths.devops_repo

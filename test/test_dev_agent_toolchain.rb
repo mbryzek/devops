@@ -218,21 +218,13 @@ class TestDevAgentToolchain < Minitest::Test
     end
   end
 
-  # ---- the registry cannot drift from the producers it names ------------------
-
-  # The whole point of naming producer keys on a tool is that a filed issue can
-  # say "the depsguard producer has never run" rather than "a binary is absent".
-  # A key that no longer exists in agent/producers.yml turns that sentence into a
-  # lie, and nothing else in the system would notice — same reasoning as
-  # test_agent_cron_migration.rb asserting children.names == ApiLint::REPOS.
-  def test_every_producer_named_by_a_tool_exists_in_the_registry
-    keys = Agent::Producers.load.fetch(:producers).map(&:key)
-    T::TOOLS.each do |t|
-      t.producers.each do |key|
-        assert_includes keys, key, "#{t.name} names producer `#{key}`, which is not in agent/producers.yml"
-      end
-    end
-  end
+  # ---- the producers a tool names ---------------------------------------------
+  #
+  # The guard that these keys still EXIST is gone, and knowingly: the registry is
+  # platform rows now (ISS-521/ISS-526), so devops has nothing local to check them
+  # against and a live API call is not something a unit test should make. The keys
+  # are display strings here — the sentence a filed issue leads with — so a stale
+  # one is a misleading message rather than a broken producer.
 
   # The two producers ISS-531 and its comment found broken. If either loses its
   # prerequisite here, the gap becomes silent again.

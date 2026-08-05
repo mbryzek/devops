@@ -97,11 +97,11 @@ module Agent
       <<~SECTION.strip
         # Playbook — #{playbook.label}
 
-        The procedure for this issue, read from `#{playbook.path}` in this runner's devops
-        checkout at the moment the issue was claimed — NOT a copy frozen when the issue was
-        filed. Where it and the abstract in the issue body differ, THIS wins. The sha above
-        is recorded as a comment on the issue, so this exact text stays retrievable at
-        #{playbook.permalink} after the file changes.
+        The procedure for this issue, resolved from the platform's playbook store at the
+        moment the issue was claimed — NOT a copy frozen when the issue was filed. Where it
+        and the abstract in the issue body differ, THIS wins. The version above is recorded
+        as a comment on the issue, and the store is append-only, so this exact text stays
+        readable after the playbook is edited.
 
         #{playbook.text}
       SECTION

@@ -17,6 +17,12 @@ load File.expand_path('../bin/dev', __dir__)
 #      prompt (Agent::Prompt.build), producer-filed or not, so a body needs to
 #      say nothing at all.
 #
+#      The GUARD for that property is gone from this file, and knowingly: it read
+#      `agent/bodies/*.md`, and ISS-526 moved the playbooks into the platform as
+#      copy-on-write rows. Re-homing it means asserting over
+#      `agent.agent_producer_playbooks`, which is platform-side work and not this
+#      branch's. Property 2 below is unaffected -- it only reads instructions.md.
+#
 #   2. Every command it names EXISTS. An instruction that cannot be executed as
 #      written is the exact thing the contract exists to surface (ISS-503 —
 #      four playbooks told sessions to write a path that does not exist on the
@@ -34,10 +40,6 @@ class TestAgentCloseOutContract < Minitest::Test
     File.read(Agent::Paths.instructions_file)
   end
 
-  def bodies
-    Dir[File.join(Agent::Paths.agent_dir, "bodies", "*.md")]
-  end
-
   def test_the_contract_is_in_the_standing_instructions
     assert_includes instructions, HEADING
   end
@@ -49,14 +51,6 @@ class TestAgentCloseOutContract < Minitest::Test
     section_one = instructions[/^## 1\. How this ends.*?^## 2\./m]
     refute_nil section_one, "instructions.md no longer has a §1 / §2 to place the contract between"
     assert_includes section_one, HEADING
-  end
-
-  def test_no_producer_playbook_duplicates_the_contract
-    refute_empty bodies, "no producer playbooks found — the guard would pass vacuously"
-    duplicated = bodies.select { |path| File.read(path).include?(COMMAND) }
-    assert_empty duplicated.map { |p| File.basename(p) },
-                 "the close-out contract belongs in agent/instructions.md alone — a playbook that " \
-                 "restates it is one the NEXT playbook added will not have (ISS-360)"
   end
 
   # The anti-quota sentence, which the playbooks already carry for their own

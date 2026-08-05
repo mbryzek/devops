@@ -12,7 +12,6 @@ require 'agent/notify'
 require 'agent/outcome'
 require 'agent/paths'
 require 'agent/playbook'
-require 'agent/producers'
 require 'agent/prompt'
 require 'agent/toolchain'
 require 'agent/workspace'
@@ -25,7 +24,7 @@ require 'agent/workspace'
 # TWO PHASES, TWO LOCKS, and the split is the point (design §4.3).
 #
 #   Phase A — vitals. Always runs, never blocked by Phase B.
-#   Phase B — work (reap, producers, claim). Skipped entirely if a previous tick
+#   Phase B — work (maintenance, reap, claim). Skipped entirely if a previous tick
 #             still holds the lock.
 #
 # Putting both under one lock inverts the system's own alarm. A slow Phase B — a
@@ -52,11 +51,6 @@ module Agent
     # network outage without flapping. The window itself is NOT duplicated here:
     # the server sets `is_stale` from the same predicate the invariant uses.
     RUNNER_HEARTBEAT_SECONDS = 10 * 60
-
-    # Non-terminal issue statuses, for the producer in-flight check. Kept as the
-    # complement of TERMINAL_ISSUE_STATUSES so adding a status to the spec cannot
-    # silently make a producer re-file over live work.
-    NON_TERMINAL_STATUSES = %w[open claimed needs_review needs_input fixed deployed].freeze
 
     # Agent::Errors source name for a real (non-benign) devops checkout pull
     # failure. Fixed rather than derived so Agent::Errors.count and the
@@ -108,7 +102,6 @@ module Agent
       identity = ensure_identity
       heartbeat_runner(identity) if identity
       heartbeat_leases(identity)
-      report_registry(identity) if identity
     rescue SessionExpired, ApiError => e
       # Vitals must not abort the tick: the hard-timeout enforcement below is
       # precisely what has to keep working when the platform is unreachable.
@@ -203,55 +196,6 @@ module Agent
       # Escalation must never take down the rest of the phase it runs in — the
       # same reasoning as phase_a's own top-level rescue.
       log("#{source} escalation: could not file an issue (#{e.message})")
-    end
-
-    # What this machine reads producers.yml to be: every producer, its cadence,
-    # and the next-due moment THIS runner computed, plus the devops sha it all
-    # came from.
-    #
-    # Reported state, not a definition. The server still never evaluates a
-    # schedule — but run history alone cannot show "should have run and did
-    # not", because a dead producer and a quiet one are the same silence, and a
-    # producer nobody schedules anymore leaves no rows at all. Comparing reports
-    # across machines is also the only way sha skew is visible: no single runner
-    # can see that it is the one on the old checkout.
-    #
-    # Rate: on a devops sha change (so a push shows up the tick after it lands),
-    # otherwise on the heartbeat cadence — next_due_at moves every time a
-    # producer runs, so a sha-only trigger would leave it stale for days.
-    def report_registry(identity)
-      sha = Agent::Checkout.head_sha
-      return log("registry: #{Agent::Checkout.devops_repo} is not a git checkout — not reporting") if sha.nil?
-      return unless registry_report_due?(sha)
-
-      registry = Agent::Producers.load
-      producers = Agent::Producers.report(registry, last_run_by_key: last_run_by_key(identity), now: @now)
-      if @dry_run
-        log("would PUT /agent/registry/#{identity.runner_id} (#{producers.length} producers @ #{Agent::Checkout.short(sha)})")
-        return
-      end
-
-      # Producers and a sha, and nothing else. The maintenance vitals that briefly
-      # rode along here moved to the heartbeat in ISS-528, for the same reason the
-      # error log did in ISS-527: they are about the MACHINE, and this report is
-      # about one machine's view of a schedule that is about to stop existing.
-      Agent::Api.report_registry(identity.runner_id, devops_sha: sha, producers: producers,
-                                 token: identity.token, use_localhost: @use_localhost)
-      Agent::Paths.write_json(Agent::Paths.registry_report_file,
-                              { "devops_sha" => sha, "at" => @now.utc.iso8601 }, mode: 0600)
-      log("registry reported: #{producers.length} producers @ #{Agent::Checkout.short(sha)}")
-    rescue Agent::Producers::ConfigError => e
-      # A registry this machine cannot parse is a real problem, but it is the
-      # producer path's problem to report — it must not cost the machine its
-      # heartbeat.
-      log("registry: #{e.message}")
-    end
-
-    def registry_report_due?(sha)
-      last = Agent::Paths.read_json(Agent::Paths.registry_report_file)
-      return true if last.nil? || last["devops_sha"] != sha
-      at = Time.parse(last["at"].to_s) rescue nil
-      at.nil? || (@now - at) >= RUNNER_HEARTBEAT_SECONDS
     end
 
     def ensure_identity
@@ -434,9 +378,7 @@ module Agent
         return
       end
       reap(identity)
-      runner = self_runner(identity)
-      run_producers(identity)
-      claim(identity, runner)
+      claim(identity, self_runner(identity))
     rescue SessionExpired, ApiError => e
       log("work phase: platform error (#{e.message})")
     end
@@ -690,239 +632,6 @@ module Agent
       Agent::Workspace.delete(record.fetch("slug"))
     end
 
-    # ---- producers ----
-
-    def run_producers(identity)
-      registry = Agent::Producers.load
-      last = last_run_by_key(identity)
-      due = Agent::Producers.due(registry, last_run_by_key: last, now: @now)
-      if due.empty?
-        log("producers: none due")
-        return
-      end
-      timezone = registry.fetch(:timezone)
-      due.each do |producer|
-        # The guard is the START OF THE CURRENT PERIOD, never the previous run's
-        # own start time — see Agent::Schedule.period_start for why that
-        # distinction is the difference between a working producer and a
-        # permanently wedged one.
-        period_start = Agent::Schedule.period_start(producer.schedule, last_run_at: last[producer.key],
-                                                    now: @now, timezone: timezone)
-        run_producer(producer, period_start, identity)
-      end
-    rescue Agent::Producers::ConfigError, Agent::Playbook::MissingError => e
-      # MissingError is all but unreachable — the registry validated every
-      # body_file at parse time, moments ago, at the top of this method. It is
-      # caught anyway because the alternative is worse than a missing issue:
-      # producers run BEFORE claim in Phase B, so an exception escaping here
-      # would take the claim path down with it and the machine would stop
-      # picking up work for a reason that has nothing to do with the queue.
-      log("producers: #{e.message}")
-    end
-
-    def last_run_by_key(identity)
-      runs = Agent::Api.producer_runs(token: identity.token, use_localhost: @use_localhost)
-      runs.each_with_object({}) do |run, acc|
-        at = Time.parse(run["started_at"]) rescue nil
-        next if at.nil?
-        key = run["producer_key"]
-        acc[key] = at if acc[key].nil? || acc[key] < at
-      end
-    end
-
-    def run_producer(producer, period_start, identity)
-      if @dry_run
-        decide("producer", "#{producer.key} is due (#{Agent::Schedule.describe(producer.schedule)}) — would start a run and #{producer.check ? "run: #{producer.check}" : 'file unconditionally'}")
-        return
-      end
-
-      run = Agent::Api.start_producer_run(producer.key, runner_id: identity.runner_id,
-                                          if_no_run_since: period_start,
-                                          token: identity.token, use_localhost: @use_localhost)
-      if run.nil?
-        # An absent `run` in the wrapper has TWO causes: a run is in flight, or
-        # one already finished within this period. A compare-and-set, not a
-        # scheduler — and the check must NOT run either way, or two machines
-        # would both do the work the arbitration exists to deduplicate.
-        #
-        # The message names both, because it cannot tell them apart from here and
-        # asserting the wrong one sends an investigation in the wrong direction:
-        # this said "another runner already started this run" for 19 consecutive
-        # ticks on a fleet that had exactly one runner and nothing in flight.
-        decide("producer", "#{producer.key}: a run for this period is already in flight or finished — skipping")
-        return
-      end
-
-      started = Time.now
-      result, issue_number = execute_producer(producer)
-      Agent::Api.finish_producer_run(run.fetch("id"), result: result, issue_number: issue_number,
-                                     token: identity.token, use_localhost: @use_localhost)
-      line = "#{@now.utc.iso8601} #{producer.key} #{result}#{issue_number ? " ISS-#{issue_number}" : ''} #{(Time.now - started).round(1)}s"
-      Agent::Paths.append_log(Agent::Paths.producers_log(@now), line)
-      decide("producer", "#{producer.key} → #{result}#{issue_number ? " (ISS-#{issue_number})" : ''}")
-    end
-
-    # A producer is a CHEAP CHECK, never the work itself, and it never spawns
-    # Claude. The check's stdout becomes the issue body, which is exactly what is
-    # wanted for `dev invariants`: the failure list IS the brief.
-    #
-    # Exit code convention, and the reason `check_failed` can stay distinct from
-    # `filed`: 0 = clean, 1 = findings, anything else = the check itself broke.
-    # Without a rule like this a crashing producer becomes a nightly stream of
-    # bogus issues, which is the fastest way to make the queue untrustworthy.
-    def execute_producer(producer)
-      output = nil
-      if producer.check
-        # Through /bin/sh deliberately: checks are written as shell command lines
-        # in producers.yml, and a missing binary must come back as exit 127
-        # (-> check_failed) rather than raising ENOENT out of the tick.
-        output, status = Open3.capture2e({ "LC_ALL" => "en_US.UTF-8" }, "/bin/sh", "-c", producer.check)
-        code = status.exitstatus
-        return ["check_failed", nil] if code.nil? || code > 1
-        return ["nothing_to_do", nil] if code.zero? && producer.file_when != "always"
-        return ["nothing_to_do", nil] if producer.file_when == "never"
-      end
-      return ["nothing_to_do", nil] unless producer.files_issue?
-
-      file_issue(producer, output)
-    end
-
-    def file_issue(producer, output)
-      existing = Agent::Api.issues(statuses: NON_TERMINAL_STATUSES, use_localhost: @use_localhost)
-      return file_epic(producer, output, existing) if producer.epic?
-
-      fingerprint = producer.fingerprint_at(@now)
-      return ["skipped_in_flight", nil] if Agent::Producers.in_flight?(existing, fingerprint)
-
-      spec = producer.issue
-      # `claim_on_create: false`, not `status: "open"` — the create form has no
-      # status field; claiming is expressed as a flag on the insert. A producer
-      # never claims: it files for the queue, and the tick's claim path decides
-      # who works it.
-      form = {
-        title: spec.fetch("title"),
-        category: spec.fetch("category"),
-        fingerprint: fingerprint,
-        # Attribution the platform stores as a column, not something anyone has
-        # to reconstruct by joining agent_producer_runs: recurrence means many
-        # runs point at one issue, so "everything this producer filed" cannot be
-        # paginated off the run history.
-        producer_key: producer.key,
-        body: producer_body(producer, output),
-        claim_on_create: false,
-      }
-      form[:severity] = spec["severity"] if spec["severity"]
-      issue = Agent::Api.create_issue(form, use_localhost: @use_localhost)
-      result = issue["occurrence_count"].to_i > 1 ? "recurrence" : "filed"
-      [result, issue["number"]]
-    end
-
-    # An epic and one child per name (ISS-397). The children are the units of
-    # work — each gets its own lease, its own retry and its own PR — and the
-    # epic is the single thing Mike verifies once they have all landed.
-    #
-    # ORDER MATTERS: the children are filtered BEFORE the epic is created, so a
-    # night where every repo still has last night's issue open files nothing at
-    # all rather than leaving an empty container in the queue. Filing the epic
-    # first and discovering that afterwards is not recoverable — there is no
-    # delete, only `dismissed`.
-    def file_epic(producer, output, existing)
-      children = producer.children.reject { |child| Agent::Producers.in_flight?(existing, child.fingerprint) }
-      if children.empty?
-        log("#{producer.key}: every child is still in flight — filing nothing")
-        return ["skipped_in_flight", nil]
-      end
-      fingerprint = producer.fingerprint_at(@now)
-      return ["skipped_in_flight", nil] if Agent::Producers.in_flight?(existing, fingerprint)
-
-      spec = producer.issue
-      epic = Agent::Api.create_issue(
-        {
-          type: "epic",
-          title: spec.fetch("title"),
-          category: spec.fetch("category"),
-          fingerprint: fingerprint,
-          producer_key: producer.key,
-          body: epic_body(producer, output, children),
-          claim_on_create: false,
-        },
-        use_localhost: @use_localhost,
-      )
-      number = epic["number"]
-
-      children.each do |child|
-        form = {
-          title: child.title,
-          category: child.category,
-          fingerprint: child.fingerprint,
-          # A STRING on the wire: issue_form.parent_number is typed `string`,
-          # and an integer here is a 400 the producer would only find at 3:45am.
-          parent_number: number.to_s,
-          # Stated rather than left to the platform's parent-inheritance: the
-          # child's attribution then does not depend on the epic having been
-          # resolved, and every issue this producer filed carries the key even if
-          # a child is later detached from its epic.
-          producer_key: producer.key,
-          body: child_body(producer, child),
-          claim_on_create: false,
-        }
-        form[:severity] = child.severity if child.severity
-        filed = Agent::Api.create_issue(form, use_localhost: @use_localhost)
-        log("#{producer.key}: ISS-#{filed['number']} #{child.name} → epic ISS-#{number}")
-      end
-
-      result = epic["occurrence_count"].to_i > 1 ? "recurrence" : "filed"
-      [result, number]
-    end
-
-    def epic_body(producer, output, children)
-      roster = children.map { |child| "- #{child.title}" }.join("\n")
-      skipped = producer.children.length - children.length
-      note = skipped.zero? ? "" : "\n\n#{skipped} child(ren) were skipped: a previous run's issue for them is still open."
-      "#{producer_body(producer, output)}\n\nThis run filed #{children.length} child issue(s):\n\n#{roster}#{note}"
-    end
-
-    def child_body(producer, child)
-      header = "Filed automatically by the `#{producer.key}` producer (devops/agent/producers.yml) " \
-               "as one child of this run's epic."
-      pointer = playbook_pointer(child.playbook_path, target: child.name)
-      return header if pointer.nil?
-      "#{header}\n\n---\n\n#{pointer}"
-    end
-
-    def producer_body(producer, output)
-      header = "Filed automatically by the `#{producer.key}` producer (devops/agent/producers.yml)."
-      body = output.to_s.strip
-      evidence =
-        if body.empty?
-          "#{header}\n\nNo check output — this producer files on a schedule (`#{producer.schedule_text}`)."
-        else
-          "#{header}\n\n```\n#{producer.check}\n```\n\n#{body}"
-        end
-
-      # The playbook POINTER goes AFTER the evidence, because the evidence is
-      # what this particular run found — run-specific, so it stays inline
-      # forever — and the playbook is the standing instruction for every run.
-      #
-      # A pointer rather than the text (ISS-505): the claiming runner reads the
-      # procedure from its own devops checkout, so an issue that sits in the
-      # queue for four days runs the CURRENT playbook rather than the copy that
-      # existed the night it was filed. What stays inline is the abstract, so
-      # the issue still reads as something in admin.
-      pointer = playbook_pointer(producer.playbook_path)
-      return evidence if pointer.nil?
-      "#{evidence}\n\n---\n\n#{pointer}"
-    end
-
-    # nil when a producer ships no playbook at all. A path that is configured but
-    # unreadable HERE cannot be papered over — the registry validated it at parse
-    # time, so an exception at this point means the checkout changed under the
-    # tick, and filing a pointer nobody can resolve is the ISS-360 failure.
-    def playbook_pointer(path, target: nil)
-      return nil if path.nil?
-      Agent::Playbook.pointer_block(path, target: target)
-    end
-
     # ---- claim ----
 
     def claim(identity, runner)
@@ -993,7 +702,7 @@ module Agent
       # resolve stops the claim dead rather than starting a session that would do
       # generic triage under the issue's title.
       begin
-        playbook = Agent::Playbook.resolve_in(issue["body"])
+        playbook = Agent::Playbook.resolve_in(issue["body"], token: identity.token, use_localhost: @use_localhost)
       rescue Agent::Playbook::MissingError => e
         return abandon_unresolvable_playbook(lease, identity, number, e.message)
       end
@@ -1031,49 +740,20 @@ module Agent
     end
 
     # The first timeline comment, and the audit trail ISS-505 turns on: WHICH
-    # playbook this run read and at WHICH sha, with a permalink, so the run stays
-    # reproducible after the file changes. Written by the runner rather than left
-    # to the session, because the runner is the thing that actually did the read.
+    # playbook this run read and at WHICH VERSION, so the run stays reproducible
+    # after the playbook is edited. Written by the runner rather than left to the
+    # session, because the runner is the thing that actually did the read.
     #
-    # The staleness note is the inversion made visible — see
-    # `checkout_staleness_reason`.
+    # The version is worth recording precisely because the playbook table is
+    # copy-on-write (ISS-523): the row this names is still there, and still
+    # readable, after ten later edits. A git sha only gave us that while the file
+    # was still in git.
     def claim_comment(identity, slug, playbook)
       lines = ["Claimed by #{hostname} (runner #{identity.runner_id}) on branch `#{slug}`."]
       return lines.first if playbook.nil?
 
-      lines << "" << "Playbook: #{playbook.label}" << playbook.permalink
-      reason = checkout_staleness_reason
-      lines << "" << "⚠️ #{reason}, so the playbook above may be behind `origin/main`." if reason
+      lines << "" << "Playbook: #{playbook.label}"
       lines.join("\n")
-    end
-
-    # Why this machine's devops checkout might not be current, or nil when there
-    # is no reason to think it isn't.
-    #
-    # THIS is the inversion ISS-505 names, answered where the answer is cheap. A
-    # runner on a stale checkout reads last month's playbook while the issue
-    # claims to run the current one, and `agent_reported_registry` surfaces that
-    # only by comparing machines after the fact — no single runner can see it is
-    # the odd one out. But a runner CAN see, right now, why its own last pull did
-    # not land, so it says so on the issue whose playbook it just read.
-    #
-    # All three causes are covered deliberately, because only the first alarms
-    # anywhere else. A failing pull escalates at three in a row (ISS-511); a
-    # DIRTY tree or a checkout off `main` is a benign skip that
-    # `record_checkout_pull_failure` never counts — correctly, since it means a
-    # human is working in that checkout — and on an unattended mini that is a
-    # machine which silently stops updating forever with nothing anywhere saying
-    # so. Two `git` calls, on the claim path only.
-    def checkout_staleness_reason
-      streak = Agent::Errors.count(CHECKOUT_PULL_ERROR_SOURCE)
-      return "This runner's devops checkout has failed to fast-forward #{streak} time(s) in a row" unless streak.zero?
-
-      repo = Agent::Checkout.devops_repo
-      branch = Agent::Checkout.current_branch(repo)
-      return "This runner's devops checkout does not answer `git rev-parse`, so the tick cannot pull it" if branch.nil?
-      return "This runner's devops checkout is on `#{branch}`, not `main`, so the tick does not pull it" if branch != "main"
-      return "This runner's devops checkout has a dirty working tree, so the tick does not pull it" if Agent::Checkout.dirty?(repo)
-      nil
     end
 
     # A configured playbook this runner cannot read is a HARD stop: no session,
@@ -1090,11 +770,12 @@ module Agent
     # status just written, and the lease still ends up closed either way.
     def abandon_unresolvable_playbook(lease, identity, number, message)
       text = "Claim aborted on #{hostname}: #{message}\n\n" \
-             "This issue points at a playbook in devops (`Playbook:` line in the body) and this runner " \
-             "could not read it, so no session was started. Running it anyway would mean generic triage " \
-             "under this issue's title — the ISS-360 failure the pointer exists to make impossible.\n\n" \
-             "Fix the path under `devops/agent/bodies/`, or correct the pointer line on this issue, then " \
-             "move it back to `open`."
+             "This issue names a playbook (the `Playbook:` line in the body) and this runner could not " \
+             "resolve it against `GET /agent/playbooks/:key`, so no session was started. Running it anyway " \
+             "would mean generic triage under this issue's title — the ISS-360 failure the pointer exists " \
+             "to make impossible.\n\n" \
+             "Fix it in /admin/agents/playbooks (or correct the pointer line on this issue), then move it " \
+             "back to `open`."
       push("playbook_unresolved", "dev-agent: ISS-#{number} playbook did not resolve on #{hostname} (#{message})")
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)

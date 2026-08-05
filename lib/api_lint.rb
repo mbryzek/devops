@@ -1,5 +1,5 @@
 # The repos the weekly `api lint` sweep covers — one child issue per name in
-# `REPOS`, filed by the `api-lint` producer in agent/producers.yml.
+# `REPOS`, filed by the `api-lint` producer.
 #
 # This list lives in code rather than in the playbook's prose because the way it
 # goes wrong is silent. A repo that starts owning apibuilder specs and is never
