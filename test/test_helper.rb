@@ -77,6 +77,38 @@ module DevTestSupport
     end
   end
 
+  # The same reasoning again, for the toolchain probe the tick runs once a day
+  # (Agent::Toolchain, ISS-531).
+  #
+  # Left real, it makes every tick test depend on WHAT IS INSTALLED ON THE BOX
+  # RUNNING THE SUITE: a developer machine without `depsguard` would have the
+  # tick try to file an issue about it, which NetworkGuard raises on — and
+  # NetworkBlocked is not an ApiError, so it escapes the tick's rescue and fails
+  # a test that was about something else entirely. It also shells out to
+  # `/bin/zsh -lc` per call, which is real cost in a suite that runs the tick
+  # dozens of times.
+  #
+  # The default is a healthy machine, for the same reason MaintenanceGuard's is a
+  # clean success. A test that cares opts back in by stubbing `check` itself.
+  module ToolchainGuard
+    def self.install
+      return unless defined?(Agent::Toolchain)
+      @saved = Agent::Toolchain.method(:check)
+      Agent::Toolchain.define_singleton_method(:check) do |tools: Agent::Toolchain::TOOLS, now: Time.now, **_opts|
+        found = tools.map do |tool|
+          Agent::Toolchain::Found.new(tool: tool, path: "/stubbed/bin/#{tool.name}", version: nil)
+        end
+        Agent::Toolchain::Result.new(at: now, path: "/stubbed/bin", found: found)
+      end
+    end
+
+    def self.uninstall
+      return unless defined?(Agent::Toolchain) && @saved
+      Agent::Toolchain.define_singleton_method(:check, @saved)
+      @saved = nil
+    end
+  end
+
   # Wraps every test in every class that loads this helper. `before_setup` /
   # `after_teardown` rather than `setup` / `teardown` so a test class defining
   # its own setup cannot silently drop the guard.
@@ -85,11 +117,13 @@ module DevTestSupport
       super
       DevTestSupport::NetworkGuard.install
       DevTestSupport::MaintenanceGuard.install
+      DevTestSupport::ToolchainGuard.install
     end
 
     def after_teardown
       DevTestSupport.restore_stubbed_globals(@dev_test_stubbed_globals)
       @dev_test_stubbed_globals = nil
+      DevTestSupport::ToolchainGuard.uninstall
       DevTestSupport::MaintenanceGuard.uninstall
       DevTestSupport::NetworkGuard.uninstall
       super

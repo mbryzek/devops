@@ -29,6 +29,7 @@ dev agent refresh <issue>         re-open a fixed issue for rebase / review feed
 dev agent release <issue>         force-release a stuck lease
 dev agent gc                      purge logs and workspaces per the retention table
 dev agent maintenance             this machine's housekeeping: gc + aidirs/docker prune
+dev agent doctor                  does this box have the binaries its jobs shell out to?
 ```
 
 `dev agent tick --dry-run` prints every decision a real tick would make and
@@ -42,17 +43,37 @@ Install the toolchain, then:
 
 1. `gh auth login`
 2. `dev auth ai provision` (or `dev auth ai set <token>`)
-3. `cp launchd/com.bryzek.dev-agent.plist ~/Library/LaunchAgents/`
-4. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bryzek.dev-agent.plist`
+3. **`dev agent doctor` — it must exit 0**
+4. `cp launchd/com.bryzek.dev-agent.plist ~/Library/LaunchAgents/`
+5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bryzek.dev-agent.plist`
 
 The first tick self-registers the machine on its `IOPlatformUUID` and the server
 derives `max_concurrency` from the reported RAM. Nothing else is configured by
 hand.
 
-**Host prerequisites** — the full table, and why each one silently kills an
-unattended machine, is in the XML comment at the top of the plist: auto-login,
-FileVault (stays on, deliberately), sleep disabled, Docker Desktop at login, `gh`
-+ `dev auth ai`.
+**Host prerequisites.** The toolchain half is `Agent::Toolchain::TOOLS` in
+`lib/agent/toolchain.rb`: every external binary the dispatcher, its producers and
+its claimed sessions shell out to, with what each one blocks and the command that
+installs it. `dev agent doctor` compares this machine to that list and exits 1 if
+anything required is absent; the tick re-checks once a day and files an issue
+naming the machine and the producers it cannot run.
+
+Step 3 is a gate rather than a suggestion because of ISS-531: `depsguard` was in
+the prerequisites, was never installed on the runner, and the weekly
+supply-chain scan therefore never ran once in the producer's whole history. It
+left no error, because a check that cannot run exits 2, and the producer contract
+records exit >1 as `check_failed` — deliberately indistinguishable in the queue
+from a clean week.
+
+The doctor resolves against **the PATH `/bin/zsh -lc` gives the tick, not your
+shell's**. That is the same bug in its other form: `-lc` is a login,
+*non-interactive* shell, so it never sources `.zshrc`, so nvm never loads, so
+nvm's `node` is on PATH in your terminal and on no PATH the agent has ever had.
+Install anything the agent shells out to with homebrew.
+
+The rest — auto-login, FileVault (stays on, deliberately), sleep disabled, Docker
+Desktop at login — is in the XML comment at the top of the plist. Those are the
+ones no command can check for itself.
 
 ## Where everything is written
 
