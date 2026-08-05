@@ -308,7 +308,7 @@ class TestDevAgentTick < Minitest::Test
 
       # The third failure, recorded well inside the floor.
       Agent::Errors.record("checkout_pull", "pull failed")
-      assert_equal Agent::Tick::CHECKOUT_PULL_ESCALATE_AT, Agent::Errors.count("checkout_pull")
+      assert_equal Agent::Tick::ERROR_ESCALATE_AT, Agent::Errors.count("checkout_pull")
       assert_equal 3, heartbeat_once(now: start + 5).fetch(:errors).size,
                    "the streak that triggers escalation must be visible on the platform at once"
     end
@@ -1156,6 +1156,99 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- ISS-520: housekeeping is runner-local, not a producer ----
+  #
+  # The bug: agent-gc, aidirs-prune and docker-prune were producers, so they ran
+  # behind the fleet-wide daily compare-and-set. With N runners exactly one
+  # machine won each lock per day and N-1 machines never collected a log, never
+  # pruned a feature dir and never pruned an image — silently, on the box nobody
+  # watches, until the disk filled and took Docker with it.
+
+  # No stubs at all: every platform call in this test would flunk on the
+  # unstubbed-request guard. That is the assertion — housekeeping takes no lock,
+  # starts no producer run, and asks nobody for permission, so two runners both
+  # prune on the same day and neither writes an agent_producer_run row.
+  def test_maintenance_runs_with_no_platform_call_at_all
+    with_agent_home do
+      register_identity
+      ran = []
+      stub_singleton(Agent::Maintenance, :run_shell, lambda { |source, trigger|
+        ran << source
+        Agent::Maintenance::Outcome.new(source: source, label: source, ok: true, message: "ok")
+      }) do
+        with_stubbed_api({}) { capture_stdout { tick(dry_run: false).run_maintenance } }
+      end
+      assert_equal [Agent::Maintenance::AIDIRS_SOURCE, Agent::Maintenance::DOCKER_SOURCE], ran
+      refute_nil Agent::Maintenance.last_run_at, "the pass must stamp its own marker"
+    end
+  end
+
+  # Hygiene must not depend on the control plane. If the platform is unreachable
+  # for a week every machine must still prune — the moment you most need disk
+  # headroom is the moment things are already broken — so maintenance runs BEFORE
+  # the identity check and before anything that can raise ApiError.
+  def test_maintenance_runs_on_a_machine_the_platform_has_never_heard_of
+    with_agent_home do
+      out = with_stubbed_api({}) { capture_stdout { tick(dry_run: false).phase_b } }
+      assert_match(/no runner identity yet/, out)
+      refute_nil Agent::Maintenance.last_run_at, "an unregistered machine still has to collect its own disk"
+    end
+  end
+
+  def test_a_dry_run_says_what_it_would_prune_and_prunes_nothing
+    with_agent_home do
+      register_identity
+      out = with_stubbed_api({}) { capture_stdout { tick.run_maintenance } }
+      assert_match(/maintenance: first_run — would run: /, out)
+      assert_match(/docker prune --days 7 --apply/, out)
+      assert_nil Agent::Maintenance.last_run_at, "a dry run must not claim the machine was pruned"
+    end
+  end
+
+  # A chore that keeps failing must reach a human, and before ISS-520 it could
+  # not: the 3-in-a-row escalation was hard-coded to `checkout_pull`. Agent::Errors
+  # already derives the streak by counting a source's entries, so the threshold
+  # was the only thing that was source-specific.
+  def test_three_consecutive_maintenance_failures_escalate_like_any_other_source
+    with_agent_home do
+      register_identity
+      filed = nil
+      stub_singleton(Agent::Maintenance, :run_shell, lambda { |source, _trigger|
+        Agent::Maintenance::Outcome.new(source: source, label: source, ok: source != Agent::Maintenance::DOCKER_SOURCE,
+                                        message: "`docker prune` exited 1: Cannot connect to the Docker daemon")
+      }) do
+        with_ai_token do
+          stubs = { "POST /playbook/issues" => ->(body) { filed = body; { "number" => 42, "occurrence_count" => 1 } } }
+          with_stubbed_api(stubs) do
+            3.times do |i|
+              # The marker is what stops a failing chore re-running every tick,
+              # so each pass has to be separately due.
+              File.delete(Agent::Paths.maintenance_file) if File.exist?(Agent::Paths.maintenance_file)
+              capture_stdout { tick(dry_run: false).run_maintenance }
+              assert_nil filed, "must not escalate before the 3rd consecutive failure" if i < 2
+            end
+          end
+        end
+      end
+      assert_equal 3, Agent::Errors.count(Agent::Maintenance::DOCKER_SOURCE)
+      assert_equal 0, Agent::Errors.count(Agent::Maintenance::AIDIRS_SOURCE),
+                   "a chore that succeeded must have no streak, whatever its neighbours did"
+      refute_nil filed, "the 3rd consecutive failure must file an issue"
+      assert_match(/docker_prune:\d{4}-\d{2}-\d{2}/, filed[:fingerprint])
+      assert_match(/docker_prune failing on /, filed[:title])
+      refute filed[:claim_on_create]
+    end
+  end
+
+  def test_a_successful_pass_clears_a_prior_maintenance_streak
+    with_agent_home do
+      register_identity
+      Agent::Errors.record(Agent::Maintenance::DOCKER_SOURCE, "prior failure", now: Time.now)
+      with_stubbed_api({}) { capture_stdout { tick(dry_run: false).run_maintenance } }
+      assert_equal 0, Agent::Errors.count(Agent::Maintenance::DOCKER_SOURCE)
+    end
+  end
+
   # ---- ISS-392: the registry each runner reports ----
 
   def test_the_runner_reports_its_registry_with_the_devops_sha
@@ -1185,6 +1278,47 @@ class TestDevAgentTick < Minitest::Test
         assert_equal ["probe"], reported[:producers].map { |p| p[:producer_key] }
         assert_equal "every 1 hour", reported[:producers].first[:schedule]
         refute_nil reported[:producers].first[:next_due_at]
+      end
+    end
+  end
+
+  # Errors report the runs that BROKE. They can never report a run that NEVER
+  # HAPPENED — a crashed tick, an unloaded launchd job, a cadence bug — and from
+  # off the machine "never ran" and "ran clean" are the same silence. That is why
+  # the report carries last_maintenance_at and this machine's headroom: the
+  # server cannot schedule the work, but it is the only place that can notice one
+  # machine has stopped doing it.
+  def test_the_registry_report_carries_this_machines_maintenance_vitals
+    reported = nil
+    now = Time.utc(2026, 8, 5, 12)
+    with_agent_home do |root|
+      with_devops_clone(root) do |_origin, _checkout|
+        register_identity
+        stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} })
+        stub_singleton(Agent::Maintenance, :disk, ->(*) { [11, 22] }) do
+          with_stubbed_api(stubs) do
+            capture_stdout { tick(dry_run: false, now: now).run_maintenance }
+            capture_stdout { tick(dry_run: false, now: now).report_registry(Agent::Host.cached_identity) }
+          end
+        end
+        assert_equal "2026-08-05T12:00:00Z", reported[:last_maintenance_at]
+        assert_equal 11, reported[:disk_free_bytes]
+        assert_equal 22, reported[:disk_total_bytes]
+      end
+    end
+  end
+
+  # A machine that has never pruned reports no timestamp at all, rather than one
+  # that would make it look current. The absence IS the signal the staleness
+  # invariant reads.
+  def test_a_machine_that_has_never_pruned_reports_no_maintenance_time
+    reported = nil
+    with_agent_home do |root|
+      with_devops_clone(root) do |_origin, _checkout|
+        register_identity
+        stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} })
+        with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false).report_registry(Agent::Host.cached_identity) } }
+        refute reported.key?(:last_maintenance_at)
       end
     end
   end

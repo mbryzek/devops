@@ -54,6 +54,14 @@ module Agent
     # across invocations, so "how many times in a row has X failed" has nowhere
     # else to live between ticks.
     def errors_file = File.join(state_dir, "agent-errors.json")
+    # When this machine last ran its own housekeeping, what triggered it, and how
+    # it went (Agent::Maintenance, ISS-520). A throttle in the same sense as
+    # heartbeat_file: the cadence is decided here, on the machine, with no
+    # platform involvement, so hygiene keeps happening while the platform is
+    # unreachable. What the platform gets is a REPORT of it, on the registry
+    # report — which is how "this machine stopped pruning" becomes visible
+    # somewhere other than the machine that stopped.
+    def maintenance_file = File.join(state_dir, "agent-maintenance.json")
     def work_lock      = File.join(state_dir, "agent-tick.lock")
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
 

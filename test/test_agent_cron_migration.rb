@@ -21,9 +21,12 @@ class TestAgentCronMigration < Minitest::Test
   def producer(key) = producers.find { |p| p.key == key }
 
   # Every openclaw cron this epic retired, and the producer that replaced it.
+  #
+  # `aidirs-prune` and `docker-prune` are deliberately absent: ISS-520 moved them
+  # OFF the registry entirely (see RUNNER_LOCAL below), because a producer runs
+  # behind a fleet-wide daily lock and these delete files on the machine that
+  # runs them.
   MIGRATED = {
-    "aidirs-prune"                => "aidirs-prune",
-    "docker-prune"                => "docker-prune",
     "browserslist-update"         => "browserslist-update",
     "depsguard-weekly"            => "depsguard",
     "dep-upgrade-nightly"         => "dependency-upgrade",
@@ -70,9 +73,71 @@ class TestAgentCronMigration < Minitest::Test
   # The chores that act directly must NOT carry an issue block: they are the work,
   # and filing an issue for a completed chore is queue noise.
   def test_the_direct_chores_file_nothing
-    %w[aidirs-prune docker-prune browserslist-update].each do |key|
+    %w[browserslist-update].each do |key|
       assert_equal "never", producer(key).file_when, "#{key}: acts directly, so it must file nothing"
       refute_nil producer(key).check, "#{key}: file_when never needs a check to run"
+    end
+  end
+
+  # ---- ISS-520: housekeeping is runner-local, not a producer ------------------
+  #
+  # Every producer — `file_when: never` included — runs behind the daily
+  # compare-and-set in POST /agent/producers/:key/runs, so with N runners exactly
+  # ONE machine wins each key per day. For work whose output is an issue that is
+  # the entire point. For work whose output is free disk ON THE MACHINE THAT RAN
+  # IT, it meant N-1 machines never collected a log, never pruned a feature dir
+  # and never pruned an image, until a disk filled and took Docker with it.
+  #
+  # This assertion is the guard against putting them back: re-registering any of
+  # them here would restore the starvation silently, and the symptom would show
+  # up weeks later as unrelated spec failures on the box nobody watches.
+  RUNNER_LOCAL = %w[agent-gc aidirs-prune docker-prune].freeze
+
+  def test_runner_local_housekeeping_is_not_a_producer
+    RUNNER_LOCAL.each do |key|
+      assert_nil producer(key),
+                 "#{key} deletes files on the machine that runs it — as a producer, the fleet-wide " \
+                 "daily lock means only one machine per day ever does (ISS-520)"
+    end
+  end
+
+  # ...and the other half: removing them from the registry is only correct
+  # because something else runs them on EVERY machine.
+  def test_every_retired_housekeeping_chore_runs_as_runner_local_maintenance
+    assert_operator Agent::Maintenance::CADENCE_SECONDS, :>, 0
+    plan = Agent::Maintenance.plan(:cadence)
+    %w[agent_gc aidirs_prune docker_prune].each do |source|
+      assert plan.any? { |line| line.start_with?("#{source}:") },
+             "#{source} left producers.yml with nothing running it per machine"
+    end
+  end
+
+  # Cadence is the routine path; disk pressure is the failure being prevented and
+  # must not wait for it. A floor with no cooldown would be worse than none: a
+  # machine that is genuinely full stays under the floor after a prune that
+  # reclaimed everything reclaimable, and would then prune every 30 seconds.
+  def test_disk_pressure_runs_now_but_not_in_a_loop
+    now = Time.utc(2026, 8, 5, 12)
+    tiny = Agent::Maintenance::PRESSURE_FLOOR_BYTES - 1
+    with_last_run(now - 120) do
+      assert_nil Agent::Maintenance.due(now: now, free_bytes: tiny),
+                 "a run two minutes ago must not re-run, however full the disk is"
+    end
+    with_last_run(now - Agent::Maintenance::PRESSURE_COOLDOWN_SECONDS - 1) do
+      assert_equal :pressure, Agent::Maintenance.due(now: now, free_bytes: tiny)
+      assert_nil Agent::Maintenance.due(now: now, free_bytes: Agent::Maintenance::PRESSURE_FLOOR_BYTES * 2),
+                 "healthy headroom waits for the cadence"
+    end
+  end
+
+  def with_last_run(at)
+    Dir.mktmpdir do |root|
+      previous = ENV["DEV_AGENT_STATE_DIR"]
+      ENV["DEV_AGENT_STATE_DIR"] = File.join(root, "state")
+      Agent::Paths.write_json(Agent::Paths.maintenance_file, { "at" => at.utc.iso8601 }, mode: 0600)
+      yield
+    ensure
+      ENV["DEV_AGENT_STATE_DIR"] = previous
     end
   end
 
@@ -231,8 +296,6 @@ class TestAgentCronMigration < Minitest::Test
   # quietly moved a job to a different hour would be indistinguishable from one
   # that worked, until something else started colliding with it.
   CRON_SCHEDULES = {
-    "aidirs-prune"                => "daily at 6:00am",
-    "docker-prune"                => "daily at 5:08am",
     "browserslist-update"         => "weekly on monday at 4:13am",
     "depsguard"                   => "weekly on monday at 5:13am",
     "dependency-upgrade"          => "daily at 3:45am",
@@ -271,6 +334,17 @@ class TestAgentCronMigration < Minitest::Test
     %w[aidirs-prune-status.md docker-prune-status.md browserslist-status.md].each do |file|
       assert_includes src, file, "nothing writes #{file} any more — its briefing section would go dark"
     end
+  end
+
+  # The two chores that left the registry are still the SAME commands, so the
+  # briefing keeps reading the same status files. Their windows are the flags the
+  # producer checks passed (`dev aidirs prune --apply` defaults to 3 days;
+  # docker-prune passed --days 7): a move that quietly changed how much history a
+  # machine keeps would be indistinguishable from one that worked.
+  def test_the_runner_local_chores_kept_the_windows_their_producers_passed
+    plan = Agent::Maintenance.plan(:cadence).join("\n")
+    assert_includes plan, "aidirs prune --days 3 --apply"
+    assert_includes plan, "docker prune --days 7 --apply"
   end
 
   # Ported playbooks must not carry the openclaw scaffolding a lease replaces, or

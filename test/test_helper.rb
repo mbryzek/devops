@@ -46,6 +46,37 @@ module DevTestSupport
     end
   end
 
+  # The same reasoning as NetworkGuard, for the machine instead of the network.
+  #
+  # `dev agent tick` now runs runner-local housekeeping (Agent::Maintenance,
+  # ISS-520), which shells out to `dev aidirs prune --apply` and `dev docker
+  # prune --apply`. Neither of those is scoped by a DEV_AGENT_* override: aidirs
+  # hard-codes ~/code/ai and docker talks to whatever daemon is running. So any
+  # test that exercises a tick is one missing override away from deleting the
+  # developer's own feature dirs and Docker images — the same accident
+  # NetworkGuard exists for, with no undo.
+  #
+  # The default answer is a clean no-op success rather than a raise, because a
+  # test about the tick's OTHER behaviour should not have to know this exists. A
+  # test that wants the real shell path opts back in with
+  # `stub_singleton(Agent::Maintenance, :run_shell) { ... }`.
+  module MaintenanceGuard
+    def self.install
+      return unless defined?(Agent::Maintenance)
+      @saved = Agent::Maintenance.method(:run_shell)
+      Agent::Maintenance.define_singleton_method(:run_shell) do |source, _trigger|
+        Agent::Maintenance::Outcome.new(source: source, label: source.tr("_", " "), ok: true,
+                                        message: "stubbed by DevTestSupport::MaintenanceGuard")
+      end
+    end
+
+    def self.uninstall
+      return unless defined?(Agent::Maintenance) && @saved
+      Agent::Maintenance.define_singleton_method(:run_shell, @saved)
+      @saved = nil
+    end
+  end
+
   # Wraps every test in every class that loads this helper. `before_setup` /
   # `after_teardown` rather than `setup` / `teardown` so a test class defining
   # its own setup cannot silently drop the guard.
@@ -53,11 +84,13 @@ module DevTestSupport
     def before_setup
       super
       DevTestSupport::NetworkGuard.install
+      DevTestSupport::MaintenanceGuard.install
     end
 
     def after_teardown
       DevTestSupport.restore_stubbed_globals(@dev_test_stubbed_globals)
       @dev_test_stubbed_globals = nil
+      DevTestSupport::MaintenanceGuard.uninstall
       DevTestSupport::NetworkGuard.uninstall
       super
     end

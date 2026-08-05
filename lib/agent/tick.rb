@@ -7,6 +7,7 @@ require 'agent/gc'
 require 'agent/github'
 require 'agent/host'
 require 'agent/jobs'
+require 'agent/maintenance'
 require 'agent/notify'
 require 'agent/outcome'
 require 'agent/paths'
@@ -61,9 +62,15 @@ module Agent
     # escalation below always agree on what they are counting.
     CHECKOUT_PULL_ERROR_SOURCE = "checkout_pull".freeze
 
-    # File an issue the moment consecutive failures CROSS this threshold, not
-    # on every tick once past it — see `update_checkout`.
-    CHECKOUT_PULL_ESCALATE_AT = 3
+    # File an issue the moment consecutive failures for ANY source CROSS this
+    # threshold, not on every tick once past it — see `record_failure`.
+    #
+    # Deliberately not per-source. Agent::Errors already derives the streak by
+    # counting a source's entries rather than tracking a counter, so "3 in a row"
+    # is source-agnostic by construction; hard-coding it to `checkout_pull` (as
+    # it was when ISS-511 introduced it) was the only thing keeping the machine's
+    # other recurring failures — its housekeeping chores above all — silent.
+    ERROR_ESCALATE_AT = 3
 
     attr_reader :decisions
 
@@ -146,40 +153,55 @@ module Agent
     # fetch+reset fallback was tried and still failed, or the checkout is
     # broken outright — is worth a durable count and, eventually, an issue.
     def record_checkout_pull_failure(result)
-      entries = Agent::Errors.record(CHECKOUT_PULL_ERROR_SOURCE, result.message, now: @now)
-      count = entries.count { |e| e["source"] == CHECKOUT_PULL_ERROR_SOURCE }
-      # Only fire exactly on the tick that crosses the threshold. A streak that
-      # is already past it must not re-notify or re-file every 30 seconds.
-      escalate_checkout_pull_failure(result, count) if count == CHECKOUT_PULL_ESCALATE_AT
+      record_failure(
+        CHECKOUT_PULL_ERROR_SOURCE, result.message,
+        title: ->(hostname) { "dev-agent: devops checkout pull failing on #{hostname}" },
+        explain: "This machine's devops checkout (Agent::Checkout.devops_repo) could not fast-forward from " \
+                 "`origin/main`, and the automatic `git fetch` + `git reset --hard origin/main` recovery " \
+                 "attempted in Agent::Checkout.pull also failed. The tick keeps running the code it already " \
+                 "has, but producer schedule and prompt changes pushed to devops will not reach this machine " \
+                 "until the checkout is fixed by hand.",
+      )
     end
 
-    def escalate_checkout_pull_failure(result, count)
-      summary = "dev-agent: devops checkout pull has failed #{count} times in a row on #{hostname} (#{result.message})"
-      Agent::Notify.once("checkout_pull_failing", Agent::Checkout.devops_repo, now: @now) do
-        Agent::Notify.event(summary)
+    # One durable failure for `source`, and an issue the moment its streak
+    # crosses ERROR_ESCALATE_AT.
+    #
+    # `title` and `explain` come from the CALLER rather than from a table keyed
+    # by source. A per-source lookup would be a second registry of prose sitting
+    # a file away from the code that knows what actually broke, and it drifts the
+    # first time a source is added without one; passing them in makes it
+    # impossible to record a failure nobody can explain.
+    def record_failure(source, message, title:, explain:)
+      entries = Agent::Errors.record(source, message, now: @now)
+      count = entries.count { |e| e["source"] == source }
+      # Only fire exactly on the tick that crosses the threshold. A streak that
+      # is already past it must not re-notify or re-file every 30 seconds.
+      escalate_failure(source, message, count, title: title, explain: explain) if count == ERROR_ESCALATE_AT
+    end
+
+    def escalate_failure(source, message, count, title:, explain:)
+      host = hostname
+      Agent::Notify.once("agent_error", source, now: @now) do
+        Agent::Notify.event("dev-agent: #{source} has failed #{count} times in a row on #{host} (#{message})")
       end
       return if @dry_run
 
       Agent::Api.create_issue(
         {
-          title: "dev-agent: devops checkout pull failing on #{hostname}",
+          title: title.call(host),
           category: "bug",
-          fingerprint: "#{CHECKOUT_PULL_ERROR_SOURCE}:#{@now.utc.strftime('%Y-%m-%d')}",
-          body: "The `#{CHECKOUT_PULL_ERROR_SOURCE}` source has failed #{count} times in a row on #{hostname}.\n\n" \
-                "Last error:\n\n```\n#{result.message}\n```\n\n" \
-                "This machine's devops checkout (Agent::Checkout.devops_repo) could not fast-forward from " \
-                "`origin/main`, and the automatic `git fetch` + `git reset --hard origin/main` recovery " \
-                "attempted in Agent::Checkout.pull also failed. The tick keeps running the code it already " \
-                "has, but producer schedule and prompt changes pushed to devops will not reach this machine " \
-                "until the checkout is fixed by hand.",
+          fingerprint: "#{source}:#{@now.utc.strftime('%Y-%m-%d')}",
+          body: "The `#{source}` source has failed #{count} times in a row on #{host}.\n\n" \
+                "Last error:\n\n```\n#{message}\n```\n\n#{explain}",
           claim_on_create: false,
         },
         use_localhost: @use_localhost,
       )
     rescue SessionExpired, ApiError => e
-      # Escalation must never take down the rest of Phase A (heartbeat,
-      # report_registry) — the same reasoning as phase_a's own top-level rescue.
-      log("checkout_pull escalation: could not file an issue (#{e.message})")
+      # Escalation must never take down the rest of the phase it runs in — the
+      # same reasoning as phase_a's own top-level rescue.
+      log("#{source} escalation: could not file an issue (#{e.message})")
     end
 
     # What this machine reads producers.yml to be: every producer, its cadence,
@@ -208,7 +230,14 @@ module Agent
         return
       end
 
+      # Maintenance vitals ride with the registry report because they are the
+      # same kind of fact: local state only this machine can see, reported so it
+      # can be COMPARED across machines. Errors report the runs that broke;
+      # last_maintenance_at is the half an error channel structurally cannot
+      # cover — a run that never happened leaves no error, and "never ran" and
+      # "ran clean" are the same silence from the outside.
       Agent::Api.report_registry(identity.runner_id, devops_sha: sha, producers: producers,
+                                 maintenance: Agent::Maintenance.report(now: @now),
                                  token: identity.token, use_localhost: @use_localhost)
       Agent::Paths.write_json(Agent::Paths.registry_report_file,
                               { "devops_sha" => sha, "at" => @now.utc.iso8601 }, mode: 0600)
@@ -370,7 +399,15 @@ module Agent
 
     # ---------------- Phase B: work ----------------
 
+    # FIRST, and deliberately before the identity check and everything that
+    # touches the platform: housekeeping is the one piece of work in Phase B that
+    # must keep happening on a machine the platform has never heard of and on a
+    # machine the platform is currently unreachable from. Anything below this
+    # line can raise ApiError and abort the phase (see the rescue), and the point
+    # of ISS-520 is that a disk does not stop filling while the control plane is
+    # down.
     def phase_b
+      run_maintenance
       identity = Agent::Host.cached_identity
       if identity.nil?
         log("no runner identity yet — skipping work phase")
@@ -382,6 +419,55 @@ module Agent
       claim(identity, runner)
     rescue SessionExpired, ApiError => e
       log("work phase: platform error (#{e.message})")
+    end
+
+    # ---- maintenance (ISS-520) ----
+    #
+    # In Phase B rather than Phase A because it is WORK: a full `docker prune`
+    # runs for minutes, and Phase A's lock is what the heartbeat and the lease
+    # heartbeats sit behind. Holding the vitals lock through a prune would stop
+    # the heartbeats of a machine that is perfectly healthy — the exact inversion
+    # the two-phase split exists to prevent — while the work lock is already the
+    # right home for something slow: the next tick simply skips its work phase,
+    # which is what it does today for any long-running producer.
+    #
+    # No platform call, no lock beyond the work lock this phase already holds,
+    # and no producer run: with N runners the daily compare-and-set gave exactly
+    # one machine per day the right to delete ITS OWN files, so N-1 machines
+    # never collected anything.
+    def run_maintenance
+      free, = Agent::Maintenance.disk
+      trigger = Agent::Maintenance.due(now: @now, free_bytes: free)
+      return if trigger.nil?
+
+      if @dry_run
+        decide("maintenance", "#{trigger} — would run: #{Agent::Maintenance.plan(trigger, now: @now).join('; ')}")
+        return
+      end
+
+      result = Agent::Maintenance.run(now: @now, trigger: trigger)
+      result.outcomes.each { |outcome| apply_maintenance_outcome(outcome) }
+      decide("maintenance", "#{trigger}: #{result.outcomes.map { |o| "#{o.source} #{o.ok ? 'ok' : 'FAILED'}" }.join(', ')}" \
+                            " — reclaimed #{result.reclaimed_bytes || 'unknown'} byte(s)")
+    end
+
+    # Success CLEARS the source's streak, exactly as a recovered checkout pull
+    # does: a chore that just worked has no active streak, whatever it had
+    # before. Failure counts toward the shared 3-in-a-row escalation, which is
+    # the whole reason ERROR_ESCALATE_AT stopped being checkout-specific.
+    def apply_maintenance_outcome(outcome)
+      return Agent::Errors.clear(outcome.source) if outcome.ok
+
+      record_failure(
+        outcome.source, outcome.message,
+        title: ->(host) { "dev-agent: #{outcome.source} failing on #{host}" },
+        explain: "`#{outcome.label}` is runner-local housekeeping: it reclaims disk on THIS machine and " \
+                 "nothing another runner does frees it. While it keeps failing this machine's disk only " \
+                 "fills, and a full disk here does not announce itself — it kills Docker and then surfaces " \
+                 "as unrelated spec failures on whatever this box claims next.\n\n" \
+                 "Run it by hand on that machine to see the failure directly: `dev agent maintenance --dry-run` " \
+                 "for what it would do, then the command above.",
+      )
     end
 
     def self_runner(identity)
