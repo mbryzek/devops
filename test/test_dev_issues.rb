@@ -580,6 +580,34 @@ class TestDevIssues < Minitest::Test
     assert_includes issues_list_path(statuses: "open", is_snoozed: false), "is_snoozed=false"
   end
 
+  # ---- the claim preview must not offer epics ----
+  # An epic is a container, and `POST /claims` skips it server-side — so listing
+  # one offered work the claim then refused. With an epic as the only open
+  # improvement, `all` came back "Nothing claimed — every issue listed above was
+  # taken or deferred", which named the wrong cause entirely.
+
+  def test_issues_list_path_omits_types_when_not_asked_for
+    refute_includes issues_list_path(statuses: "open"), "types"
+  end
+
+  def test_issues_list_path_can_filter_to_units_of_work
+    assert_includes issues_list_path(statuses: "open", types: "issue"), "types=issue"
+  end
+
+  # The regression itself: the claim preview's request must carry types=issue.
+  # with_stubbed_api flunks on any path it was not given, so a claim that drops
+  # the filter fails here rather than silently listing epics again.
+  def test_claim_asks_the_server_for_units_of_work_only
+    path = issues_list_path(statuses: "open", is_snoozed: false, types: "issue")
+    out, = capture_io do
+      with_stubbed_api("GET #{path}" => []) do
+        cmd_issues_claim([])
+      end
+    end
+    assert_includes out, "No open issues to claim."
+    assert_includes out, "epics are not offered"
+  end
+
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
 
   def test_issue_session_prompt_names_the_plan
