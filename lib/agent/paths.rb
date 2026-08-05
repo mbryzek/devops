@@ -48,6 +48,12 @@ module Agent
     # throttle, not a record: the platform holds the report, this only answers
     # "has anything changed, or has it been long enough to re-report".
     def registry_report_file = File.join(state_dir, "agent-registry-report.json")
+    # A small bounded rolling log of recent failures (Agent::Errors), keyed by
+    # source. Local cache only, same as everything else under state_dir: it
+    # exists because `dev agent tick` is one-shot with no in-memory continuity
+    # across invocations, so "how many times in a row has X failed" has nowhere
+    # else to live between ticks.
+    def errors_file = File.join(state_dir, "agent-errors.json")
     def work_lock      = File.join(state_dir, "agent-tick.lock")
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
 

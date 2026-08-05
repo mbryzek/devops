@@ -72,9 +72,15 @@ module Agent
     # same one is a no-op rather than a second row. `producers` is the whole
     # list every time (full desired state) -- a producer deleted from
     # producers.yml has to disappear from the report, not linger looking overdue.
-    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:)
+    #
+    # `errors` is Agent::Errors.list — this machine's bounded local error
+    # history (ISS-511) — sent defensively ahead of the platform side landing
+    # (spec/agent.json `AgentReportedRegistry.errors` + `agent_reported_error`).
+    # Until that field exists server-side, an apibuilder-generated form on the
+    # receiving end simply ignores an unknown key, so this can ship first.
+    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:, errors: [])
       request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost,
-                                                    body: { devops_sha: devops_sha, producers: producers })
+                                                    body: { devops_sha: devops_sha, producers: producers, errors: errors })
     end
 
     def reported_registries(token:, use_localhost:)

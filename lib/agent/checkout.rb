@@ -12,10 +12,17 @@ require 'agent/paths'
 #
 # THREE PROPERTIES MAKE THIS SAFE, and none of them is optional:
 #
-#   --ff-only     A machine whose checkout has diverged (a hand-edit, an
-#                 abandoned local commit) must STOP, not merge. A merge here
-#                 would silently invent a fleet-wide code state that exists in
-#                 nobody's repo and in no review.
+#   --ff-only     A machine whose checkout has diverged must STOP, not merge. A
+#                 merge here would silently invent a fleet-wide code state that
+#                 exists in nobody's repo and in no review. A DIRTY tree or a
+#                 checkout on a branch other than main is left completely
+#                 alone -- that is Mike (or a claimed session) doing
+#                 interactive work in this exact checkout, and `pull` reports
+#                 it as a benign skip rather than touching anything. A CLEAN
+#                 checkout on main that still refuses to fast-forward has no
+#                 local explanation left, so `pull` allows itself exactly one
+#                 `fetch` + `reset --hard origin/main` to recover from rewritten
+#                 upstream history before calling it a real failure.
 #   report, never crash
 #                 The pull runs on the vitals path. A network blip, a locked
 #                 index, a checkout on the wrong branch -- none of those may be
@@ -30,9 +37,15 @@ require 'agent/paths'
 #                 have to reason about swapping code under itself; this does not.
 module Agent
   module Checkout
-    Result = Struct.new(:ok, :sha, :changed, :message, keyword_init: true) do
+    # `benign` marks a failed pull that is NOT this module's problem to report:
+    # the checkout is dirty, or on a branch other than main, which means a
+    # human is doing interactive work in it right here. Only a non-benign
+    # (`ok: false, benign: false`) result is a real failure worth escalating —
+    # see Agent::Tick#update_checkout.
+    Result = Struct.new(:ok, :sha, :changed, :message, :benign, keyword_init: true) do
       def ok? = ok
       def changed? = changed
+      def benign? = benign
     end
 
     # Phase A is bounded by construction and this is the only thing in it that
@@ -69,22 +82,74 @@ module Agent
 
     # `git pull --ff-only origin main`, with every failure mode folded into a
     # Result rather than an exception.
+    #
+    # A refused fast-forward has two, very different causes, and conflating
+    # them would either bulldoze a human's work or silently leave the fleet
+    # stuck forever:
+    #
+    #   DIRTY, or not on main   Mike (or a claimed session) is doing
+    #                           interactive work in this exact checkout. NEVER
+    #                           touch it — return `benign: true` and stop.
+    #   CLEAN, on main          Nothing local explains the refusal, so the only
+    #                           remaining cause is upstream history that no
+    #                           longer fast-forwards from here (a rebase, a
+    #                           force-push). One shot at `fetch` + `reset
+    #                           --hard origin/main` recovers automatically;
+    #                           if even that fails, it's a real failure.
     def pull(repo = devops_repo)
       before = head_sha(repo)
-      return Result.new(ok: false, sha: nil, changed: false, message: "#{repo} is not a git checkout") if before.nil?
+      return Result.new(ok: false, sha: nil, changed: false, benign: false, message: "#{repo} is not a git checkout") if before.nil?
 
       out, ok = run_bounded("git", "-C", repo, "pull", "--ff-only", "origin", "main")
       after = head_sha(repo)
-      if ok
-        Result.new(ok: true, sha: after, changed: after != before,
-                   message: after == before ? "already at #{short(after)}" : "#{short(before)} -> #{short(after)}")
+      return Result.new(ok: true, sha: after, changed: after != before, benign: false,
+                        message: after == before ? "already at #{short(after)}" : "#{short(before)} -> #{short(after)}") if ok
+
+      if dirty?(repo) || current_branch(repo) != "main"
+        # after == before here in every case worth naming (a refused
+        # fast-forward changes nothing), so the machine keeps running the code
+        # it has, and this checkout is left exactly as the human left it.
+        return Result.new(ok: false, sha: after, changed: false, benign: true, message: first_error_line(out))
+      end
+
+      if reset_to_origin(repo)
+        recovered = head_sha(repo)
+        Result.new(ok: true, sha: recovered, changed: recovered != before, benign: false,
+                   message: "recovered via fetch + reset --hard: #{short(before)} -> #{short(recovered)}")
       else
-        # after == before here in every case worth naming (a refused fast-forward
-        # changes nothing), so the machine keeps running the code it has.
-        Result.new(ok: false, sha: after, changed: false, message: first_error_line(out))
+        Result.new(ok: false, sha: head_sha(repo), changed: false, benign: false, message: first_error_line(out))
       end
     rescue Errno::ENOENT => e
-      Result.new(ok: false, sha: before, changed: false, message: e.message)
+      Result.new(ok: false, sha: before, changed: false, benign: false, message: e.message)
+    end
+
+    # True when the working tree has any local changes — staged, unstaged, or
+    # untracked. A `git status` that itself fails is treated as dirty: "cannot
+    # tell" must never be the reason a hard reset runs.
+    def dirty?(repo)
+      out, status = Open3.capture2e("git", "-C", repo, "status", "--porcelain")
+      !status.success? || !out.strip.empty?
+    rescue Errno::ENOENT
+      true
+    end
+
+    def current_branch(repo)
+      out, status = Open3.capture2e("git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD")
+      status.success? ? out.strip : nil
+    rescue Errno::ENOENT
+      nil
+    end
+
+    # The one fallback this module ever runs, and only reachable once the
+    # caller has proven the tree is clean and on main (see `pull`). Fetch,
+    # then reset — two bounded calls, never a bare `git pull` retried, so a
+    # fetch that succeeds but a reset that fails still leaves an accurate sha
+    # for the caller to read back.
+    def reset_to_origin(repo)
+      _out, fetch_ok = run_bounded("git", "-C", repo, "fetch", "origin", "main")
+      return false unless fetch_ok
+      _out, reset_ok = run_bounded("git", "-C", repo, "reset", "--hard", "origin/main")
+      reset_ok
     end
 
     # Runs a command with a hard deadline, non-interactively. Returns
