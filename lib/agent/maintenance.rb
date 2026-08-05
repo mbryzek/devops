@@ -37,12 +37,14 @@ require 'agent/paths'
 # forever. Pressure buys urgency, not a spin loop.
 #
 # LIVENESS IS REPORTED, NOT INFERRED. Every run stamps a marker file, and the
-# tick's registry report carries `last_maintenance_at` plus this machine's disk
-# headroom. An error channel can only ever report a run that BROKE; it cannot
-# report one that NEVER HAPPENED (a crashed tick, an unloaded launchd job, a
-# cadence bug), and "never ran" and "ran clean" are the same silence — which is
-# the failure this whole issue is about. The server-side invariant
-# (AgentInvariants.agent_runner_maintenance_stale) is what notices.
+# tick's RUNNER HEARTBEAT carries `last_maintenance_at` plus this machine's disk
+# headroom (ISS-528 — on the machine's own heartbeat rather than its registry
+# report, because the subject is the machine and the reported registry goes away
+# with server-side scheduling). An error channel can only ever report a run that
+# BROKE; it cannot report one that NEVER HAPPENED (a crashed tick, an unloaded
+# launchd job, a cadence bug), and "never ran" and "ran clean" are the same
+# silence — which is the failure this whole issue is about. The server-side
+# invariant (AgentInvariants.agent_runner_maintenance_stale) is what notices.
 module Agent
   module Maintenance
     # Once a day, matching the producer schedules this replaced (agent-gc 4:00am,
@@ -230,7 +232,7 @@ module Agent
 
     # Enough of a failing command's output to diagnose it, bounded because this
     # string is written to a capped on-disk log AND sent to the platform on every
-    # registry report.
+    # runner heartbeat.
     TAIL_LINES = 10
 
     def tail(output)
@@ -258,7 +260,7 @@ module Agent
       )
     end
 
-    # What the tick sends with its registry report. Disk is re-read here rather
+    # What the tick sends with its runner heartbeat. Disk is re-read here rather
     # than taken from the marker: headroom is a fact about the machine RIGHT NOW,
     # and a report that quoted yesterday's number would be at its least accurate
     # exactly while the disk was filling.

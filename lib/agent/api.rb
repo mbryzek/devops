@@ -55,18 +55,25 @@ module Agent
       request(:get, "/agent/runners", token: token, use_localhost: use_localhost) || []
     end
 
-    # Liveness, the machine's job census, AND its local error log, in one call. Both lists are the
-    # whole list every time (full desired state), for the same reason report_registry sends every
-    # producer: the platform stores what it is told wholesale, so a session that has finished has to
-    # DISAPPEAR from the report rather than linger looking live forever, and a source that recovered
-    # has to disappear rather than show a failure that is over.
+    # Liveness, the machine's job census, its local error log, AND its housekeeping vitals, in one
+    # call. Every one of them is the whole value every time (full desired state), for the same
+    # reason report_registry sends every producer: the platform stores what it is told wholesale, so
+    # a session that has finished has to DISAPPEAR from the report rather than linger looking live
+    # forever, and a source that recovered has to disappear rather than show a failure that is over.
     #
     # `errors` rides the HEARTBEAT and not the registry report (ISS-527) because it is about the
     # MACHINE. The reported registry exists only to detect that runners disagree about the schedule,
     # and it goes away entirely once scheduling moves server-side (ISS-526) — the machine does not.
-    def runner_heartbeat(runner_id, jobs:, token:, use_localhost:, errors: [])
-      request(:post, "/agent/runners/#{runner_id}/heartbeat", token: token, use_localhost: use_localhost,
-                                                              body: { jobs: jobs, errors: errors })
+    #
+    # `maintenance` is Agent::Maintenance.report (ISS-528): last_maintenance_at,
+    # maintenance_reclaimed_bytes, disk_free_bytes, disk_total_bytes. Same noun for the same reason
+    # as `errors`, and it started on the registry report for the same wrong one. Merged rather than
+    # nested so each is a column the staleness invariant can query directly, and OMITTED when
+    # unknown — a machine that has never pruned has no last_maintenance_at, and that absence is
+    # exactly what the invariant reads.
+    def runner_heartbeat(runner_id, jobs:, token:, use_localhost:, errors: [], maintenance: {})
+      body = { jobs: jobs, errors: errors }.merge(maintenance)
+      request(:post, "/agent/runners/#{runner_id}/heartbeat", token: token, use_localhost: use_localhost, body: body)
     end
 
     def update_runner(runner_id, form, token:, use_localhost:)
@@ -78,17 +85,14 @@ module Agent
     # list every time (full desired state) -- a producer deleted from
     # producers.yml has to disappear from the report, not linger looking overdue.
     #
-    # Deliberately carries NO error log: that moved to runner_heartbeat in
-    # ISS-527. See its comment for why.
-    #
-    # `maintenance` is Agent::Maintenance.report (ISS-520): last_maintenance_at,
-    # maintenance_reclaimed_bytes, disk_free_bytes, disk_total_bytes. Merged
-    # rather than nested so each is a column the staleness invariant can query
-    # directly, and OMITTED when unknown — a machine that has never pruned has no
-    # last_maintenance_at, and that absence is exactly what the invariant reads.
-    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:, maintenance: {})
-      body = { devops_sha: devops_sha, producers: producers }.merge(maintenance)
-      request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost, body: body)
+    # Deliberately carries NEITHER the error log (ISS-527) nor the maintenance
+    # vitals (ISS-528): both moved to runner_heartbeat, because both are about the
+    # MACHINE and this noun is deleted outright once scheduling is server-side.
+    # See runner_heartbeat's comment for why. What is left here is exactly what
+    # this endpoint is for — the producer schedule as one checkout reads it.
+    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:)
+      request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost,
+                                                    body: { devops_sha: devops_sha, producers: producers })
     end
 
     def reported_registries(token:, use_localhost:)

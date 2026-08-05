@@ -295,6 +295,73 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- the machine's housekeeping vitals on the heartbeat (ISS-528) ----
+  #
+  # Same re-home as the error log above, one issue later, and for the same reason: the subject is
+  # the MACHINE. This half is the one an error channel structurally cannot cover — errors describe
+  # runs that BROKE, and from off the box a run that never happened and a clean night are the same
+  # silence.
+
+  def test_the_maintenance_vitals_ride_the_heartbeat_rather_than_the_registry_report
+    now = Time.utc(2026, 8, 5, 12)
+    with_agent_home do |root|
+      with_devops_clone(root) do |_origin, _checkout|
+        register_identity
+        sent = nil
+        stub_singleton(Agent::Maintenance, :disk, ->(*) { [11, 22] }) do
+          capture_stdout { with_stubbed_api({}) { tick(dry_run: false, now: now).run_maintenance } }
+          sent = heartbeat_once(now: now)
+        end
+        assert_equal "2026-08-05T12:00:00Z", sent[:last_maintenance_at]
+        assert_equal 11, sent[:disk_free_bytes]
+        assert_equal 22, sent[:disk_total_bytes]
+      end
+    end
+  end
+
+  # A machine that has never pruned sends no timestamp at all, rather than one that would make it
+  # look current. The ABSENCE is the signal agent_runner_maintenance_stale reads, so it has to
+  # survive the wire as an omitted key rather than a defaulted value.
+  def test_a_machine_that_has_never_pruned_reports_no_maintenance_time
+    with_agent_home do
+      register_identity
+      sent = heartbeat_once
+      refute sent.key?(:last_maintenance_at)
+      refute sent.key?(:maintenance_reclaimed_bytes)
+    end
+  end
+
+  # A machine whose `df` cannot be read reports nothing rather than 0. A reported 0 would read as a
+  # full disk on a machine whose only problem is an unreadable df, and the platform would file about
+  # headroom that is probably fine.
+  def test_an_unreadable_disk_reports_nothing_rather_than_zero
+    with_agent_home do
+      register_identity
+      sent = nil
+      stub_singleton(Agent::Maintenance, :disk, ->(*) { nil }) { sent = heartbeat_once }
+      refute sent.key?(:disk_free_bytes)
+      refute sent.key?(:disk_total_bytes)
+    end
+  end
+
+  # The vitals are deliberately NOT part of the change test that forces an early send. Free disk
+  # moves on almost every tick, so gating on it would turn a ten-minute heartbeat into a 30-second
+  # one — for a signal whose staleness threshold is 48 hours.
+  def test_a_disk_that_moved_does_not_force_an_early_heartbeat
+    with_agent_home do
+      register_identity
+      start = Time.now
+      free = 900
+      stub_singleton(Agent::Maintenance, :disk, ->(*) { [free, 1000] }) do
+        refute_nil heartbeat_once(now: start), "the first heartbeat always sends"
+        free = 400
+        assert_nil heartbeat_once(now: start + 60), "free disk moving is not news worth a send"
+        assert_equal 400, heartbeat_once(now: start + Agent::Tick::RUNNER_HEARTBEAT_SECONDS + 1)[:disk_free_bytes],
+                     "...but the next scheduled heartbeat carries the current number"
+      end
+    end
+  end
+
   # Escalation is local — it fires out of update_checkout, not out of the reporting path — so it
   # must cross 3-in-a-row on the tick that gets there regardless of when the heartbeat window falls.
   # update_checkout also runs BEFORE heartbeat_runner in phase_a, so the third failure is reported
@@ -1396,43 +1463,23 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
-  # Errors report the runs that BROKE. They can never report a run that NEVER
-  # HAPPENED — a crashed tick, an unloaded launchd job, a cadence bug — and from
-  # off the machine "never ran" and "ran clean" are the same silence. That is why
-  # the report carries last_maintenance_at and this machine's headroom: the
-  # server cannot schedule the work, but it is the only place that can notice one
-  # machine has stopped doing it.
-  def test_the_registry_report_carries_this_machines_maintenance_vitals
+  # The registry report carries the schedule and the sha, and nothing else. The maintenance vitals
+  # that briefly rode here moved to the heartbeat in ISS-528 (see that block above), and leaving a
+  # single one behind would mean the platform had two homes for the same fact — one of which is
+  # deleted at the server-side-scheduling cutover.
+  def test_the_registry_report_carries_no_machine_state
     reported = nil
-    now = Time.utc(2026, 8, 5, 12)
     with_agent_home do |root|
       with_devops_clone(root) do |_origin, _checkout|
         register_identity
         stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} })
         stub_singleton(Agent::Maintenance, :disk, ->(*) { [11, 22] }) do
           with_stubbed_api(stubs) do
-            capture_stdout { tick(dry_run: false, now: now).run_maintenance }
-            capture_stdout { tick(dry_run: false, now: now).report_registry(Agent::Host.cached_identity) }
+            capture_stdout { tick(dry_run: false).run_maintenance }
+            capture_stdout { tick(dry_run: false).report_registry(Agent::Host.cached_identity) }
           end
         end
-        assert_equal "2026-08-05T12:00:00Z", reported[:last_maintenance_at]
-        assert_equal 11, reported[:disk_free_bytes]
-        assert_equal 22, reported[:disk_total_bytes]
-      end
-    end
-  end
-
-  # A machine that has never pruned reports no timestamp at all, rather than one
-  # that would make it look current. The absence IS the signal the staleness
-  # invariant reads.
-  def test_a_machine_that_has_never_pruned_reports_no_maintenance_time
-    reported = nil
-    with_agent_home do |root|
-      with_devops_clone(root) do |_origin, _checkout|
-        register_identity
-        stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} })
-        with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false).report_registry(Agent::Host.cached_identity) } }
-        refute reported.key?(:last_maintenance_at)
+        assert_equal %i[devops_sha producers], reported.keys.sort_by(&:to_s)
       end
     end
   end
