@@ -44,10 +44,6 @@ module Agent
     def jobs_dir       = File.join(state_dir, "agent-jobs")
     def heartbeat_file = File.join(state_dir, "agent-heartbeat")
     def notified_file  = File.join(state_dir, "agent-notified.json")
-    # What this machine last told the platform its producer registry was. A
-    # throttle, not a record: the platform holds the report, this only answers
-    # "has anything changed, or has it been long enough to re-report".
-    def registry_report_file = File.join(state_dir, "agent-registry-report.json")
     # A small bounded rolling log of recent failures (Agent::Errors), keyed by
     # source. Local cache only, same as everything else under state_dir: it
     # exists because `dev agent tick` is one-shot with no in-memory continuity
@@ -73,7 +69,6 @@ module Agent
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
 
     def tick_log(date)      = File.join(log_root, "tick", "#{date.strftime('%Y-%m-%d')}.log")
-    def producers_log(date) = File.join(log_root, "producers", "#{date.strftime('%Y-%m-%d')}.log")
     def issues_dir          = File.join(log_root, "issues")
     def issue_dir(number)   = File.join(issues_dir, "ISS-#{number}")
     def claude_log(number)  = File.join(issue_dir(number), "claude.log")
@@ -91,11 +86,13 @@ module Agent
       File.expand_path(ENV["DEV_AGENT_DEVOPS_REPO"] || File.expand_path("../..", __dir__))
     end
 
-    # The standing prompt and the producer registry, versioned in git beside the
-    # code that reads them.
+    # The standing prompt, versioned in git beside the code that reads it. The
+    # producer registry and the playbooks used to live here too; both are platform
+    # rows now (ISS-521, ISS-523) and the file that held them is deleted --
+    # a definition split across two systems, only one of which is queryable, is
+    # what ISS-526 ended.
     def agent_dir           = File.join(devops_repo, "agent")
     def instructions_file   = File.join(agent_dir, "instructions.md")
-    def producers_file      = File.join(agent_dir, "producers.yml")
     def githooks_dir        = File.join(agent_dir, "githooks")
 
     # ---- small IO helpers, atomic where a half-written file would confuse a

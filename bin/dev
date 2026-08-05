@@ -435,8 +435,9 @@ USAGE = <<~USAGE
         add/revert churn it caused on apibuilder-ui's .npmrc.
         The verdict is the exit code — 0 clean, 1 real failures (listed on
         stdout), 2 the scan itself could not run — for the `depsguard` producer
-        in devops/agent/producers.yml. It fixes nothing; a failing scan files an
-        issue and the fix happens as claimed work.
+        `depsguard`. It fixes nothing: the producer files unconditionally
+        (ISS-525) and the claiming session runs this first, dismissing the issue
+        on exit 0.
 
     #{INVOCATIONS["codegen sync"]}
         Regenerate every codegen-consuming repo against the latest generators and
@@ -450,8 +451,8 @@ USAGE = <<~USAGE
         --regen-only opens draft PRs but skips the review-completion workflow;
         --full-tests runs the full Scala suite instead of Test/compile.
         --check is a dry run whose verdict is its exit code — 0 in sync, 1 drift
-        found, 2 the check itself broke — for the `codegen-sync` producer in
-        devops/agent/producers.yml. It never opens a PR or spawns Claude.
+        found, 2 the check itself broke — run by the `codegen-sync` playbook as its
+        first step (ISS-525). It never opens a PR or spawns Claude.
 
     #{INVOCATIONS["dependencies check"]}
         Report outdated library dependencies for the scala repos (platform,
@@ -855,9 +856,10 @@ USAGE = <<~USAGE
         The fleet: hostname, hardware, max concurrency, paused state, last seen.
 
     #{INVOCATIONS["agent producers"]}
-        The registry in devops/agent/producers.yml with each producer's schedule,
-        last run and result, and when it is next due. Due-ness is computed here,
-        never by the server.
+        The registry — platform rows, managed at /admin/agents — with each
+        producer's schedule, last run and result, and when it is next due. Every
+        number here is READ from the server, the one thing that schedules
+        producers; nothing is computed locally.
 
     #{INVOCATIONS["agent runs"]}
         Full history: every producer run, and every lease attempt for --issue N.
@@ -1736,7 +1738,8 @@ def invariants_apply_deferrals(results, deferrals)
   end
 end
 
-# The exit codes ARE the producer contract documented in agent/producers.yml.
+# The exit codes ARE the producer contract: 0 clean, 1 findings, 2 the check
+# itself broke. See integrations.agent.scheduler.ProducerCheckOutcome.
 # Named here so the two files can be read against each other: `dev invariants
 # check` is a producer check, and a producer check that misreports its own
 # failure as a finding is indistinguishable from a real one. Both failure codes
@@ -1756,7 +1759,7 @@ INVARIANTS_EXIT_UNCHECKABLE = 2 # no trustworthy verdict — recorded as `check_
 # nothing, so it is UNCHECKABLE rather than a finding — the same distinction
 # `invariants_failing_apps` already draws to decide what deserves a session.
 # Collapsing the two is not merely noisy, it is silencing: the bogus issue takes
-# the `invariants:<app>` fingerprint, and `Agent::Producers.in_flight?` then
+# the `invariants:<app>` fingerprint, and the platform's fingerprint dedup then
 # blocks every REAL invariant failure from filing for as long as it sits
 # non-terminal. An expired session would hide the data problems it never looked
 # for, which is exactly what ISS-358 was.
@@ -6075,7 +6078,7 @@ CODEGEN_WORKDIR_ROOT = File.join(CODE_ROOT, "ai")
 # runs by this prefix.
 CODEGEN_WORKDIR_PREFIX = "cgs".freeze
 CODEGEN_STACKS = %i[scala elm sveltekit].freeze
-# `--check` is the `codegen-sync` producer's check (devops/agent/producers.yml),
+# `--check` is what the `codegen-sync` playbook runs as its first step (ISS-525),
 # so its exit codes are the producer contract, not a convenience. 1 means "file
 # the issue", which is why a broken sweep must NOT come back as 1: a check that
 # crashes every night would otherwise become a nightly stream of bogus issues.
@@ -8066,8 +8069,8 @@ end
 
 # `--check`'s verdict, in the exit-code contract every producer check speaks
 # (0 clean / 1 findings / >1 the check itself broke). It survives the move out of
-# producers.yml and into the playbook: the claiming session reads these codes the
-# same way the tick used to.
+# a producer's `check` field and into the playbook (ISS-525): the claiming
+# session reads these codes the same way the tick used to.
 #
 # Findings beat uncheckable deliberately, for the reason codegen's check gives:
 # a repo that demonstrably regenerated to a diff is a real finding worth a PR
@@ -10169,20 +10172,31 @@ def cmd_agent_producers(args)
   reject_unknown_args("agent producers", rest + [app_filter].compact)
   identity = agent_identity!(use_localhost)
   handle_errors do
-    registry = Agent::Producers.load
+    # Straight off the platform, and deliberately doing no arithmetic of its own.
+    # This command used to parse `agent/producers.yml` out of THIS checkout and
+    # compute due-ness locally, which made it a second implementation of the
+    # schedule grammar and a second opinion about the registry -- so two machines
+    # on different devops shas printed two different answers and neither was
+    # wrong. There is one registry now and one `next_due_at`, both server-side
+    # (ISS-526); this just prints them.
+    producers = Agent::Api.producers(token: identity.token, use_localhost: use_localhost)
     runs = Agent::Api.producer_runs(token: identity.token, use_localhost: use_localhost)
     latest = runs.group_by { |r| r["producer_key"] }
     now = Time.now
-    puts "Registry: #{Agent::Paths.producers_file}   timezone #{registry.fetch(:timezone)}"
-    registry.fetch(:producers).each do |producer|
-      last = (latest[producer.key] || []).max_by { |r| r["started_at"].to_s }
-      last_at = last && (Time.parse(last["started_at"]) rescue nil)
-      due = Agent::Schedule.next_due(producer.schedule, last_run_at: last_at, now: now,
-                                     timezone: registry.fetch(:timezone))
-      puts "#{producer.key}"
-      puts "  #{Agent::Schedule.describe(producer.schedule)}   file_when: #{producer.file_when}"
+    if producers.empty?
+      puts "No producers in the registry. Add one at /admin/agents."
+      next
+    end
+    puts "Registry: #{producers.length} producer(s), managed at /admin/agents"
+    producers.each do |producer|
+      last = (latest[producer["key"]] || []).max_by { |r| r["started_at"].to_s }
+      due = Time.parse(producer["next_due_at"]) rescue nil
+      action = producer.dig("action", "file_when")
+      check = producer.dig("action", "check")
+      puts "#{producer['key']}"
+      puts "  #{producer['schedule']} (#{producer['timezone']})   file_when: #{action}#{check ? "   check: #{check}" : ''}"
       puts "  last run: #{last ? "#{last['started_at']} → #{last['result']}" : 'never'}"
-      puts "  next due: #{due <= now ? 'now' : due}"
+      puts "  next due: #{due.nil? ? producer['next_due_at'] : (due <= now ? 'now' : due)}"
     end
   end
 end

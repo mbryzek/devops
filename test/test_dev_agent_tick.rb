@@ -25,7 +25,7 @@ class TestDevAgentTick < Minitest::Test
         "DEV_AGENT_WORKSPACE_ROOT" => File.join(root, "ai"),
         "DEV_AGENT_CLAUDE_REPO" => File.join(root, "claude"),
         # A stand-in devops checkout: it carries a real copy of `agent/` (so
-        # producers.yml and the githooks resolve) but is NOT a git repo, so no
+        # the standing prompt and the githooks resolve) but is NOT a git repo, so no
         # test can reach out and `git pull` the developer's own checkout. The
         # tests that exercise the pull point this at a throwaway clone instead.
         "DEV_AGENT_DEVOPS_REPO" => File.join(root, "devops"),
@@ -92,11 +92,13 @@ class TestDevAgentTick < Minitest::Test
       # is proven by the test still passing.
       assert_match(/would POST \/agent\/runners\/#{RUNNER_ID}\/heartbeat/, out)
 
-      # Phase B: every due producer is named, with its schedule.
+      # Phase B: maintenance, the toolchain check, and the claim. NO producer
+      # phase — ISS-526 moved scheduling, checking and filing entirely into the
+      # platform, so a producer is not something a tick has an opinion about
+      # anymore. This assertion is the verification the issue asks for.
       kinds = decisions.map(&:first)
-      assert_includes kinds, "producer"
+      refute_includes kinds, "producer", "the tick must not evaluate, run or file producers (ISS-526)"
       assert_includes kinds, "claim"
-      assert_match(/invariants-platform is due \(every 1 hour\)/, out)
       assert_match(/would POST \/playbook\/issue\/leases/, out)
 
       # ...and nothing happened.
@@ -538,20 +540,29 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
-  # ---- claim-time playbook resolution (ISS-505) ----
+  # ---- claim-time playbook resolution (ISS-505, ISS-526) ----
   #
-  # The producer files a POINTER; the runner reads the playbook off its own
-  # checkout when it claims. That is the entire point — an issue filed on Friday
-  # and claimed on Tuesday must run TUESDAY's procedure — so what these prove is
-  # that the read happens here, that what was read is recorded, and that a
-  # pointer which does not resolve stops the claim instead of starting a session
-  # that would do something else.
+  # The platform files a POINTER; the runner resolves it against
+  # `GET /agent/playbooks/:key` when it claims. That is the entire point — an issue
+  # filed on Friday and claimed on Tuesday must run TUESDAY's procedure — so what
+  # these prove is that the read happens HERE, that what was read is recorded, and
+  # that a pointer which does not resolve stops the claim instead of starting a
+  # session that would do something else.
+  #
+  # The pointer used to be a path into this runner's devops checkout, which is why
+  # the staleness warnings that used to live here are gone: the playbook no longer
+  # comes off the machine, so this machine's checkout being behind cannot make it
+  # stale.
 
-  CLAIM_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".freeze
+  PLAYBOOK_KEY = "weekly-review".freeze
+
+  PLAYBOOK_VERSION = "2026-08-05T14:04:20.055Z".freeze
+
+  PLAYBOOK_BODY = "# Weekly code review\n\nPosture: full-auto. Review the week's merges.".freeze
 
   # Drives one real claim with Jobs.spawn_session stubbed: everything up to and
   # including the prompt is exercised, and no `claude` is launched.
-  def claim_one(body:, number: 707, errors: [], branch: "main", dirty: false)
+  def claim_one(body:, number: 707, errors: [], playbooks: nil)
     seen = { comments: [], statuses: [], released: [], prompt: nil, spawned: false }
     with_agent_home do
       register_identity
@@ -567,23 +578,21 @@ class TestDevAgentTick < Minitest::Test
           "PUT /playbook/issues/#{number}/status" => ->(b) { seen[:statuses] << b; {} },
           "DELETE /playbook/issue/leases/lse-1" => ->(_b) { seen[:released] << "lse-1"; {} },
         }
+        # The playbook store, as this claim will see it. nil for a key means the
+        # platform has never heard of it — a 404, which Agent::Api turns into nil.
+        (playbooks || { PLAYBOOK_KEY => { "key" => PLAYBOOK_KEY, "body" => PLAYBOOK_BODY,
+                                          "created_at" => PLAYBOOK_VERSION } }).each do |key, row|
+          stubs["GET /agent/playbooks/#{key}"] = row
+        end
         spawn = lambda do |argv:, prompt:, workspace:, number:, env: {}|
           seen[:prompt] = prompt
           seen[:spawned] = true
           Process.pid
         end
-        # The stand-in devops checkout is deliberately not a git repo, so what
-        # `git` would answer about it is stubbed rather than reached for.
-        stub_singleton(Agent::Checkout, :head_sha, ->(*_args) { CLAIM_SHA }) do
-          stub_singleton(Agent::Checkout, :current_branch, ->(*_args) { branch }) do
-            stub_singleton(Agent::Checkout, :dirty?, ->(*_args) { dirty }) do
-              stub_singleton(Agent::Jobs, :spawn_session, spawn) do
-                with_stubbed_api(stubs) do
-                  seen[:out] = capture_stdout do
-                    tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: 1))
-                  end
-                end
-              end
+        stub_singleton(Agent::Jobs, :spawn_session, spawn) do
+          with_stubbed_api(stubs) do
+            seen[:out] = capture_stdout do
+              tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: 1))
             end
           end
         end
@@ -592,67 +601,39 @@ class TestDevAgentTick < Minitest::Test
     seen
   end
 
-  POINTER = "Playbook: `agent/bodies/weekly-review.md`".freeze
+  POINTER = "Playbook: `#{PLAYBOOK_KEY}`".freeze
 
   def test_the_session_is_handed_the_playbook_read_at_claim_time
     seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n")
     assert seen[:spawned], "the session must still start"
-    assert_match(/^# Playbook — agent\/bodies\/weekly-review\.md @ #{CLAIM_SHA[0, 8]}$/, seen[:prompt],
-                 "the prompt gets the resolved playbook, labelled with the sha it was read at")
+    assert_match(/^# Playbook — #{PLAYBOOK_KEY} @ #{Regexp.escape(PLAYBOOK_VERSION)}$/, seen[:prompt],
+                 "the prompt gets the resolved playbook, labelled with the version it was read at")
     assert_match(/Posture: full-auto/, seen[:prompt], "the FULL procedure reaches the session")
     assert_operator seen[:prompt].index("# Playbook —"), :<, seen[:prompt].index("# Issue comments"),
                     "comments stay last so the most recent instruction is read last"
   end
 
-  # Requirement 2: the run has to stay reproducible after the file changes, so
-  # WHAT was read and at WHICH sha go on the timeline, with a permalink.
-  def test_the_first_comment_records_the_playbook_and_the_sha_it_was_read_at
+  # Requirement 2: the run has to stay reproducible after the playbook changes, so
+  # WHAT was read and at WHICH version go on the timeline. The version is worth
+  # naming because the store is append-only (ISS-523) — the row it names is still
+  # there after any number of later edits.
+  def test_the_first_comment_records_the_playbook_and_the_version_it_was_read_at
     seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n")
     comment = seen[:comments].first
     assert_match(/^Claimed by /, comment, "the claim line still leads")
-    assert_match(/^Playbook: agent\/bodies\/weekly-review\.md @ #{CLAIM_SHA[0, 8]}$/, comment)
-    assert_match(%r{https://github\.com/mbryzek/devops/blob/#{CLAIM_SHA}/agent/bodies/weekly-review\.md}, comment)
-  end
-
-  # The inversion ISS-505 names: a runner on a stale checkout reads last month's
-  # playbook while the issue claims to be running the current one, and
-  # `agent_reported_registry` shows that only by comparing machines after the
-  # fact. A runner CAN see why its own last pull did not land, so it says so on
-  # the issue whose playbook it just read.
-  def test_a_runner_whose_pull_is_failing_says_so_on_the_issue
-    failing = [{ "source" => "checkout_pull", "message" => "fatal: could not read from remote",
-                 "created_at" => Time.now.utc.iso8601 }]
-    seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n", errors: failing)
-    assert_match(/failed to fast-forward 1 time\(s\) in a row.*may be behind `origin\/main`/m, seen[:comments].first)
-  end
-
-  # A dirty tree and a checkout off `main` are BENIGN skips: the tick leaves them
-  # alone on purpose, because it means a human is working in that checkout. So
-  # they never count toward the ISS-511 escalation and nothing else in the system
-  # reports them — on an unattended mini that is a machine which quietly stops
-  # updating forever, which is exactly the case this note exists for.
-  def test_a_benign_pull_skip_still_warns_because_nothing_else_reports_it
-    dirty = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n", dirty: true)
-    assert_match(/dirty working tree.*may be behind `origin\/main`/m, dirty[:comments].first)
-
-    off_main = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n", branch: "wip")
-    assert_match(/on `wip`, not `main`/, off_main[:comments].first)
-  end
-
-  def test_a_healthy_runner_adds_no_staleness_warning
-    seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n")
-    refute_match(/behind `origin\/main`/, seen[:comments].first)
+    assert_match(/^Playbook: #{PLAYBOOK_KEY} @ #{Regexp.escape(PLAYBOOK_VERSION)}$/, comment)
   end
 
   # ISS-360: a producer ported without its playbook silently fell back to generic
   # triage and filed issues instead of shipping PRs for a week. A pointer that
   # does not resolve reintroduces exactly that, so it must be a HARD stop.
   def test_a_pointer_that_does_not_resolve_starts_no_session_at_all
-    seen = claim_one(body: "Filed by a producer.\n\nPlaybook: `agent/bodies/never-existed.md`\n")
+    seen = claim_one(body: "Filed by a producer.\n\nPlaybook: `never-existed`\n",
+                     playbooks: { "never-existed" => nil })
     refute seen[:spawned], "a session without its playbook does a different job than the one scheduled"
     assert_equal ["needs_input"], seen[:statuses].map { |s| s[:status] },
-                 "a human has to fix the path — releasing it would just be re-claimed and re-fail every 30s"
-    assert_match(/did not resolve/, seen[:statuses].first[:comment])
+                 "a human has to fix it — releasing would just be re-claimed and re-fail every 30s"
+    assert_match(/does not exist in the platform/, seen[:statuses].first[:comment])
     assert_equal ["lse-1"], seen[:released], "the lease must not be left held by a session that never started"
     assert_match(/no session started/, seen[:out])
   end
@@ -710,327 +691,6 @@ class TestDevAgentTick < Minitest::Test
     assert_empty events, "runner-offline is the platform's alert (CheckAgentRunnerHealthProcessor), not a peer runner's"
   end
 
-  # ---- producer execution: check_failed stays distinct from filed ----
-
-  def producer(check:, file_when: "check_fails")
-    issue = file_when == "never" ? nil : { "title" => "t", "category" => "infrastructure", "fingerprint" => "fp:1" }
-    Agent::Producers::Producer.new(key: "probe", schedule: Agent::Schedule.parse("every 1 hour"),
-                                   schedule_text: "every 1 hour", check: check,
-                                   file_when: file_when, issue: issue)
-  end
-
-  def run_producer_with(check, extra_stubs: {}, file_when: "check_fails")
-    result = nil
-    stubs = {
-      # agent_producer_run_start wraps the run, same 2xx-varying-type constraint
-      # as the claim: an absent `run` means the compare-and-set did not fire.
-      "POST /agent/producers/probe/runs" => { "run" => { "id" => "run-1" } },
-      "PUT /agent/producers/runs/run-1" => ->(body) { result = body[:result]; { "id" => "run-1" } },
-    }.merge(extra_stubs)
-    with_agent_home do
-      register_identity
-      with_ai_token do
-        with_stubbed_api(stubs) do
-          capture_stdout do
-            tick(dry_run: false).run_producer(producer(check: check, file_when: file_when),
-                                              nil, Agent::Host.cached_identity)
-          end
-        end
-      end
-    end
-    result
-  end
-
-  # The regression that would have caught the one-shot producer bug: run the real
-  # `run_producers` path against a registry with a producer that ALREADY RAN, and
-  # look at the guard it actually puts on the wire. Sending the previous run's own
-  # `started_at` makes the platform's inclusive `started_at >= if_no_run_since`
-  # match that very row, so the producer declines itself forever.
-  def test_a_producer_that_already_ran_guards_on_the_period_not_on_its_own_last_run
-    ran_at = Time.utc(2026, 8, 4, 16, 57, 29)
-    now    = Time.utc(2026, 8, 4, 17, 36, 0)          # well past the 30-minute interval
-    sent   = nil
-
-    registry = <<~YAML
-      timezone: America/New_York
-      producers:
-        - key: probe
-          schedule: every 30 minutes
-          check: "true"
-          file_when: never
-    YAML
-
-    with_agent_home do
-      register_identity
-      with_producer_registry(registry) do
-        stubs = {
-          "GET /agent/producers/runs?limit=100&offset=0" => [
-            { "producer_key" => "probe", "started_at" => ran_at.iso8601, "finished_at" => ran_at.iso8601 },
-          ],
-          "POST /agent/producers/probe/runs" => lambda do |body|
-            sent = body[:if_no_run_since] || body["if_no_run_since"]
-            { "run" => { "id" => "run-1" } }
-          end,
-          "PUT /agent/producers/runs/run-1" => { "id" => "run-1" },
-        }
-        with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false, now: now).run_producers(Agent::Host.cached_identity) } }
-      end
-    end
-
-    refute_nil sent, "the producer was due and must have attempted a run"
-    assert_equal "2026-08-04T17:27:29Z", sent
-    assert Time.parse(sent) > ran_at,
-           "the guard must be the period boundary, not the previous run's own start time"
-  end
-
-  def with_producer_registry(yaml)
-    file = File.join(Agent::Paths.state_dir, "producers.yml")
-    FileUtils.mkdir_p(File.dirname(file))
-    File.write(file, yaml)
-    original = Agent::Paths.method(:producers_file)
-    Agent::Paths.define_singleton_method(:producers_file) { file }
-    yield
-  ensure
-    Agent::Paths.define_singleton_method(:producers_file, original)
-  end
-
-  def test_a_crashing_check_is_check_failed_not_filed
-    # Exit 2 and up means the check itself broke. Filing on it would turn a
-    # broken producer into a nightly stream of bogus issues.
-    assert_equal "check_failed", run_producer_with("exit 2")
-    assert_equal "check_failed", run_producer_with("this-command-does-not-exist-zzz")
-  end
-
-  def test_a_clean_check_is_nothing_to_do
-    assert_equal "nothing_to_do", run_producer_with("true")
-  end
-
-  # The list the in-flight check reads: every non-terminal status, so `fixed`
-  # (PR open, not yet merged) blocks a re-file with no GitHub call.
-  ISSUES_PATH = "GET /playbook/issues?statuses=open&statuses=claimed&statuses=needs_review" \
-                "&statuses=needs_input&statuses=fixed&statuses=deployed&limit=200&offset=0".freeze
-
-  def test_findings_file_an_issue_and_the_check_output_is_the_body
-    filed = nil
-    result = run_producer_with(
-      "echo 'invariant x: 4 rows'; exit 1",
-      extra_stubs: {
-        ISSUES_PATH => [],
-        "POST /playbook/issues" => ->(body) { filed = body; { "number" => 200, "occurrence_count" => 1 } },
-      },
-    )
-    assert_equal "filed", result
-    assert_equal "infrastructure", filed[:category]
-    assert_equal "fp:1", filed[:fingerprint]
-    # Attribution the platform stores as a column: without it, "everything this
-    # producer filed" has to be reconstructed from the run history, which
-    # recurrence (many runs -> one issue) makes unpaginatable.
-    assert_equal "probe", filed[:producer_key]
-    refute filed[:claim_on_create], "a producer files for the queue; it never claims"
-    assert_match(/invariant x: 4 rows/, filed[:body], "the check's stdout IS the brief")
-  end
-
-  # `{date}` used to be resolved on the epic path only, so a plain nightly
-  # producer filed the literal "pr:auto-merge:{date}" — one issue, forever, with
-  # every later run skipping in flight behind it and nothing anywhere saying so.
-  def test_a_plain_producer_resolves_the_date_token_in_its_fingerprint
-    filed = nil
-    dated = Agent::Producers::Producer.new(
-      key: "probe", schedule: Agent::Schedule.parse("daily at 6:45am"),
-      schedule_text: "daily at 6:45am", check: nil, file_when: "always",
-      timezone: "America/New_York",
-      issue: { "title" => "t", "category" => "infrastructure", "fingerprint" => "pr:auto-merge:{date}" },
-    )
-    with_agent_home do
-      register_identity
-      with_ai_token do
-        stubs = {
-          ISSUES_PATH => [],
-          "POST /playbook/issues" => ->(body) { filed = body; { "number" => 201, "occurrence_count" => 1 } },
-        }
-        with_stubbed_api(stubs) do
-          # 6:45am America/New_York is 10:45 UTC — the date must be the LOCAL one.
-          capture_stdout { tick(dry_run: false, now: Time.utc(2026, 8, 5, 10, 45)).file_issue(dated, nil) }
-        end
-      end
-    end
-    assert_equal "pr:auto-merge:2026-08-05", filed[:fingerprint]
-  end
-
-  # And the same run's fingerprint still dedups, so a double fire on one night
-  # files once rather than twice.
-  def test_a_dated_fingerprint_still_blocks_a_refile_within_the_same_day
-    dated = Agent::Producers::Producer.new(
-      key: "probe", schedule: Agent::Schedule.parse("daily at 6:45am"),
-      schedule_text: "daily at 6:45am", check: nil, file_when: "always",
-      timezone: "America/New_York",
-      issue: { "title" => "t", "category" => "infrastructure", "fingerprint" => "pr:auto-merge:{date}" },
-    )
-    result = nil
-    with_agent_home do
-      register_identity
-      with_ai_token do
-        stubs = { ISSUES_PATH => [{ "fingerprint" => "pr:auto-merge:2026-08-05", "status" => "claimed" }] }
-        with_stubbed_api(stubs) do
-          capture_stdout { result, _number = tick(dry_run: false, now: Time.utc(2026, 8, 5, 10, 45)).file_issue(dated, nil) }
-        end
-      end
-    end
-    assert_equal "skipped_in_flight", result
-  end
-
-  def test_a_non_terminal_issue_with_the_same_fingerprint_blocks_a_refile
-    result = run_producer_with(
-      "exit 1",
-      extra_stubs: { ISSUES_PATH => [{ "fingerprint" => "fp:1", "status" => "fixed" }] },
-    )
-    assert_equal "skipped_in_flight", result
-  end
-
-  # The compare-and-set did not fire — another runner started this run first.
-  # An absent `run` must skip quietly, and must NOT run the check or report a
-  # result against a run id that does not exist.
-  def test_an_empty_run_wrapper_skips_without_running_the_check
-    out = nil
-    with_agent_home do
-      register_identity
-      # Only the start is stubbed: running the check would write this file, and
-      # reporting a result would hit an unstubbed PUT and flunk.
-      marker = File.join(Agent::Paths.state_dir, "check-ran")
-      with_stubbed_api({ "POST /agent/producers/probe/runs" => {} }) do
-        out = capture_stdout do
-          tick(dry_run: false).run_producer(producer(check: "touch #{marker}"), nil, Agent::Host.cached_identity)
-        end
-      end
-      refute File.exist?(marker), "a skipped producer must not run its check"
-    end
-    # The message names both causes rather than asserting one. It used to claim
-    # "another runner already started this run", which was wrong in the case that
-    # actually happened in production — a single-runner fleet with nothing in
-    # flight — and sent the investigation looking for a second machine.
-    assert_match(/already in flight or finished/, out)
-  end
-
-  def test_file_when_never_acts_directly_and_files_nothing
-    assert_equal "nothing_to_do", run_producer_with("true", file_when: "never")
-    assert_equal "check_failed", run_producer_with("exit 3", file_when: "never")
-  end
-
-  # ---- epics: one container, one child per target (ISS-397) ----
-
-  EPIC_REGISTRY = <<~YAML.freeze
-    timezone: America/New_York
-    producers:
-      - key: probe
-        schedule: every 1 hour
-        file_when: always
-        issue:
-          type: epic
-          category: infrastructure
-          title: Nightly upgrades
-          fingerprint: "up:{date}"
-          children:
-            names: [alpha, beta]
-            category: infrastructure
-            title: "Upgrades: {child}"
-            fingerprint: "up:{child}"
-  YAML
-
-  def epic_producer
-    registry = Agent::Producers.parse(EPIC_REGISTRY)
-    registry.fetch(:producers).first
-  end
-
-  # Runs the real file path against a stubbed platform, returning
-  # [result, issue_number, every form POSTed to /playbook/issues].
-  def file_epic_with(existing)
-    filed = []
-    number = 100
-    result = nil
-    issue_number = nil
-    with_agent_home do
-      register_identity
-      with_ai_token do
-        stubs = {
-          ISSUES_PATH => existing,
-          "POST /playbook/issues" => lambda do |body|
-            filed << body
-            { "number" => (number += 1), "occurrence_count" => 1 }
-          end,
-        }
-        with_stubbed_api(stubs) do
-          capture_stdout do
-            result, issue_number = tick(dry_run: false, now: Time.utc(2026, 8, 5, 7, 45)).file_issue(epic_producer, nil)
-          end
-        end
-      end
-    end
-    [result, issue_number, filed]
-  end
-
-  def test_an_epic_producer_files_a_container_and_one_child_per_name
-    result, number, filed = file_epic_with([])
-
-    assert_equal "filed", result
-    assert_equal 101, number, "the run records the EPIC, which is what gets verified"
-    assert_equal 3, filed.length
-
-    epic = filed.first
-    assert_equal "epic", epic[:type]
-    # 3:45am America/New_York is 07:45 UTC — the date must be the LOCAL one.
-    assert_equal "up:2026-08-05", epic[:fingerprint]
-    refute epic[:claim_on_create], "a producer files for the queue; it never claims"
-
-    children = filed.drop(1)
-    assert_equal ["Upgrades: alpha", "Upgrades: beta"], children.map { |c| c[:title] }
-    assert_equal %w[up:alpha up:beta], children.map { |c| c[:fingerprint] }
-    # issue_form.parent_number is typed `string` on the platform.
-    assert_equal %w[101 101], children.map { |c| c[:parent_number] }
-    children.each { |c| assert_nil c[:type], "a child is an issue, never a nested epic" }
-    # Epic AND children, so one producer's whole night resolves to one key --
-    # stated on the children rather than left to the platform's inheritance, so
-    # a child detached from its epic keeps its attribution.
-    assert_equal %w[probe probe probe], filed.map { |f| f[:producer_key] }
-  end
-
-  # Per-child dedup is the whole reason for the split: one repo stuck on an open
-  # issue must not take the other five down with it.
-  def test_a_child_with_an_open_issue_is_skipped_and_its_siblings_still_file
-    _result, _number, filed = file_epic_with([{ "fingerprint" => "up:alpha", "status" => "claimed" }])
-
-    assert_equal 2, filed.length, "the epic plus the ONE child that was free"
-    assert_equal "Upgrades: beta", filed.last[:title]
-    assert_includes filed.first[:body], "1 child(ren) were skipped"
-  end
-
-  # An epic with no children is a container nobody can work and nobody can
-  # delete — there is no hard delete, only `dismissed`.
-  def test_a_night_where_every_child_is_in_flight_files_nothing_at_all
-    existing = [
-      { "fingerprint" => "up:alpha", "status" => "open" },
-      { "fingerprint" => "up:beta", "status" => "fixed" },
-    ]
-    result, number, filed = file_epic_with(existing)
-
-    assert_equal "skipped_in_flight", result
-    assert_nil number
-    assert_empty filed, "no epic may be created with nothing under it"
-  end
-
-  # A fingerprint template with no {child} would make every child dedup against
-  # its siblings, so only the first would ever be filed.
-  def test_a_child_template_without_the_token_is_a_parse_error
-    yaml = EPIC_REGISTRY.sub('fingerprint: "up:{child}"', 'fingerprint: "up:all"')
-    error = assert_raises(Agent::Producers::ConfigError) { Agent::Producers.parse(yaml) }
-    assert_match(/\{child\}/, error.message)
-  end
-
-  def test_an_epic_without_children_is_a_parse_error
-    yaml = EPIC_REGISTRY.sub(/^ *children:\n(.*\n)*/, "")
-    error = assert_raises(Agent::Producers::ConfigError) { Agent::Producers.parse(yaml) }
-    assert_match(/requires an issue.children block/, error.message)
-  end
-
   # ---- the ~/code/claude push guard is ENFORCED, not merely instructed ----
 
   def test_pre_push_hook_refuses_a_claude_repo_push_outside_plans
@@ -1082,7 +742,7 @@ class TestDevAgentTick < Minitest::Test
   # ---- ISS-393: the tick pulls its own devops checkout ----
   #
   # One push to devops has to reach the whole fleet. Before this, a producer
-  # schedule change meant logging into every machine, so "producers.yml in git is
+  # prompt change meant logging into every machine, so "the prompt in git is
   # the registry" was true only of the file, never of what a machine was running.
 
   # An `origin` with one commit, and a clone of it pointed at by
@@ -1090,7 +750,7 @@ class TestDevAgentTick < Minitest::Test
   def with_devops_clone(root)
     origin = File.join(root, "devops-origin")
     init_repo(origin)
-    write_commit(origin, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n")
+    write_commit(origin, "agent/instructions.md", "# standing prompt\n")
     checkout = File.join(root, "devops-checkout")
     system("git", "clone", "-q", origin, checkout, out: File::NULL, err: File::NULL)
     previous = ENV["DEV_AGENT_DEVOPS_REPO"]
@@ -1105,7 +765,7 @@ class TestDevAgentTick < Minitest::Test
   def test_the_tick_fast_forwards_its_devops_checkout
     with_agent_home do |root|
       with_devops_clone(root) do |origin, checkout|
-        write_commit(origin, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n# newer\n")
+        write_commit(origin, "agent/instructions.md", "# standing prompt\n# newer\n")
         register_identity
         with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
         assert_equal head_of(origin), head_of(checkout), "one push to devops must reach the machine"
@@ -1121,8 +781,8 @@ class TestDevAgentTick < Minitest::Test
   def test_a_clean_diverged_checkout_on_main_recovers_via_reset
     with_agent_home do |root|
       with_devops_clone(root) do |origin, checkout|
-        write_commit(origin, "agent/producers.yml", "# theirs\n")
-        write_commit(checkout, "agent/producers.yml", "# ours\n")
+        write_commit(origin, "agent/instructions.md", "# theirs\n")
+        write_commit(checkout, "agent/instructions.md", "# ours\n")
         register_identity
         out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
         refute_match(/devops pull failed/, out)
@@ -1137,14 +797,14 @@ class TestDevAgentTick < Minitest::Test
   def test_a_dirty_checkout_is_left_completely_alone
     with_agent_home do |root|
       with_devops_clone(root) do |origin, checkout|
-        write_commit(origin, "agent/producers.yml", "# theirs\n")
-        File.write(File.join(checkout, "agent/producers.yml"), "# uncommitted local edit\n")
+        write_commit(origin, "agent/instructions.md", "# theirs\n")
+        File.write(File.join(checkout, "agent/instructions.md"), "# uncommitted local edit\n")
         local = head_of(checkout)
         register_identity
         out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
         assert_match(/devops pull failed/, out)
         assert_equal local, head_of(checkout), "a dirty checkout must never be reset"
-        assert_equal "# uncommitted local edit\n", File.read(File.join(checkout, "agent/producers.yml")),
+        assert_equal "# uncommitted local edit\n", File.read(File.join(checkout, "agent/instructions.md")),
                      "a dirty checkout's working tree must be left exactly as the human left it"
         assert_empty Agent::Errors.list, "a benign skip (dirty tree) must never be recorded as a reportable failure"
       end
@@ -1159,9 +819,9 @@ class TestDevAgentTick < Minitest::Test
   def test_a_checkout_not_on_main_is_left_completely_alone
     with_agent_home do |root|
       with_devops_clone(root) do |origin, checkout|
-        write_commit(origin, "agent/producers.yml", "# theirs\n")
+        write_commit(origin, "agent/instructions.md", "# theirs\n")
         system("git", "-C", checkout, "checkout", "-qb", "feature", out: File::NULL, err: File::NULL)
-        write_commit(checkout, "agent/producers.yml", "# ours, on feature\n")
+        write_commit(checkout, "agent/instructions.md", "# ours, on feature\n")
         local = head_of(checkout)
         register_identity
         out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
@@ -1179,7 +839,7 @@ class TestDevAgentTick < Minitest::Test
     with_agent_home do |root|
       origin = File.join(root, "devops-origin")
       init_repo(origin)
-      write_commit(origin, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n")
+      write_commit(origin, "agent/instructions.md", "# standing prompt\n")
       checkout = File.join(root, "devops-checkout")
       system("git", "clone", "-q", origin, checkout, out: File::NULL, err: File::NULL)
       previous = ENV["DEV_AGENT_DEVOPS_REPO"]
@@ -1226,7 +886,7 @@ class TestDevAgentTick < Minitest::Test
   def test_a_dry_run_never_pulls
     with_agent_home do |root|
       with_devops_clone(root) do |origin, checkout|
-        write_commit(origin, "agent/producers.yml", "# newer\n")
+        write_commit(origin, "agent/instructions.md", "# newer\n")
         before = head_of(checkout)
         out = capture_stdout { tick.update_checkout }
         assert_match(/would pull/, out)
@@ -1449,84 +1109,6 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
-  # ---- ISS-392: the registry each runner reports ----
-
-  def test_the_runner_reports_its_registry_with_the_devops_sha
-    reported = nil
-    with_agent_home do |root|
-      with_devops_clone(root) do |_origin, checkout|
-        write_commit(checkout, "agent/producers.yml", <<~YML)
-          timezone: America/New_York
-          producers:
-            - key: probe
-              schedule: every 1 hour
-              check: "true"
-              file_when: check_fails
-              issue:
-                category: infrastructure
-                title: t
-                fingerprint: fp:1
-        YML
-        register_identity
-        stubs = fleet_responses.merge(
-          "PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} },
-        )
-        with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false).report_registry(Agent::Host.cached_identity) } }
-
-        assert_equal head_of(checkout), reported[:devops_sha],
-                     "the reported sha is what makes a machine stuck on an old checkout visible"
-        assert_equal ["probe"], reported[:producers].map { |p| p[:producer_key] }
-        assert_equal "every 1 hour", reported[:producers].first[:schedule]
-        refute_nil reported[:producers].first[:next_due_at]
-      end
-    end
-  end
-
-  # The registry report carries the schedule and the sha, and nothing else. The maintenance vitals
-  # that briefly rode here moved to the heartbeat in ISS-528 (see that block above), and leaving a
-  # single one behind would mean the platform had two homes for the same fact — one of which is
-  # deleted at the server-side-scheduling cutover.
-  def test_the_registry_report_carries_no_machine_state
-    reported = nil
-    with_agent_home do |root|
-      with_devops_clone(root) do |_origin, _checkout|
-        register_identity
-        stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(body) { reported = body; {} })
-        stub_singleton(Agent::Maintenance, :disk, ->(*) { [11, 22] }) do
-          with_stubbed_api(stubs) do
-            capture_stdout { tick(dry_run: false).run_maintenance }
-            capture_stdout { tick(dry_run: false).report_registry(Agent::Host.cached_identity) }
-          end
-        end
-        assert_equal %i[devops_sha producers], reported.keys.sort_by(&:to_s)
-      end
-    end
-  end
-
-  # The throttle is what keeps a 30-second tick from PUTting 2,880 times a day.
-  # It is keyed on the sha as well as on time, so a push converges the fleet on
-  # the next tick rather than up to ten minutes later.
-  def test_a_second_report_is_skipped_until_the_sha_moves
-    with_agent_home do |root|
-      with_devops_clone(root) do |_origin, checkout|
-        register_identity
-        calls = 0
-        stubs = fleet_responses.merge("PUT /agent/registry/#{RUNNER_ID}" => ->(_body) { calls += 1; {} })
-        with_stubbed_api(stubs) do
-          capture_stdout do
-            runner = tick(dry_run: false)
-            runner.report_registry(Agent::Host.cached_identity)
-            runner.report_registry(Agent::Host.cached_identity)
-            assert_equal 1, calls, "an unchanged registry must not be re-sent every 30 seconds"
-
-            write_commit(checkout, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n# moved\n")
-            tick(dry_run: false).report_registry(Agent::Host.cached_identity)
-          end
-        end
-        assert_equal 2, calls, "a new devops sha must be reported on the next tick"
-      end
-    end
-  end
 
   def init_repo(dir)
     FileUtils.mkdir_p(dir)

@@ -7,8 +7,8 @@ require 'agent/paths'
 # this machine's feature dirs, prune this machine's Docker images.
 #
 # WHY THIS IS NOT A PRODUCER. `agent-gc`, `aidirs-prune` and `docker-prune` were
-# registered in agent/producers.yml, which means they ran behind the platform's
-# daily compare-and-set in POST /agent/producers/:key/runs. That arbitration is
+# registered as producers, which means they ran behind the platform's daily
+# compare-and-set in POST /agent/producers/:key/runs. That arbitration is
 # exactly right for a producer — a producer FILES an issue, and one issue for the
 # fleet is the whole point of deduplicating it — and exactly wrong for these,
 # because they DELETE FILES ON THE MACHINE THEY RUN ON. With N runners exactly

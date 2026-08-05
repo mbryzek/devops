@@ -63,6 +63,10 @@ module Agent
       rotated_logs(now) + issue_dirs(now) + workspaces(now, workspace_days)
     end
 
+    # `producers/` is swept but never written anymore: producers moved into the
+    # platform entirely (ISS-526), so what is left on a machine is history. Kept
+    # in the sweep precisely because nothing writes it — dropping it would leave
+    # up to 30 days of files on every runner with nothing that ever collects them.
     def rotated_logs(now)
       %w[tick producers].flat_map do |kind|
         dir = File.join(Agent::Paths.log_root, kind)

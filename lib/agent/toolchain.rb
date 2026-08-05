@@ -36,7 +36,7 @@ module Agent
   module Toolchain
     # One external binary and what stops working without it.
     #
-    # `producers` names producer KEYS in agent/producers.yml, and is checked
+    # `producers` names producer KEYS in the platform registry, and is checked
     # against that file by test_dev_agent_toolchain.rb — so a producer whose
     # check shells out to a new binary cannot be added with its prerequisite left
     # off this list, and a producer renamed here cannot drift from the registry.
@@ -150,8 +150,8 @@ module Agent
       def missing_optional = found.select { |f| f.missing? && f.tool.optional? }.map(&:tool)
       def ok? = missing_required.empty?
 
-      # Producer keys that cannot run on this machine, deduped and ordered as
-      # producers.yml orders them via TOOLS. This is the sentence the filed issue
+      # Producer keys whose PLAYBOOK cannot be carried out on this machine, deduped
+      # and ordered as TOOLS orders them. This is the sentence the filed issue
       # leads with: "missing depsguard" is a fact about a laptop, "the depsguard
       # producer has never run" is the failure.
       def blocked_producers = missing_required.flat_map(&:producers).uniq
