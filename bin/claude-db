@@ -650,6 +650,11 @@ def do_gc(apps, days, apply)
         :cutoff_seconds => cutoff, :current_db => current_db
       )
 
+      # What was ACTUALLY dropped, which is not the same as what was planned:
+      # the re-check below can spare a database that woke up mid-run, and the
+      # container must then not be reclaimed out from under it.
+      dropped = []
+
       if stale.empty?
         puts "#{name} (:#{port}): nothing older than #{days} day(s) (#{dbs.length} database(s) kept)."
       else
@@ -661,6 +666,16 @@ def do_gc(apps, days, apply)
             puts "  would drop #{db} (#{age_days}d)"
             next
           end
+          # Asked again, immediately before the drop. The `active` set above was
+          # sampled once for the whole container, and everything between that
+          # sample and this line is time a session had to reconnect to a
+          # database we had already decided was idle. Since the drop terminates
+          # backends first, losing that race destroys live work rather than just
+          # failing.
+          if app.session_db_active?(port, db)
+            puts "  skipped #{db} (#{age_days}d) — became active since the scan"
+            next
+          end
           # Terminate lingering connections (safety net — active dbs are kept above).
           DbImages.psql_exec_quiet(
             port,
@@ -668,8 +683,10 @@ def do_gc(apps, days, apply)
           )
           DbImages.psql_exec(port, "DROP DATABASE #{db}")
           puts "  dropped #{db} (#{age_days}d)"
+          dropped << db
         end
-        total_dropped += stale.length
+        # A dry run reports what it WOULD drop; only a real run counts.
+        total_dropped += apply ? dropped.length : stale.length
       end
 
       # A container is removed only once it holds no session databases at all —
@@ -678,7 +695,13 @@ def do_gc(apps, days, apply)
       # session in it: platformdb-claude-0.5.39 was created 07-31 but still held
       # a database created 08-02. Reaping containers by age would take the newer
       # sessions with them.
-      next unless (dbs - stale).empty?
+      #
+      # On an --apply run this asks what is actually GONE, not what was planned:
+      # a database the re-check above spared is still in the container, and
+      # removing the container would destroy it just as surely as the DROP would
+      # have.
+      remaining = apply ? (dbs - dropped) : (dbs - stale)
+      next unless remaining.empty?
 
       # An empty container is only reclaimed once it is itself older than the
       # cutoff. `claude-db start` creates the container and then the database as

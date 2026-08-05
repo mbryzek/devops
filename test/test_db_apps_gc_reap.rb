@@ -124,4 +124,50 @@ class TestDbAppsGcReap < Minitest::Test
       assert_equal({ "platformdb_sess_ok" => 100 }, app.session_db_ages(5432))
     end
   end
+
+  # ── the last look before the drop ─────────────────────────────────────────
+  #
+  # `active` is sampled ONCE per container, and gc then walks that container's
+  # whole stale list dropping databases one at a time. Everything in between is
+  # time a session had to reconnect to a database already judged idle -- and gc
+  # does not lose that race politely, it pg_terminate_backend()s first, so the
+  # reconnected session has its connection killed and its database destroyed
+  # under it.
+  #
+  # Same bias as every other test in this file: when in doubt, KEEP.
+
+  def test_a_database_that_woke_up_since_the_scan_reads_as_active
+    stub_singleton(DbImages, :psql_query, ->(*) { ["1"] }) do
+      assert app.session_db_active?(5432, "platformdb_sess_awake")
+    end
+  end
+
+  def test_an_idle_database_reads_as_inactive
+    stub_singleton(DbImages, :psql_query, ->(*) { [] }) do
+      refute app.session_db_active?(5432, "platformdb_sess_idle")
+    end
+  end
+
+  # The check asks about ONE database, not the prefix -- a sibling session's
+  # connection must not spare an unrelated database (nor the reverse).
+  def test_the_recheck_is_scoped_to_the_one_database
+    seen = nil
+    stub_singleton(DbImages, :psql_query, ->(_port, sql, **_o) { seen = sql; [] }) do
+      app.session_db_active?(5432, "platformdb_sess_target")
+    end
+    assert_includes seen, "datname = 'platformdb_sess_target'"
+    refute_includes seen, "LIKE"
+  end
+
+  # A failed psql returns no rows. That reads as "not active", which drops --
+  # the one place in this file where the fallback is not "keep". It is the right
+  # call: this is a SECOND look, and the first one (active_session_dbs, which
+  # fails the same way) already had to say the database was idle. Treating a
+  # failed re-check as active would make an unreachable psql mean nothing is
+  # ever reaped.
+  def test_a_failed_recheck_does_not_block_the_drop
+    stub_singleton(DbImages, :psql_query, ->(*) { [] }) do
+      refute app.session_db_active?(5432, "platformdb_sess_x")
+    end
+  end
 end
