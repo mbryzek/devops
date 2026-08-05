@@ -5818,15 +5818,24 @@ def parse_dependencies_args(argv, command_key)
   apps.empty? ? Dependencies::Updates::APPS.keys : apps.uniq
 end
 
-# Scratch workdir for this run, under ~/code/ai so `dev aidirs prune` purges
-# it automatically. Deliberately SHORT (dep-up.<MMDD-HHMM>, 16 chars — within
-# the ≤19-char feature-dir budget) because sbt runs inside <workdir>/<repo>
-# and macOS caps unix-socket paths (sbt's boot server socket) at 104 bytes.
+# Scratch workdir for the DAY, under ~/code/ai so `dev aidirs prune` purges it
+# automatically. Deliberately SHORT (dep-up.<MMDD>, 11 chars — within the
+# ≤19-char feature-dir budget) because sbt runs inside <workdir>/<repo> and
+# macOS caps unix-socket paths (sbt's boot server socket) at 104 bytes.
+#
+# Per DAY rather than per run, because the nightly upgrade is now one epic with
+# a child issue per repo (ISS-397) and each child invokes this command with its
+# own `--app`. Per-run workdirs would give the night six status files, and the
+# morning briefing reads the NEWEST one — it would have reported a single repo
+# and silently dropped the other five. One workdir a night, merged per repo,
+# keeps that file whole. Clones are removed before reuse (clone_repo), so a
+# repeat run of the same repo on the same day is safe.
+#
 # Also writes the sbt-updates plugin files (one per sbt major — the plugin
 # needs a different release on sbt 2) the detection step injects. Returns
 # workdir.
 def dependencies_workdir
-  workdir = File.expand_path("~/code/ai/dep-up.#{Time.now.strftime('%m%d-%H%M')}")
+  workdir = File.expand_path("~/code/ai/dep-up.#{Time.now.strftime('%m%d')}")
   FileUtils.mkdir_p(workdir)
   File.write(File.join(workdir, "sbt-updates.sbt"), Dependencies::Updates::SBT_UPDATES_PLUGIN + "\n")
   File.write(File.join(workdir, "sbt-updates-sbt2.sbt"), Dependencies::Updates::SBT_UPDATES_PLUGIN_SBT2 + "\n")
@@ -5956,19 +5965,27 @@ end
 
 # dependencies-status.json in workdir, same idea as codegen-sync-status.json:
 # machine-readable per-repo outcome for openclaw's morning briefing.
+#
+# MERGED, not overwritten. The night is one invocation per repo (one per child
+# issue of the upgrade epic), and each of them writes this file in the day's
+# shared workdir; a plain write would leave the briefing reading whichever repo
+# happened to finish last. Later runs of the same repo replace that repo's entry.
 def write_dependencies_status_json(workdir, results)
-  data = results.keys.sort.map do |app|
-    r = results[app]
-    {
-      repo: app,
-      status: r[:status].to_s,
-      pr_url: r[:pr_url],
-      error: r[:error],
-      bumps: (r[:bumps] || []).map { |b| "#{b[:group]}:#{b[:artifact]} #{b[:current]} -> #{b[:target]}" },
-      held: (r[:held] || []).map { |h| "#{h[:group]}:#{h[:artifact]} (#{h[:reason]})" },
+  path = File.join(workdir, "dependencies-status.json")
+  existing = File.exist?(path) ? (JSON.parse(File.read(path)) rescue []) : []
+  by_repo = Array(existing).each_with_object({}) { |row, acc| acc[row["repo"]] = row if row.is_a?(Hash) }
+
+  results.each do |app, r|
+    by_repo[app] = {
+      "repo" => app,
+      "status" => r[:status].to_s,
+      "pr_url" => r[:pr_url],
+      "error" => r[:error],
+      "bumps" => (r[:bumps] || []).map { |b| "#{b[:group]}:#{b[:artifact]} #{b[:current]} -> #{b[:target]}" },
+      "held" => (r[:held] || []).map { |h| "#{h[:group]}:#{h[:artifact]} (#{h[:reason]})" },
     }
   end
-  File.write(File.join(workdir, "dependencies-status.json"), JSON.pretty_generate(data))
+  File.write(path, JSON.pretty_generate(by_repo.keys.sort.map { |app| by_repo.fetch(app) }))
 end
 
 def release_one(name, progress)

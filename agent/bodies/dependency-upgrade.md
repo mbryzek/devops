@@ -1,52 +1,35 @@
 # Nightly library dependency upgrades
 
-Run the dependency-upgrade pipeline and report what it did. The pipeline itself
-is `dev dependencies upgrade`; this issue exists so the run has a lease, a
-heartbeat, a retry and a run record instead of being a backgrounded process
-nobody was watching.
+This is a CONTAINER, not a unit of work. Nothing is claimed here and nothing is
+implemented here: each child issue is one repo's upgrade, worked on its own
+branch with its own PR.
 
-## The one command
+The pipeline behind every child is `dev dependencies upgrade --app <repo>`:
 
-    cd ~/code && dev dependencies upgrade
-
-That is the whole job. It is deliberately not something you reimplement:
-
-- It clones each watched repo (platform, acumen, lib-util, lib-query, lib-cipher,
-  lib-ai) into a fresh workdir under `~/code/ai/dep-up.<MMDD-HHMM>/` — nothing
-  ever touches the checkouts under `~/code/<repo>`.
+- It clones the repo into a fresh workdir under `~/code/ai/dep-up.<MMDD>/` —
+  nothing ever touches the checkouts under `~/code/<repo>`.
 - It detects candidate bumps with `sbt dependencyUpdates` (sbt-updates injected
   via `--addPluginSbtFile`, so no repo commits the plugin), then applies the
   version policy and `lib/dependencies/denylist.yml`.
-- It hands the allowed bumps for each repo to its own Claude session, which must
-  end in a verified, review-ready PR.
 - It is **self-gating**: a repo that already has an open `dep-upgrade-*` PR is
-  skipped. That is what makes it safe to run every night, and what makes a night
-  that gets cut short harmless — the next run picks up where this one stopped.
-- It writes `dependencies-status.json` in its workdir. **The morning briefing
-  reads that file** (via the `bf-dependencies` generator, which looks for the
-  newest `~/code/ai/dep-up.*/dependencies-status.json` with today's date), so the
-  run must be allowed to reach the end where the file is written.
+  skipped, so a night that gets cut short is harmless — the next one resumes.
+- It merges that repo's outcome into `dependencies-status.json` in the day's
+  workdir. **The morning briefing reads that file** (the `bf-dependencies`
+  generator takes the newest `~/code/ai/dep-up.*/dependencies-status.json` dated
+  today), which is why all of a night's children share one workdir.
 
-Do not open PRs yourself, do not edit any repo directly, and do not re-run a repo
-the pipeline already handled.
+## Why an epic
 
-## Budget
+The night is six independent runs — six clones, six suites, six PRs. As one
+issue they shared one lease and one 4-hour budget, so a single slow repo took
+the whole night with it and a failure in the fourth repo hid the first three. As
+children each repo gets its own lease, retry, budget and outcome.
 
-An agent session is killed at 4 hours. The pipeline is serial across six repos
-and most of them are usually in sync, so a normal night finishes well inside
-that. If you are approaching the limit, let the pipeline finish the repo it is on
-and report which repos it got through — the self-gating means tomorrow's run
-resumes from there. Do NOT background the command and end early: a backgrounded
-process outlives the lease, which is exactly the failure mode this migration
-removed.
+A repo whose previous night's issue is still open is deliberately NOT re-filed;
+the rest still run.
 
-## Report and close out
+## Verification
 
-Report the workdir path, the per-repo outcome from the summary table, and every
-PR URL the run opened. Then close this issue per CLAUDE.md:
-
-    dev issues status <n> --status fixed --url "<the most significant PR URL>"
-
-If the run opened no PRs because everything was in sync, close it `fixed` with
-the workdir's `dependencies-status.json` path as the URL and say so — a quiet
-night is a successful run, not a failure.
+This epic advances to `deployed` on its own once every child is terminal, and it
+is the single thing to verify for the night — verifying it verifies every child
+with it. Review the PRs the children opened, then verify here.

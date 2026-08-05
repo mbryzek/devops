@@ -476,6 +476,117 @@ class TestDevAgentTick < Minitest::Test
     assert_equal "check_failed", run_producer_with("exit 3", file_when: "never")
   end
 
+  # ---- epics: one container, one child per target (ISS-397) ----
+
+  EPIC_REGISTRY = <<~YAML.freeze
+    timezone: America/New_York
+    producers:
+      - key: probe
+        schedule: every 1 hour
+        file_when: always
+        issue:
+          type: epic
+          category: infrastructure
+          title: Nightly upgrades
+          fingerprint: "up:{date}"
+          children:
+            names: [alpha, beta]
+            category: infrastructure
+            title: "Upgrades: {child}"
+            fingerprint: "up:{child}"
+  YAML
+
+  def epic_producer
+    registry = Agent::Producers.parse(EPIC_REGISTRY)
+    registry.fetch(:producers).first
+  end
+
+  # Runs the real file path against a stubbed platform, returning
+  # [result, issue_number, every form POSTed to /playbook/issues].
+  def file_epic_with(existing)
+    filed = []
+    number = 100
+    result = nil
+    issue_number = nil
+    with_agent_home do
+      register_identity
+      with_ai_token do
+        stubs = {
+          ISSUES_PATH => existing,
+          "POST /playbook/issues" => lambda do |body|
+            filed << body
+            { "number" => (number += 1), "occurrence_count" => 1 }
+          end,
+        }
+        with_stubbed_api(stubs) do
+          capture_stdout do
+            result, issue_number = tick(dry_run: false, now: Time.utc(2026, 8, 5, 7, 45)).file_issue(epic_producer, nil)
+          end
+        end
+      end
+    end
+    [result, issue_number, filed]
+  end
+
+  def test_an_epic_producer_files_a_container_and_one_child_per_name
+    result, number, filed = file_epic_with([])
+
+    assert_equal "filed", result
+    assert_equal 101, number, "the run records the EPIC, which is what gets verified"
+    assert_equal 3, filed.length
+
+    epic = filed.first
+    assert_equal "epic", epic[:type]
+    # 3:45am America/New_York is 07:45 UTC — the date must be the LOCAL one.
+    assert_equal "up:2026-08-05", epic[:fingerprint]
+    refute epic[:claim_on_create], "a producer files for the queue; it never claims"
+
+    children = filed.drop(1)
+    assert_equal ["Upgrades: alpha", "Upgrades: beta"], children.map { |c| c[:title] }
+    assert_equal %w[up:alpha up:beta], children.map { |c| c[:fingerprint] }
+    # issue_form.parent_number is typed `string` on the platform.
+    assert_equal %w[101 101], children.map { |c| c[:parent_number] }
+    children.each { |c| assert_nil c[:type], "a child is an issue, never a nested epic" }
+  end
+
+  # Per-child dedup is the whole reason for the split: one repo stuck on an open
+  # issue must not take the other five down with it.
+  def test_a_child_with_an_open_issue_is_skipped_and_its_siblings_still_file
+    _result, _number, filed = file_epic_with([{ "fingerprint" => "up:alpha", "status" => "claimed" }])
+
+    assert_equal 2, filed.length, "the epic plus the ONE child that was free"
+    assert_equal "Upgrades: beta", filed.last[:title]
+    assert_includes filed.first[:body], "1 child(ren) were skipped"
+  end
+
+  # An epic with no children is a container nobody can work and nobody can
+  # delete — there is no hard delete, only `dismissed`.
+  def test_a_night_where_every_child_is_in_flight_files_nothing_at_all
+    existing = [
+      { "fingerprint" => "up:alpha", "status" => "open" },
+      { "fingerprint" => "up:beta", "status" => "fixed" },
+    ]
+    result, number, filed = file_epic_with(existing)
+
+    assert_equal "skipped_in_flight", result
+    assert_nil number
+    assert_empty filed, "no epic may be created with nothing under it"
+  end
+
+  # A fingerprint template with no {child} would make every child dedup against
+  # its siblings, so only the first would ever be filed.
+  def test_a_child_template_without_the_token_is_a_parse_error
+    yaml = EPIC_REGISTRY.sub('fingerprint: "up:{child}"', 'fingerprint: "up:all"')
+    error = assert_raises(Agent::Producers::ConfigError) { Agent::Producers.parse(yaml) }
+    assert_match(/\{child\}/, error.message)
+  end
+
+  def test_an_epic_without_children_is_a_parse_error
+    yaml = EPIC_REGISTRY.sub(/^ *children:\n(.*\n)*/, "")
+    error = assert_raises(Agent::Producers::ConfigError) { Agent::Producers.parse(yaml) }
+    assert_match(/requires an issue.children block/, error.message)
+  end
+
   # ---- the ~/code/claude push guard is ENFORCED, not merely instructed ----
 
   def test_pre_push_hook_refuses_a_claude_repo_push_outside_plans

@@ -22,19 +22,55 @@ module Agent
 
     FILE_WHEN = %w[check_fails always never].freeze
 
+    ISSUE_TYPES = %w[issue epic].freeze
+
+    # Substituted into a child's title, fingerprint and playbook.
+    CHILD_TOKEN = "{child}".freeze
+
+    # Substituted into an EPIC's fingerprint only, and the reason it exists is
+    # the wedge it prevents. An epic reaches `deployed` when every child is
+    # terminal and then waits for Mike to verify it — `deployed` is non-terminal
+    # for dedup, so an undated epic fingerprint would stop a NIGHTLY producer
+    # filing again until a human clicked verify. The children carry the real
+    # dedup (one fingerprint per app, undated, so an unfinished repo is not
+    # re-filed); the epic is just tonight's container.
+    DATE_TOKEN = "{date}".freeze
+
     # An issue in any other status is still "in flight" for dedup purposes — see
     # skip_in_flight?. `fixed` counts as in flight, which is what makes "don't
     # re-file while a PR is open" fall out with no GitHub call at all.
     TERMINAL_ISSUE_STATUSES = %w[verified dismissed].freeze
 
-    Producer = Struct.new(:key, :schedule, :schedule_text, :check, :file_when, :issue, :command, :body_file, keyword_init: true) do
+    # One child issue of an epic, already expanded: the templates in
+    # `issue.children` are resolved at PARSE time, one Child per name, so the
+    # tick never does string substitution and a broken template fails the next
+    # tick instead of at 3:45am.
+    Child = Struct.new(:name, :title, :fingerprint, :category, :severity, :body_file, keyword_init: true) do
+      # The shared playbook with `{child}` resolved, so one file can carry the
+      # exact command each child runs (`--app {child}`) instead of telling the
+      # session to read its own title.
+      def body_text = body_file && File.read(body_file).strip.gsub(CHILD_TOKEN, name)
+    end
+
+    Producer = Struct.new(:key, :schedule, :schedule_text, :check, :file_when, :issue, :command, :body_file,
+                          :issue_type, :children, :timezone, keyword_init: true) do
       def files_issue? = file_when != "never"
       def fingerprint  = issue && issue["fingerprint"]
+      def epic?        = issue_type == "epic"
 
       # The playbook this producer ships with its issue, or nil. Read at file
       # time so an edit to the playbook takes effect on the next run without a
       # restart — the registry is re-parsed every tick anyway.
       def body_text = body_file && File.read(body_file).strip
+
+      # The epic's fingerprint for a given run, with `{date}` resolved in the
+      # registry's timezone. A plain producer has no token and this is the
+      # identity function.
+      def fingerprint_at(now)
+        return fingerprint unless fingerprint.to_s.include?(DATE_TOKEN)
+        date = Agent::Schedule.in_zone(timezone) { now.getlocal.strftime("%Y-%m-%d") }
+        fingerprint.gsub(DATE_TOKEN, date)
+      end
     end
 
     module_function
@@ -54,7 +90,7 @@ module Agent
       entries = data["producers"]
       raise ConfigError, "#{path}: `producers` must be a list" unless entries.is_a?(Array)
 
-      producers = entries.map { |entry| build(entry, path) }
+      producers = entries.map { |entry| build(entry, path, timezone) }
       keys = producers.map(&:key)
       dupes = keys.tally.select { |_, n| n > 1 }.keys
       raise ConfigError, "#{path}: duplicate producer key(s): #{dupes.join(', ')}" unless dupes.empty?
@@ -62,7 +98,7 @@ module Agent
       { timezone: timezone, producers: producers }
     end
 
-    def build(entry, path)
+    def build(entry, path, timezone = nil)
       raise ConfigError, "#{path}: each producer must be a mapping" unless entry.is_a?(Hash)
       key = entry["key"].to_s
       raise ConfigError, "#{path}: every producer needs a `key`" if key.empty?
@@ -95,9 +131,75 @@ module Agent
         file_when: file_when,
         issue: issue,
         body_file: resolve_body_file(issue, key, path),
+        issue_type: issue_type(issue, key, path),
+        children: build_children(issue, key, path),
+        timezone: timezone,
       )
     rescue Agent::Schedule::ParseError => e
       raise ConfigError, "#{path}: #{entry.is_a?(Hash) ? entry['key'] : '?'}: #{e.message}"
+    end
+
+    # `issue.type` — `issue` (the default) or `epic`.
+    #
+    # An epic files a CONTAINER plus one child per name in `issue.children`, and
+    # the children are what a session claims and works. It exists for the run
+    # that is really N independent runs: the nightly dependency upgrade is six
+    # repos, each with its own clone, its own suite and its own PR, and as one
+    # issue a single wedged repo took the whole night with it. As six children it
+    # is six leases, six retries and six separately visible outcomes, with one
+    # thing for Mike to verify at the end.
+    def issue_type(issue, key, path)
+      return "issue" unless issue.is_a?(Hash)
+      type = (issue["type"] || "issue").to_s
+      raise ConfigError, "#{path}: #{key}: issue.type must be one of #{ISSUE_TYPES.join(', ')}" unless ISSUE_TYPES.include?(type)
+      raise ConfigError, "#{path}: #{key}: issue.type: epic requires an issue.children block" if type == "epic" && !issue["children"].is_a?(Hash)
+      raise ConfigError, "#{path}: #{key}: issue.children is only meaningful with issue.type: epic" if type != "epic" && issue["children"]
+      type
+    end
+
+    # Expands `issue.children` into one concrete Child per name.
+    #
+    #   children:
+    #     names: [platform, acumen]
+    #     category: infrastructure
+    #     title: "Dependency upgrades: {child}"
+    #     fingerprint: "dependencies:upgrade:{child}"
+    #     body_file: bodies/dependency-upgrade-app.md
+    #
+    # Templates rather than N literal blocks because every child of an epic is
+    # the same job pointed at a different target — N blocks would be N copies to
+    # keep in sync, which is how one of them silently stops matching the others.
+    # `{child}` is REQUIRED in both title and fingerprint: without it in the
+    # fingerprint every child would dedup against its siblings and only the first
+    # would ever be filed.
+    def build_children(issue, key, path)
+      spec = issue.is_a?(Hash) ? issue["children"] : nil
+      return [] unless spec.is_a?(Hash)
+
+      names = spec["names"]
+      raise ConfigError, "#{path}: #{key}: issue.children.names must be a non-empty list" unless names.is_a?(Array) && !names.empty?
+      dupes = names.map(&:to_s).tally.select { |_, n| n > 1 }.keys
+      raise ConfigError, "#{path}: #{key}: duplicate child name(s): #{dupes.join(', ')}" unless dupes.empty?
+
+      %w[title fingerprint category].each do |field|
+        raise ConfigError, "#{path}: #{key}: issue.children.#{field} is required" if spec[field].to_s.empty?
+      end
+      %w[title fingerprint].each do |field|
+        next if spec[field].to_s.include?(CHILD_TOKEN)
+        raise ConfigError, "#{path}: #{key}: issue.children.#{field} must contain #{CHILD_TOKEN} or every child would be identical"
+      end
+
+      body_file = resolve_body_file(spec, "#{key} (children)", path)
+      names.map do |name|
+        Child.new(
+          name: name.to_s,
+          title: spec["title"].gsub(CHILD_TOKEN, name.to_s),
+          fingerprint: spec["fingerprint"].gsub(CHILD_TOKEN, name.to_s),
+          category: spec["category"].to_s,
+          severity: spec["severity"],
+          body_file: body_file,
+        )
+      end
     end
 
     # `issue.body_file` names a playbook that ships with the issue, resolved

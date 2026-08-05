@@ -1,5 +1,14 @@
 # Running `dev dependencies upgrade` every morning via openclaw
 
+> **HISTORICAL.** The nightly run moved onto the devops agent (ISS-397): the
+> `dependency-upgrade` producer in `agent/producers.yml` files an epic every
+> night at 3:45am with one child issue per repo, and a claiming session runs
+> `dev dependencies upgrade --app <repo>` for its own repo under a lease. The
+> openclaw cron and the launchd plist are both gone — do not re-add either, or
+> the open-PR gate becomes the only thing standing between you and duplicate
+> runs. What follows describes the retired setup, kept for the flag values and
+> the briefing wiring.
+
 Two cron jobs on the openclaw gateway: one runs the pipeline overnight, one
 delivers the morning summary. Use EITHER this OR the launchd plist
 (`launchd/com.bryzek.dev-dependencies.plist`) — not both, or you'll get
