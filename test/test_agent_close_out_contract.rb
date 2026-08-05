@@ -34,6 +34,11 @@ class TestAgentCloseOutContract < Minitest::Test
   HEADING = "### Before you close out: file what you WORKED AROUND".freeze
   COMMAND = "dev issues workaround".freeze
 
+  # The contract's other half (ISS-563): a step the session could not take AT ALL,
+  # as opposed to one it routed around. Same two properties, same reasons.
+  HANDOFF_HEADING = "### Before you close out: hand over what only a HUMAN can run".freeze
+  HANDOFF_COMMAND = "dev issues handoff".freeze
+
   # Read per call rather than memoized into an ivar: minitest inspects `self` on
   # a failure, and a 10KB ivar buries the assertion that failed.
   def instructions
@@ -106,4 +111,57 @@ class TestAgentCloseOutContract < Minitest::Test
       assert_includes invocation, flag
     end
   end
+
+  # ---- the handoff half (ISS-563) -------------------------------------------
+
+  def test_the_handoff_contract_lives_in_the_close_out_section
+    section_one = instructions[/^## 1\. How this ends.*?^## 2\./m]
+    refute_nil section_one, "instructions.md no longer has a §1 / §2 to place the contract between"
+    assert_includes section_one, HANDOFF_HEADING
+  end
+
+  def test_the_handoff_command_exists
+    assert_includes instructions, HANDOFF_COMMAND
+    assert_includes SUBCOMMANDS.fetch("issues"), "handoff"
+    assert INVOCATIONS.key?("issues handoff")
+    assert Object.private_method_defined?(:cmd_issues_handoff),
+           "instructions.md names `#{HANDOFF_COMMAND}` but bin/dev has no cmd_issues_handoff"
+  end
+
+  def test_every_flag_the_handoff_contract_names_is_a_real_flag
+    invocation = usage_for("issues handoff")
+    %w[--from --key --title --body --command --url].each do |flag|
+      assert_includes invocation, flag
+    end
+  end
+
+  # `--command` is the whole difference between this and a close-out comment, and
+  # a close-out comment is what left two openclaw crons firing for a day. A
+  # contract that shows the flag but not what belongs in it invites prose.
+  def test_the_handoff_contract_shows_the_commands_as_the_artifact
+    assert_match(/`--command` is the artifact/, instructions)
+    assert_match(/the exact line to paste/, instructions)
+  end
+
+  # The same anti-quota sentence the workaround half carries, for the opposite
+  # failure: a handoff is cheap to file and expensive to receive, so an agent that
+  # reads this as an escape hatch costs Mike a queue item per avoided task.
+  def test_the_handoff_contract_says_it_is_not_an_escape_hatch
+    assert_match(/not an escape hatch for work you could do/i, instructions)
+    assert_match(/whether \*any\* session on \*any\* runner could run the command/, instructions)
+  end
+
+  # Why `needs_input` rather than `open` IS the fix — stated where a session
+  # reads it, because a session that files a handoff at `open` with `workaround`
+  # has reproduced ISS-563 exactly.
+  def test_the_handoff_contract_says_why_it_is_not_claimable
+    assert_match(/`dev issues claim` never offers `needs_input`/, instructions)
+  end
+
+  # The one-home guard (property 1) is deliberately absent for this half too, and
+  # for the reason the preamble gives: ISS-526 moved the playbooks into the
+  # platform, so there is no `agent/bodies/*.md` left to read. When that assertion
+  # is re-homed over `agent.agent_producer_playbooks`, it covers HANDOFF_COMMAND
+  # alongside COMMAND — the contract is one contract with two halves, and a
+  # playbook restating either of them is the same ISS-360 failure.
 end

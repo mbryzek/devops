@@ -2950,6 +2950,191 @@ class TestDevIssues < Minitest::Test
     assert_match(/dev auth login --app playbook/, out)
   end
 
+  # ---- issues handoff (the step only a human can run, ISS-563) ----
+
+  def handoff_args(overrides = {})
+    args = {
+      "--from" => "563",
+      "--key" => "openclaw-cron-rm-check-invariants",
+      "--title" => "check-invariants cron still needs deleting from openclaw",
+      "--body" => "openclaw is not on the runner and the agent identity lacks operator.admin.",
+      "--command" => "openclaw cron rm 0c8a3666",
+      "--url" => "https://github.com/mbryzek/devops/pull/332",
+    }.merge(overrides)
+    args.reject { |_flag, value| value.nil? }.flat_map { |flag, value| [flag, value] }
+  end
+
+  def filed_handoff(status: "open", occurrence_count: 1)
+    { "id" => "iss-h", "number" => "570", "category" => "improvement", "status" => status,
+      "title" => "check-invariants cron still needs deleting from openclaw",
+      "occurrence_count" => occurrence_count }
+  end
+
+  def stub_handoff(create:, park: ->(_body) { filed_handoff(status: "needs_input") }, comment: ->(_body) { {} })
+    with_stubbed_api(
+      "POST #{issues_path}" => create,
+      "PUT #{issues_path('/570/status')}" => park,
+      "POST #{issues_path('/563/comments')}" => comment,
+    ) { capture_stdout { cmd_issues_handoff(handoff_args) } }
+  end
+
+  # The whole reason this is not `issues workaround`. A human-only step filed at
+  # `open` is offered by `dev issues claim`, and the agent that claims it can no
+  # more run the command than the session that filed it — which is ISS-563
+  # literally: two sessions handed over the same two `openclaw cron rm` calls, a
+  # third claimed the finding, and the crons kept firing.
+  def test_handoff_parks_the_issue_at_needs_input
+    parked = nil
+    stub_handoff(create: ->(_body) { filed_handoff },
+                 park: ->(body) { parked = body; filed_handoff(status: "needs_input") })
+    assert_equal "needs_input", parked[:status]
+    assert_equal "internal", parked[:visibility]
+  end
+
+  def test_handoff_files_unclaimed_under_the_handoff_namespace
+    sent = nil
+    stub_handoff(create: ->(body) { sent = body; filed_handoff })
+    assert_equal false, sent[:claim_on_create]
+    assert_equal "handoff:openclaw-cron-rm-check-invariants", sent[:fingerprint]
+    assert_equal "improvement", sent[:category]
+  end
+
+  # The commands ARE the artifact: prose describing the step is what already
+  # failed twice, so they have to survive into the issue verbatim and pasteable.
+  def test_handoff_body_carries_the_commands_verbatim
+    sent = nil
+    stub_handoff(create: ->(body) { sent = body; filed_handoff })
+    assert_includes sent[:body], "    openclaw cron rm 0c8a3666"
+    assert_match(/Handed over from ISS-563/, sent[:body])
+    assert_match(/needs_input/, sent[:body])
+  end
+
+  # The transition comment is where the close-out lives, because only there is the
+  # issue's own number known — a human reading the nudge gets the exact command.
+  def test_handoff_park_comment_carries_the_close_out_command
+    parked = nil
+    stub_handoff(create: ->(_body) { filed_handoff },
+                 park: ->(body) { parked = body; filed_handoff(status: "needs_input") })
+    assert_match(%r{dev issues status 570 --status fixed --url "https://github.com/mbryzek/devops/pull/332"},
+                 parked[:comment])
+  end
+
+  def test_handoff_notes_the_commands_on_the_source_issue
+    note = nil
+    stub_handoff(create: ->(_body) { filed_handoff }, comment: ->(body) { note = body; {} })
+    assert_match(/Filed as ISS-570/, note[:body])
+    assert_match(/openclaw cron rm 0c8a3666/, note[:body])
+    assert_equal "internal", note[:visibility]
+  end
+
+  # A recurrence folds into whatever live issue already exists. `fixed` and
+  # `deployed` are forward of `needs_input` on a one-way ladder, so parking one of
+  # those would walk it BACKWARD — the write that un-verified ten issues in eleven
+  # seconds (ISS-536). Only `open` is parked, which also makes a previous run's
+  # failed park self-healing.
+  def test_handoff_never_walks_a_shipped_issue_backward
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(_body) { filed_handoff(status: "fixed", occurrence_count: 3) },
+      "POST #{issues_path('/563/comments')}" => ->(_body) { {} },
+    ) { capture_stdout { cmd_issues_handoff(handoff_args) } }
+    # No PUT stub above: reaching the status endpoint at all would flunk.
+  end
+
+  def test_handoff_reports_a_recurrence_without_filing_a_duplicate
+    out = with_stubbed_api(
+      "POST #{issues_path}" => ->(_body) { filed_handoff(status: "needs_input", occurrence_count: 4) },
+      "POST #{issues_path('/563/comments')}" => ->(_body) { {} },
+    ) { capture_stdout { cmd_issues_handoff(handoff_args) } }
+    assert_match(/already handed over \(occurrence 4\)/, out)
+    assert_match(/no duplicate filed/, out)
+  end
+
+  # A failed park leaves the commands filed but claimable, which is the one thing
+  # this command exists to prevent — so it says so, and says how to finish it.
+  def test_handoff_is_loud_when_the_park_fails
+    out, err = capture_io do
+      with_stubbed_api(
+        "POST #{issues_path}" => ->(_body) { filed_handoff },
+        "PUT #{issues_path('/570/status')}" => ->(_body) { raise ApiError, "503" },
+        "POST #{issues_path('/563/comments')}" => ->(_body) { {} },
+      ) { cmd_issues_handoff(handoff_args) }
+    end
+    assert_match(/still `open`/, err)
+    assert_match(/An agent can claim it/, err)
+    assert_match(/dev issues status 570 --status needs_input/, err)
+    assert_match(/Filed ISS-570/, out)
+  end
+
+  # ---- arg validation (no network: these exit before the credential guard) ----
+
+  def test_handoff_requires_from_key_title_body_and_a_command
+    out, status = capture_stderr_and_exit { cmd_issues_handoff([]) }
+    assert_equal 1, status
+    assert_match(/--from is required/, out)
+    assert_match(/--key is required/, out)
+    assert_match(/--title is required/, out)
+    assert_match(/--body is required/, out)
+    assert_match(/--command is required at least once/, out)
+  end
+
+  # One handoff routinely carries several commands (ISS-396 had two crons), and a
+  # dropped one is a step nobody ever runs.
+  def test_handoff_accepts_a_command_more_than_once
+    sent = nil
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(body) { sent = body; filed_handoff },
+      "PUT #{issues_path('/570/status')}" => ->(_body) { filed_handoff(status: "needs_input") },
+      "POST #{issues_path('/563/comments')}" => ->(_body) { {} },
+    ) { capture_stdout { cmd_issues_handoff(handoff_args + ["--command", "openclaw cron rm 31120b6d"]) } }
+    assert_includes sent[:body], "    openclaw cron rm 0c8a3666"
+    assert_includes sent[:body], "    openclaw cron rm 31120b6d"
+  end
+
+  # A multi-line value breaks the indented block into fragments that no longer
+  # paste as commands — rejected rather than silently reflowed.
+  def test_handoff_rejects_a_multi_line_command
+    out, status = capture_stderr_and_exit do
+      cmd_issues_handoff(handoff_args("--command" => "openclaw cron rm a\nopenclaw cron rm b"))
+    end
+    assert_equal 1, status
+    assert_match(/--command must be a single line/, out)
+  end
+
+  def test_handoff_rejects_a_key_that_is_not_a_stable_slug
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args("--key" => "ISS-396 handoff")) }
+    assert_equal 1, status
+    assert_match(/is not a valid dedup key/, out)
+  end
+
+  def test_handoff_key_hint_names_the_pending_step_not_the_run
+    assert_match(/naming the PENDING STEP rather than the run that hands it over/, HANDOFF_KEY_HINT)
+  end
+
+  def test_handoff_rejects_stray_arguments
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args + ["--status", "open"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument\(s\): --status, open/, out)
+  end
+
+  # Both filing commands write into one fingerprint namespace, so they cannot
+  # disagree about what a key may look like — but they must not share the PREFIX,
+  # or a workaround and a handoff about the same subject would dedup each other.
+  def test_handoff_and_workaround_agree_on_key_format_and_not_on_namespace
+    ["Openclaw Cron", "openclaw_cron", "handoff:openclaw", "openclaw--cron"].each do |bad|
+      _, handoff_status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args("--key" => bad)) }
+      _, workaround_status = capture_stderr_and_exit { cmd_issues_workaround(workaround_args("--key" => bad)) }
+      assert_equal workaround_status, handoff_status, "#{bad.inspect}: the two commands disagree"
+    end
+    refute_equal HANDOFF_FINGERPRINT_PREFIX, WORKAROUND_FINGERPRINT_PREFIX
+  end
+
+  def test_handoff_with_valid_args_passes_arg_validation
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args) }
+    assert_equal 1, status
+    refute_match(/is required/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
   # The reverse of the same edge, which used to need a separate list query: the
   # canonical is carrying more reports than its own body shows.
   def test_show_lists_what_a_canonical_absorbed
