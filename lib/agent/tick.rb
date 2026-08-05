@@ -289,8 +289,17 @@ module Agent
     #
     # They are DELIBERATELY not part of the change test above. Free disk moves on almost every tick,
     # so gating on it would turn a ten-minute heartbeat into a 30-second one for a signal whose
-    # threshold is 48 HOURS — the floor is already three orders of magnitude finer than anything
-    # that reads these. Measured only once a send is decided, so a skipped heartbeat costs no `df`.
+    # threshold is HALF A DAY (AgentInvariants.MaintenanceStaleAfterHours, 12h since ISS-561 —
+    # deliberately not restated as a number the platform can move without us) — the floor is still
+    # orders of magnitude finer than anything that reads these. Measured only once a send is
+    # decided, so a skipped heartbeat costs no `df`.
+    #
+    # The edge that leaves, named so the next reader does not rediscover it: this runs in phase_a
+    # and reads the marker BEFORE the work phase prunes, so after a gap the server sees the OLD
+    # last_maintenance_at for up to one heartbeat window. Harmless, because a machine that was down
+    # long enough to exceed the platform's window was already reported by agent_runner_heartbeat_
+    # stale at three hours — reporting it is a true statement about a machine that genuinely was
+    # off, not a false alarm on a healthy one.
     #
     # Phase A's own short lock, held across the read-POST-write so the throttle
     # file actually throttles. It guards nothing else — two concurrent Phase A
