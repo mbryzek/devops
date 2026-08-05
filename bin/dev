@@ -1772,81 +1772,6 @@ def invariants_exit_code(results)
   INVARIANTS_EXIT_CLEAN
 end
 
-# Extra briefing for a session nobody is watching. The interactive session can
-# ask Mike a question; a cron-launched one cannot, so it is told to land on a
-# durable artifact and to announce itself when it is done.
-def invariants_unattended_suffix
-  <<~SUFFIX.strip
-    ## This session is unattended
-
-    You were launched by a scheduled `dev invariants check --fix`, headless. Nobody is
-    watching this session and nobody can answer a question, so:
-
-    - Never wait for input. Make the most reasonable call, record the assumption in what
-      you write, and keep going.
-    - End on something durable that Mike can find later: a ready PR, or findings written
-      to `~/code/claude/plans/`. A conclusion that exists only in this session's output is
-      a conclusion that is lost.
-    - If the right resolution is that the failure is transient and expected, snooze it
-      (`dev invariants snooze <name> --app <app> --days N --reason "TEXT"`) rather than
-      leaving it to fail again tomorrow. Default to 1 day, 7 at the very most, and prefer
-      a PR whenever you are unsure.
-    - When you finish, announce the outcome:
-      `openclaw system event --text "Invariants <app>: <what you did and the PR or plan URL>" --mode now`
-  SUFFIX
-end
-
-# Where an unattended session's transcript lands. One file per app per dispatch,
-# so a cron run that spawned two sessions leaves two readable logs rather than
-# interleaved output nobody can untangle.
-def invariants_log_path(app, now)
-  dir = File.expand_path("~/Library/Logs/dev-invariants")
-  FileUtils.mkdir_p(dir)
-  File.join(dir, "#{now.strftime('%Y%m%d-%H%M%S')}-#{app}.log")
-end
-
-# Records what was dispatched unattended, so a failure that persists for a week
-# does not spawn a session (and a PR) every single night. Keyed by app, holding
-# the exact set of invariant names that was dispatched and when.
-INVARIANTS_DISPATCH_STATE = File.expand_path("~/.platform/invariant-dispatches.json").freeze
-
-# How long the same set of failures stays deduped. Long enough that a session
-# gets time to land a PR and Mike gets time to look at it; short enough that a
-# genuinely stuck failure comes back around rather than going quiet forever.
-INVARIANTS_REDISPATCH_DAYS = 3
-
-def invariants_dispatch_state
-  JSON.parse(File.read(INVARIANTS_DISPATCH_STATE))
-rescue Errno::ENOENT, JSON::ParserError
-  # A missing or corrupt marker file must not stop a dispatch: the cost of it is
-  # one duplicate session, and the cost of the opposite is silence on a real
-  # failure. Start over rather than raise.
-  {}
-end
-
-def invariants_record_dispatch(state, app, names, now)
-  state[app] = { "invariants" => names, "at" => now.iso8601 }
-  FileUtils.mkdir_p(File.dirname(INVARIANTS_DISPATCH_STATE))
-  File.write(INVARIANTS_DISPATCH_STATE, JSON.pretty_generate(state))
-end
-
-# Whether this app's failures were already handed to an unattended session
-# recently. Only an EXACT match on the failing invariant names is deduped — a new
-# invariant joining the list, or one dropping off, is new information and gets a
-# fresh session.
-def invariants_recently_dispatched?(state, app, names, now)
-  entry = state[app]
-  return false if entry.nil?
-  return false unless entry["invariants"] == names
-  at = Time.parse(entry["at"].to_s) rescue nil
-  return false if at.nil?
-  (now - at) < INVARIANTS_REDISPATCH_DAYS * 24 * 60 * 60
-end
-
-def invariant_names(result)
-  ((result["non_zero"] || []) + (result["error"] || [])).map { |inv| inv["name"].to_s }.sort
-end
-
 # Argv for a headless session. `--print` because there is no terminal to attach
 # to, and `--dangerously-skip-permissions` because there is no human to answer a
 # permission prompt — without it the session is blocked on its first Bash call
@@ -1860,69 +1785,20 @@ def headless_claude_argv(prompt = nil)
   prompt.nil? ? argv : argv + [prompt]
 end
 
-# Unattended dispatch: ONE headless session per failing app, detached, running in
-# parallel. This is the path a cron takes, and it is where "one session per app"
-# is literal — with no terminal to hand over there is no single-TTY constraint
-# forcing the apps to share a session through subagents.
-#
-# Detached and not waited on: the scheduler that invoked us has its own (much
-# shorter) timeout, and an investigation runs for tens of minutes. Each session's
-# output goes to its own log, and each is told to end on a PR or a written plan,
-# so nothing depends on this process staying alive to collect a result.
-def invariants_dispatch_unattended(failing, now: Time.now)
-  state = invariants_dispatch_state
-  dispatched = []
-
-  failing.each do |endpoint, result|
-    app = endpoint[:app]
-    names = invariant_names(result)
-    if invariants_recently_dispatched?(state, app, names, now)
-      puts "#{endpoint[:name]}: same failures already dispatched within #{INVARIANTS_REDISPATCH_DAYS} days — skipping."
-      next
-    end
-
-    prompt = "#{invariants_app_prompt(endpoint, result)}\n\n#{invariants_unattended_suffix}"
-    log = invariants_log_path(app, now)
-    begin
-      pid = Process.spawn(*headless_claude_argv(prompt),
-                          chdir: File.expand_path("~/code"),
-                          out: log, err: [:child, :out], pgroup: true)
-      Process.detach(pid)
-    rescue SystemCallError => e
-      warn "#{endpoint[:name]}: could not start Claude (#{e.message}) — not dispatched."
-      next
-    end
-
-    invariants_record_dispatch(state, app, names, now)
-    dispatched << endpoint[:name]
-    puts "#{endpoint[:name]}: dispatched headless session (Opus 5, 1M context), pid #{pid} → #{log}"
-  end
-
-  puts "Nothing dispatched — every failing app was already handed to a recent session." if dispatched.empty?
-  dispatched
-end
-
-# Hand the failures to a Claude session. Nothing happens when no failure has data
-# behind it. Otherwise the route depends on whether anyone is at the terminal:
-#
-#   tty      → ask (unless --fix), then hand the terminal over interactively.
-#   no tty   → only with --fix, and then headless: one detached session per app.
-#
-# Without --fix a non-interactive run reports and exits, exactly as it always
-# did — a cron must never block on a question nobody can answer, and must never
-# start work Mike did not ask for.
+# Hand the failures to a Claude session, interactively. Nothing happens when no
+# failure has data behind it, and nothing happens at all outside a terminal —
+# ISS-396 retired the unattended/headless dispatch path (the `check-invariants`
+# cron that used to call `dev invariants check --fix` headlessly): the hourly
+# devops producers (`invariants-platform`, `invariants-acumen`) already detect
+# and file an issue for the same failures, so a second, independent auto-fix
+# session raced the filed issue instead of being the one true remediation path.
+# Remediation is now claimed work off that filed issue.
 def invariants_offer_investigation(results, auto_fix)
   failing = invariants_failing_apps(results)
   return if failing.empty?
+  return unless interactive_terminal?
 
   names = failing.map { |endpoint, _| endpoint[:name] }
-
-  unless interactive_terminal?
-    return unless auto_fix
-    puts ""
-    invariants_dispatch_unattended(failing)
-    return
-  end
 
   unless auto_fix
     return unless Ask.for_boolean("Launch a Claude session to investigate #{names.join(', ')}? [y/n]")
