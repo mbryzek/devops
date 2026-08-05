@@ -2855,6 +2855,13 @@ def issue_render_item(issue, index = nil, comments: [], heading: true)
   lines << "- Created: #{issue.dig('created', 'at')} by #{issue_author_label(issue)}"
   lines << "- Occurrences: #{issue['occurrence_count'] || 1}"
   lines << "- Fingerprint: `#{issue['fingerprint']}`" if issue["fingerprint"] && !issue["fingerprint"].empty?
+  # ISS-553. Printed only when set, because it is set on almost nothing — and when
+  # it IS set it changes what a reader can do with the issue: the work is about one
+  # machine's own local state and only that machine can claim it, so a session
+  # reading this anywhere else should stop rather than improvise.
+  if issue["assigned_runner_id"] && !issue["assigned_runner_id"].to_s.empty?
+    lines << "- Assigned to machine: `#{issue['assigned_runner_id']}` — ONLY that runner can claim this issue"
+  end
   attachments = (issue["attachments"] || []).map do |a|
     url = a.dig("file", "url")
     next if url.nil? || url.empty?
@@ -3935,6 +3942,52 @@ def issue_print_blocked(blocked)
   puts ""
 end
 
+# Work filed for ANOTHER machine (ISS-553). Held out of the offer for exactly the
+# reason blocked issues are — `POST /claims` refuses it server-side, so listing it
+# puts work on the menu that cannot be ordered — and printed for exactly the same
+# reason too: "nothing to claim" and "three issues, all of them for mini-2" are
+# different situations, and a bare "No open issues" says the wrong one.
+def issue_print_assigned_elsewhere(assigned, runners_by_id)
+  return if assigned.empty?
+
+  puts Util.underline("assigned to another machine (#{assigned.length}) — not offered here")
+  assigned.each do |c|
+    id = c["assigned_runner_id"].to_s
+    who = runners_by_id[id] || id
+    title = c["title"].to_s.gsub(/\s+/, " ").strip
+    title = "#{title[0, 57]}..." if title.length > 60
+    puts "  #{issue_label(c)} · for #{who} · #{title}"
+  end
+  puts "  (claim these from that machine, or re-point one in the admin at /admin/issues/<n>)"
+  puts ""
+end
+
+# This machine's runner id, or nil when it is not a registered runner at all — a
+# laptop, a script, CI. nil is not a failure here: it claims UNASSIGNED work only,
+# which is what every caller got before assignment existed. Deliberately does NOT
+# go through `agent_identity!`, which exits: `dev issues claim` has always worked
+# on an unregistered machine and must keep working there.
+def issue_claiming_runner_id
+  Agent::Host.cached_identity&.runner_id
+rescue StandardError
+  nil
+end
+
+# Hostnames for the machines named in `issues`, so a held-out row reads "for
+# mini-2" rather than "for agr-1d2a…". Best effort: a fleet call that fails leaves
+# the ids, which is worse to read but never wrong.
+def issue_runner_names(assigned, use_localhost)
+  return {} if assigned.empty?
+
+  identity = Agent::Host.cached_identity
+  return {} unless identity
+
+  Agent::Api.runners(token: identity.token, use_localhost: use_localhost)
+            .to_h { |r| [r["id"], r["hostname"]] }
+rescue StandardError
+  {}
+end
+
 def cmd_issues_claim(args)
   rest, _app, use_localhost = parse_common_flags(args)
   assume_yes = false
@@ -4008,11 +4061,18 @@ def cmd_issues_claim(args)
     # issues all waiting on one unwritten scheduler" are different situations and a
     # bare "No open issues" would say the wrong one.
     open, blocked = all_open.partition { |c| !c["is_blocked"] }
+    # ISS-553: an issue filed for one machine is claimable only by that machine.
+    claiming_runner_id = issue_claiming_runner_id
+    open, assigned_elsewhere = open.partition { |c|
+      c["assigned_runner_id"].nil? || c["assigned_runner_id"] == claiming_runner_id
+    }
+    runner_names = issue_runner_names(assigned_elsewhere, use_localhost)
     present = issue_categories_present(open)
     if present.empty?
       puts category ? "No open #{category} issues to claim." : "No open issues to claim."
       puts "(Snoozed issues and epics are not offered — `dev issues list` shows them; `dev issues snooze <n> --wake` brings a snoozed one back, and an epic is worked through its children.)"
       issue_print_blocked(blocked)
+      issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
       return
     end
 
@@ -4029,6 +4089,7 @@ def cmd_issues_claim(args)
       puts ""
     end
     issue_print_blocked(blocked)
+    issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
 
     selected, hand_picked =
       if requested
@@ -4048,6 +4109,20 @@ def cmd_issues_claim(args)
                 "#{issue_label(c)} is blocked by #{live.map { |b| issue_ref_label(b) }.join(', ')} — those have to ship first."
               }.join("\n") +
               "\nDrop an edge that is not really a prerequisite with `dev issues block <n> --on <m> --remove`."
+            )
+          end
+          # Same refusal, same reason, for work filed for another machine (ISS-553).
+          # The server refuses it too and names the machine; this is that refusal
+          # one round trip earlier, so the operator does not learn it after
+          # picking a set they thought they had.
+          named_assigned, _ = issue_resolve_requested(unknown.join(","), assigned_elsewhere)
+          unless named_assigned.empty?
+            Util.exit_with_error(
+              named_assigned.map { |c|
+                id = c["assigned_runner_id"].to_s
+                "#{issue_label(c)} is assigned to #{runner_names[id] || id} — only that machine can claim it."
+              }.join("\n") +
+              "\nClaim it from that machine, or re-point it in the admin at /admin/issues/<n>."
             )
           end
           # "not listed" also covers snoozed and epics — say so, or naming a
@@ -4087,7 +4162,11 @@ def cmd_issues_claim(args)
       cat_selected = selected.select { |c| c["category"] == cat }
       next if cat_selected.empty?
       scope = issue_claim_scope(cat, cat_selected, open.select { |c| c["category"] == cat }, hand_picked: hand_picked)
-      claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: { scope: scope }) || []
+      body = { scope: scope }
+      # Omitted entirely when this machine is not a runner, which the server reads
+      # as "claim unassigned work only".
+      body[:runner_id] = claiming_runner_id if claiming_runner_id
+      claimed = ApiClient.request(endpoint, :post, issues_path("/claims"), body: body) || []
       next if claimed.empty?
       claimed_issues.concat(claimed)
       comments_by_number = issue_comments_by_number(endpoint, claimed)
