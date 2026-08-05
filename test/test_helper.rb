@@ -56,6 +56,8 @@ module DevTestSupport
     end
 
     def after_teardown
+      DevTestSupport.restore_stubbed_globals(@dev_test_stubbed_globals)
+      @dev_test_stubbed_globals = nil
       DevTestSupport::NetworkGuard.uninstall
       super
     end
@@ -149,6 +151,58 @@ module DevTestSupport
   ensure
     ApiClient.define_singleton_method(:request, orig_request)
     ApiClient.define_singleton_method(:session_id_for, orig_sid)
+  end
+
+  # Replace a singleton method (`Open3.capture2e`, …) for the duration of a
+  # block. Minitest's own `Object#stub` is NOT available here — minitest 6
+  # stopped loading `minitest/mock` from `minitest/autorun` — so tests that
+  # reach for it fail with "undefined method 'stub'". This is the substitute.
+  def stub_singleton(obj, name, impl)
+    original = obj.method(name)
+    obj.define_singleton_method(name, &impl)
+    yield
+  ensure
+    obj.define_singleton_method(name, original)
+  end
+
+  # Same, for a top-level `dev` function (they land as private methods on
+  # Object, so a test calls them as bare methods and this replaces them).
+  def stub_global(name, impl)
+    original = method(name)
+    Object.send(:define_method, name, &impl)
+    yield
+  ensure
+    Object.send(:define_method, name, original)
+  end
+
+  # Same substitution, scoped to the whole test rather than to a block. A setup
+  # that replaces every boundary a command crosses (`dev changelog build` stubs
+  # nine) is unreadable as nine nested blocks, and the stubs have to outlive
+  # setup anyway. GuardEveryTest restores them after every test: a global stub
+  # lands on Object, so one left behind is visible to every later test in the
+  # process, not just this class.
+  def stub_global_for_test(name, &body)
+    @dev_test_stubbed_globals ||= {}
+    unless @dev_test_stubbed_globals.key?(name)
+      @dev_test_stubbed_globals[name] = begin
+        Object.instance_method(name)
+      rescue NameError
+        nil
+      end
+    end
+    Object.send(:define_method, name, body)
+  end
+
+  # Put back everything stub_global_for_test replaced. A name that did not exist
+  # before is removed rather than restored — define_method(name, nil) raises.
+  def self.restore_stubbed_globals(stubs)
+    stubs&.each do |name, original|
+      if original
+        Object.send(:define_method, name, original)
+      else
+        Object.send(:remove_method, name)
+      end
+    end
   end
 end
 
