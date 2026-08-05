@@ -1,53 +1,40 @@
 # Weekly api lint cleanup
 
-Run `api lint` across the spec-owning repos and open a PR wherever it rewrote a
-spec. The linter is mechanical (it removes unused imports and normalizes spec
-JSON); your job is to run it, read what it changed, and ship the changes that
-are right.
+This is a CONTAINER, not a unit of work. Nothing is claimed here and nothing is
+linted here: each child issue is ONE spec-owning repo's lint run, worked in its
+own workspace, on its own branch, with its own PR.
 
-## Repos
+`api lint` itself is mechanical — it removes imports a spec declares and never
+references, and it rewrites the spec JSON in place. The judgment is in reading
+what it rewrote, and that is why this is a claimed session rather than a cron:
+a linter that dropped an import a spec still uses is a FINDING, not a PR.
 
-    platform  acumen  dependency  lib-ai
+## Why an epic
 
-All four own apibuilder specs. Handle every one — a repo that is clean costs a
-clone and a lint.
+The week is N independent runs — N clones, N lints, N PRs. As one issue they
+shared one lease and one 4-hour budget, so a single wedged repo took the whole
+run with it and a failure in the fourth repo hid the first three. As children
+each repo gets its own lease, its own retry, its own budget and its own visible
+outcome.
 
-## Doing it
+A repo whose previous week's issue is still open — a lint PR nobody has merged
+yet — is deliberately NOT re-filed; the rest still run. Before, that one open PR
+held up the whole weekly producer.
 
-Work in ONE feature dir under `~/code/ai/<short-name>/` (≤19 chars) and clone
-each repo into it. Never lint a checkout under `~/code/<repo>` — those are
-Mike's working trees.
+## Which repos
 
-`api` is hermetic and resolves each repo's `.api/config.pkl`, which amends
-`../../devops/api/ApiConfig.pkl` and therefore expects a sibling `devops` next
-to the clone. Symlink one into the feature dir before linting:
+`ApiLint::REPOS` in devops/lib/api_lint.rb, which is what `children.names` in
+agent/producers.yml must equal — asserted by test/test_agent_cron_migration.rb,
+so a spec-owning repo added to one list and not the other fails the suite
+instead of silently never being linted.
 
-    ln -sfn ~/code/devops <feature-dir>/devops
+`dependency` owns specs and is deliberately NOT a child: it never migrated off
+the legacy `.apibuilder/config`, so `api lint` there exits immediately with "No
+.api/config.pkl found". It is recorded in `ApiLint::UNSUPPORTED` with that
+reason rather than dropped from the list.
 
-Then, per repo:
+## Verification
 
-1. `git clone git@github.com:mbryzek/<repo>.git` into the feature dir. A FULL
-   clone — never `--depth`, which cannot be rebased or pushed from reliably.
-2. Run `api lint` in the clone.
-3. `git status --porcelain`. Nothing changed → that repo is done, say so.
-4. Something changed → **read the diff**. This is the part a script could not
-   do: confirm the rewrite is only unused-import removal / formatting, and that
-   no resource, model, enum, field or import something still references was
-   dropped. If the linter removed an import a spec actually uses, that is a
-   finding to report, not a PR to open.
-5. Commit on a branch, push, and open the PR with
-   `gh pr create --draft --title "ISS-<this issue>: api lint cleanup (<repo>)"`,
-   then `gh pr ready <pr>`. No `--base` — it defaults to main, and passing it is
-   how stacked PRs happen.
-
-If `api lint` itself fails in a repo, that is the finding: capture the error,
-keep going with the other repos, and report it.
-
-## Report and close out
-
-One line per repo (clean / PR URL / error), then:
-
-    dev issues status <n> --status fixed --url "<the first PR URL>"
-
-A week where all four repos are clean is a successful run, not a failure —
-close it `fixed` with a comment saying no drift was found and no PR was needed.
+This epic advances to `deployed` on its own once every child is terminal, and it
+is the single thing to verify for the week — verifying it verifies every child
+with it. Review the PRs the children opened, then verify here.

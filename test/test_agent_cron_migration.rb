@@ -158,17 +158,72 @@ class TestAgentCronMigration < Minitest::Test
     p = producer("api-lint")
     assert_equal "always", p.file_when
     assert_nil p.check, "a producer check must not clone repos and open PRs"
-    assert_equal "api-lint:weekly", p.fingerprint
     assert_includes p.body_text, "api lint"
     refute File.exist?(File.expand_path("../scripts/api-lint-pr.sh", __dir__)),
            "the script did the work the claiming session now does"
   end
 
-  # The repos the retired cron covered, plus the two that also own specs.
-  def test_the_api_lint_playbook_covers_every_spec_owning_repo
-    text = producer("api-lint").body_text
-    %w[platform acumen dependency lib-ai].each do |repo|
-      assert_includes text, repo, "api-lint playbook does not mention #{repo}"
+  # ---- ISS-501: the weekly lint is an epic with one child per repo -----------
+
+  def test_the_api_lint_producer_files_an_epic_per_repo
+    p = producer("api-lint")
+    assert p.epic?, "the weekly lint files an epic, not one issue for every spec-owning repo"
+    assert_equal ApiLint::REPOS.sort, p.children.map(&:name).sort,
+                 "children must be exactly ApiLint::REPOS — a repo in one list and not the " \
+                 "other is a repo that is never linted, with nothing anywhere saying so"
+  end
+
+  # The list in code is only worth having if it is anchored to something that
+  # cannot go stale quietly. ApiProducers::REPOS is that anchor: those are the
+  # repos `api` resolves other repos' specs FROM, so a fourth spec producer has
+  # to be added there or cross-repo resolution breaks loudly. Adding one there
+  # and forgetting the lint sweep is the silent half, and this is what catches it.
+  def test_every_spec_producer_is_linted_or_explicitly_unsupported
+    missing = ApiProducers::REPOS - ApiLint::SPEC_OWNERS
+    assert_empty missing, "spec producer(s) #{missing.join(', ')} own specs but are not in ApiLint::SPEC_OWNERS"
+
+    skipped = ApiProducers::REPOS & ApiLint::UNSUPPORTED.keys
+    assert_empty skipped, "#{skipped.join(', ')}: a repo `api` resolves specs from cannot be left unlinted"
+  end
+
+  # A repo dropped from the sweep must say why, in code, or the next person to
+  # look sees a shorter list and no reason it is shorter.
+  def test_an_unlinted_spec_owner_carries_its_reason
+    (ApiLint::SPEC_OWNERS - ApiLint::REPOS).each do |repo|
+      reason = ApiLint::UNSUPPORTED[repo].to_s
+      refute_empty reason, "#{repo}: excluded from the sweep with no recorded reason"
+    end
+  end
+
+  # The asymmetry is the whole design, and it is the one an editor is most
+  # likely to "fix". The epic reaches `deployed` and waits for Mike; `deployed`
+  # is non-terminal for producer dedup, so an undated epic key would stop the
+  # WEEKLY producer until he clicked verify. The children must stay undated for
+  # the opposite reason: dating them would file a second issue on top of a repo's
+  # still-open lint PR every week.
+  def test_the_api_lint_epic_fingerprint_is_dated_and_the_children_are_not
+    p = producer("api-lint")
+    assert_includes p.fingerprint, Agent::Producers::DATE_TOKEN
+    assert_equal "api-lint:weekly:2026-08-05", p.fingerprint_at(Time.utc(2026, 8, 5, 7, 30))
+    p.children.each do |child|
+      refute_includes child.fingerprint, Agent::Producers::DATE_TOKEN,
+                      "#{child.name}: an open lint PR must suppress this week's re-file"
+      assert_equal "api-lint:#{child.name}", child.fingerprint
+    end
+  end
+
+  # Each child lints ONE repo. A playbook that named the whole repo list would
+  # have every child linting every repo — the shape ISS-501 removed.
+  def test_each_api_lint_child_playbook_names_its_own_repo_and_only_its_own
+    children = producer("api-lint").children
+    children.each do |child|
+      text = child.body_text
+      assert_includes text, "mbryzek/#{child.name}", "#{child.name}: the playbook must scope the clone to this repo"
+      refute_includes text, Agent::Producers::CHILD_TOKEN,
+                      "#{child.name}: an unsubstituted {child} reached the filed body"
+      (children.map(&:name) - [child.name]).each do |sibling|
+        refute_includes text, sibling, "#{child.name}: playbook also names #{sibling}, which a sibling child owns"
+      end
     end
   end
 
@@ -248,10 +303,12 @@ class TestAgentCronMigration < Minitest::Test
   # CLAUDE.md: never `--base` (it is how stacked PRs happen), never a shallow
   # clone. The retired openclaw script did both, and the playbook that replaced
   # it is where that guidance now has to live.
+  # The CHILD playbook, not the epic's: the epic is a container that opens no PR,
+  # and the conventions have to live where the `gh pr create` line is.
   def test_playbooks_that_open_prs_carry_the_pr_conventions
-    text = producer("api-lint").body_text
+    text = producer("api-lint").children.first.body_text
     refute_match(/gh pr create[^\n]*--base/, text, "never pass --base to gh pr create")
-    refute_match(/git clone[^\n]*--depth/, text, "no shallow clones")
+    refute_match(/(git|gh repo) clone[^\n]*--depth/, text, "no shallow clones")
     assert_includes text, "--draft", "PRs open as drafts, then go ready"
   end
 

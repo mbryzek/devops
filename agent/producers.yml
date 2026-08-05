@@ -321,14 +321,43 @@ producers:
   # job — so a check would do the work twice and hold the tick's work lock while
   # it did. A quiet week costs one issue that closes itself out as "nothing to
   # do", which is the cheaper of the two.
+  #
+  # ISS-501 made it AN EPIC WITH ONE CHILD PER REPO, for the reason ISS-397 gave
+  # the nightly upgrade the same shape: the week is N independent runs — N
+  # clones, N lints, N PRs — and as one issue they shared one lease and one 4h
+  # budget, so one wedged repo took the whole run and a failure in the fourth
+  # repo hid the first three.
+  #
+  # `children.names` MUST stay equal to ApiLint::REPOS (devops/lib/api_lint.rb)
+  # — asserted by test/test_agent_cron_migration.rb, so a spec-owning repo added
+  # to one list and not the other fails the suite instead of silently never
+  # being linted. `dependency` owns specs and is deliberately absent: it never
+  # migrated off the legacy `.apibuilder/config`, so `api lint` cannot run there
+  # at all. That exclusion is recorded, with its reason, in
+  # ApiLint::UNSUPPORTED.
+  #
+  # The fingerprint asymmetry is deliberate and is the thing to leave alone. The
+  # CHILDREN carry the dedup (`api-lint:<repo>`, UNDATED): a repo whose lint PR
+  # is still open is not re-filed, and the others still run. Dating the children
+  # too would file a second issue on top of that open PR every week. The EPIC's
+  # own key is dated because an epic awaiting Mike's verification sits at
+  # `deployed`, which is non-terminal for dedup — an undated one would hold the
+  # weekly producer until he clicked verify.
   - key: api-lint
     schedule: weekly on wednesday at 3:30am
     file_when: always
     issue:
+      type: epic
       category: infrastructure
       title: Weekly api lint cleanup across the spec-owning repos
-      fingerprint: api-lint:weekly
+      fingerprint: api-lint:weekly:{date}
       body_file: bodies/api-lint.md
+      children:
+        names: [platform, acumen, lib-ai]
+        category: infrastructure
+        title: "api lint cleanup: {child}"
+        fingerprint: "api-lint:{child}"
+        body_file: bodies/api-lint-repo.md
 
   # The scan is cheap and its verdict is its exit code; the FIX is a session's
   # work. That split is the whole producer contract, and it replaces the openclaw
