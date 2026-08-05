@@ -671,6 +671,85 @@ class TestDevIssues < Minitest::Test
     assert_includes out, "epics are not offered"
   end
 
+  # ---- ISS-553: work filed for one machine ----
+
+  # An assigned issue is claimable only by the machine it names, enforced server-side.
+  # The preview holds it out for the same reason it holds out blocked and snoozed work
+  # — offering something `POST /claims` will refuse puts it on a menu that cannot be
+  # ordered — and PRINTS it for the same reason too: "nothing to claim" and "one issue,
+  # and it belongs to mini-2" are different situations.
+  def assigned_issue(runner_id)
+    graph_issue.merge("number" => "090", "status" => "open", "assigned_runner_id" => runner_id)
+  end
+
+  # Not a machine at all — a laptop, a script, CI. It claims UNASSIGNED work only, so
+  # every assigned issue is held out and named. The identity is stubbed rather than read
+  # off the box this runs on, or the same suite would take a different path on a
+  # registered runner than on a developer's laptop.
+  def test_claim_holds_out_work_filed_for_another_machine
+    path = issues_list_path(statuses: "open", is_snoozed: false, types: "issue")
+    out, = capture_io do
+      stub_singleton(Agent::Host, :cached_identity, -> { nil }) do
+        with_stubbed_api("GET #{path}" => [assigned_issue("agr-other")]) do
+          cmd_issues_claim([])
+        end
+      end
+    end
+    assert_includes out, "No open issues to claim."
+    assert_includes out, "assigned to another machine (1)"
+    assert_includes out, "ISS-090"
+    # No fleet call is even attempted with no identity to authenticate it, so the row
+    # falls back to the raw id rather than failing to render.
+    assert_includes out, "agr-other"
+  end
+
+  # THIS machine's own assigned work is ordinary work: offered, not held out. The rule
+  # narrows one issue to one machine; it never narrows that machine's queue.
+  def test_claim_offers_this_machines_own_assigned_work
+    path = issues_list_path(statuses: "open", is_snoozed: false, types: "issue")
+    identity = Agent::Host::Identity.new(runner_id: "agr-mine", token: "tok")
+    out, = capture_io do
+      stub_singleton(Agent::Host, :cached_identity, -> { identity }) do
+        with_stubbed_api("GET #{path}" => [assigned_issue("agr-mine")]) do
+          cmd_issues_claim(["--number", "999"])
+        end
+      end
+    rescue SystemExit
+      nil
+    end
+    refute_includes out, "assigned to another machine"
+    assert_includes out, "ISS-090"
+  end
+
+  # The other half of the same rule: an UNASSIGNED issue is offered to everyone, so
+  # assignment narrows one issue rather than the queue.
+  def test_claim_still_offers_unassigned_work
+    path = issues_list_path(statuses: "open", is_snoozed: false, types: "issue")
+    out, = capture_io do
+      stub_singleton(Agent::Host, :cached_identity, -> { nil }) do
+        with_stubbed_api("GET #{path}" => [graph_issue.merge("number" => "091", "status" => "open")]) do
+          cmd_issues_claim(["--number", "999"])
+        end
+      end
+    rescue SystemExit
+      nil
+    end
+    refute_includes out, "assigned to another machine"
+    assert_includes out, "ISS-091"
+  end
+
+  # An assignment changes what a reader may DO with the issue, so `dev issues show`
+  # says so outright rather than leaving it to be inferred from the body.
+  def test_render_item_names_the_machine_an_issue_is_filed_for
+    out = issue_render_item(assigned_issue("agr-mini-2"))
+    assert_includes out, "- Assigned to machine: `agr-mini-2`"
+    assert_includes out, "ONLY that runner can claim"
+  end
+
+  def test_render_item_says_nothing_about_assignment_when_there_is_none
+    refute_includes issue_render_item(graph_issue), "Assigned to machine"
+  end
+
   # ---- spawned-session command (interactive Opus 4.8 / 1M) ----
 
   def test_issue_session_prompt_names_the_plan
