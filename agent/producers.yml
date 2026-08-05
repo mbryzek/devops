@@ -76,6 +76,14 @@
 # dismissed — `fixed` included, which is what makes "don't re-file while a PR is
 # open" free). Even on a double-fire the server increments occurrence_count
 # instead of creating a duplicate.
+#
+# A `{date}` in a fingerprint is resolved to the run's local date, so the key
+# identifies TONIGHT'S run rather than a standing condition. Use it on a
+# `file_when: always` producer that should run every night: those issues sit at
+# `fixed` and then `deployed` until Mike verifies them, both non-terminal, so an
+# undated key would quietly hold the producer for a week at a time. Leave it out
+# where the fingerprint names a condition ("this check is failing") — there,
+# not re-filing while the last one is open is exactly right.
 
 timezone: America/New_York
 
@@ -402,6 +410,32 @@ producers:
       title: Daily production error and stability triage
       fingerprint: triage:daily-errors
       body_file: bodies/daily-error-triage.md
+
+  # ISS-453. The autonomy ledger's first real consumer.
+  #
+  # `file_when: always` for the same reason the weekly reviews use it: deciding
+  # whether a PR may merge means cloning it, rebasing it onto latest main and
+  # running its suite — that IS the work, so a check would do all of it inline,
+  # inside the tick, holding the work lock.
+  #
+  # Nothing here grants any authority. The session must ask the ledger before
+  # every merge and may act only on `auto_approved`, and the workflow registers
+  # at `dry_run` — so the first weeks of runs record what they would have merged
+  # and merge nothing, which is the point. Mode, envelope and budget are set by a
+  # human at /admin/autonomy/workflows/pr_auto_merge; a run that widened its own
+  # envelope would have no envelope.
+  #
+  # 6:45am is deliberately after the nightly producers (3:03–5:45) have filed and
+  # before the working day: PRs opened overnight are decided while nobody is
+  # mid-review of them.
+  - key: pr-auto-merge
+    schedule: daily at 6:45am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: Auto-merge review-ready PRs
+      fingerprint: pr:auto-merge:{date}
+      body_file: bodies/pr-auto-merge.md
 
   # Retention is a producer, not a cron, so log purging gets the same history,
   # visibility and mutual exclusion as everything else on the tick (§4.3.1).

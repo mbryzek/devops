@@ -27,13 +27,17 @@ module Agent
     # Substituted into a child's title, fingerprint and playbook.
     CHILD_TOKEN = "{child}".freeze
 
-    # Substituted into an EPIC's fingerprint only, and the reason it exists is
-    # the wedge it prevents. An epic reaches `deployed` when every child is
-    # terminal and then waits for Mike to verify it — `deployed` is non-terminal
-    # for dedup, so an undated epic fingerprint would stop a NIGHTLY producer
-    # filing again until a human clicked verify. The children carry the real
-    # dedup (one fingerprint per app, undated, so an unfinished repo is not
-    # re-filed); the epic is just tonight's container.
+    # Substituted into a fingerprint, epic or plain, and the reason it exists is
+    # the wedge it prevents. An issue sits at `fixed` and then `deployed` until
+    # Mike verifies it, and both are non-terminal for dedup — so an undated
+    # fingerprint stops a NIGHTLY producer filing again until a human clicks
+    # verify, turning a daily loop into a roughly weekly one with no error
+    # anywhere. Dating the fingerprint says "this is tonight's run", which is
+    # what a producer that files unconditionally every night actually means.
+    #
+    # For an epic the children still carry the real dedup (one fingerprint per
+    # app, undated, so an unfinished repo is not re-filed); the epic is just
+    # tonight's container.
     DATE_TOKEN = "{date}".freeze
 
     # An issue in any other status is still "in flight" for dedup purposes — see
@@ -63,9 +67,10 @@ module Agent
       # restart — the registry is re-parsed every tick anyway.
       def body_text = body_file && File.read(body_file).strip
 
-      # The epic's fingerprint for a given run, with `{date}` resolved in the
-      # registry's timezone. A plain producer has no token and this is the
-      # identity function.
+      # This run's fingerprint, with `{date}` resolved in the registry's
+      # timezone. A fingerprint carrying no token is returned unchanged, which is
+      # every producer that dedups on the CONDITION it found rather than on the
+      # night it ran.
       def fingerprint_at(now)
         return fingerprint unless fingerprint.to_s.include?(DATE_TOKEN)
         date = Agent::Schedule.in_zone(timezone) { now.getlocal.strftime("%Y-%m-%d") }
