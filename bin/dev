@@ -92,6 +92,8 @@ INVOCATIONS = {
   "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
+  "issues webhook status" => 'issues webhook [status] [--repo NAME]... [--owner OWNER] [--url URL]',
+  "issues webhook sync" => 'issues webhook sync [--apply] [--repo NAME]... [--owner OWNER] [--url URL]',
   "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
   "autonomy outcome"    => 'autonomy outcome <decision-id> (--applied | --failed "ERROR") [--undo-command CMD] [--localhost]',
   "autonomy workflows"  => 'autonomy workflows [KEY] [--localhost]',
@@ -708,6 +710,29 @@ USAGE = <<~USAGE
         `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
         pass --apply to record the transitions (e.g. from a cron).
 
+    #{INVOCATIONS["issues webhook status"]}
+        What GitHub is actually configured to tell the platform about merges.
+        `POST /webhooks/github` is what moves an issue out of `claimed` the moment
+        its `ISS-<number>: ...` PR merges — but only if a hook exists on the repo the
+        PR merged in. `mbryzek` is a USER account, so there is no org-level hook:
+        it is one per repository, and for a month there were none at all, which is
+        invisible because a webhook nobody configured fails by delivering nothing.
+        Read-only, needs nothing but `gh`. Reports the signing secret's presence
+        (never its value), each repo's hook, and — for hooks that have fired — the
+        last delivery GitHub recorded, which is how you confirm one is working
+        without waiting for a merge. EXITS NON-ZERO when anything is missing or
+        drifted, so it can be a check and not just a report.
+
+    #{INVOCATIONS["issues webhook sync"]}
+        Put the hooks back: create one where none delivers to the platform, and
+        repair one that has drifted (disabled, extra events, wrong URL, no secret).
+        Idempotent, so the answer to "did a new repo get one" is to re-run it. The
+        signing secret comes from GITHUB_WEBHOOK_SECRET in the platform's env, which
+        is the same value the platform verifies against — a hook configured with
+        anything else is a hook whose every delivery is rejected. Refuses to run
+        when that value is unset or git-crypt is locked, and never writes to the env
+        repo itself. Dry-run by default; pass --apply to write.
+
     #{INVOCATIONS["autonomy decide"]}
         Ask the autonomy ledger for permission BEFORE acting, and act only if it
         says yes. Records the decision with its reasoning either way. EXITS 0 ONLY
@@ -937,7 +962,8 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent block duplicate workaround claim show status fix snooze reconcile resume],
+  "issues"       => %w[create list parent block duplicate workaround claim show status fix snooze reconcile resume webhook],
+  "issues webhook" => %w[status sync],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -5004,6 +5030,237 @@ def issue_released_since_fix?(info, issue)
   baseline = issue_fix_deployment(issue)&.fetch("baseline_version", nil)
   live = info["version"]
   !baseline.nil? && !live.nil? && live != baseline
+end
+
+# ---------- issues webhook ----------
+#
+# The provisioning half of the merge webhook. See lib/github_webhooks.rb for why
+# it is per-repository, and docs/github-merge-webhook.md for the rollout.
+
+# --repo/--owner/--url mean the same thing to both subcommands, so they parse in
+# one place. --apply is only meaningful to `sync`; `status` hands it back as
+# leftover so it is rejected by name rather than silently ignored.
+def issues_webhook_flags(command, args)
+  repos = []
+  owner = GithubWebhooks::OWNER
+  url = GithubWebhooks::DEFAULT_URL
+  apply = false
+  leftover = []
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--repo"
+      value = args[i + 1]
+      usage_exit("--repo requires a repository name", example: usage_for(command)) if value.nil?
+      repos << value
+      i += 2
+    when "--owner"
+      owner = args[i + 1]
+      usage_exit("--owner requires a value", example: usage_for(command)) if owner.nil?
+      i += 2
+    when "--url"
+      url = args[i + 1]
+      usage_exit("--url requires a value", example: usage_for(command)) if url.nil?
+      i += 2
+    when "--apply"
+      apply = true
+      i += 1
+    when "-h", "--help"
+      usage_exit
+    else
+      leftover << args[i]
+      i += 1
+    end
+  end
+  [repos, owner, url, apply, leftover]
+end
+
+# `owner/repo` for each name in scope: the explicit --repo list, or every
+# non-archived source repo the owner has.
+def issues_webhook_slugs(repos, owner)
+  names = repos.empty? ? GithubWebhooks.repos(owner: owner) : repos
+  names.map { |n| n.include?("/") ? n : "#{owner}/#{n}" }
+end
+
+# One repo the token cannot read must not abort the other fifty-one: an audit
+# that dies partway through reports nothing about the repos it never reached,
+# and "nothing reported" is the state this command exists to stop trusting.
+def issues_webhook_states(slugs, url)
+  slugs.map do |slug|
+    begin
+      GithubWebhooks.evaluate(repo: slug, hooks: GithubWebhooks.hooks(slug), url: url)
+    rescue GithubWebhooks::Error => e
+      GithubWebhooks.unreadable(slug, e.message)
+    end
+  end
+end
+
+# The secret's state, reported without ever printing it. `sync` needs the value;
+# `status` needs only to say whether the platform could verify a delivery at all,
+# because a fleet of perfect hooks signing against a secret the platform does not
+# have is still zero issues moved.
+def issues_webhook_secret_line(state)
+  path = Util.cleanpath(GithubWebhooks.secret_file)
+  case state
+  when :present then "set in #{path}"
+  when :locked  then "UNREADABLE — #{path} is git-crypt locked"
+  when :no_file then "UNKNOWN — no env file at #{path} (run from ~/code/devops, next to ~/code/env)"
+  else               "NOT SET in #{path}"
+  end
+end
+
+def issues_webhook_header(url, secret_state)
+  puts "GitHub merge webhook -> #{url}"
+  puts "  #{GithubWebhooks::SECRET_KEY}: #{issues_webhook_secret_line(secret_state)}"
+  return unless secret_state == :missing
+  puts "  Until it is set the platform rejects every delivery it receives:"
+  puts "  GithubWebhookParsers.verifySignature returns Left with no secret, by design."
+end
+
+def cmd_issues_webhook_status(args)
+  repos, owner, url, apply, leftover = issues_webhook_flags("issues webhook status", args)
+  leftover << "--apply" if apply
+  reject_unknown_args("issues webhook status", leftover)
+
+  secret_state, = GithubWebhooks.secret
+  begin
+    states = issues_webhook_states(issues_webhook_slugs(repos, owner), url)
+  rescue GithubWebhooks::Error => e
+    Util.exit_with_error(e.message)
+  end
+
+  puts ""
+  issues_webhook_header(url, secret_state)
+  puts ""
+
+  ok, rest = states.partition(&:ok?)
+  unreadable, rest = rest.partition(&:unreadable?)
+  absent, drifted = rest.partition(&:absent?)
+
+  puts "  #{states.length} #{states.length == 1 ? 'repository' : 'repositories'} checked"
+  puts "  ok         #{ok.length}"
+  unless drifted.empty?
+    puts "  drifted    #{drifted.length}"
+    drifted.each { |s| puts "    #{s.repo}: #{s.summary}" }
+  end
+  unless absent.empty?
+    puts "  absent     #{absent.length}"
+    puts Util.indent(absent.map(&:repo).join(", "), 4)
+  end
+  unless unreadable.empty?
+    puts "  unreadable #{unreadable.length}"
+    unreadable.each { |s| puts "    #{s.repo}: #{s.summary}" }
+  end
+
+  puts ""
+  if states.all?(&:ok?) && secret_state == :present
+    puts "Every merge in scope reaches the platform."
+    return
+  end
+  puts "Merges in #{states.reject(&:ok?).length} of these repositories move no issue."
+  puts "`dev issues webhook sync --apply` adds and repairs the hooks."
+  exit 1
+end
+
+def cmd_issues_webhook_sync(args)
+  repos, owner, url, apply, leftover = issues_webhook_flags("issues webhook sync", args)
+  reject_unknown_args("issues webhook sync", leftover)
+
+  secret_state, secret = GithubWebhooks.secret
+  issues_webhook_require_secret!(secret_state)
+
+  begin
+    states = issues_webhook_states(issues_webhook_slugs(repos, owner), url)
+  rescue GithubWebhooks::Error => e
+    Util.exit_with_error(e.message)
+  end
+
+  puts ""
+  issues_webhook_header(url, secret_state)
+  puts ""
+
+  changed = 0
+  failed = false
+  states.each do |state|
+    if state.ok?
+      puts "  ok       #{state.repo}"
+      next
+    end
+    if state.unreadable?
+      warn "  SKIPPED  #{state.repo}: #{state.summary}"
+      failed = true
+      next
+    end
+    changed += 1
+    verb = state.absent? ? "create" : "repair"
+    unless apply
+      puts "  would #{verb} #{state.repo}#{state.absent? ? '' : " (#{state.summary})"}"
+      next
+    end
+    begin
+      if state.absent?
+        GithubWebhooks.create(state.repo, url: url, secret: secret)
+      else
+        GithubWebhooks.update(state.repo, state.hook_id, url: url, secret: secret)
+      end
+      puts "  #{state.absent? ? 'created' : 'repaired'}  #{state.repo}"
+    rescue GithubWebhooks::Error => e
+      # One repo's failure is not the fleet's: keep going and fail at the end, so
+      # a single permission problem does not leave the rest unprovisioned.
+      warn "  FAILED   #{e.message}"
+      changed -= 1
+      failed = true
+    end
+  end
+
+  puts ""
+  if changed.zero? && !failed
+    puts "Nothing to do — every repository in scope already delivers merges to the platform."
+  elsif apply
+    puts "#{changed} #{changed == 1 ? 'repository' : 'repositories'} updated."
+    puts "Verify with `dev issues webhook status` once a pull request has merged."
+  else
+    puts "#{changed} #{changed == 1 ? 'repository' : 'repositories'} would change. Re-run with --apply to write them."
+  end
+  exit 1 if failed
+end
+
+# A hook without the platform's own secret is worse than no hook: it looks
+# configured, GitHub reports 2xx deliveries, and every one of them is thrown away
+# at the HMAC check. So `sync` refuses rather than writing something that would
+# read as working.
+def issues_webhook_require_secret!(secret_state)
+  return if secret_state == :present
+  path = Util.cleanpath(GithubWebhooks.secret_file)
+  if secret_state == :locked
+    Util.exit_with_error(<<~MSG)
+      #{path} is git-crypt locked, so #{GithubWebhooks::SECRET_KEY} cannot be read.
+
+      Unlock it yourself (`cd ~/code/env && git-crypt unlock`) and re-run. This
+      command will not unlock it, and agent sessions are forbidden from doing so.
+    MSG
+  end
+  if secret_state == :no_file
+    Util.exit_with_error(<<~MSG)
+      No env file at #{path}, so #{GithubWebhooks::SECRET_KEY} cannot be read.
+
+      That path is resolved relative to this checkout of devops, so run this from
+      ~/code/devops, where ~/code/env is a sibling — not from a clone in a
+      feature directory.
+    MSG
+  end
+  Util.exit_with_error(<<~MSG)
+    #{GithubWebhooks::SECRET_KEY} is not set in #{path}, and a hook without it is
+    worse than no hook: the platform rejects every delivery whose signature it
+    cannot verify, while GitHub reports the hook as healthy.
+
+      1. Add to #{path} (git-crypt unlocked):
+           #{GithubWebhooks::SECRET_KEY}=#{GithubWebhooks.suggested_secret}
+         (a fresh value, generated here for convenience — nothing has stored it)
+      2. Push it to the running app:
+           dev config rollout --app #{GithubWebhooks::SECRET_APP}
+      3. Then re-run: dev issues webhook sync --apply
+  MSG
 end
 
 # ---------- features ----------
@@ -10640,6 +10897,13 @@ when "issues"
   when "fix"        then cmd_issues_fix(argv)
   when "snooze"     then cmd_issues_snooze(argv)
   when "reconcile"  then cmd_issues_reconcile(argv)
+  when "webhook"
+    hook_sub = resolve_subcommand(argv, default: "status")
+    case hook_sub
+    when "status" then cmd_issues_webhook_status(argv)
+    when "sync"   then cmd_issues_webhook_sync(argv)
+    else               unknown("issues webhook subcommand", hook_sub, SUBCOMMANDS["issues webhook"])
+    end
   when nil          then require_subcommand("issues")
   else                unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
   end
