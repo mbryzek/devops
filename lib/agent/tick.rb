@@ -184,7 +184,7 @@ module Agent
     def escalate_failure(source, message, count, title:, explain:)
       host = hostname
       Agent::Notify.once("agent_error", source, now: @now) do
-        Agent::Notify.event("dev-agent: #{source} has failed #{count} times in a row on #{host} (#{message})")
+        push("agent_error", "dev-agent: #{source} has failed #{count} times in a row on #{host} (#{message})")
       end
       return if @dry_run
 
@@ -523,8 +523,8 @@ module Agent
     def file_toolchain_issue(result)
       host = hostname
       Agent::Notify.once("toolchain", "#{host}:#{Agent::Toolchain.missing_key(result)}", now: @now) do
-        Agent::Notify.event("dev-agent: #{host} is missing #{result.missing_required.map(&:name).join(', ')} " \
-                            "— #{result.blocked_producers.join(', ')} cannot run there")
+        push("toolchain", "dev-agent: #{host} is missing #{result.missing_required.map(&:name).join(', ')} " \
+                          "— #{result.blocked_producers.join(', ')} cannot run there")
       end
       Agent::Api.create_issue(
         {
@@ -540,31 +540,33 @@ module Agent
       log("toolchain: could not file an issue (#{e.message})")
     end
 
+    # THE RUNNER-OFFLINE ALERT IS NOT SENT FROM HERE, DELIBERATELY (ISS-535).
+    #
+    # It used to be: this method read `is_stale` off every OTHER runner in the
+    # fleet response and pushed an openclaw event about it. That is the single
+    # most important alert in the system — a machine that reboots and never logs
+    # back in looks exactly like an empty queue — and a runner-local check is the
+    # wrong place for it twice over. An offline machine cannot report itself, so
+    # the alert depends on some PEER being awake; a one-runner fleet, or the last
+    # machine standing, therefore reports nothing at all. And every push it did
+    # make was a no-op anyway, because `openclaw` is not installed on the runners
+    # (ISS-535, ISS-531).
+    #
+    # The platform already owns it, and already delivers it:
+    # `CheckAgentRunnerHealthProcessor` is queued every 15 minutes by
+    # `PeriodicActor`, alerts on the machine that CROSSES into staleness (once,
+    # by construction, with no notified flag), and emails Mike. It reads the same
+    # `AgentInvariants.StaleAfterHours` that produced the `is_stale` this code
+    # used to consume — so nothing was lost with the copy, and the server sees
+    # the machine that went dark whether or not anything else in the fleet is up.
+    #
+    # Do not re-add a local copy. Add to the processor instead.
     def self_runner(identity)
       runners = Agent::Api.runners(token: identity.token, use_localhost: @use_localhost)
-      notify_offline_runners(runners, identity)
       runners.find { |r| r["id"] == identity.runner_id }
     rescue ApiError => e
       log("could not read the fleet (#{e.message}) — assuming this runner is unchanged")
       nil
-    end
-
-    # The single most important alert in the system: a machine that reboots and
-    # never logs back in looks exactly like an empty queue.
-    #
-    # `is_stale` comes from the server, which evaluates the SAME predicate as the
-    # `agent_runner_heartbeat_stale` invariant and the 15-minute health task.
-    # Recomputing it here from `last_heartbeat_at` would be a fourth copy of one
-    # threshold, and the CLI and the invariant would eventually disagree about
-    # what "offline" means.
-    def notify_offline_runners(runners, identity)
-      runners.each do |runner|
-        next if runner["id"] == identity.runner_id
-        next unless runner["is_stale"]
-        Agent::Notify.once("runner_offline", runner["id"], now: @now) do
-          Agent::Notify.event("dev-agent: runner #{runner['hostname'] || runner['id']} has not checked in since #{runner['last_heartbeat_at']}")
-        end
-      end
     end
 
     # ---- reap ----
@@ -647,12 +649,26 @@ module Agent
     def notify_outcome(number, result)
       case result.name
       when "ready_pr"
-        Agent::Notify.event("dev-agent: ISS-#{number} ready for review — #{result.url}")
+        push("pr_ready", "dev-agent: ISS-#{number} ready for review — #{result.url}")
       when "merged_pr"
-        Agent::Notify.event("dev-agent: ISS-#{number} fixed by an already-merged PR — #{result.url}")
+        push("merged_pr", "dev-agent: ISS-#{number} fixed by an already-merged PR — #{result.url}")
       when "gave_up"
-        Agent::Notify.event("dev-agent: ISS-#{number} gave up after #{Agent::Outcome::MAX_ATTEMPTS} attempts — needs input")
+        push("gave_up", "dev-agent: ISS-#{number} gave up after #{Agent::Outcome::MAX_ATTEMPTS} attempts — needs input")
       end
+    end
+
+    # One push, and a log line for every one that did not arrive (ISS-535).
+    #
+    # `Agent::Notify.event` returning a bare `false` into a caller that discarded
+    # it is what let this fleet run its whole history with no notification
+    # channel at all and nothing anywhere saying so. The line names the backstop
+    # that carries the fact instead, because the two halves are only useful
+    # together: "undelivered" alone reads as lost work, and the backstop alone
+    # reads as a healthy channel.
+    def push(kind, text)
+      outcome = Agent::Notify.event(kind, text)
+      log("notify #{kind}: #{Agent::Notify.explain(kind, outcome)}") if Agent::Notify.reportable?(outcome)
+      outcome
     end
 
     def cleanup(record, result)
@@ -1070,7 +1086,7 @@ module Agent
              "under this issue's title — the ISS-360 failure the pointer exists to make impossible.\n\n" \
              "Fix the path under `devops/agent/bodies/`, or correct the pointer line on this issue, then " \
              "move it back to `open`."
-      Agent::Notify.event("dev-agent: ISS-#{number} playbook did not resolve on #{hostname} (#{message})")
+      push("playbook_unresolved", "dev-agent: ISS-#{number} playbook did not resolve on #{hostname} (#{message})")
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)

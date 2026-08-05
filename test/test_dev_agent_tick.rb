@@ -667,7 +667,7 @@ class TestDevAgentTick < Minitest::Test
     refute_match(/# Playbook/, seen[:prompt])
   end
 
-  # ---- runner staleness comes from the server, never recomputed here ----
+  # ---- runner staleness is the PLATFORM's alert, not a runner's ----
 
   # Restores the real method rather than removing it — Notify.event is a
   # module_function, so remove_method would delete it for every later test in
@@ -675,7 +675,10 @@ class TestDevAgentTick < Minitest::Test
   def capturing_events
     captured = []
     original = Agent::Notify.method(:event)
-    Agent::Notify.define_singleton_method(:event) { |text| captured << text; true }
+    Agent::Notify.define_singleton_method(:event) do |kind, text|
+      captured << [kind, text]
+      Agent::Notify::DELIVERED
+    end
     no_notify = ENV.delete("DEV_AGENT_NO_NOTIFY")
     yield captured
     captured
@@ -684,7 +687,17 @@ class TestDevAgentTick < Minitest::Test
     ENV["DEV_AGENT_NO_NOTIFY"] = no_notify
   end
 
-  def test_offline_runner_notification_uses_the_servers_is_stale
+  # ISS-535. The tick used to push an openclaw event for every OTHER runner the
+  # fleet response called stale, and that is the wrong place for this alert by
+  # construction: it needs a peer to be awake, so the machine that matters most —
+  # the only one, or the last one standing — reports nothing. It also never
+  # delivered, because `openclaw` is not on the runners.
+  #
+  # `CheckAgentRunnerHealthProcessor` (platform, every 15 minutes, emails on the
+  # crossing tick) owns it, off the same AgentInvariants.StaleAfterHours that
+  # produced the `is_stale` below. This test is the guard against someone helpfully
+  # re-adding the local copy.
+  def test_a_stale_peer_produces_no_runner_local_notification
     events = with_agent_home do
       register_identity
       capturing_events do
@@ -694,8 +707,7 @@ class TestDevAgentTick < Minitest::Test
         with_stubbed_api(fleet) { capture_stdout { tick.run } }
       end
     end
-    assert_equal 1, events.length, "exactly the stale runner should notify"
-    assert_match(/mini-2\.local has not checked in/, events.first)
+    assert_empty events, "runner-offline is the platform's alert (CheckAgentRunnerHealthProcessor), not a peer runner's"
   end
 
   # ---- producer execution: check_failed stays distinct from filed ----
