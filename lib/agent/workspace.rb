@@ -24,7 +24,30 @@ module Agent
     # Feature dir / branch name ceiling from CLAUDE.md.
     MAX_SLUG_LENGTH = 19
 
+    # Exactly what `slug` below generates, stated as a pattern so the consumers
+    # can check rather than assume. Defined HERE, at the producer, because this
+    # is the only thing that mints a slug -- Agent::Gc matches directories under
+    # ~/code/ai against it to decide what the executor created and may therefore
+    # rm -rf.
+    SLUG = /\Ai\d+_[a-z0-9]{3}\z/
+
     module_function
+
+    # A slug this module could have produced.
+    #
+    # Worth checking rather than trusting, because not every slug reaching
+    # `create` came from `slug`: resuming a prior attempt passes
+    # `lease["branch"]` straight through (Tick#claim), which is a value the
+    # PLATFORM supplied. Today that value always originated here, but nothing on
+    # this side enforces it, and what the unchecked path does is mkdir_p -- and
+    # later rm_rf -- a caller-controlled path under the developer's ~/code/ai.
+    #
+    # The length ceiling is re-checked too, not only asserted in the generator:
+    # an over-long slug does not fail loudly, sbt just cannot open its socket.
+    def valid_slug?(slug)
+      s = slug.to_s
+      s.length <= MAX_SLUG_LENGTH && s.match?(SLUG)
+    end
 
     # Random suffix, not a sequence: two attempts on one issue must not collide,
     # and a counter would need durable local state, which this design does not
@@ -38,6 +61,7 @@ module Agent
     def path(slug) = Agent::Paths.workspace(slug)
 
     def create(slug)
+      raise "refusing to materialize a workspace for slug #{slug.inspect}" unless valid_slug?(slug)
       dir = path(slug)
       FileUtils.mkdir_p(dir)
       dir
@@ -147,6 +171,7 @@ module Agent
     end
 
     def delete(slug)
+      return false unless valid_slug?(slug)
       dir = path(slug)
       return false unless File.directory?(dir)
       # Refuse to remove anything that is not under the workspace root — this

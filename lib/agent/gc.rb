@@ -46,7 +46,12 @@ module Agent
 
     # Only directories the executor itself created, ever. `~/code/ai` is also
     # where Mike's own feature dirs live and this runs unattended with rm -rf.
-    AGENT_SLUG = /\Ai\d+_[a-z0-9]{3}\z/
+    #
+    # Taken from Agent::Workspace rather than restated: the pattern has to mean
+    # "what Workspace.slug produces", and two copies of that could drift apart
+    # into a gc that either misses real workspaces or matches a hand-made
+    # feature dir.
+    AGENT_SLUG = Agent::Workspace::SLUG
 
     module_function
 
