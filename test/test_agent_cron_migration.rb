@@ -128,9 +128,9 @@ class TestAgentCronMigration < Minitest::Test
   end
 
   # Cadence is the routine path; disk pressure is the failure being prevented and
-  # must not wait for it. A floor with no cooldown would be worse than none: a
-  # machine that is genuinely full stays under the floor after a prune that
-  # reclaimed everything reclaimable, and would then prune every 30 seconds.
+  # is what shortens the windows. A floor with no cooldown would be worse than
+  # none: a machine that is genuinely full stays under the floor after a prune
+  # that reclaimed everything reclaimable, and would then prune every 30 seconds.
   def test_disk_pressure_runs_now_but_not_in_a_loop
     now = Time.utc(2026, 8, 5, 12)
     tiny = Agent::Maintenance::PRESSURE_FLOOR_BYTES - 1
@@ -140,8 +140,8 @@ class TestAgentCronMigration < Minitest::Test
     end
     with_last_run(now - Agent::Maintenance::PRESSURE_COOLDOWN_SECONDS - 1) do
       assert_equal :pressure, Agent::Maintenance.due(now: now, free_bytes: tiny)
-      assert_nil Agent::Maintenance.due(now: now, free_bytes: Agent::Maintenance::PRESSURE_FLOOR_BYTES * 2),
-                 "healthy headroom waits for the cadence"
+      assert_equal :cadence, Agent::Maintenance.due(now: now, free_bytes: Agent::Maintenance::PRESSURE_FLOOR_BYTES * 2),
+                   "healthy headroom takes the routine path and the routine windows (ISS-555)"
     end
   end
 
