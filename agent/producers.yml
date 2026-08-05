@@ -437,6 +437,45 @@ producers:
       fingerprint: pr:auto-merge:{date}
       body_file: bodies/pr-auto-merge.md
 
+  # ISS-508. The structural half of gap review: ISS-507 makes a session file what
+  # it WORKED AROUND, this finds what no single run could see.
+  #
+  # A session sees one night, so a workaround it applied on each of the last
+  # thirty is, from inside the run, just how the job is done. Lining a week of
+  # runs up side by side is the whole job — a check that exits >1 files nothing
+  # and is deliberately indistinguishable from a clean one, an issue that went
+  # `fixed` on a PR that never merged looks closed from every angle but GitHub's,
+  # and a producer that has stopped firing produces no rows at all.
+  #
+  # `file_when: always` for the same reason the weekly reviews use it: no cheap
+  # check exists, because the review IS the work. Answering "is there a gap?"
+  # means reading the run history and the issues, which is the job.
+  #
+  # Sunday 7:00am, after the Sunday weekly reviews (02:00, 06:00) and after
+  # pr-auto-merge (06:45), so a week's PR decisions are already recorded when the
+  # window is read.
+  #
+  # The fingerprint is DATED, unlike its weekly-review neighbours, and the
+  # difference is deliberate. A weekly review closes out `fixed` against a PR with
+  # an app and a baseline, so `issues reconcile` walks it to `deployed` and then
+  # `verified` — terminal, and the producer files again. This one usually closes
+  # out `fixed` against a document, which nothing advances automatically; at
+  # `fixed` it is still non-terminal, so an undated key would hold this producer
+  # forever after its first run. Silently. Which is precisely detector D5 —
+  # a producer built to find dark producers has no business being one.
+  #
+  # NOTE for epic ISS-519: this is the 28th producer, added after that design was
+  # written. It ports like every other row — registry entry to a platform row
+  # (ISS-521), body file to a playbook row (ISS-523).
+  - key: meta-review
+    schedule: weekly on sunday at 7:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: Weekly meta-review of producer runs and recent issues
+      fingerprint: meta-review:weekly:{date}
+      body_file: bodies/meta-review.md
+
   # Retention is a producer, not a cron, so log purging gets the same history,
   # visibility and mutual exclusion as everything else on the tick (§4.3.1).
   - key: agent-gc
