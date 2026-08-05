@@ -248,3 +248,195 @@ class TestDependenciesSbtCmd < Minitest::Test
     end
   end
 end
+
+# ISS-478: the nightly run cloned over SSH from a launchd job with no ssh-agent
+# identity, so every repo came back "clone failed" on a box where HTTPS reads and
+# writes the same private repos fine.
+class TestGithubCloneTransport < Minitest::Test
+  def test_github_origin_is_https
+    assert_equal "https://github.com/mbryzek/lib-cipher.git", github_origin("mbryzek/lib-cipher")
+  end
+
+  def test_rewrites_scp_style_ssh_remote
+    assert_equal "https://github.com/mbryzek/platform.git", github_https_url("git@github.com:mbryzek/platform.git")
+  end
+
+  def test_rewrites_ssh_remote_without_git_suffix
+    assert_equal "https://github.com/mbryzek/platform.git", github_https_url("git@github.com:mbryzek/platform")
+  end
+
+  def test_rewrites_ssh_scheme_remote
+    assert_equal "https://github.com/mbryzek/platform.git", github_https_url("ssh://git@github.com/mbryzek/platform.git")
+  end
+
+  def test_https_remote_is_unchanged
+    assert_equal "https://github.com/mbryzek/platform.git", github_https_url("https://github.com/mbryzek/platform.git")
+  end
+
+  # `browserslist update` clones from whatever remote a local checkout carries.
+  # Only github.com is rewritten — another host or a local path is not ours to
+  # rewrite, and silently pointing a clone somewhere else would be worse than
+  # failing.
+  def test_other_hosts_and_paths_pass_through
+    assert_equal "git@gitlab.com:acme/thing.git", github_https_url("git@gitlab.com:acme/thing.git")
+    assert_equal "/tmp/some/local/repo", github_https_url("/tmp/some/local/repo")
+  end
+end
+
+class TestCloneRepo < Minitest::Test
+  include DevTestSupport
+
+  # Replaces run_step for the duration of the block, recording its arguments.
+  # Defined on Object because bin/dev's helpers are top-level methods.
+  def with_recorded_run_step(result)
+    calls = []
+    Object.send(:alias_method, :__real_run_step, :run_step)
+    Object.send(:define_method, :run_step) do |cmd, path, verbose, log, env: {}|
+      calls << { cmd: cmd, path: path, env: env }
+      log << "fatal: could not read Username for 'https://github.com'\n"
+      result
+    end
+    yield calls
+  ensure
+    Object.send(:alias_method, :run_step, :__real_run_step)
+    Object.send(:remove_method, :__real_run_step)
+  end
+
+  def test_clones_an_ssh_origin_over_https
+    with_recorded_run_step([true, nil]) do |calls|
+      Dir.mktmpdir { |wd| clone_repo("git@github.com:mbryzek/platform.git", "platform", wd, false, +"") }
+      assert_includes calls.first[:cmd], "https://github.com/mbryzek/platform.git"
+      refute_includes calls.first[:cmd].join(" "), "git@github.com"
+    end
+  end
+
+  # A credential prompt in a launchd job hangs the sweep for its whole timeout;
+  # failing fast with git's own message is the only useful outcome there.
+  def test_clone_never_prompts_for_credentials
+    with_recorded_run_step([true, nil]) do |calls|
+      Dir.mktmpdir { |wd| clone_repo(github_origin("mbryzek/lib-ai"), "lib-ai", wd, false, +"") }
+      assert_equal "0", calls.first[:env]["GIT_TERMINAL_PROMPT"]
+    end
+  end
+
+  def test_failed_clone_returns_nil_and_keeps_gits_reason
+    with_recorded_run_step([false, nil]) do |_calls|
+      log = +""
+      Dir.mktmpdir { |wd| assert_nil clone_repo(github_origin("mbryzek/lib-ai"), "lib-ai", wd, false, log) }
+      assert_includes clone_failed_error(log), "could not read Username"
+    end
+  end
+
+  def test_clone_failed_error_without_output_is_still_readable
+    assert_equal "clone failed", clone_failed_error("")
+  end
+end
+
+# ISS-478: both commands printed `[error] - clone failed` and exited 0, so a
+# night where nothing worked was indistinguishable from a quiet one to the agent
+# session, the cron and anything else reading `$?`.
+class TestDependenciesExitCode < Minitest::Test
+  def test_ok_when_every_repo_finished
+    results = { "lib-ai" => { status: :pr_opened }, "acumen" => { status: :in_sync } }
+    assert_equal DEPS_EXIT_OK, dependencies_exit_code(results)
+  end
+
+  # The open-PR gate. The pipeline documents this as a successful, self-gating
+  # night, so it must not turn the run red.
+  def test_open_pr_skip_is_not_a_failure
+    results = { "lib-ai" => { status: :skipped, error: "an open dep-upgrade PR already exists" } }
+    assert_equal DEPS_EXIT_OK, dependencies_exit_code(results)
+  end
+
+  def test_check_status_ok_is_a_success
+    assert_equal DEPS_EXIT_OK, dependencies_exit_code("platform" => { status: :ok, bumps: [] })
+  end
+
+  def test_failed_when_any_repo_errored
+    results = { "lib-ai" => { status: :in_sync }, "lib-cipher" => { status: :error, error: "clone failed" } }
+    assert_equal DEPS_EXIT_FAILED, dependencies_exit_code(results)
+  end
+
+  # A Claude session that timed out or ended without a PR left the repo unfinished
+  # — not an error status, and previously counted as a clean night.
+  def test_failed_when_a_repo_needs_attention
+    assert_equal DEPS_EXIT_FAILED, dependencies_exit_code("platform" => { status: :needs_attention })
+  end
+
+  # Success is asserted, not inferred: an unrecognised status is not evidence of
+  # a healthy run.
+  def test_failed_on_an_unknown_status
+    assert_equal DEPS_EXIT_FAILED, dependencies_exit_code("platform" => { status: :something_new })
+  end
+
+  def test_failed_when_no_repo_was_processed
+    assert_equal DEPS_EXIT_FAILED, dependencies_exit_code({})
+  end
+
+  # The verdict is the last line of a long nightly log — it has to name the repos
+  # that caused the non-zero exit.
+  def test_verdict_names_the_failed_repos
+    results = { "lib-ai" => { status: :in_sync }, "lib-cipher" => { status: :error }, "acumen" => { status: :needs_attention } }
+    verdict = dependencies_verdict(results, DEPS_EXIT_FAILED)
+    assert_includes verdict, "lib-cipher"
+    assert_includes verdict, "acumen"
+    refute_includes verdict, "lib-ai"
+  end
+end
+
+# Unit-testing `dependencies_exit_code` proves nothing about the process exit
+# code: the bug was that the command computed a per-repo status, printed it, and
+# then fell off the end returning 0. What is under test here is that the command
+# actually exits with the verdict.
+class TestDependenciesUpgradeCommand < Minitest::Test
+  include DevTestSupport
+
+  def with_stubbed_run(workdir, result)
+    Object.send(:alias_method, :__real_upgrade_one, :dependencies_upgrade_one)
+    Object.send(:alias_method, :__real_deps_workdir, :dependencies_workdir)
+    Object.send(:define_method, :dependencies_upgrade_one) { |*_args, &_blk| result }
+    Object.send(:define_method, :dependencies_workdir) { workdir }
+    yield
+  ensure
+    Object.send(:alias_method, :dependencies_upgrade_one, :__real_upgrade_one)
+    Object.send(:alias_method, :dependencies_workdir, :__real_deps_workdir)
+    Object.send(:remove_method, :__real_upgrade_one)
+    Object.send(:remove_method, :__real_deps_workdir)
+  end
+
+  def run_upgrade(result)
+    status = nil
+    out = nil
+    Dir.mktmpdir do |workdir|
+      with_stubbed_run(workdir, result) do
+        out = capture_stdout do
+          begin
+            cmd_dependencies_upgrade(%w[--app lib-cipher])
+          rescue SystemExit => e
+            status = e.status
+          end
+        end
+      end
+      # The morning briefing reads this file, so a failed night must still write it.
+      @status_json = JSON.parse(File.read(File.join(workdir, "dependencies-status.json")))
+    end
+    [out, status]
+  end
+
+  def test_clone_failure_exits_non_zero
+    out, status = run_upgrade({ status: :error, error: "clone failed: Permission denied (publickey)" })
+    assert_equal DEPS_EXIT_FAILED, status
+    assert_includes out, "lib-cipher"
+    assert_equal "error", @status_json.first["status"]
+  end
+
+  def test_pr_opened_exits_zero
+    _out, status = run_upgrade({ status: :pr_opened, pr_url: "https://github.com/mbryzek/lib-cipher/pull/9" })
+    assert_equal DEPS_EXIT_OK, status
+  end
+
+  def test_in_sync_exits_zero
+    _out, status = run_upgrade({ status: :in_sync, held: [] })
+    assert_equal DEPS_EXIT_OK, status
+  end
+end
