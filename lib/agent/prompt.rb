@@ -1,3 +1,4 @@
+require 'agent/credentials'
 require 'agent/paths'
 
 # The prompt fed to a session on stdin (design §4.3.2). Four parts, in this
@@ -33,18 +34,20 @@ module Agent
       File.read(path)
     end
 
-    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], playbook: nil)
+    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], playbook: nil,
+              credentials: Agent::Credentials.check)
       [
         instructions.strip,
         assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo,
-                   prepared_repos: prepared_repos),
+                   prepared_repos: prepared_repos, credentials: credentials),
         issue_section(issue),
         playbook_section(playbook),
         comments_section(comments),
       ].compact.join("\n\n---\n\n") + "\n"
     end
 
-    def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [])
+    def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [],
+                   credentials: Agent::Credentials.check)
       lines = []
       lines << "# Your assignment"
       lines << ""
@@ -85,6 +88,44 @@ module Agent
         lines << "Your workspace is empty. Clone every repo you need into it (`gh repo clone <owner>/<repo>"
         lines << "#{workspace}/<repo>`), create branch `#{slug}` in each from the latest `origin/main`, and"
         lines << "work there. Never edit a checkout under ~/code outside this workspace."
+      end
+      lines << "" << credentials_section(credentials)
+      lines.join("\n")
+    end
+
+    # Which external-API credentials THIS runner holds, stated before the
+    # session plans rather than discovered halfway through it (ISS-570).
+    #
+    # This is executor state in the same sense the workspace path is: a fact
+    # about the machine the session cannot establish for itself, because a
+    # credential's absence looks exactly like a credential it has not thought to
+    # look for. The ISS-565 session wrote a Claude-API probe, could not run one
+    # request, and only found that out after the code existed — by which point
+    # "verify it against the API" had already been treated as in scope.
+    #
+    # PRESENCE ONLY. `Agent::Credentials.check` carries no values by
+    # construction, so nothing here can render a secret into prompt.md — which
+    # is written to the log tree and is exactly the sort of file that ends up
+    # quoted in an issue comment.
+    def credentials_section(found)
+      lines = ["## Live external-API credentials on this runner", ""]
+      Array(found).each do |f|
+        if f.present?
+          lines << "- `#{f.name}` — **available in your environment** (#{f.explanation}). Needed for " \
+                   "#{f.credential.required_by}."
+          lines << "  Pass it explicitly to whatever you are verifying — e.g. " \
+                   "`curl -H \"x-api-key: $#{f.name}\" -H \"anthropic-version: 2023-06-01\" ...`."
+          lines << "  **Never print, echo, commit, or paste it** into a PR, an issue comment, a plan or a " \
+                   "test fixture, and never copy it into `ANTHROPIC_API_KEY` — that variable reconfigures " \
+                   "the `claude` CLI you are running inside."
+        else
+          lines << "- `#{f.name}` — **NOT available on this runner** (#{f.explanation})."
+          lines << "  Anything in your assignment that asks you to verify behaviour against the live API " \
+                   "this key is for (#{f.credential.required_by}) **cannot be closed out here**. Say so up " \
+                   "front, do the offline work in full, state plainly in the PR which part is unverified, " \
+                   "and file it with `dev issues workaround`. Do not design against the documentation and " \
+                   "then report it as verified."
+        end
       end
       lines.join("\n")
     end

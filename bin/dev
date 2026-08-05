@@ -42,6 +42,7 @@ require 'depsguard'
 require 'agent/gc'
 require 'agent/maintenance'
 require 'agent/tick'
+require 'agent/credentials'
 require 'agent/toolchain'
 
 # Single source of truth for each command's invocation line, keyed by the command
@@ -10569,6 +10570,8 @@ def cmd_agent_doctor(args)
     optional.each { |t| puts "Optional, absent: #{t.name} — #{t.required_by} (`#{t.install}`)" }
   end
 
+  agent_doctor_credentials
+
   if missing.empty?
     puts
     puts "All #{result.found.count { |f| f.tool.required? }} required tool(s) present."
@@ -10588,6 +10591,40 @@ def cmd_agent_doctor(args)
     puts "They record `check_failed`, file nothing, and look exactly like a quiet week."
   end
   exit 1
+end
+
+# The external-API credentials half of the doctor (ISS-570).
+#
+# NEVER affects the exit code, and that is the whole design: a runner with no
+# Anthropic key is perfectly able to claim the overwhelming majority of the
+# queue, and failing provisioning over it would make a narrow capability into a
+# blocker. What an absent credential must not do is stay invisible until a
+# session is halfway through an issue whose entire subject is that API — so the
+# real enforcement is the same fact rendered into every session's prompt at
+# claim time (Agent::Prompt#credentials_section). This is the operator's view of
+# it.
+#
+# Prints presence, never values: `Agent::Credentials.check` cannot carry a
+# secret, so this cannot print one.
+def agent_doctor_credentials
+  found = Agent::Credentials.check
+  return if found.empty?
+
+  puts
+  puts "Live external-API credentials (read from the env repo WITHOUT unlocking it):"
+  width = found.map { |f| f.name.length }.max
+  found.each { |f| puts "  #{f.present? ? 'ok  ' : '--  '} #{f.name.ljust(width)}  #{f.explanation}" }
+
+  absent = found.reject(&:present?)
+  return if absent.empty?
+
+  puts
+  absent.each do |f|
+    puts "ABSENT #{f.name} — needed by #{f.credential.required_by}"
+    puts "  provide it: #{f.credential.how_to_provide}"
+  end
+  puts "Sessions on this machine are TOLD this up front and will report such work as unverified " \
+       "rather than guessing (ISS-570). Nothing else is blocked."
 end
 
 # ---------- dispatch ----------
