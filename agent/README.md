@@ -267,6 +267,9 @@ pushes get a tick-log line naming the backstop that carried the fact instead.
 Both halves are needed: "undelivered" alone reads as lost work, and the backstop
 alone reads as a healthy channel.
 
-`openclaw` stays **optional** on a runner, deliberately. That is not a shrug — it
-follows from the backstop table above, and the day a push is added with no
-durable record behind it, the answer changes and the test is what will say so.
+`openclaw` is not in `Agent::Toolchain::TOOLS` and `dev agent doctor` does not
+check for it — deliberately, not a shrug. It follows from the backstop table
+above: every push already survives its absence, so doctor tracking it would
+just be a second, noisier way of learning what `dev agent status` and the
+tick log already say. The day a push is added with no durable record behind
+it, the answer changes and the test is what will say so.
