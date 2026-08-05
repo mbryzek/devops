@@ -494,6 +494,14 @@ USAGE = <<~USAGE
         issue is filed and claimed — no session id, no plan, nothing to resume:
         that is the mode for filing work you are already doing yourself, and it
         prints the `issues status` command to close it.
+
+        Filing checks the queue for you. When the brief names something a LIVE
+        issue already names — an invariant, an entity id — the server links the
+        two on both timelines and `create` prints the link here, before the work
+        is handed to a session. It never refuses the filing: it says what is
+        already tracked while that can still change what you do. (ISS-462 and
+        ISS-486 shipped the same acumen fix three minutes apart because nothing
+        ever said it.)
         Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first.
 
@@ -2687,6 +2695,32 @@ def issue_history_comments(comments)
   Array(comments).reject { |c| c["transition"].nil? && /\AClaude session `/.match?(c["body"].to_s) }
 end
 
+# The first words of the note the platform writes when a new issue names a symbol
+# (an invariant name, an entity id) that a LIVE issue already names — see
+# IssuesService.OverlapCommentPrefix, which is the definition; this is the copy
+# that recognises it. The note is already on both timelines by the time `create`
+# returns, so this is not a second opinion: it is the same finding, reprinted in
+# the terminal at the one moment it can still change what the filer does.
+#
+# Drifting from the server's wording costs the reprint and nothing else — the
+# link is on the timeline either way, and the plan below renders the whole
+# timeline rather than matching on this.
+ISSUE_OVERLAP_COMMENT_PREFIX = "Possible duplicate".freeze
+
+def issue_overlap_notes(comments)
+  Array(comments).map { |c| c["body"].to_s }.select { |b| b.start_with?(ISSUE_OVERLAP_COMMENT_PREFIX) }
+end
+
+# Two issues on one failure is not an error — the create succeeded and the issue
+# is real — so this reads as a finding to act on, not a failure to recover from.
+# Indented as a block so it does not read as more of the "Filed ISS-nnn" line.
+def issue_render_overlap_notes(notes)
+  return "" if notes.empty?
+  ["", "⚠ This may already be tracked:", ""].concat(
+    notes.flat_map { |n| n.split("\n").map { |line| line.empty? ? "" : "  #{line}" } + [""] }
+  ).join("\n")
+end
+
 # One timeline entry: when, who, the status transition it recorded, and the note.
 # Visibility is called out only for `shared` — that text went to the submitter,
 # so it is the one thing here a reply must stay consistent with.
@@ -2988,13 +3022,18 @@ def write_issue_plan(issue, category, comments = [])
   path
 end
 
-def write_manual_issue_plan(issue, local_paths)
+# `comments` is the freshly filed issue's timeline. Usually empty of anything a
+# session needs — but not always: the server writes the "this may already be
+# tracked" link there at create time, and a plan that drops it hands the session
+# the exact blind spot that shipped one acumen fix twice.
+def write_manual_issue_plan(issue, local_paths, comments = [])
   date = Time.now.strftime("%Y-%m-%d")
   category = issue["category"]
   path = issue_plan_path(issue, date)
   File.write(path, issue_plan_markdown(issue: issue, category: category,
                                        body: issue_manual_body_text,
                                        intro: issue_manual_plan_intro(category, date),
+                                       comments: comments,
                                        local_paths: local_paths))
   path
 end
@@ -3251,6 +3290,16 @@ def issue_file_and_start(endpoint:, form:, category:, status: "claimed", local_p
   number = issue.fetch("number")
   puts "Filed #{issue_label(issue)} (#{category})"
 
+  # The timeline as the server left it — which already carries the overlap note if
+  # this issue names something a live issue names. Read once and used twice: shown
+  # to whoever is at the terminal right now, and rendered into the plan below so the
+  # session that works this issue is told before it writes a line of code. That is
+  # the whole point: on 2026-08-05 two sessions shipped one acumen fix three minutes
+  # apart because neither was ever told the other issue existed.
+  comments = issue_fetch_comments(endpoint, number)
+  overlaps = issue_render_overlap_notes(issue_overlap_notes(comments))
+  puts overlaps unless overlaps.empty?
+
   return issue_filed_open(issue) unless claimed
 
   # --no-spawn stops HERE, before any session id or plan exists. The session
@@ -3267,7 +3316,7 @@ def issue_file_and_start(endpoint:, form:, category:, status: "claimed", local_p
   ApiClient.request(endpoint, :post, issues_path("/#{number}/comments"),
                     body: { body: issue_session_comment_body(uuid), visibility: "internal" })
 
-  path = write_manual_issue_plan(issue, local_paths)
+  path = write_manual_issue_plan(issue, local_paths, comments)
   puts "Claimed #{issue_label(issue)} → #{path}"
   puts "Session #{uuid} (reattach later with `dev issues resume #{number}`)"
 
