@@ -54,8 +54,8 @@ generated, so this routes to the insight-generation improvement session.
    for any schema change). Never edit `~/code/platform` or `~/code/playbook-admin` directly.
 3. Group related issues into one branch/PR — one root cause, one fix.
 4. Verify: a scoped `sbt` spec that FAILS without your fix, run against the isolated Docker
-   session DB (`eval "$(~/code/devops/bin/claude-db start | grep '^CONF_DB_DEV_URL=' | sed
-   's/^/export /')"`), never Mike's `:5432` and never production. For a console change, the Elm
+   session DB (`eval "$(~/code/devops/bin/claude-db start --app platform | grep '^CONF_DB_DEV_URL='
+   | sed 's/^/export /')"`), never Mike's `:5432` and never production. For a console change, the Elm
    build plus `./review.sh`. Any API Builder spec change needs explicit approval on the exact
    JSON before you implement it.
 5. Commit, push, open a DRAFT PR (`gh pr create --draft`), then mark it ready

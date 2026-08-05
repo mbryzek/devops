@@ -422,8 +422,8 @@ USAGE = <<~USAGE
         change and commits/pushes nothing. Its verdict is its exit code — 0
         nothing to update, 1 repos need updating (listed on stdout), 2 the check
         itself could not run — and it is the first step of the
-        `browserslist-update` producer's playbook (agent/bodies/browserslist-update.md),
-        which fixes what it finds as a normal PR per repo. Nothing schedules the
+        `browserslist-update` producer's playbook, which fixes what it finds as a
+        normal PR per repo. Nothing schedules the
         pushing form any more; it stays for running the sweep by hand.
         Writes data/browserslist-status.md in the openclaw workspace, which the
         morning briefing reads — in both modes, so the section does not go dark.
@@ -475,8 +475,12 @@ USAGE = <<~USAGE
         body with a paste-ready denylist entry), and opens a draft PR then
         marks it ready. One PR per repo. Skips a repo that already has an open
         dep-upgrade PR. Lib repo PRs bump the lib's own dependencies only —
-        releasing the lib stays manual (release-lib). Scheduled nightly via
-        launchd/com.bryzek.dev-dependencies.plist (see that file to install).
+        releasing the lib stays manual (release-lib). Scheduled by the
+        `dependency-upgrade` producer, which files an epic with one child issue
+        per repo; a claiming session then runs this for its own repo under a
+        lease. The launchd plist it used to run from is gone (ISS-397) — do not
+        re-add one, or the open-PR gate becomes the only thing standing between
+        you and duplicate runs.
 
     scripts [list]
         List utility scripts in devops/scripts/ with their allowed targets and
@@ -7095,7 +7099,7 @@ DEPS_EXIT_OK     = 0
 DEPS_EXIT_FAILED = 1
 # The statuses that mean "this repo's run finished". `:skipped` is deliberately
 # among them: it is the open-PR gate, and the pipeline documents that as a
-# successful, self-gating night (agent/bodies/dependency-upgrade-app.md).
+# successful, self-gating night -- see the `dependency-upgrade-app` playbook.
 DEPS_SUCCESS_STATUSES = %i[ok in_sync pr_opened skipped].freeze
 
 # Success is ASSERTED, never inferred: every repo must have reported a status
