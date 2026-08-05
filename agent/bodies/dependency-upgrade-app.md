@@ -21,6 +21,10 @@ That is the whole job, and it is deliberately not something you reimplement:
   and the next night picks the repo up.
 - It merges {child}'s outcome into `dependencies-status.json` in the day's
   workdir, which the morning briefing reads. Let it run to the end.
+- **Its exit code is the verdict** (ISS-478): 0 means {child}'s run finished —
+  a PR, an in-sync repo, or the open-PR skip. Non-zero means it did not, and the
+  last line names why. Do not close this issue `fixed` on a non-zero exit; read
+  that line, fix what it names, and rerun.
 
 Do not edit `~/code/{child}` directly, do not open a second PR by hand, and do
 not upgrade any other repo — the sibling children of this epic own those.

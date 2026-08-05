@@ -5403,9 +5403,34 @@ def codegen_workdir(run_id)
   File.join(CODEGEN_WORKDIR_ROOT, "#{CODEGEN_WORKDIR_PREFIX}.#{run_id}")
 end
 
+# HTTPS, never SSH (ISS-478). Every unattended clone in this CLI runs as the
+# agent user under launchd, where there is no ssh-agent identity and no private
+# key on disk — an SSH origin fails with "Permission denied (publickey)" and the
+# nightly sweep reports "clone failed" for a repo it can read perfectly well.
+# HTTPS is what the rest of the flow already uses: gh is logged in with `repo`
+# scope, the osxkeychain helper answers both fetch and push, and `gh pr create`
+# has always gone over it.
 def github_origin(repo_slug)
-  "git@github.com:#{repo_slug}.git"
+  "https://github.com/#{repo_slug}.git"
 end
+
+# The same rule for an origin we did not build: `browserslist update` clones from
+# whatever remote the local checkout under ~/code happens to carry, and Mike's
+# checkouts are SSH. Rewrite GitHub SSH remotes to their HTTPS form; anything
+# else (another host, an already-HTTPS url, a local path) is passed through
+# untouched.
+def github_https_url(origin)
+  case origin.to_s
+  when %r{\Agit@github\.com:(?<slug>.+?)(?:\.git)?\z}       then "https://github.com/#{$~[:slug]}.git"
+  when %r{\Assh://git@github\.com/(?<slug>.+?)(?:\.git)?\z} then "https://github.com/#{$~[:slug]}.git"
+  else origin
+  end
+end
+
+# Git must never wait on a human here: these clones run in launchd jobs and
+# headless sessions, and a credential prompt would hang the sweep for its whole
+# timeout instead of failing with a readable error.
+GIT_NONINTERACTIVE_ENV = { "GIT_TERMINAL_PROMPT" => "0" }.freeze
 
 # `Codegen::ApiConfig.load` runs `pkl eval` under the hood (via the top-level
 # `ApiConfig` class), which calls `Util.exit_with_error` (hard `exit 1`) on any
@@ -5940,6 +5965,39 @@ DEPS_CLAUDE_TIMEOUT_SECS = 90 * 60
 DEPS_CLAUDE_MODEL = "sonnet".freeze
 DEPS_DENYLIST_PATH = File.expand_path("../lib/dependencies/denylist.yml", __dir__)
 
+# The process exit code of `dependencies check` / `dependencies upgrade`
+# (ISS-478). Both used to end 0 no matter what: a night where every repo failed
+# to clone printed `[error] - clone failed` and still looked like a clean run to
+# the agent session, the cron and anything else reading `$?`. A repo that did not
+# finish is a failed run, and it has to be visible as one.
+DEPS_EXIT_OK     = 0
+DEPS_EXIT_FAILED = 1
+# The statuses that mean "this repo's run finished". `:skipped` is deliberately
+# among them: it is the open-PR gate, and the pipeline documents that as a
+# successful, self-gating night (agent/bodies/dependency-upgrade-app.md).
+DEPS_SUCCESS_STATUSES = %i[ok in_sync pr_opened skipped].freeze
+
+# Success is ASSERTED, never inferred: every repo must have reported a status
+# from the list above. A status this does not recognise — a new one, or
+# `:needs_attention` from a Claude session that timed out without a PR — is a run
+# nobody can call finished, so it exits non-zero rather than being counted as
+# fine because it was not explicitly an error. An empty results hash means no
+# repo was processed at all, which is never evidence of a healthy sweep.
+def dependencies_exit_code(results)
+  return DEPS_EXIT_FAILED if results.empty?
+  results.all? { |_, r| DEPS_SUCCESS_STATUSES.include?(r[:status]) } ? DEPS_EXIT_OK : DEPS_EXIT_FAILED
+end
+
+# Printed under the summary so the non-zero exit says which repos caused it —
+# the summary lines scroll away in a nightly log, the verdict is the last line.
+def dependencies_verdict(results, code)
+  return "All #{results.length} repo(s) completed" if code == DEPS_EXIT_OK
+  return "No repos were processed — nothing was concluded" if results.empty?
+
+  failed = results.reject { |_, r| DEPS_SUCCESS_STATUSES.include?(r[:status]) }.keys.sort
+  "#{failed.length} repo(s) did not complete: #{failed.join(', ')}"
+end
+
 # Returns the app names to process: every `--app` given (validated, deduped),
 # or all known apps when none was passed.
 def parse_dependencies_args(argv, command_key)
@@ -5999,8 +6057,7 @@ end
 def dependencies_detect(app, clone, workdir, denylist)
   ok, out = run_step(dependencies_sbt_cmd(clone, workdir), clone, false, +"")
   unless ok && out.to_s.include?("[success]")
-    tail = out.to_s.split("\n").last(15).join("\n")
-    return { status: :error, error: "sbt dependencyUpdates failed:\n#{tail}" }
+    return { status: :error, error: "sbt dependencyUpdates failed:\n#{last_lines(out, 15)}" }
   end
   updates = Dependencies::Updates.parse_report(out)
   Dependencies::Updates.apply_policy(updates, denylist, app).merge(status: :ok)
@@ -6014,12 +6071,13 @@ def cmd_dependencies_check(argv)
   results = {}
   apps.each do |app|
     puts "  #{app}: cloning + running sbt dependencyUpdates…"
-    clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
+    log = +""
+    clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, log)
     results[app] =
       if clone
         dependencies_detect(app, clone, workdir, denylist)
       else
-        { status: :error, error: "clone failed" }
+        { status: :error, error: clone_failed_error(log) }
       end
   end
   puts ""
@@ -6038,6 +6096,17 @@ def cmd_dependencies_check(argv)
     r[:held].each { |h| puts "    held back: #{h[:group]}:#{h[:artifact]} #{h[:current]} -> #{h[:target]} (#{h[:reason]})" }
     r[:skipped].each { |s| puts "    no stable target: #{s[:group]}:#{s[:artifact]} #{s[:current]} (candidates: #{s[:candidates].join(', ')})" }
   end
+  dependencies_finish(results)
+end
+
+# The last thing both dependencies commands do: state the verdict and exit with
+# it. Nothing runs after this, by design — an exit code that is only printed is
+# an exit code nobody checks.
+def dependencies_finish(results)
+  code = dependencies_exit_code(results)
+  puts ""
+  puts dependencies_verdict(results, code)
+  exit code
 end
 
 # One repo, end to end: clone, gate on an already-open dep-upgrade PR, branch
@@ -6045,8 +6114,9 @@ end
 # session that must end with a review-ready PR. Mirrors codegen's run_repo.
 def dependencies_upgrade_one(app, workdir, branch, denylist, &announce)
   note = ->(msg) { announce&.call(msg) }
-  clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
-  return { status: :error, error: "clone failed" } unless clone
+  clone_log = +""
+  clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, clone_log)
+  return { status: :error, error: clone_failed_error(clone_log) } unless clone
 
   if (pr = open_pr_with_prefix(clone, DEPS_BRANCH_PREFIX))
     return { status: :skipped, error: "an open dep-upgrade PR already exists (#{pr}) — merge or close it first" }
@@ -6102,7 +6172,11 @@ def cmd_dependencies_upgrade(argv)
     line << " (held back: #{held.map { |h| "#{h[:group]}:#{h[:artifact]}" }.join(', ')})" unless held.empty?
     puts line
   end
+  # Status file first: it is what the morning briefing reads, and it has to be on
+  # disk even when the run ends non-zero — a failed night is exactly the one the
+  # briefing must be able to describe.
   write_dependencies_status_json(workdir, results)
+  dependencies_finish(results)
 end
 
 # dependencies-status.json in workdir, same idea as codegen-sync-status.json:
@@ -6652,18 +6726,24 @@ def git_clean?(path)
   status.success? && out.strip.empty?
 end
 
-def run_step(cmd, path, verbose, captured_log)
+def run_step(cmd, path, verbose, captured_log, env: {})
   if verbose
-    ok = system(*cmd, chdir: path)
+    ok = system(env, *cmd, chdir: path)
     [ok, nil]
   else
-    out, status = Open3.capture2e(*cmd, chdir: path)
+    out, status = Open3.capture2e(env, *cmd, chdir: path)
     # Subprocess output can contain arbitrary bytes; scrub so one malformed
     # byte can't crash the regex/string matching every caller does on it.
     out = Util.to_utf8(out)
     captured_log << out
     [status.success?, out]
   end
+end
+
+# Last `n` non-blank lines of a captured subprocess log: enough to say WHY a step
+# failed in a one-repo summary line without pasting a whole sbt run into it.
+def last_lines(out, n)
+  out.to_s.split("\n").reject { |line| line.strip.empty? }.last(n).to_a.join("\n")
 end
 
 def report_repo_line(name, status, detail, verbose)
@@ -7234,15 +7314,30 @@ def cmd_prune_plans(args)
   puts "#{CLAUDE_ROOT} picks the deletions up on its next pull."
 end
 
-# Shared shallow-clone-into-workdir idiom used by both `browserslist update`
-# and `codegen sync`: wipe any stale directory left from a prior run, then
-# `git clone --depth=1 --quiet`. Returns the clone path on success, nil on
-# failure (caller decides how to report/log it).
+# Shared shallow-clone-into-workdir idiom used by `browserslist update`,
+# `codegen sync` and `dependencies check/upgrade`: wipe any stale directory left
+# from a prior run, then `git clone --depth=1 --quiet`. Returns the clone path on
+# success, nil on failure — with git's own output appended to `captured`, which
+# is the only place the reason survives (callers report it).
+#
+# The transport is forced to HTTPS and the prompt is disabled here rather than at
+# each call site: all three sweeps run unattended, and this is the single choke
+# point every one of them clones through.
 def clone_repo(origin, name, workdir, verbose, captured)
   clone_path = File.join(workdir, name)
   FileUtils.rm_rf(clone_path) if File.directory?(clone_path)
-  ok, _ = run_step(["git", "clone", "--depth=1", "--quiet", origin, clone_path], workdir, verbose, captured)
+  cmd = ["git", "clone", "--depth=1", "--quiet", github_https_url(origin), clone_path]
+  ok, _ = run_step(cmd, workdir, verbose, captured, env: GIT_NONINTERACTIVE_ENV)
   ok ? clone_path : nil
+end
+
+# A one-line-plus-tail reason for a failed clone. A bare "clone failed" is what
+# sent ISS-478 to a human to reproduce by hand — git's own message ("Permission
+# denied (publickey)", "Repository not found", "could not read Username") names
+# the cause, and it is already in the log clone_repo captured.
+def clone_failed_error(log)
+  tail = last_lines(log, 5)
+  tail.empty? ? "clone failed" : "clone failed: #{tail}"
 end
 
 def cmd_browserslist_update(args)
