@@ -10,7 +10,7 @@ look. Everything here exists to drain the open issue queue.
 
 | File | What it is |
 |---|---|
-| `instructions.md` | Part 1 of every session's prompt. Outcome protocol (including the close-out contract: a session files what it WORKED AROUND before it closes out), the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. It is also why a playbook never restates any of that — reaching every session, including the next playbook's, is what this file is for. |
+| `instructions.md` | Part 1 of every session's prompt. Outcome protocol (including the close-out contract: before it closes out, a session files what it WORKED AROUND and hands over what only a HUMAN can run), the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. It is also why a playbook never restates any of that — reaching every session, including the next playbook's, is what this file is for. |
 | `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
 
 ## The commands
@@ -262,3 +262,37 @@ above: every push already survives its absence, so doctor tracking it would
 just be a second, noisier way of learning what `dev agent status` and the
 tick log already say. The day a push is added with no durable record behind
 it, the answer changes and the test is what will say so.
+
+## Retiring an openclaw cron is a TWO-PARTY job, permanently
+
+Migrating a scheduled job onto the agent has a last step the agent cannot take:
+deleting the old cron from the openclaw gateway. Two independent walls, and
+neither is a gap to close.
+
+- `openclaw` is not installed on the runners at all, the same absence ISS-535
+  documents for `Agent::Notify`.
+- The agent identity lacks `operator.admin`, so even on a box that has the binary,
+  `openclaw cron rm` comes back `missing scope: operator.admin`.
+
+**Granting that scope is the wrong fix, not the pending one.** `operator.admin` is
+admin over *every* cron on the gateway, and ISS-394 deliberately left a set of
+them there: the morning-briefing fragments, `email-drafter`, and the personal and
+financial checkers. An agent credential that can delete `codegen-sync-weekly` can
+delete those too, and no amount of good intent narrows it. The gateway is
+third-party software this repo does not build, so a scoped cron-delete is not
+ours to add either.
+
+So the deletion is a human step, and the only question worth engineering is how it
+reaches the human. Not a PR description: ISS-396 put two `openclaw cron rm`
+commands in a close-out comment on 2026-08-04 and both crons were still firing a
+day later. Not `dev issues workaround` either — that files at `open`, `dev issues
+claim` offers `open`, and the agent that claimed the finding could no more run the
+commands than the two sessions before it (ISS-563).
+
+`dev issues handoff` is the mechanism: it files the commands at `needs_input`,
+which `dev issues claim` never offers and the daily nudge lists every morning
+until a human clears it. Every future cron retirement ends with that call rather
+than with a paragraph. Nothing in this repo can assert the other half — the
+gateway's cron store is not visible from here, so "the replacement exists" is
+checkable and "the old cron is gone" is not. The handoff issue is what carries
+it, and the issue staying open is the only signal that it has not happened.

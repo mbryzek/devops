@@ -26,6 +26,10 @@ Exactly one of these, always:
 | A blocker only a human can clear | `dev issues status <n> --status needs_input --comment "<the specific question>"` | `needs_input` |
 | Genuinely nothing to do | Say what you checked and why you found nothing | see §5 |
 
+The rows are about the issue you were assigned. A finished piece of work can still
+leave one command behind that no session can run — that is not a fifth row, it is
+`dev issues handoff` on top of whichever row you landed on (see below).
+
 **Never exit having done none of these.** An issue that silently ages in the
 queue is the worst outcome in this system — worse than a wrong answer, because
 nobody learns anything from it.
@@ -103,6 +107,42 @@ session hitting the same thing then recurs onto your issue instead of filing a
 second one, and the queue does not fill up with the same finding once a night.
 `--from` records the cross-reference in both directions — the finding names the
 run that hit it, and that run's timeline names the finding.
+
+### Before you close out: hand over what only a HUMAN can run
+
+The other half of the same question. A workaround is something you routed around;
+a handoff is something you finished *except* for one command you are not able to
+run at all. Both look identical from outside — a PR, a closed issue, a clean
+report — and only one of them is actually done.
+
+File it when the last step needs a **scope, a credential, or a binary no
+autonomous session has**, on any runner. The standing example is retiring an
+openclaw cron: `openclaw` is not installed on the runners, and the agent identity
+lacks `operator.admin` — which it should not be given, because that is admin over
+every cron on the gateway, including the personal and financial ones deliberately
+left there. There is no version of this you unblock by trying harder.
+
+    dev issues handoff --from <this issue's number> --key <stable-slug> \
+      --title "<the step that is still pending>" \
+      --body "<why no session can run it, and what stays broken until it does>" \
+      --command "<the exact line to paste>" \
+      --command "<one flag per command>" \
+      --url "<the PR or document these commands complete>"
+
+`--command` is the artifact. Prose describing the step is precisely what has
+already failed: ISS-396 handed over two `openclaw cron rm` calls in a close-out
+comment on 2026-08-04, both crons were still firing a day later, and the follow-up
+issue was filed at `open` with `workaround` — so an agent claimed it and could no
+more run the commands than the two sessions before it. That is why this command
+files at `needs_input` instead: `dev issues claim` never offers `needs_input`, so
+no agent can take it, and the daily nudge lists it every morning until a human
+clears it.
+
+**This is not an escape hatch for work you could do and would rather not.** The
+test is whether *any* session on *any* runner could run the command at all. If the
+answer is yes, it is your work — do it. Handing over something you were capable of
+doing is worse than the problem this solves, because it teaches the queue that
+handoffs are noise.
 
 ## 2. Gates become artifacts, not blocks
 

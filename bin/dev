@@ -91,6 +91,7 @@ INVOCATIONS = {
   "issues fix"          => 'issues fix <number> --url URL [--comment "TEXT"] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
   "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
+  "issues handoff"      => 'issues handoff --from NUMBER --key SLUG --title "TEXT" --body "TEXT" --command "CMD" [--command "CMD"]... [--url URL] [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
@@ -703,6 +704,34 @@ USAGE = <<~USAGE
         exactly as on `issues create` — a finding filed with them is one whose
         session opens into a checkout.
 
+    #{INVOCATIONS["issues handoff"]}
+        Hand a human the ONE step this session could not take — a command needing a
+        scope, a credential, or a binary no autonomous session has. Retiring an
+        openclaw cron is the standing example: `openclaw` is not installed on the
+        runners, and the agent identity lacks `operator.admin` (which it should not
+        have — that is admin over every cron on the gateway, including the personal
+        and financial ones deliberately left there).
+
+        Files at `needs_input`, not `open`, and that is the entire point.
+        `dev issues claim` only offers `open` issues, so a handoff cannot be claimed
+        by an agent that will fail on it exactly as this one did — which is what
+        happened when the same commands were filed as a workaround (ISS-563: two
+        sessions handed over two `openclaw cron rm` calls, a third claimed the
+        finding, and the crons kept firing). `needs_input` is also a standing
+        section of the daily nudge, so it arrives every morning until it is cleared.
+
+        --command is required at least once and is the artifact: the exact line to
+        paste, one flag per command. Prose describing the step is what already
+        failed twice. --url names the PR or document the commands complete, and is
+        rendered into the close-out command the issue tells the human to run.
+        --key is the dedup key, naming the PENDING STEP rather than this run, so a
+        later session blocked on the same thing recurs onto the same issue instead
+        of filing a second one. --from is the issue this session was working; it is
+        recorded in both directions.
+
+        A handoff is NOT for work you could do and would rather not. The test is
+        whether any autonomous session on any runner could run the command at all.
+
     #{INVOCATIONS["issues snooze"]}
         Defer an issue for --days N: it drops out of the queue, out of
         `issues claim`, and out of the daily nudge email until then, keeping its
@@ -953,7 +982,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent block duplicate workaround claim show status fix snooze reconcile resume],
+  "issues"       => %w[create list parent block duplicate workaround handoff claim show status fix snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -3573,7 +3602,12 @@ WORKAROUND_FINGERPRINT_PREFIX = "workaround:".freeze
 # facts: "Openclaw status path missing", "openclaw_status_path_missing" and
 # "openclaw-status-path-missing" would otherwise be three issues for one finding.
 # Narrow enough that there is only one way to write any given key.
-WORKAROUND_KEY_RE = /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/.freeze
+#
+# Shared with `issues handoff`: two commands whose keys land in the same
+# fingerprint namespace cannot afford to disagree about what a key may look like.
+# The HINT stays per-command — the rule is identical, but what a key should NAME
+# is not (what broke, vs. what is still pending).
+ISSUE_DEDUP_KEY_RE = /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/.freeze
 
 WORKAROUND_KEY_HINT =
   "lowercase words joined by hyphens, naming WHAT BROKE rather than the run that hit it " \
@@ -3675,7 +3709,7 @@ def workaround_problems(from:, key:, title:, body:, category:, severity:, leftov
   end
   if key.nil? || key.empty?
     problems << "--key is required: #{WORKAROUND_KEY_HINT}"
-  elsif !WORKAROUND_KEY_RE.match?(key)
+  elsif !ISSUE_DEDUP_KEY_RE.match?(key)
     problems << "--key '#{key}' is not a valid dedup key: #{WORKAROUND_KEY_HINT}"
   end
   problems << "--title is required (what could not be done as written)" if title.nil? || title.strip.empty?
@@ -3701,10 +3735,6 @@ end
 # The run's half. Load-bearing on a RECURRENCE specifically: nothing new is
 # created that night, so without this the run that hit the workaround again shows
 # no trace of it at all — the exact invisibility this command exists to remove.
-#
-# Best-effort, and deliberately after the create: the issue is the artifact worth
-# protecting, and losing the back-reference must not also lose the finding (or,
-# worse, leave a caller retrying a create that already succeeded).
 def workaround_note_on_source(endpoint, from, issue, title:, recurrence:)
   note =
     if recurrence
@@ -3713,6 +3743,16 @@ def workaround_note_on_source(endpoint, from, issue, title:, recurrence:)
     else
       "Worked around during this run, not fixed. Filed as #{issue_label(issue)}: #{title}"
     end
+  note_on_source_issue(endpoint, from, issue, note)
+end
+
+# Post a cross-reference comment on the issue the session was working, so the link
+# reads in both directions. Shared by `issues workaround` and `issues handoff`.
+#
+# Best-effort, and deliberately after the create: the filed issue is the artifact
+# worth protecting, and losing the back-reference must not also lose it (or, worse,
+# leave a caller retrying a create that already succeeded).
+def note_on_source_issue(endpoint, from, issue, note)
   ApiClient.request(endpoint, :post, issues_path("/#{URI.encode_www_form_component(from)}/comments"),
                     body: { body: note, visibility: "internal" })
   puts "  noted on ISS-#{from}"
@@ -3720,6 +3760,226 @@ rescue SessionExpired, ApiError => e
   warn "#{issue_label(issue)} is filed, but ISS-#{from} could not be noted (#{e.message}). " \
        "The finding is recorded; only the back-reference from ISS-#{from} is missing — " \
        "say it in that issue's close-out comment instead: #{note}"
+end
+
+# ---- issues handoff: the step only a human can take (ISS-563) ----
+#
+# Some work ends in a command no autonomous session can run: it needs a scope, a
+# credential, or a binary that exists only on Mike's laptop. Retiring an openclaw
+# cron is the standing example — `openclaw` is not installed on the runners at all
+# (the same absence ISS-535 documents for `Agent::Notify`) and the agent identity
+# lacks `operator.admin`, so there is no path to the cron store by binary or by
+# scope. That is not a gap to close: `operator.admin` is admin over EVERY cron on
+# the gateway, including the personal and financial ones ISS-394 deliberately left
+# there, so the credential an agent would need is one it must not hold.
+#
+# Handing the commands over in a PR description or a close-out comment does not
+# work, and the failure is recorded rather than hypothetical: ISS-396 handed over
+# two `openclaw cron rm` commands on 2026-08-04 and both crons were still firing a
+# day later, against code that had been retired around them.
+#
+# The reason the FIRST attempt to fix that also failed is the one worth encoding.
+# ISS-563 was filed with `issues workaround`, which files at `open` — and `open`
+# means "an agent may claim this". An agent did, and could no more run
+# `openclaw cron rm` than the session that filed it. A human-only step parked in
+# the agent queue gets claimed and re-deferred, indefinitely.
+#
+# So this is `issues workaround`'s sibling with the one field that matters set the
+# other way. `needs_input` is the only status that does both halves of the job:
+# `dev issues claim` never offers it, so no agent can take it; and it is a standing
+# section of the daily nudge (NotifyOpenIssuesProcessor), so it keeps arriving in
+# front of the one person who can clear it until they do.
+HANDOFF_FINGERPRINT_PREFIX = "handoff:".freeze
+
+HANDOFF_KEY_HINT =
+  "lowercase words joined by hyphens, naming the PENDING STEP rather than the run that hands it " \
+  "over (openclaw-cron-rm-check-invariants, not iss396-handoff-2026-08-05) — a key that changes " \
+  "per run dedups against nothing and files the same pending step again every time".freeze
+
+# A handoff is the tail of whatever work produced it, not a defect in it, so
+# `improvement` rather than `workaround`'s `bug`. Named categories stay available.
+HANDOFF_DEFAULT_CATEGORY = "improvement".freeze
+
+def cmd_issues_handoff(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  from = nil
+  key = nil
+  title = nil
+  body = nil
+  url = nil
+  category = nil
+  severity = nil
+  commands = []
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--from"
+      from = rest[i + 1]
+      usage_exit("--from requires an issue number", example: usage_for("issues handoff")) if from.nil?
+      i += 2
+    when "--key"
+      key = rest[i + 1]
+      usage_exit("--key requires a value", example: usage_for("issues handoff")) if key.nil?
+      i += 2
+    when "--title"
+      title = rest[i + 1]
+      usage_exit("--title requires a value", example: usage_for("issues handoff")) if title.nil?
+      i += 2
+    when "--body"
+      body = rest[i + 1]
+      usage_exit("--body requires a value", example: usage_for("issues handoff")) if body.nil?
+      i += 2
+    when "--command"
+      value = rest[i + 1]
+      usage_exit("--command requires a value", example: usage_for("issues handoff")) if value.nil?
+      commands << value
+      i += 2
+    when "--url"
+      url = rest[i + 1]
+      usage_exit("--url requires a value", example: usage_for("issues handoff")) if url.nil?
+      i += 2
+    when "--category"
+      category = rest[i + 1]
+      usage_exit("--category requires a value", example: usage_for("issues handoff")) if category.nil?
+      i += 2
+    when "--severity"
+      severity = rest[i + 1]
+      usage_exit("--severity requires a value", example: usage_for("issues handoff")) if severity.nil?
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  category = HANDOFF_DEFAULT_CATEGORY if category.nil? || category.empty?
+  problems = handoff_problems(from: from, key: key, title: title, body: body, commands: commands,
+                              category: category, severity: severity, leftover: leftover)
+  report_arg_problems("issues handoff", problems, usage_for("issues handoff"))
+
+  require_playbook_session!(use_localhost)
+
+  form = {
+    title: title,
+    category: category,
+    fingerprint: "#{HANDOFF_FINGERPRINT_PREFIX}#{key}",
+    body: handoff_body(body, from, commands),
+    # Never claimed. The move to needs_input below is what actually keeps agents
+    # off it; this only closes the window between the create and that move.
+    claim_on_create: false,
+  }
+  form[:severity] = severity if severity
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    issue = ApiClient.request(endpoint, :post, issues_path, body: form)
+    recurrence = issue["occurrence_count"].to_i > 1
+    issue = handoff_park(endpoint, issue, url)
+    if recurrence
+      puts "#{issue_label(issue)}: already handed over (occurrence #{issue['occurrence_count']}) — " \
+           "no duplicate filed. Status: #{issue['status']}."
+    else
+      puts "Filed #{issue_label(issue)} (#{category}) — #{issue['status']}, waiting on a human."
+    end
+    puts "  fingerprint: #{form[:fingerprint]}"
+    note_on_source_issue(endpoint, from, issue, handoff_note(issue, commands, recurrence: recurrence))
+    issue
+  end
+end
+
+def handoff_problems(from:, key:, title:, body:, commands:, category:, severity:, leftover:)
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  if from.nil? || from.empty?
+    problems << "--from is required (the issue this session is working — the run handing the step over)"
+  elsif !/\A\d+\z/.match?(from)
+    problems << "--from must be an issue number (563, or zero-padded 0563), not '#{from}'"
+  end
+  if key.nil? || key.empty?
+    problems << "--key is required: #{HANDOFF_KEY_HINT}"
+  elsif !ISSUE_DEDUP_KEY_RE.match?(key)
+    problems << "--key '#{key}' is not a valid dedup key: #{HANDOFF_KEY_HINT}"
+  end
+  problems << "--title is required (the step that is still pending)" if title.nil? || title.strip.empty?
+  if body.nil? || body.strip.empty?
+    problems << "--body is required (why no session can run this, and what stays broken until it runs)"
+  end
+  problems.concat(handoff_command_problems(commands))
+  unless ISSUE_MANUAL_CATEGORIES.include?(category)
+    problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')}"
+  end
+  problems << "--severity must be one of: #{ISSUE_SEVERITIES.join(', ')}" if severity && !ISSUE_SEVERITIES.include?(severity)
+  problems
+end
+
+# The commands are the whole artifact: a handoff that describes the step in prose
+# is the PR description that already failed twice. Each one has to be pasteable as
+# it stands, so a newline — which would silently break the block into unrunnable
+# fragments — is rejected rather than reflowed.
+def handoff_command_problems(commands)
+  return ["--command is required at least once (the exact command a human must run, verbatim)"] if commands.empty?
+
+  problems = []
+  problems << "--command cannot be empty" if commands.any? { |c| c.strip.empty? }
+  if commands.any? { |c| c.include?("\n") }
+    problems << "--command must be a single line; pass --command once per command"
+  end
+  problems
+end
+
+def handoff_body(body, from, commands)
+  block = commands.map { |command| "    #{command}" }.join("\n")
+  "#{body.strip}\n\n## Run these\n\n#{block}\n\n---\n\n" \
+    "Handed over from ISS-#{from}. That session could not run the commands above, and no " \
+    "autonomous session can: they need a scope, a credential, or a binary the runners do not " \
+    "have.\n\n" \
+    "Filed at `needs_input` deliberately. `dev issues claim` only ever offers `open` issues, so " \
+    "nothing here can be claimed by an agent and deferred again — which is exactly what happened " \
+    "when this kind of step was filed at `open` (ISS-563). It stays in the daily nudge every " \
+    "morning until a human clears it."
+end
+
+# Park the issue where no agent can take it. Only from `open`: a fingerprint
+# recurrence folds into whatever live issue already exists, and `fixed`/`deployed`
+# are forward of this on a one-way ladder — writing needs_input onto one of those
+# would walk it BACKWARD, which is the ISS-536 shape. `open` is both the status a
+# fresh create lands on and the one a previous run's failed park left behind, so
+# this is idempotent without being destructive.
+def handoff_park(endpoint, issue, url)
+  return issue unless issue["status"] == "open"
+
+  ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(issue['number'])}/status"),
+                    body: { status: "needs_input", visibility: "internal",
+                            comment: handoff_park_comment(issue, url) })
+rescue SessionExpired, ApiError => e
+  # The commands are already filed and visible; what is lost is the guarantee that
+  # no agent claims them. That is the entire point of the command, so it is loud.
+  warn "#{issue_label(issue)} is filed but is still `open` — moving it to needs_input failed " \
+       "(#{e.message}). An agent can claim it in that state and will not be able to run it. Run:\n" \
+       "  dev issues status #{issue['number']} --status needs_input --comment \"waiting on a human\""
+  issue
+end
+
+def handoff_park_comment(issue, url)
+  target = url && !url.strip.empty? ? url : "<the PR or document these commands complete>"
+  "Waiting on a human: the commands in this issue need a scope, a credential, or a binary no " \
+    "autonomous session has. Nothing is working it — `dev issues claim` skips `needs_input`.\n\n" \
+    "When they have been run:\n\n" \
+    "    dev issues status #{issue['number']} --status fixed --url \"#{target}\""
+end
+
+def handoff_note(issue, commands, recurrence:)
+  lead =
+    if recurrence
+      "Handed over again this run. Already tracked as #{issue_label(issue)} " \
+        "(occurrence #{issue['occurrence_count']}, #{issue['status']})"
+    else
+      "Handed over rather than done: this session could not run the step. Filed as " \
+        "#{issue_label(issue)} (#{issue['status']})"
+    end
+  "#{lead} — #{commands.length} command(s) waiting on a human:\n\n" +
+    commands.map { |command| "    #{command}" }.join("\n")
 end
 
 # Adopt an existing issue onto an epic, or detach it. The four ISS-314 follow-ups
@@ -10765,6 +11025,7 @@ when "issues"
   when "block"      then cmd_issues_block(argv)
   when "duplicate"  then cmd_issues_duplicate(argv)
   when "workaround" then cmd_issues_workaround(argv)
+  when "handoff"    then cmd_issues_handoff(argv)
   when "show"       then cmd_issues_show(argv)
   when "resume"     then cmd_issues_resume(argv)
   when "claim"      then cmd_issues_claim(argv)
