@@ -248,6 +248,53 @@ class TestDevIssues < Minitest::Test
     refute_includes claim_plan_markdown(child_club_issue, category: "graphs"), "Comment history"
   end
 
+  # ---- overlap notes ----
+  #
+  # The server writes these at create time when a new issue names a symbol a LIVE
+  # issue already names. They matter at exactly two moments: in the terminal of
+  # whoever just filed, and in the plan the session about to work it reads. ISS-462
+  # and ISS-486 shipped the same acumen fix three minutes apart because neither
+  # moment existed.
+
+  def overlap_comment
+    comment(body: "Possible duplicate: 1 live issue names the same thing as this one.\n\n" \
+                  "- ISS-462 (deployed) Run dev invariants — shares `category_all_categories_have_at_least_one_allocation_or_target`\n\n" \
+                  "Read them before working this issue.")
+  end
+
+  def test_overlap_notes_picks_out_the_servers_note_and_nothing_else
+    notes = issue_overlap_notes([comment(body: "just a note"), overlap_comment, comment(body: nil)])
+    assert_equal 1, notes.length
+    assert_includes notes.first, "ISS-462"
+  end
+
+  def test_overlap_notes_is_empty_for_an_ordinary_timeline
+    assert_empty issue_overlap_notes([comment(body: "we are on it"), comment(body: nil)])
+    assert_empty issue_overlap_notes(nil)
+  end
+
+  def test_render_overlap_notes_leads_with_the_finding_and_indents_the_body
+    out = issue_render_overlap_notes(issue_overlap_notes([overlap_comment]))
+    assert_includes out, "⚠ This may already be tracked:"
+    assert_includes out, "  Possible duplicate: 1 live issue names the same thing as this one."
+    assert_includes out, "  - ISS-462 (deployed)"
+  end
+
+  def test_render_overlap_notes_says_nothing_when_there_is_nothing_to_say
+    assert_equal "", issue_render_overlap_notes([])
+  end
+
+  # The session that works the issue is handed the plan, not the terminal output —
+  # so the link has to survive into the file, or filing and working in one session
+  # (`dev issues create`, the common case) learns nothing.
+  def test_manual_plan_carries_the_overlap_note_into_the_session_brief
+    md = issue_plan_markdown(issue: graph_issue, category: "graphs", body: "BODY",
+                             intro: issue_manual_plan_intro("graphs", "2026-08-05"),
+                             comments: [overlap_comment])
+    assert_includes md, "Possible duplicate"
+    assert_includes md, "ISS-462"
+  end
+
   # ---- issue_club_label ----
 
   def test_club_label_prefixes_parent_when_present
@@ -302,6 +349,14 @@ class TestDevIssues < Minitest::Test
   # ---- issue_plan_markdown ----
 
   # A plan as `dev issues claim` writes it: one issue, claim-flavoured intro.
+  # `issue_file_and_start` reads the freshly filed issue's timeline back: that is
+  # where the server puts the "this may already be tracked" note, and it is the
+  # only thing that gets it in front of the filer and into the session's plan.
+  # Tests that care only about the filing itself stub it empty.
+  def filed_issue_comments_path(number = "099")
+    "GET /playbook/issues/#{number}/comments?limit=101&offset=0"
+  end
+
   def claim_plan_markdown(issue, category: "graphs", body: "BODY-ORIENTATION", comments: [])
     issue_plan_markdown(issue: issue, category: category, body: body,
                         intro: issue_claim_plan_intro(category), comments: comments)
@@ -1652,7 +1707,8 @@ class TestDevIssues < Minitest::Test
   def test_file_and_start_claims_on_create_for_a_claimed_issue
     captured = nil
     define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
-    with_stubbed_api("POST /playbook/issues" => ->(body) { captured = body; { "number" => "099" } }) do
+    with_stubbed_api("POST /playbook/issues" => ->(body) { captured = body; { "number" => "099" } },
+                         filed_issue_comments_path => []) do
       capture_stdout do
         issue_file_and_start(
           endpoint: "https://example.test", form: { category: "bug" },
@@ -1667,7 +1723,8 @@ class TestDevIssues < Minitest::Test
     captured = nil
     define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for an issue nobody claimed") }
     out = nil
-    with_stubbed_api("POST /playbook/issues" => ->(body) { captured = body; { "number" => "099" } }) do
+    with_stubbed_api("POST /playbook/issues" => ->(body) { captured = body; { "number" => "099" } },
+                         filed_issue_comments_path => []) do
       out = capture_stdout do
         issue_file_and_start(
           endpoint: "https://example.test", form: { category: "bug" },
@@ -1683,7 +1740,7 @@ class TestDevIssues < Minitest::Test
   # what it needs printed is how it gets picked up.
   def test_file_and_start_prints_how_to_claim_an_open_issue
     out = nil
-    with_stubbed_api("POST /playbook/issues" => { "number" => "099" }) do
+    with_stubbed_api("POST /playbook/issues" => { "number" => "099" }, filed_issue_comments_path => []) do
       out = capture_stdout do
         issue_file_and_start(
           endpoint: "https://example.test", form: { category: "bug" },
@@ -1786,7 +1843,7 @@ class TestDevIssues < Minitest::Test
     define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
     filed = { "number" => "099", "status" => "claimed" }
     out = nil
-    with_stubbed_api("POST /playbook/issues" => filed) do
+    with_stubbed_api("POST /playbook/issues" => filed, filed_issue_comments_path => []) do
       out = capture_stdout do
         issue_file_and_start(
           endpoint: "https://example.test", form: { category: "bug" },
@@ -1806,7 +1863,7 @@ class TestDevIssues < Minitest::Test
   def test_no_spawn_prints_how_to_close_the_issue
     define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
     out = nil
-    with_stubbed_api("POST /playbook/issues" => { "number" => "099" }) do
+    with_stubbed_api("POST /playbook/issues" => { "number" => "099" }, filed_issue_comments_path => []) do
       out = capture_stdout do
         issue_file_and_start(
           endpoint: "https://example.test", form: { category: "bug" },
@@ -1816,6 +1873,69 @@ class TestDevIssues < Minitest::Test
     end
     assert_includes out, "dev issues status 099 --status fixed"
     assert_includes out, "dev issues status 099 --status open"
+  end
+
+  # ---- dev issues create: surfacing the overlap the server found ----
+
+  # The server has already written this note to both timelines by the time `create`
+  # returns. Reprinting it here is what puts it in front of the filer while filing
+  # is still the thing they are doing — ISS-486 was filed, claimed and fixed without
+  # anyone learning that ISS-462 was mid-fix on the identical failure.
+  def test_file_and_start_prints_the_overlap_the_server_recorded
+    define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
+    out = nil
+    with_stubbed_api("POST /playbook/issues" => { "number" => "099" },
+                     filed_issue_comments_path => [overlap_comment]) do
+      out = capture_stdout do
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "claimed", spawn_session: false
+        )
+      end
+    end
+    assert_includes out, "⚠ This may already be tracked:"
+    assert_includes out, "ISS-462"
+  end
+
+  def test_file_and_start_says_nothing_extra_when_nothing_overlaps
+    define_singleton_method(:write_manual_issue_plan) { |*| flunk("wrote a plan for a session that will not run") }
+    out = nil
+    with_stubbed_api("POST /playbook/issues" => { "number" => "099" },
+                     filed_issue_comments_path => []) do
+      out = capture_stdout do
+        issue_file_and_start(
+          endpoint: "https://example.test", form: { category: "bug" },
+          category: "bug", status: "claimed", spawn_session: false
+        )
+      end
+    end
+    refute_includes out, "already be tracked"
+  end
+
+  # The spawning path is the one that matters most: `dev issues create` files and
+  # hands the work straight to a session, and that session reads the PLAN, not the
+  # terminal. Stopped at the plan write rather than stubbing `exec` — nothing in a
+  # test run should be one missed override away from replacing itself with Claude.
+  def test_file_and_start_hands_the_overlap_note_to_the_session_plan
+    captured = nil
+    stop = Class.new(StandardError)
+    define_singleton_method(:write_manual_issue_plan) do |_issue, _paths, comments = []|
+      captured = comments
+      raise stop
+    end
+    assert_raises(stop) do
+      with_stubbed_api("POST /playbook/issues" => { "number" => "099" },
+                       filed_issue_comments_path => [overlap_comment],
+                       "POST /playbook/issues/099/comments" => {}) do
+        capture_stdout do
+          issue_file_and_start(
+            endpoint: "https://example.test", form: { category: "bug" },
+            category: "bug", status: "claimed"
+          )
+        end
+      end
+    end
+    assert_includes issue_overlap_notes(captured).first.to_s, "ISS-462"
   end
 
   # ---- dev issues list (read-only) ----
