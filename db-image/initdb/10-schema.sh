@@ -39,6 +39,21 @@ echo "[10-schema] Loading journal partition/queue settings..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$DB_NAME" \
     -f /schema/journal-settings.sql
 
+# The rows the migrations replayed at build time INSERTED. schema.sql is
+# --schema-only and carries none of them, while sem-tracking.sql above records
+# those same scripts as applied -- so without this every data migration is
+# recorded as done in a session database whose rows it never wrote, and
+# `claude-db sync` will never re-run it. That is what left agent.agent_producers
+# and agent.agent_producer_playbooks empty in every session DB (ISS-559) while
+# the specs that read them failed on unmodified main.
+#
+# After seed.sql because a migration's rows may reference a seeded tenant, and
+# before the partition maintenance below because the dump is --disable-triggers
+# and so needs no partition to exist. Empty when built at the baseline tag.
+echo "[10-schema] Loading rows inserted by migrations..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$DB_NAME" \
+    -f /schema/migration-data.sql
+
 # The baked dump carries the partitions that existed when the image was BUILT, and journal
 # partitions are per-period. An image cut in July has no August partition, so on August 1st every
 # session database cloned from it fails every insert into a journaled table with

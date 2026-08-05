@@ -92,7 +92,30 @@ port, applies the baseline plus its tracking and journal rows, transfers
 ownership to the app role, then runs `sem-apply` for only the scripts added
 between the baseline and the target tag — `sem-apply` rather than raw `psql`, so
 the tracking rows are recorded exactly as a real database would record them. The
-result is dumped and baked.
+result is dumped and baked: the schema (`--schema-only`), the SEM tracking rows,
+`journal.settings`, and **`migration-data.sql` — every row the delta scripts
+inserted**.
+
+That last artifact is not an optimization, it closes a silent hole. The schema
+dump carries no rows while the tracking dump says those scripts ran, so a data
+migration used to land in every session database as "applied, but its rows are
+not here" — and because SEM considers it applied, `claude-db sync` never re-runs
+it. `agent.agent_producers` and `agent.agent_producer_playbooks` were empty in
+every session DB for exactly this reason, and the two specs asserting the seeded
+registry failed on unmodified `main` (ISS-559). The dump is the whole database
+rather than a keep-list, which is safe precisely because the scratch database
+started from a `--schema-only` baseline: the only rows in it are the ones the
+delta scripts wrote, so no production row can reach the image this way. Schema
+`journal` and the two SEM tables are excluded — they are dumped and applied at
+their own steps.
+
+**When you re-cut a baseline past a data migration, `--keep-data` the tables it
+seeded.** A baseline is cut from a production snapshot with all data dropped, so
+rows a migration inserted *before* the new baseline tag are dropped with
+everything else and no delta script remains to re-insert them. That is a
+deliberate operator decision rather than something the tooling can infer,
+because the same tables may also hold production rows that must never be
+committed to git.
 
 `docker/seed.sql` is baked as-is either way. It is **hand-curated, never
 generated**: the image is pushed to a shared registry and cloned into every
