@@ -345,4 +345,27 @@ class TestDevAidirs < Minitest::Test
       return git_slug(dir)
     end
   end
+
+  # ================================================================
+  # What prune is even allowed to look at.
+  # ================================================================
+
+  # ~/code/ai holds the session tooling's own state alongside the feature dirs —
+  # .claude-db-ports.json, and .claude-db-schema (the schema clone claude-db
+  # keeps at origin/main). Neither has a branch or a PR behind it, so neither is
+  # a feature dir: classifying them puts a line in the daily briefing for
+  # something nobody is working on, and reaping one throws away a cache.
+  def test_prunable_dirs_skip_tooling_state_and_symlinks
+    Dir.mktmpdir do |root|
+      FileUtils.mkdir_p(File.join(root, "i545_cwh"))
+      FileUtils.mkdir_p(File.join(root, ".claude-db-schema", "platform-postgresql"))
+      File.write(File.join(root, ".claude-db-ports.json"), "{}")
+      File.write(File.join(root, "loose.txt"), "")
+      FileUtils.mkdir_p(File.join(root, "target"))
+      File.symlink(File.join(root, "target"), File.join(root, "linked"))
+
+      assert_equal [File.join(root, "i545_cwh"), File.join(root, "target")],
+                   prunable_ai_dirs(root)
+    end
+  end
 end

@@ -44,13 +44,39 @@ class DbApp
   SCRIPTS_DIR   = "scripts".freeze
   SEM_SCRIPTS_TABLE = "schema_evolution_manager.scripts".freeze
 
-  attr_reader :name, :database, :role, :repo_dir
+  attr_reader :name, :database, :role, :repo_dir, :repo_source
 
-  def initialize(name:, database:, role:, repo_dir:)
+  # Where `repo_dir` CAME FROM, which is a different question from what it is —
+  # and the one that decides whether the tooling may replace it:
+  #
+  #   :explicit  --repo-dir, or a direct construction: the caller named it.
+  #   :cwd       the command was run inside this app's schema repo.
+  #   :sibling   a clone of it sits next to the cwd (a feature dir's own).
+  #   :default   nothing pointed anywhere, so ~/code/<app>-postgresql was
+  #              assumed. NOBODY chose this one, which is what makes it the only
+  #              one safe to swap out — see SchemaMirror.
+  #   :mirror    the tooling's own clone, pinned to origin/main.
+  REPO_SOURCES = [:explicit, :cwd, :sibling, :default, :mirror].freeze
+
+  def initialize(name:, database:, role:, repo_dir:, repo_source: :explicit)
+    # Fail loud on a typo. A misspelled source is not inert: `claude-db` decides
+    # whether it may substitute a current checkout by comparing against
+    # :default, so an unrecognised symbol would silently turn the substitution
+    # off and take the stale-checkout bug back with it.
+    unless REPO_SOURCES.include?(repo_source)
+      raise ArgumentError, "unknown repo_source #{repo_source.inspect} (one of #{REPO_SOURCES.join(', ')})"
+    end
     @name = name
     @database = database
     @role = role
     @repo_dir = repo_dir
+    @repo_source = repo_source
+  end
+
+  # The same app reading its schema from somewhere else.
+  def with_repo_dir(dir, repo_source:)
+    DbApp.new(:name => name, :database => database, :role => role,
+              :repo_dir => dir, :repo_source => repo_source)
   end
 
   # ── construction ──────────────────────────────────────────────────────────
@@ -66,7 +92,7 @@ class DbApp
 
   # `repo_dir` overrides the ~/code checkout — a release (or a feature branch
   # under ~/code/ai) builds from the checkout it is running in, not Mike's.
-  def DbApp.load(name, repo_dir: nil)
+  def DbApp.load(name, repo_dir: nil, repo_source: nil)
     base = DbApp.base_name(name)
     config = Config.load(base)
     scala = config.scala
@@ -78,7 +104,8 @@ class DbApp
       :name => base,
       :database => db.name,
       :role => db.user,
-      :repo_dir => repo_dir || DbApp.default_repo_dir(base)
+      :repo_dir => repo_dir || DbApp.default_repo_dir(base),
+      :repo_source => repo_source || (repo_dir ? :explicit : :default)
     )
   end
 
@@ -142,9 +169,16 @@ class DbApp
     name ||= cwd_name
     return nil if name.nil?
     base = DbApp.base_name(name)
-    repo_dir ||= DbApp.cwd_repo_dir(dir) if base == cwd_name
-    repo_dir ||= DbApp.sibling_repo_dir(base, dir)
-    DbApp.load(name, :repo_dir => repo_dir)
+    source = repo_dir ? :explicit : nil
+    if repo_dir.nil? && base == cwd_name
+      repo_dir = DbApp.cwd_repo_dir(dir)
+      source = :cwd if repo_dir
+    end
+    if repo_dir.nil?
+      repo_dir = DbApp.sibling_repo_dir(base, dir)
+      source = :sibling if repo_dir
+    end
+    DbApp.load(name, :repo_dir => repo_dir, :repo_source => source)
   end
 
   # Every app with a scala database config AND a schema repo checked out. The
@@ -357,6 +391,41 @@ class DbApp
     require_repo!
     out = Dir.chdir(repo_dir) { `git rev-list --count HEAD..origin/main 2>/dev/null`.strip }
     out =~ /\A\d+\z/ ? out.to_i : nil
+  end
+
+  # Every migration script origin/main carries, or nil when that cannot be read
+  # (no origin, no main, never fetched). Read from the REF, not the working
+  # tree, so it costs nothing beyond the fetch repo_fetch_origin already did.
+  def origin_scripts
+    require_repo!
+    out = Dir.chdir(repo_dir) {
+      `git ls-tree --name-only origin/main -- #{SCRIPTS_DIR}/ 2>/dev/null`
+    }
+    names = out.split("\n").map { |p| File.basename(p.strip) }.select { |f| f.end_with?(".sql") }
+    # A schema repo always has scripts, so an empty answer means the ref did not
+    # resolve rather than "main has no migrations" — and reporting that as "you
+    # are missing nothing" is the exact false green this exists to remove.
+    names.empty? ? nil : names.sort
+  end
+
+  # Migrations origin/main has that THIS CHECKOUT does not, or nil when the
+  # comparison cannot be made.
+  #
+  # This is the drift that actually costs something, and it is not the same
+  # thing as repo_behind_origin: a checkout twenty commits behind on README
+  # edits runs a perfectly good test suite, while one commit behind on a script
+  # is a wall of red. Syncing a database matches it to a CHECKOUT, so whatever
+  # is in this list is missing from the database too — and it surfaces later as
+  # a missing relation or a not-null violation that reads like the branch's
+  # fault (ISS-545, ISS-276).
+  #
+  # One-directional on purpose: a script the checkout has and main does not is
+  # this branch's own migration, which is the normal case and not drift.
+  def missing_scripts_vs_origin
+    origin = origin_scripts
+    return nil if origin.nil?
+    have = repo_scripts.to_set
+    origin.reject { |f| have.include?(f) }
   end
 
   # ── docker / postgres, scoped to this app ─────────────────────────────────
