@@ -388,7 +388,8 @@ def run_result(profile, dry_run)
   Util.exit_with_error("Config file not found: #{config_path}") unless File.exist?(config_path)
   config = ApiConfig.new(config_path)
 
-  sources = build_spec_sources(config, Dir.pwd)
+  # `result` has one root by definition — it generates from this repo's own config.
+  sources = build_spec_sources([[config, Dir.pwd]])
   applications = collect_result_applications(config, sources)
   if applications.empty?
     Util.exit_with_error("No applications in #{config_path} bind the play_controller generator")
@@ -793,28 +794,65 @@ def source_project_name(source)
   end
 end
 
-# Payload sources for THIS repo's own specs (all apps in the config, ignoring
-# --app/--group filters: a filtered-out app can still be needed as import context).
-def local_spec_paths(config, project_root)
-  label = "working tree (#{project_root == Dir.pwd ? '.' : project_root})"
+# Payload sources for THIS repo's own spec files, across every codegen root the
+# repo owns (all apps in each config, ignoring --app/--group filters: a
+# filtered-out app can still be needed as import context). The repo root is first
+# in `roots`, so it wins any app a nested root also names — same repo, one answer.
+def local_spec_paths(roots)
   paths = {}
-  config.blocks.each do |block|
-    block.applications.each do |app|
-      fp = File.join(project_root, app.file_path)
-      paths[[block.org, app.key]] ||= { path: fp, root: project_root, label: label } if File.exist?(fp)
+  roots.each do |config, project_root|
+    label = "working tree (#{project_root == Dir.pwd ? '.' : project_root})"
+    config.blocks.each do |block|
+      block.applications.each do |app|
+        fp = File.join(project_root, app.file_path)
+        paths[[block.org, app.key]] ||= { path: fp, root: project_root, label: label } if File.exist?(fp)
+      end
     end
   end
   paths
 end
 
-# The full resolution chain for one codegen root.
-def build_spec_sources(config, project_root)
-  siblings = sibling_spec_paths(project_root)
+# The full resolution chain for the whole invocation — every codegen root shares
+# one chain, resolved from the repo root that owns the top-level .api/config.pkl.
+#
+# A nested root is a second OUTPUT location for the same repo, never a second
+# repo, so it must never resolve a spec differently from its parent. Deriving the
+# chain from the nested directory did exactly that: sibling_spec_paths gates on
+# an ai/<feature>/<repo> layout, and for <repo>/playwright the "feature dir" is
+# the REPO, whose parent is the workspace rather than `ai`. The gate failed, no
+# siblings were found, and the nested client was generated from the ~/code
+# producers at origin/main while the repo's own client was generated from the
+# branch — two spec snapshots, one command, no warning (ISS-444).
+def build_spec_sources(roots)
+  repo_root = owning_repo_root(roots.first.last)
+  siblings = sibling_spec_paths(repo_root)
   SpecSources.new(
-    local: local_spec_paths(config, project_root),
+    local: local_spec_paths(roots),
     siblings: siblings,
-    producers: ApiProducers.new(exclude: local_repo_names(project_root, siblings)),
+    producers: ApiProducers.new(exclude: local_repo_names(repo_root, siblings)),
   )
+end
+
+# The repo that owns a codegen root: the parent directory when its config names
+# this one in `nestedConfigs`, otherwise the root itself. Running `api` from
+# INSIDE <repo>/playwright is the other way to trip ISS-444 — the run has one
+# root, the nested one, and anchoring the chain on it is one directory too deep
+# for sibling_spec_paths' ai/<feature>/<repo> gate. Costs nothing in the normal
+# case: a repo root's parent (the feature dir, ~/code) holds no `.api/config.pkl`,
+# so no pkl is evaluated. A parent whose config will not evaluate is not this
+# run's problem — fall back to the root, as if it had no parent.
+def owning_repo_root(dir)
+  parent = File.dirname(dir)
+  parent_config = File.join(parent, ".api", "config.pkl")
+  return dir unless File.exist?(parent_config)
+
+  nested = begin
+             ApiConfig.new(parent_config, base_dir: parent).nested_configs
+           rescue SystemExit, StandardError => e
+             Util.warning("Skipping nested-root check against #{parent_config}: #{e.message}")
+             []
+           end
+  nested.any? { |rel| File.expand_path(rel, parent) == File.expand_path(dir) } ? parent : dir
 end
 
 # Closes the payload set under imports: for every import of every payload already in
@@ -1018,80 +1056,86 @@ end
 def run_batch(profile, operations, app_filter, group_filter)
   roots = resolve_config_roots(Dir.pwd)
   if roots.size > 1
-    puts "==> #{roots.size} codegen roots: #{roots.map { |_, dir| dir == Dir.pwd ? "." : Pathname.new(dir).relative_path_from(Pathname.new(Dir.pwd)).to_s }.join(', ')}"
+    puts "==> #{roots.size} codegen roots: #{roots.map { |_, dir| root_label(dir) }.join(', ')}"
   end
 
   validate_filters(roots.map { |config, _| config }, app_filter, group_filter)
 
-  roots.each do |config, project_root|
-    run_batch_for_config(profile, operations.dup, app_filter, group_filter, config, project_root)
-  end
-end
-
-def run_batch_for_config(profile, operations, app_filter, group_filter, config, project_root)
   if operations.empty?
     operations = ["codegen"]
     puts "==> Hermetic codegen (working-tree specs ride along; nothing is published)"
   end
 
   # Publish uploads only what is in this checkout — no chain, no announcement.
-  sources = operations.include?("upload") ? nil : build_spec_sources(config, project_root)
+  # One chain for every root: see build_spec_sources.
+  sources = operations.include?("upload") ? nil : build_spec_sources(roots)
 
-  client = ApibuilderClient.new(profile)
-  batch_client = ApiBatchClient.new(client)
-
-  num_orgs = config.orgs.size
-  puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}"
-
-  # Every form is built (and therefore every spec resolved) before the first
-  # batch goes out, so the source announcement is one block covering the whole
-  # run rather than a line here and there between batch progress output.
-  forms = config.orgs.map do |org|
-    puts "==> Building batch for #{org}"
-    [org, build_batch_form(config, org, operations, app_filter, group_filter, project_root, sources)]
+  # Every form of every root is built (and therefore every spec resolved) before
+  # the first batch goes out, so the source announcement is one block covering the
+  # whole run rather than a line here and there between batch progress output.
+  batches = roots.flat_map do |config, project_root|
+    num_orgs = config.orgs.size
+    where = roots.size > 1 ? " in #{root_label(project_root)}" : ""
+    puts "==> Processing #{num_orgs} #{num_orgs == 1 ? 'organization' : 'organizations'}#{where}"
+    config.orgs.map do |org|
+      puts "==> Building batch for #{org}"
+      { config: config, project_root: project_root, org: org,
+        form: build_batch_form(config, org, operations, app_filter, group_filter, project_root, sources) }
+    end
   end
   sources&.announce
 
-  forms.each do |org, form|
-    next if form["applications"].empty?
+  client = ApibuilderClient.new(profile)
+  batch_client = ApiBatchClient.new(client)
+  batches.each { |batch| submit_batch(batch_client, operations, batch) }
+end
 
-    num_apps = form["applications"].size
-    puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
-    batch = batch_client.create_batch(org, form)
-    batch_id = batch["id"]
-    puts "==> Batch #{batch_id} created, polling for processing to begin..."
+# How a codegen root is printed: "." for the repo root, otherwise its path
+# relative to it.
+def root_label(dir)
+  dir == Dir.pwd ? "." : Pathname.new(dir).relative_path_from(Pathname.new(Dir.pwd)).to_s
+end
 
-    result = batch_client.poll_until_complete(org, batch_id)
+def submit_batch(batch_client, operations, batch)
+  config, project_root, org, form = batch.values_at(:config, :project_root, :org, :form)
+  return if form["applications"].empty?
 
-    case result["status"]
-    when "error"
-      $stderr.puts ""
-      $stderr.puts "=" * 60
-      errors = result["errors"] || []
-      $stderr.puts "Batch failed with #{errors.size} error(s):"
-      errors.each do |err|
-        parts = [err["application_key"], err["generator_key"]].compact.join("/")
-        $stderr.puts "  - #{parts}: #{err["message"]}"
+  num_apps = form["applications"].size
+  puts "==> Submitting batch to #{org} (#{num_apps} #{num_apps == 1 ? 'application' : 'applications'}, operations: #{operations.join(', ')})"
+  created = batch_client.create_batch(org, form)
+  batch_id = created["id"]
+  puts "==> Batch #{batch_id} created, polling for processing to begin..."
+
+  result = batch_client.poll_until_complete(org, batch_id)
+
+  case result["status"]
+  when "error"
+    $stderr.puts ""
+    $stderr.puts "=" * 60
+    errors = result["errors"] || []
+    $stderr.puts "Batch failed with #{errors.size} error(s):"
+    errors.each do |err|
+      parts = [err["application_key"], err["generator_key"]].compact.join("/")
+      $stderr.puts "  - #{parts}: #{err["message"]}"
+    end
+    $stderr.puts "=" * 60
+    exit 1
+  when "done"
+    puts "==> Batch #{batch_id} completed"
+
+    if operations.include?("codegen") && result["zip_file"].nil?
+      $stderr.puts "WARNING: Batch completed but no zip_file in response. Full result: #{JSON.generate(result.reject { |k,_| k == "applications" })}"
+    end
+
+    if operations.include?("codegen") && result["zip_file"]
+      zip_url = result["zip_file"]["url"]
+      puts "==> Downloading generated code..."
+      zip_data = batch_client.download_zip(zip_url)
+      if zip_data.nil?
+        Util.exit_with_error("Batch completed but zip has expired. Please re-run.")
       end
-      $stderr.puts "=" * 60
-      exit 1
-    when "done"
-      puts "==> Batch #{batch_id} completed"
-
-      if operations.include?("codegen") && result["zip_file"].nil?
-        $stderr.puts "WARNING: Batch completed but no zip_file in response. Full result: #{JSON.generate(result.reject { |k,_| k == "applications" })}"
-      end
-
-      if operations.include?("codegen") && result["zip_file"]
-        zip_url = result["zip_file"]["url"]
-        puts "==> Downloading generated code..."
-        zip_data = batch_client.download_zip(zip_url)
-        if zip_data.nil?
-          Util.exit_with_error("Batch completed but zip has expired. Please re-run.")
-        end
-        puts "==> Extracting files..."
-        extract_zip(zip_data, config, project_root)
-      end
+      puts "==> Extracting files..."
+      extract_zip(zip_data, config, project_root)
     end
   end
 end
