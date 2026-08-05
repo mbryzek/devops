@@ -921,14 +921,16 @@ USAGE = <<~USAGE
     #{INVOCATIONS["agent gc"]}
         Apply the retention rules: tick/producer logs 30 days, a terminal issue's
         logs 14 days, a failed one's 30 (the post-mortem window), agent
-        workspaces 7 days. One third of what `agent maintenance` runs.
+        workspaces 7 days. One of the chores `agent maintenance` runs.
 
     #{INVOCATIONS["agent maintenance"]}
-        This machine's own housekeeping — `agent gc`, `aidirs prune` and
-        `docker prune` — and what the tick runs once an hour, with shorter
-        retention windows whenever free space is under the floor. Runner-local
-        by design: these delete files on THIS disk, so every machine runs its
-        own (ISS-520).
+        This machine's own housekeeping — `agent gc`, `aidirs prune`,
+        `claude-db gc` (session databases, and the containers and ports left
+        holding none) and `docker prune` — and what the tick runs once an hour,
+        with shorter retention windows whenever free space is under the floor —
+        except for session databases, whose window never shortens (ISS-588).
+        Runner-local by design: these delete files on THIS disk, so every
+        machine runs its own (ISS-520).
         Prints when it last ran, this machine's headroom, and whether a run is
         due. --dry-run says what it would do; --force runs regardless of cadence.
 

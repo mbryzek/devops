@@ -110,6 +110,52 @@ class TestDevAgentMaintenance < Minitest::Test
     end
   end
 
+  # ISS-588: the only automatic caller of `claude-db gc` in the fleet passed no
+  # `--apply`, and gc has been dry-run-by-default since e87d89e — so nothing on
+  # any runner ever reclaimed a session database, and a port was freed only when
+  # a human noticed the range was full and ran the command by hand. The flag is
+  # the assertion; the rest of this file is about chores that already had it.
+  def test_the_session_database_reap_actually_applies
+    with_agent_home do
+      recording_shell do |ran|
+        Agent::Maintenance.run(trigger: :cadence)
+        gc = ran.find { |c| c.include?("gc") }
+        refute_nil gc, "nothing reclaims session databases, containers or ports without this chore"
+        assert_equal [Agent::Paths.claude_db_bin, "gc", "--days", "3", "--apply"], gc
+      end
+    end
+  end
+
+  # The one window that deliberately does NOT shorten under pressure. Everything
+  # else these chores delete is reproducible — an image re-pulls, a feature dir
+  # re-clones — while a dropped session database is a session's test data, gone.
+  # A Postgres container is a couple of hundred MB, so a shorter window buys
+  # almost no disk in exchange for reaching further into live work; what a
+  # machine short of PORTS needs is this running at all.
+  def test_pressure_does_not_shorten_the_session_database_window
+    with_agent_home do
+      recording_shell do |ran|
+        Agent::Maintenance.run(trigger: :pressure)
+        gc = ran.find { |c| c.include?("gc") }
+        assert_equal Agent::Maintenance::CLAUDE_DB_GC_DAYS.to_s, gc[gc.index("--days") + 1]
+      end
+    end
+  end
+
+  # Both chores shell out to THIS checkout, never to whatever is on PATH: the
+  # tick fast-forwards its devops checkout on every Phase A and then runs out of
+  # it, so a chore reaching a different copy would run code nothing here updates.
+  def test_the_chores_run_this_checkouts_binaries
+    with_agent_home do
+      recording_shell do |ran|
+        Agent::Maintenance.run(trigger: :cadence)
+        ran.each do |cmd|
+          assert cmd.first.start_with?(Agent::Paths.devops_repo), "#{cmd.first} is not this checkout's"
+        end
+      end
+    end
+  end
+
   # Under pressure everything these two delete is reproducible — an image
   # re-pulls, a feature dir re-clones — so a short window costs a slow rebuild
   # rather than work.
@@ -190,7 +236,7 @@ class TestDevAgentMaintenance < Minitest::Test
 
       recording_shell(ok: false) do |_ran|
         result = Agent::Maintenance.run(trigger: :cadence)
-        assert_equal 3, result.outcomes.length
+        assert_equal 1 + Agent::Maintenance::SHELL_SOURCES.length, result.outcomes.length
         assert result.outcomes.find { |o| o.source == Agent::Maintenance::GC_SOURCE }.ok,
                "a failing shell chore must not stop the in-process collection"
       end

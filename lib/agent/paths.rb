@@ -95,6 +95,13 @@ module Agent
     def instructions_file   = File.join(agent_dir, "instructions.md")
     def githooks_dir        = File.join(agent_dir, "githooks")
 
+    # THIS checkout's executables, never whatever is on PATH, for the same reason
+    # everything else here hangs off `devops_repo`: the tick fast-forwards that
+    # checkout on every Phase A and then runs out of it, so a chore that shelled
+    # out to a different copy would be running code nothing here updates.
+    def dev_bin             = File.join(devops_repo, "bin", "dev")
+    def claude_db_bin       = File.join(devops_repo, "bin", "claude-db")
+
     # ---- small IO helpers, atomic where a half-written file would confuse a
     # later tick (identity, job records, meta).
 
