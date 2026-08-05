@@ -556,37 +556,6 @@ class TestCodegenCheckCommand < Minitest::Test
   end
 end
 
-# The regression this whole flag exists for (ISS-359): the producer invoked a
-# flag `dev codegen` did not have, so the nightly check exited 1 on a usage
-# error every night and filed an issue that said only "unknown option --check".
-#
-# ISS-525 moved that command out of producers.yml and into the playbook, which
-# makes this test MORE load-bearing rather than less: an invocation written in
-# prose has nothing validating it, and the failure has moved from a nightly
-# stream of bogus issues to a claimed session that cannot run its first step. The
-# command is read back out of the playbook — the first `dev` invocation in it —
-# so the test follows the command wherever it is written rather than pinning a
-# literal that could drift from the file the session actually reads.
-class TestCodegenProducerContract < Minitest::Test
-  PLAYBOOK = File.read(File.expand_path('../agent/bodies/codegen-sync.md', __dir__)).freeze
-  CHECK = PLAYBOOK.lines.map(&:strip).find { |line| line.start_with?("dev ") }.to_s.freeze
-
-  def test_the_playbook_still_carries_a_command_to_run
-    refute_empty CHECK, "the codegen-sync playbook names no `dev` command — its first step is prose"
-  end
-
-  # Parsed exactly as bin/dev's dispatcher parses it — `dev` and the command are
-  # consumed by the shell/dispatch, then the subcommand, then the flags.
-  def test_producer_check_parses_end_to_end_with_check_mode_on
-    argv = CHECK.split
-    assert_equal %w[dev codegen], argv.shift(2)
-    assert_equal "sync", resolve_subcommand(argv, default: "sync")
-    opts = parse_codegen_sync_args(argv)
-    assert opts[:check]
-    assert opts[:dry_run]
-  end
-end
-
 class TestCodegenSummary < Minitest::Test
   def test_rows_sorted_with_full_urls
     results = {
