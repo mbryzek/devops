@@ -83,7 +83,8 @@ INVOCATIONS = {
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
-  "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--app APP --baseline-version VERSION] [--localhost]',
+  "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--duplicate-of NUMBER] [--app APP --baseline-version VERSION] [--localhost]',
+  "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
@@ -566,8 +567,22 @@ USAGE = <<~USAGE
         neither) for a code fix: they are what let `dev issues reconcile` flip the
         issue to `deployed` once that app releases past the baseline; a
         document-linked fix has neither and is advanced by hand. --comment carries
-        the question (needs_input) or a reason (dismissed). The generated plan tells
+        the question (needs_input) or a reason (dismissed). --duplicate-of NUMBER
+        records this issue as a duplicate of that one; it applies only to
+        `--status dismissed`, and `issues duplicate` is the shorter way to say it. The generated plan tells
         the fix session to call this so no session token is written into the plan file.
+
+    #{INVOCATIONS["issues duplicate"]}
+        Record NUMBER as a duplicate of --of NUMBER: it is dismissed, both issues
+        get a note, and each one shows the link from then on (`issues show`, and a
+        `(dup of ISS-<n>)` tag in lists). Sugar for
+        `issues status <n> --status dismissed --duplicate-of <m>`. Naming an issue
+        that was ITSELF absorbed links to that issue's canonical instead, so the
+        chain stays one level deep and `issues show` on the canonical lists every
+        duplicate rather than only the last hop. Reopening a duplicate clears the
+        link. Use it instead of dismissing with the reason in prose: a comment
+        leaves the two records unconnected, so the canonical issue never learns it
+        absorbed anything.
 
     #{INVOCATIONS["issues snooze"]}
         Defer an issue for --days N: it drops out of the queue, out of
@@ -800,7 +815,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent claim show status snooze reconcile resume],
+  "issues"       => %w[create list parent duplicate claim show status snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -2417,10 +2432,11 @@ end
 # returns snoozed AND awake issues. A snoozed issue is still `open`, so anything
 # that offers work to do must pass false — `POST /claims` skips snoozed issues
 # server-side, and a preview that lists them offers work the claim will refuse.
-def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil)
+def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil, duplicate_of_number: nil)
   params = { "statuses" => Array(statuses) }
   params["categories"] = category if category
   params["parent_number"] = parent_number if parent_number
+  params["duplicate_of_number"] = duplicate_of_number if duplicate_of_number
   params["is_snoozed"] = is_snoozed unless is_snoozed.nil?
   params["limit"] = limit
   params["offset"] = 0
@@ -2513,6 +2529,15 @@ end
 # refuse (ISS-244). Empty for an awake issue, and for a wake time already past:
 # `snoozed_until` is not cleared when it expires, the server just stops honoring
 # it (see InternalIssuesDao.snoozeClause).
+# Marks a dismissed issue as absorbed rather than dropped. Without it the two read
+# identically in a list, and "dismissed" is the wrong story for work that moved.
+def issue_duplicate_note(issue)
+  canonical = issue["duplicate_of"]
+  return "" if canonical.nil?
+
+  " (dup of ISS-#{canonical.fetch('number')})"
+end
+
 def issue_snooze_note(issue)
   until_at = issue["snoozed_until"]
   return "" if until_at.nil? || until_at.to_s.empty?
@@ -2531,7 +2556,7 @@ def issue_summary_line(issue, index)
   # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
   # No category here: the only caller prints these under a per-category heading.
-  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)} · #{club}#{title}"
+  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{title}"
 end
 
 # A timeline comment that moved the issue BACK to `open` from anything else is a
@@ -3345,7 +3370,27 @@ def cmd_issues_show(args)
     issue = issue_fetch(endpoint, number)
     puts issue_render_item(issue, comments: issue_fetch_comments(endpoint, number))
     puts issue_family_section(endpoint, issue)
+    puts issue_duplicate_section(endpoint, issue)
   end
+end
+
+# Both ends of the duplicate link, because either one changes how the issue should be
+# read: a dismissed duplicate is not work that was dropped, it is work that moved, and a
+# canonical issue that absorbed others is carrying more reports than its own body shows.
+def issue_duplicate_section(endpoint, issue)
+  canonical = issue["duplicate_of"]
+  return "\nDuplicate of ISS-#{canonical.fetch('number')} — #{canonical.fetch('title')} (#{canonical.fetch('status')}).\n" \
+         "Work it there; reopening this issue clears the link.\n" if canonical
+
+  # Only ever one level deep, so this single filter reaches every issue absorbed into
+  # this one rather than just the most recent hop.
+  absorbed = ApiClient.request(
+    endpoint, :get, issues_list_path(statuses: [], duplicate_of_number: issue.fetch("number"), limit: 100)
+  ) || []
+  return "" if absorbed.empty?
+
+  labels = absorbed.map { |d| "ISS-#{d.fetch('number')}" }.join(", ")
+  "\nAbsorbed #{absorbed.length} duplicate#{'s' if absorbed.length != 1}: #{labels}.\n"
 end
 
 # The epic/child context an issue's own record does not carry: an epic's children
@@ -3568,11 +3613,16 @@ def cmd_issues_status(args)
   comment = nil
   url = nil
   baseline_version = nil
+  duplicate_of = nil
   leftover = []
   i = 0
   while i < rest.length
     a = rest[i]
     case a
+    when "--duplicate-of"
+      duplicate_of = rest[i + 1]
+      usage_exit("--duplicate-of requires an issue number", example: usage_for("issues status")) if duplicate_of.nil?
+      i += 2
     when "--status"
       status = rest[i + 1]
       usage_exit("--status requires a value", example: usage_for("issues status")) if status.nil?
@@ -3611,6 +3661,9 @@ def cmd_issues_status(args)
   # detects nothing, so it is always a mistake.
   problems << "--app requires --baseline-version (the app's live release tag at fix time)" if has_app && !has_baseline
   problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
+  # Caught here as well as server-side so the mistake reads as a usage error rather than a 422:
+  # a duplicate is recorded BY dismissing it, so there is no other status it can travel with.
+  problems << "--duplicate-of only applies to --status dismissed (a duplicate is recorded by dismissing it)" if duplicate_of && !duplicate_of.empty? && status != "dismissed"
   report_arg_problems("issues status", problems, usage_for("issues status"))
 
   # Always internal, never settable from here. This command is how a Claude fix session talks to
@@ -3621,6 +3674,7 @@ def cmd_issues_status(args)
   body[:comment] = comment if comment && !comment.empty?
   body[:visibility] = "internal" if body.key?(:comment)
   body[:url] = url if url && !url.empty?
+  body[:duplicate_of_number] = duplicate_of if duplicate_of && !duplicate_of.empty?
 
   if has_app
     registry = Work::Registry.load
@@ -3646,6 +3700,79 @@ def cmd_issues_status(args)
                             body: body)
     puts "#{issue_label(res)}: status set to #{res['status']}"
     puts "  target app: #{target_app} (baseline #{baseline_version})" if has_app
+    print_duplicate_link(res)
+  end
+end
+
+# The link as the server actually stored it, which is not always the number that was
+# asked for: naming an issue that was itself absorbed links to ITS canonical instead,
+# and saying so here is the only place that collapse is visible.
+def print_duplicate_link(issue)
+  canonical = issue["duplicate_of"]
+  return if canonical.nil?
+
+  puts "  duplicate of ISS-#{canonical['number']}: #{canonical['title']}"
+end
+
+# Record one issue as a duplicate of another. Sugar for
+# `issues status <n> --status dismissed --duplicate-of <m>`, the same relationship
+# `issues reopen` has to `issues status --status open`: one PUT, no read-modify-write,
+# so there is nothing for a partial form to clobber.
+#
+# Exists because the link was previously recorded only in the prose of a dismissal
+# comment (ISS-429 into ISS-427), which left the two records unconnected: the canonical
+# issue did not know it had absorbed anything, and nothing could answer "what was
+# dismissed into this".
+def cmd_issues_duplicate(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  canonical = nil
+  comment = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--of"
+      canonical = rest[i + 1]
+      usage_exit("--of requires an issue number", example: usage_for("issues duplicate")) if canonical.nil?
+      i += 2
+    when "--comment"
+      comment = rest[i + 1]
+      usage_exit("--comment requires a value", example: usage_for("issues duplicate")) if comment.nil?
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  number = leftover.shift
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 429)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--of is required (the issue this one duplicates, e.g. 427)" if canonical.nil? || canonical.empty?
+  problems << "an issue cannot be a duplicate of itself" if number && canonical && number.sub(/\A0+/, "") == canonical.sub(/\A0+/, "")
+  report_arg_problems("issues duplicate", problems, usage_for("issues duplicate"))
+
+  require_playbook_session!(use_localhost)
+
+  body = {
+    status: "dismissed",
+    duplicate_of_number: canonical,
+    # Internal for the same reason every other write from this CLI is: an automated actor
+    # writes notes to the team, never words put in front of the club that filed the issue.
+    comment: comment && !comment.empty? ? comment : "Duplicate of ISS-#{canonical}.",
+    visibility: "internal",
+  }
+
+  handle_errors do
+    res = ApiClient.request(issue_endpoint(use_localhost), :put,
+                            issues_path("/#{URI.encode_www_form_component(number)}/status"),
+                            body: body)
+    puts "#{issue_label(res)}: dismissed as a duplicate."
+    print_duplicate_link(res)
+    puts ""
+    puts "The canonical issue now carries a note that it absorbed this one:"
+    puts "  dev issues show #{(res.dig('duplicate_of', 'number') || canonical).sub(/\A0+/, '')}"
   end
 end
 
@@ -9382,6 +9509,7 @@ when "issues"
   when "create"    then cmd_issues_create(argv)
   when "list"      then cmd_issues_list(argv)
   when "parent"    then cmd_issues_parent(argv)
+  when "duplicate" then cmd_issues_duplicate(argv)
   when "show"      then cmd_issues_show(argv)
   when "resume"    then cmd_issues_resume(argv)
   when "claim"     then cmd_issues_claim(argv)

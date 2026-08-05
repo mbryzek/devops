@@ -2221,4 +2221,107 @@ class TestDevIssues < Minitest::Test
                                body: "body", intro: "intro")
     refute_match(/EPIC/, plan)
   end
+
+  # ---------- duplicates ----------
+
+  # An issue absorbed into another one: dismissed, but carrying the link that says
+  # the work moved rather than being dropped.
+  def duplicate_issue
+    graph_issue.merge(
+      "number" => "429",
+      "status" => "dismissed",
+      "duplicate_of" => { "id" => "iss-427", "number" => "427", "title" => "Warm session stalls", "status" => "claimed" },
+    )
+  end
+
+  def test_duplicate_is_a_registered_subcommand
+    assert_includes SUBCOMMANDS["issues"], "duplicate"
+    assert INVOCATIONS.key?("issues duplicate")
+    assert_match(/dev issues duplicate/, usage_for("issues duplicate"))
+  end
+
+  def test_duplicate_requires_number
+    out, status = capture_stderr_and_exit { cmd_issues_duplicate(["--of", "427"]) }
+    assert_equal 1, status
+    assert_match(/missing issue number/, out)
+  end
+
+  def test_duplicate_requires_of
+    out, status = capture_stderr_and_exit { cmd_issues_duplicate(["429"]) }
+    assert_equal 1, status
+    assert_match(/--of is required/, out)
+  end
+
+  def test_duplicate_rejects_self_reference
+    out, status = capture_stderr_and_exit { cmd_issues_duplicate(["429", "--of", "429"]) }
+    assert_equal 1, status
+    assert_match(/cannot be a duplicate of itself/, out)
+  end
+
+  # Zero padding is cosmetic on the wire, so 429 and 0429 are the same issue and
+  # the self-check has to see through it rather than comparing strings.
+  def test_duplicate_rejects_self_reference_across_padding
+    out, status = capture_stderr_and_exit { cmd_issues_duplicate(["0429", "--of", "429"]) }
+    assert_equal 1, status
+    assert_match(/cannot be a duplicate of itself/, out)
+  end
+
+  # Valid args reach the credential guard, which proves nothing in the arg
+  # validation rejected them — the command never touches the network in tests.
+  def test_duplicate_with_valid_args_passes_arg_validation
+    out, status = capture_stderr_and_exit { cmd_issues_duplicate(["429", "--of", "427"]) }
+    assert_equal 1, status
+    refute_match(/--of is required/, out)
+    refute_match(/missing issue number/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  # The link only exists as part of closing the issue, so pairing it with any other
+  # status is a usage error rather than a round trip that comes back 422.
+  def test_status_rejects_duplicate_of_without_dismissed
+    out, status = capture_stderr_and_exit do
+      cmd_issues_status(["429", "--status", "claimed", "--duplicate-of", "427"])
+    end
+    assert_equal 1, status
+    assert_match(/--duplicate-of only applies to --status dismissed/, out)
+  end
+
+  def test_status_accepts_duplicate_of_with_dismissed
+    out, status = capture_stderr_and_exit do
+      cmd_issues_status(["429", "--status", "dismissed", "--duplicate-of", "427"])
+    end
+    assert_equal 1, status
+    refute_match(/--duplicate-of only applies/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  def test_status_usage_documents_duplicate_of
+    assert_match(/--duplicate-of NUMBER/, usage_for("issues status"))
+  end
+
+  def test_list_path_carries_the_duplicate_of_number
+    path = issues_list_path(statuses: [], duplicate_of_number: "427")
+    assert_match(/duplicate_of_number=427/, path)
+  end
+
+  def test_list_path_omits_duplicate_of_number_when_absent
+    refute_match(/duplicate_of_number/, issues_list_path(statuses: []))
+  end
+
+  # A dismissed duplicate and a dismissed dead end read identically in a list
+  # without this tag, and they are not the same outcome.
+  def test_summary_line_tags_a_duplicate
+    assert_match(/\(dup of ISS-427\)/, issue_summary_line(duplicate_issue, 1))
+  end
+
+  def test_summary_line_has_no_tag_without_a_duplicate_link
+    refute_match(/dup of/, issue_summary_line(graph_issue, 1))
+  end
+
+  def test_show_points_a_duplicate_at_its_canonical
+    section = issue_duplicate_section(nil, duplicate_issue)
+    assert_match(/Duplicate of ISS-427/, section)
+    assert_match(/Warm session stalls/, section)
+    assert_match(/reopening this issue clears the link/, section)
+  end
 end
