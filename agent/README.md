@@ -12,7 +12,7 @@ look. Everything here exists to drain the open issue queue.
 |---|---|
 | `producers.yml` | The schedule registry. The only place a schedule lives — the platform records run history but has no notion of "due". The tick pulls this checkout itself, so one push reaches every machine. |
 | `bodies/` | The playbooks a producer's issue POINTS AT (`issue.body_file`) — see "One copy of the plan" below. Without one the claiming session gets `claude-issues/default-body.md` and does generic triage instead of the job the producer was written to schedule. A `type: epic` producer shares one playbook across its children, with `{child}` substituted per child. |
-| `instructions.md` | Part 1 of every session's prompt. Outcome protocol, the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. |
+| `instructions.md` | Part 1 of every session's prompt. Outcome protocol (including the close-out contract: a session files what it WORKED AROUND before it closes out), the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. It is also why a playbook in `bodies/` never restates any of that — reaching every session, including the next playbook's, is what this file is for. |
 | `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
 
 ## The commands
