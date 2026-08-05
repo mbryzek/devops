@@ -185,6 +185,11 @@ module Agent
     # skipped. It reports on the MACHINE, not the work. A claim call cannot serve
     # this purpose — a paused or idle runner makes no claims, and "no claims" is
     # exactly what a dead machine looks like too.
+    #
+    # It also carries the job census, which is the only path by which the platform learns what this
+    # machine is actually RUNNING as opposed to what it was leased. Sent on a change or on the
+    # ten-minute floor, whichever comes first.
+    #
     # Phase A's own short lock, held across the read-POST-write so the throttle
     # file actually throttles. It guards nothing else — two concurrent Phase A
     # runs are harmless in every other respect, since extending a lease twice
@@ -192,19 +197,50 @@ module Agent
     def heartbeat_runner(identity)
       with_lock(Agent::Paths.vitals_lock) do |acquired|
         next unless acquired
-        next unless heartbeat_due?
-        next log("would POST /agent/runners/#{identity.runner_id}/heartbeat") if @dry_run
-        Agent::Api.runner_heartbeat(identity.runner_id, token: identity.token, use_localhost: @use_localhost)
-        Agent::Paths.write_atomic(Agent::Paths.heartbeat_file, "#{@now.utc.iso8601}\n", mode: 0600)
-        log("runner heartbeat sent")
+        jobs = job_census
+        last = Agent::Paths.read_json(Agent::Paths.heartbeat_file)
+        next unless heartbeat_due?(last) || census_changed?(last, jobs)
+        next log("would POST /agent/runners/#{identity.runner_id}/heartbeat (#{jobs.size} job(s))") if @dry_run
+        Agent::Api.runner_heartbeat(identity.runner_id, jobs: jobs, token: identity.token,
+                                                        use_localhost: @use_localhost)
+        Agent::Paths.write_json(Agent::Paths.heartbeat_file, { "at" => @now.utc.iso8601, "jobs" => jobs }, mode: 0600)
+        log("runner heartbeat sent (#{jobs.size} job(s))")
       end
     end
 
-    def heartbeat_due?
-      file = Agent::Paths.heartbeat_file
-      return true unless File.file?(file)
-      last = Time.parse(File.read(file).strip) rescue nil
-      last.nil? || (@now - last) >= RUNNER_HEARTBEAT_SECONDS
+    # What this machine is running, as the platform's fleet view will show it. The pid liveness
+    # check is the whole point: a lease says the platform handed out work, and only this side knows
+    # whether the process doing it still exists. `finished_unreaped` is the window between a session
+    # exiting and Phase B classifying it — ordinary and brief, and a machine that sits in it is a
+    # wedged reap rather than a busy machine.
+    def job_census
+      Agent::Jobs.all.map do |record|
+        {
+          "issue_number" => record["issue"].to_s,
+          "state" => Agent::Jobs.alive?(record["pid"]) ? "running" : "finished_unreaped",
+          "pid" => record["pid"].to_i,
+          "branch" => record["branch"],
+          "started_at" => record["started_at"],
+        }.compact
+      end.sort_by { |job| job["issue_number"] }
+    end
+
+    # The ten-minute floor. Its purpose is unchanged — proving the machine is alive when nothing
+    # else is happening — but it is now a FLOOR and not the cadence: a census change reports
+    # immediately (see census_changed?), so an idle machine stays as cheap as it ever was while a
+    # session starting or ending is visible within one tick instead of up to ten minutes later.
+    def heartbeat_due?(last)
+      at = last && last["at"]
+      return true if at.nil?
+      parsed = Time.parse(at) rescue nil
+      parsed.nil? || (@now - parsed) >= RUNNER_HEARTBEAT_SECONDS
+    end
+
+    # Compared against what was actually SENT, not against the previous tick's census: a heartbeat
+    # that failed leaves the file unwritten, so the change is still pending and the next tick
+    # retries it rather than concluding nothing happened.
+    def census_changed?(last, jobs)
+      (last && last["jobs"]) != jobs
     end
 
     def heartbeat_leases(identity)

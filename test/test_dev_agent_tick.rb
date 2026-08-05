@@ -153,6 +153,107 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- the job census (ISS-454) ----
+  #
+  # The platform knows what it LEASED; only this side knows whether the process working that lease
+  # still exists. These prove the census says so, and that reporting it does not turn the heartbeat
+  # into a per-tick write on an idle machine.
+
+  # A pid that is alive for certain, without spawning anything: this test process itself.
+  def live_pid = Process.pid
+
+  # A pid that is dead for certain: a child we reap before looking at it.
+  def dead_pid
+    pid = Process.spawn("/bin/sh", "-c", "exit 0")
+    Process.wait(pid)
+    pid
+  end
+
+  def heartbeat_once(now: Time.now)
+    body = nil
+    stubs = { "POST /agent/runners/#{RUNNER_ID}/heartbeat" => ->(b) { body = b; runner_row } }
+    with_stubbed_api(stubs) do
+      capture_stdout { tick(dry_run: false, now: now).heartbeat_runner(Agent::Host.cached_identity) }
+    end
+    body
+  end
+
+  def test_the_census_reports_pid_liveness_which_is_the_whole_point
+    with_agent_home do
+      register_identity
+      Agent::Jobs.write("issue" => 451, "pid" => live_pid, "branch" => "i451_h3o",
+                        "started_at" => Time.now.utc.iso8601)
+      Agent::Jobs.write("issue" => 452, "pid" => dead_pid, "branch" => "i452_eat",
+                        "started_at" => Time.now.utc.iso8601)
+
+      jobs = heartbeat_once.fetch(:jobs)
+      assert_equal %w[451 452], jobs.map { |j| j["issue_number"] }
+      assert_equal "running", jobs[0]["state"]
+      assert_equal "i451_h3o", jobs[0]["branch"]
+      assert_equal live_pid, jobs[0]["pid"]
+
+      # The state the admin fleet view could not see before: the lease may already be closed while
+      # this row still exists, and vice versa.
+      assert_equal "finished_unreaped", jobs[1]["state"]
+    end
+  end
+
+  def test_an_idle_machine_reports_an_empty_census_rather_than_omitting_it
+    with_agent_home do
+      register_identity
+      assert_equal [], heartbeat_once.fetch(:jobs)
+    end
+  end
+
+  def test_a_census_change_reports_immediately_instead_of_waiting_out_the_ten_minute_floor
+    with_agent_home do
+      register_identity
+      refute_nil heartbeat_once, "the first heartbeat always sends"
+
+      # Nothing changed and the floor has not elapsed: silence, which is what keeps an idle machine
+      # as cheap as it was before the census existed.
+      assert_nil heartbeat_once, "an unchanged census re-sent inside the floor"
+
+      # A session starts. That must not wait up to ten minutes to become visible.
+      Agent::Jobs.write("issue" => 454, "pid" => live_pid, "branch" => "i454_job_census",
+                        "started_at" => Time.now.utc.iso8601)
+      assert_equal %w[454], heartbeat_once.fetch(:jobs).map { |j| j["issue_number"] }
+
+      # ...and so must its ending.
+      Agent::Jobs.delete(454)
+      assert_equal [], heartbeat_once.fetch(:jobs)
+    end
+  end
+
+  def test_the_ten_minute_floor_still_fires_on_a_machine_where_nothing_changes
+    with_agent_home do
+      register_identity
+      start = Time.now
+      refute_nil heartbeat_once(now: start)
+      assert_nil heartbeat_once(now: start + 60), "sent inside the floor with no change"
+      refute_nil heartbeat_once(now: start + Agent::Tick::RUNNER_HEARTBEAT_SECONDS + 1),
+                 "an idle machine must still prove it is alive"
+    end
+  end
+
+  def test_a_failed_heartbeat_leaves_the_change_pending_so_the_next_tick_retries_it
+    with_agent_home do
+      register_identity
+      Agent::Jobs.write("issue" => 454, "pid" => live_pid, "started_at" => Time.now.utc.iso8601)
+
+      down = { "POST /agent/runners/#{RUNNER_ID}/heartbeat" => ->(_b) { raise ApiError.new("HTTP 503", code: 503) } }
+      assert_raises(ApiError) do
+        with_stubbed_api(down) do
+          capture_stdout { tick(dry_run: false).heartbeat_runner(Agent::Host.cached_identity) }
+        end
+      end
+
+      # Comparing against what was SENT rather than against the last tick's census is what makes
+      # this a retry instead of a silently dropped report.
+      assert_equal %w[454], heartbeat_once.fetch(:jobs).map { |j| j["issue_number"] }
+    end
+  end
+
   # ---- the hard timeout, enforced with no platform involved ----
 
   def test_timed_out_job_is_killed_even_when_the_platform_is_unreachable

@@ -55,8 +55,13 @@ module Agent
       request(:get, "/agent/runners", token: token, use_localhost: use_localhost) || []
     end
 
-    def runner_heartbeat(runner_id, token:, use_localhost:)
-      request(:post, "/agent/runners/#{runner_id}/heartbeat", token: token, use_localhost: use_localhost)
+    # Liveness AND the machine's job census, in one call. `jobs` is the whole list every time (full
+    # desired state), for the same reason report_registry sends every producer: the platform stores
+    # what it is told wholesale, so a session that has finished has to DISAPPEAR from the report
+    # rather than linger looking live forever.
+    def runner_heartbeat(runner_id, jobs:, token:, use_localhost:)
+      request(:post, "/agent/runners/#{runner_id}/heartbeat", token: token, use_localhost: use_localhost,
+                                                              body: { jobs: jobs })
     end
 
     def update_runner(runner_id, form, token:, use_localhost:)
