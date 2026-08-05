@@ -531,12 +531,19 @@ class TestDevIssues < Minitest::Test
   end
 
   # Regression: the body told every investigation session to close with
-  # `dev issues status --number <NNN> ...`, but the number is POSITIONAL — the
-  # parser has no `--number`, so it fell through to `leftover` and the command
-  # exited "unexpected argument(s)", leaving the suggestion stuck in `claimed`.
+  # `dev issues status --number <NNN> ...`, but on `status` the number is
+  # POSITIONAL — that parser has no `--number`, so it fell through to `leftover`
+  # and the command exited "unexpected argument(s)", leaving the suggestion stuck
+  # in `claimed`.
+  #
+  # The guard is scoped to `issues status` rather than banning the string
+  # outright: since ISS-540, `issues claim --number 078,080` is the real flag, so
+  # a blanket refute would fail a body that spells the CORRECT claim invocation.
+  ISSUES_STATUS_NUMBER_FLAG = /issues status\s+--number/
+
   def test_suggestion_body_closing_command_matches_the_real_argument_parsing
     body = issue_body_text("suggestion")
-    refute_includes body, "--number"
+    refute_match ISSUES_STATUS_NUMBER_FLAG, body
     assert_includes body, 'dev issues status <NNN> --status needs_review --comment "<your findings>"'
   end
 
@@ -544,7 +551,8 @@ class TestDevIssues < Minitest::Test
   # does not implement.
   def test_no_body_file_invents_a_number_flag
     ISSUE_CATEGORIES.each do |category|
-      refute_includes issue_body_text(category), "--number", "#{category}: invents a --number flag"
+      refute_match ISSUES_STATUS_NUMBER_FLAG, issue_body_text(category),
+                   "#{category}: invents a --number flag on `issues status`"
     end
   end
 
@@ -865,10 +873,22 @@ class TestDevIssues < Minitest::Test
     assert_match(/unexpected argument/, out)
   end
 
-  def test_claim_rejects_issues_without_value
-    out, status = capture_stderr_and_exit { cmd_issues_claim(["--issues"]) }
+  def test_claim_rejects_number_without_value
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--number"]) }
     assert_equal 1, status
-    assert_match(/--issues requires a value/, out)
+    assert_match(/--number requires a value/, out)
+  end
+
+  # `--issues` was the flag's name until ISS-540 renamed it (`dev issues claim
+  # --issues 538` said "issues" twice). It is not accepted any more, but plans
+  # and habits still spell it the old way, so it is rejected BY NAME rather than
+  # falling through to the generic "unexpected argument(s): --issues, 078" —
+  # which names the symptom and not the fix.
+  def test_claim_names_the_rename_when_given_the_old_issues_flag
+    out, status = capture_stderr_and_exit { cmd_issues_claim(["--issues", "078"]) }
+    assert_equal 1, status
+    assert_match(/--issues was renamed to --number/, out)
+    assert_match(/issues claim \[--category CATEGORY\] \[--number 078,080\]/, out)
   end
 
   # ---- selecting which open issues to claim ----
@@ -1949,7 +1969,7 @@ class TestDevIssues < Minitest::Test
         )
       end
     end
-    assert_includes out, "dev issues claim --issues 099"
+    assert_includes out, "dev issues claim --number 099"
     refute_includes out, "--status fixed"
   end
 
