@@ -1,6 +1,7 @@
 require 'time'
 require 'yaml'
 require 'agent/paths'
+require 'agent/playbook'
 require 'agent/schedule'
 
 # The producer registry: `devops/agent/producers.yml`, parsed and validated.
@@ -24,8 +25,11 @@ module Agent
 
     ISSUE_TYPES = %w[issue epic].freeze
 
-    # Substituted into a child's title, fingerprint and playbook.
-    CHILD_TOKEN = "{child}".freeze
+    # Substituted into a child's title, fingerprint and playbook. Aliased from
+    # Agent::Playbook rather than declared here: the producer writes this token
+    # into the pointer and the CLAIMING runner resolves it, so one literal has to
+    # serve both ends of that contract.
+    CHILD_TOKEN = Agent::Playbook::CHILD_TOKEN
 
     # Substituted into a fingerprint, epic or plain, and the reason it exists is
     # the wedge it prevents. An issue sits at `fixed` and then `deployed` until
@@ -50,10 +54,17 @@ module Agent
     # tick never does string substitution and a broken template fails the next
     # tick instead of at 3:45am.
     Child = Struct.new(:name, :title, :fingerprint, :category, :severity, :body_file, keyword_init: true) do
+      # `agent/bodies/x.md` — what the filed issue POINTS AT. The claiming runner
+      # re-reads this path from its own checkout, which is what keeps a child
+      # running the current procedure rather than the one that existed the night
+      # its epic was filed (ISS-505).
+      def playbook_path = Agent::Playbook.repo_relative(body_file)
+
       # The shared playbook with `{child}` resolved, so one file can carry the
       # exact command each child runs (`--app {child}`) instead of telling the
-      # session to read its own title.
-      def body_text = body_file && File.read(body_file).strip.gsub(CHILD_TOKEN, name)
+      # session to read its own title. Read at PARSE/file time only for
+      # validation — the text that reaches a session is resolved at claim time.
+      def body_text = playbook_path && Agent::Playbook.read(playbook_path, target: name)
     end
 
     Producer = Struct.new(:key, :schedule, :schedule_text, :check, :file_when, :issue, :command, :body_file,
@@ -62,10 +73,15 @@ module Agent
       def fingerprint  = issue && issue["fingerprint"]
       def epic?        = issue_type == "epic"
 
-      # The playbook this producer ships with its issue, or nil. Read at file
-      # time so an edit to the playbook takes effect on the next run without a
-      # restart — the registry is re-parsed every tick anyway.
-      def body_text = body_file && File.read(body_file).strip
+      # `agent/bodies/x.md` — what the filed issue POINTS AT rather than copies.
+      # The claiming runner re-reads this path from its own checkout, so an issue
+      # filed on Friday and claimed on Tuesday runs Tuesday's procedure (ISS-505).
+      def playbook_path = Agent::Playbook.repo_relative(body_file)
+
+      # The playbook's text on THIS machine, or nil. No longer what ships in the
+      # issue — the issue carries a pointer — but still what the abstract is
+      # derived from and what the registry validates at parse time.
+      def body_text = playbook_path && Agent::Playbook.read(playbook_path)
 
       # This run's fingerprint, with `{date}` resolved in the registry's
       # timezone. A fingerprint carrying no token is returned unchanged, which is
@@ -207,18 +223,20 @@ module Agent
       end
     end
 
-    # `issue.body_file` names a playbook that ships with the issue, resolved
-    # under `agent/` and read when the issue is filed.
+    # `issue.body_file` names a playbook the issue POINTS AT, resolved under
+    # `agent/`. The filed body carries its abstract plus the path; the claiming
+    # runner reads the full procedure from its own checkout (ISS-505).
     #
     # A file rather than an inline `body:` because the playbooks that need this
     # are long and shared: every weekly-review producer points at the SAME
     # playbook, so inlining it would mean one copy per repo, drifting the moment
     # anyone edits one of them.
     #
-    # Validated HERE, at parse time, rather than at file time. A producer with a
-    # typo'd path would otherwise stay silent until its schedule came round —
-    # `file_when: always` producers fire weekly, so the mistake would surface at
-    # 2am, a week late, as an issue whose brief is just missing.
+    # Validated HERE, at parse time, rather than at file time, and that has to
+    # STAY true now that the text is resolved later: a producer with a typo'd
+    # path would otherwise stay silent until its schedule came round —
+    # `file_when: always` producers fire weekly — and then fail on the claiming
+    # runner instead, a week late and one lease deep.
     def resolve_body_file(issue, key, path)
       return nil unless issue.is_a?(Hash)
       rel = issue["body_file"].to_s
@@ -227,6 +245,14 @@ module Agent
 
       resolved = File.expand_path(rel, Agent::Paths.agent_dir)
       raise ConfigError, "#{path}: #{key}: issue.body_file not found: #{rel}" unless File.file?(resolved)
+      # The opening heading and paragraph are what the filed issue renders in
+      # place of the procedure, so a playbook that cannot produce one would file
+      # a body that is effectively just a path — the empty box requirement 3 of
+      # ISS-505 exists to prevent.
+      unless Agent::Playbook.abstracts_cleanly?(File.read(resolved))
+        raise ConfigError, "#{path}: #{key}: issue.body_file must open with a `# Heading` and then a paragraph " \
+                           "(it is the abstract the filed issue shows): #{rel}"
+      end
       resolved
     end
 

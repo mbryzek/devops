@@ -10,6 +10,7 @@ require 'agent/jobs'
 require 'agent/notify'
 require 'agent/outcome'
 require 'agent/paths'
+require 'agent/playbook'
 require 'agent/producers'
 require 'agent/prompt'
 require 'agent/workspace'
@@ -153,7 +154,6 @@ module Agent
     end
 
     def escalate_checkout_pull_failure(result, count)
-      hostname = `hostname`.strip rescue "unknown"
       summary = "dev-agent: devops checkout pull has failed #{count} times in a row on #{hostname} (#{result.message})"
       Agent::Notify.once("checkout_pull_failing", Agent::Checkout.devops_repo, now: @now) do
         Agent::Notify.event(summary)
@@ -465,7 +465,6 @@ module Agent
     # own issue out with `dev issues status --status fixed` has already reported
     # a truer answer than a re-classification would.
     def apply_outcome(number, record, result, identity)
-      hostname = `hostname`.strip rescue "unknown"
       comment = "#{result.name} by #{hostname} — #{result.reason}"
 
       issue = begin
@@ -530,7 +529,13 @@ module Agent
                                                     now: @now, timezone: timezone)
         run_producer(producer, period_start, identity)
       end
-    rescue Agent::Producers::ConfigError => e
+    rescue Agent::Producers::ConfigError, Agent::Playbook::MissingError => e
+      # MissingError is all but unreachable — the registry validated every
+      # body_file at parse time, moments ago, at the top of this method. It is
+      # caught anyway because the alternative is worse than a missing issue:
+      # producers run BEFORE claim in Phase B, so an exception escaping here
+      # would take the claim path down with it and the machine would stop
+      # picking up work for a reason that has nothing to do with the queue.
       log("producers: #{e.message}")
     end
 
@@ -699,9 +704,9 @@ module Agent
     def child_body(producer, child)
       header = "Filed automatically by the `#{producer.key}` producer (devops/agent/producers.yml) " \
                "as one child of this run's epic."
-      playbook = child.body_text
-      return header if playbook.nil? || playbook.empty?
-      "#{header}\n\n---\n\n#{playbook}"
+      pointer = playbook_pointer(child.playbook_path, target: child.name)
+      return header if pointer.nil?
+      "#{header}\n\n---\n\n#{pointer}"
     end
 
     def producer_body(producer, output)
@@ -714,15 +719,27 @@ module Agent
           "#{header}\n\n```\n#{producer.check}\n```\n\n#{body}"
         end
 
-      # The playbook goes AFTER the evidence, because the evidence is what this
-      # particular run found and the playbook is the standing instruction for
-      # every run. A chore with no cheap check carries no evidence at all, and
-      # for those the playbook IS the brief — without it the claiming session
-      # falls back to the generic default-body triage and does a different job
-      # than the one the producer was written to schedule.
-      playbook = producer.body_text
-      return evidence if playbook.nil? || playbook.empty?
-      "#{evidence}\n\n---\n\n#{playbook}"
+      # The playbook POINTER goes AFTER the evidence, because the evidence is
+      # what this particular run found — run-specific, so it stays inline
+      # forever — and the playbook is the standing instruction for every run.
+      #
+      # A pointer rather than the text (ISS-505): the claiming runner reads the
+      # procedure from its own devops checkout, so an issue that sits in the
+      # queue for four days runs the CURRENT playbook rather than the copy that
+      # existed the night it was filed. What stays inline is the abstract, so
+      # the issue still reads as something in admin.
+      pointer = playbook_pointer(producer.playbook_path)
+      return evidence if pointer.nil?
+      "#{evidence}\n\n---\n\n#{pointer}"
+    end
+
+    # nil when a producer ships no playbook at all. A path that is configured but
+    # unreadable HERE cannot be papered over — the registry validated it at parse
+    # time, so an exception at this point means the checkout changed under the
+    # tick, and filing a pointer nobody can resolve is the ISS-360 failure.
+    def playbook_pointer(path, target: nil)
+      return nil if path.nil?
+      Agent::Playbook.pointer_block(path, target: target)
     end
 
     # ---- claim ----
@@ -789,6 +806,17 @@ module Agent
       issue = Agent::Api.issue(number, use_localhost: @use_localhost)
       comments = Agent::Api.issue_comments(number, use_localhost: @use_localhost)
 
+      # THE claim-time resolution (ISS-505). nil for every issue that carries its
+      # brief inline — human-written ones, and everything filed before pointers
+      # existed — so those are untouched. A pointer that IS present and does not
+      # resolve stops the claim dead rather than starting a session that would do
+      # generic triage under the issue's title.
+      begin
+        playbook = Agent::Playbook.resolve_in(issue["body"])
+      rescue Agent::Playbook::MissingError => e
+        return abandon_unresolvable_playbook(lease, identity, number, e.message)
+      end
+
       # A prior attempt's branch with an OPEN PR is resumed in place, so review
       # feedback and a pre-merge rebase update the same PR rather than opening a
       # second one (§4.4.1). A recorded branch whose PR is closed falls through
@@ -801,7 +829,7 @@ module Agent
       workspace = Agent::Workspace.create(slug)
 
       prompt = Agent::Prompt.build(issue: issue, comments: comments, slug: slug,
-                                   workspace: workspace, resume_repo: resume_repo)
+                                   workspace: workspace, resume_repo: resume_repo, playbook: playbook)
       pid = Agent::Jobs.spawn_session(argv: @claude_argv, prompt: prompt, workspace: workspace,
                                       number: number, env: child_env)
       Agent::Jobs.write(
@@ -816,10 +844,82 @@ module Agent
         "started_at" => @now.utc.iso8601,
         "timeout_at" => (@now + Agent::Jobs::TIMEOUT_SECONDS).utc.iso8601,
       )
-      hostname = `hostname`.strip rescue "unknown"
-      Agent::Api.comment(number, "Claimed by #{hostname} (runner #{identity.runner_id}) on branch `#{slug}`.",
-                         use_localhost: @use_localhost)
-      decide("claim", "ISS-#{number} claimed → #{workspace} (branch #{slug}, pid #{pid})")
+      Agent::Api.comment(number, claim_comment(identity, slug, playbook), use_localhost: @use_localhost)
+      decide("claim", "ISS-#{number} claimed → #{workspace} (branch #{slug}, pid #{pid})" \
+                      "#{playbook ? " playbook #{playbook.label}" : ''}")
+    end
+
+    # The first timeline comment, and the audit trail ISS-505 turns on: WHICH
+    # playbook this run read and at WHICH sha, with a permalink, so the run stays
+    # reproducible after the file changes. Written by the runner rather than left
+    # to the session, because the runner is the thing that actually did the read.
+    #
+    # The staleness note is the inversion made visible — see
+    # `checkout_staleness_reason`.
+    def claim_comment(identity, slug, playbook)
+      lines = ["Claimed by #{hostname} (runner #{identity.runner_id}) on branch `#{slug}`."]
+      return lines.first if playbook.nil?
+
+      lines << "" << "Playbook: #{playbook.label}" << playbook.permalink
+      reason = checkout_staleness_reason
+      lines << "" << "⚠️ #{reason}, so the playbook above may be behind `origin/main`." if reason
+      lines.join("\n")
+    end
+
+    # Why this machine's devops checkout might not be current, or nil when there
+    # is no reason to think it isn't.
+    #
+    # THIS is the inversion ISS-505 names, answered where the answer is cheap. A
+    # runner on a stale checkout reads last month's playbook while the issue
+    # claims to run the current one, and `agent_reported_registry` surfaces that
+    # only by comparing machines after the fact — no single runner can see it is
+    # the odd one out. But a runner CAN see, right now, why its own last pull did
+    # not land, so it says so on the issue whose playbook it just read.
+    #
+    # All three causes are covered deliberately, because only the first alarms
+    # anywhere else. A failing pull escalates at three in a row (ISS-511); a
+    # DIRTY tree or a checkout off `main` is a benign skip that
+    # `record_checkout_pull_failure` never counts — correctly, since it means a
+    # human is working in that checkout — and on an unattended mini that is a
+    # machine which silently stops updating forever with nothing anywhere saying
+    # so. Two `git` calls, on the claim path only.
+    def checkout_staleness_reason
+      streak = Agent::Errors.count(CHECKOUT_PULL_ERROR_SOURCE)
+      return "This runner's devops checkout has failed to fast-forward #{streak} time(s) in a row" unless streak.zero?
+
+      repo = Agent::Checkout.devops_repo
+      branch = Agent::Checkout.current_branch(repo)
+      return "This runner's devops checkout does not answer `git rev-parse`, so the tick cannot pull it" if branch.nil?
+      return "This runner's devops checkout is on `#{branch}`, not `main`, so the tick does not pull it" if branch != "main"
+      return "This runner's devops checkout has a dirty working tree, so the tick does not pull it" if Agent::Checkout.dirty?(repo)
+      nil
+    end
+
+    # A configured playbook this runner cannot read is a HARD stop: no session,
+    # and the issue goes to `needs_input` for a human.
+    #
+    # Never a fallback to generic triage — that is precisely ISS-360, where a
+    # producer ported without its playbook silently filed issues instead of
+    # shipping PRs for a week. And never a plain release either: releasing
+    # returns the issue to `open`, the next tick claims it again, and a runner
+    # missing the file would spin on it every 30 seconds while looking busy.
+    #
+    # `set_status` BEFORE `release_lease`, because releasing only reverts an
+    # issue that is still exactly `claimed` — so the release cannot clobber the
+    # status just written, and the lease still ends up closed either way.
+    def abandon_unresolvable_playbook(lease, identity, number, message)
+      text = "Claim aborted on #{hostname}: #{message}\n\n" \
+             "This issue points at a playbook in devops (`Playbook:` line in the body) and this runner " \
+             "could not read it, so no session was started. Running it anyway would mean generic triage " \
+             "under this issue's title — the ISS-360 failure the pointer exists to make impossible.\n\n" \
+             "Fix the path under `devops/agent/bodies/`, or correct the pointer line on this issue, then " \
+             "move it back to `open`."
+      Agent::Notify.event("dev-agent: ISS-#{number} playbook did not resolve on #{hostname} (#{message})")
+      unless @dry_run
+        Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
+        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
+      end
+      decide("claim", "ISS-#{number}: #{message} — no session started, moved to needs_input")
     end
 
     # Enforcement, not advice (§4.6): core.hooksPath is injected through
@@ -852,6 +952,13 @@ module Agent
     ensure
       file&.flock(File::LOCK_UN) if acquired
       file&.close
+    end
+
+    # This machine's name, as it appears in every escalation, claim comment and
+    # reap comment. "unknown" rather than an exception: a box whose `hostname`
+    # binary is missing still has to be able to say what it did.
+    def hostname
+      @hostname ||= (`hostname`.strip rescue "unknown")
     end
 
     def decide(kind, message)

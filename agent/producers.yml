@@ -35,14 +35,32 @@
 # collapsing the two turns a broken producer into a nightly stream of bogus
 # issues.
 #
-# `issue.body_file` is an OPTIONAL playbook that ships with the issue, resolved
-# relative to `agent/` and appended to the filed body. Use it wherever the brief
-# is longer than a title — without one the claiming session gets
-# claude-issues/default-body.md and does generic triage. It is a file rather than
-# an inline `body:` because these playbooks are shared: every weekly-review
-# producer points at the same one, and inlining would mean a copy per repo that
-# drifts the moment anyone edits one. Validated at PARSE time, so a typo'd path
-# fails the next tick instead of surfacing a week later as an issue with no brief.
+# `issue.body_file` is an OPTIONAL playbook the issue POINTS AT, resolved
+# relative to `agent/`. Use it wherever the brief is longer than a title —
+# without one the claiming session gets claude-issues/default-body.md and does
+# generic triage. It is a file rather than an inline `body:` because these
+# playbooks are shared: every weekly-review producer points at the same one, and
+# inlining would mean a copy per repo that drifts the moment anyone edits one.
+#
+# THE FILED ISSUE CARRIES A POINTER, NOT THE TEXT (ISS-505). The body gets the
+# playbook's heading and opening paragraph — so it still reads as something in
+# admin — plus a `Playbook: \`agent/bodies/x.md\`` line and a permalink. The
+# CLAIMING runner reads the procedure from its own devops checkout, so an issue
+# filed on Friday and claimed on Tuesday runs Tuesday's playbook: there is one
+# copy of the plan and it is the current one. The runner records the sha it read
+# as the issue's first comment, which is what keeps a run reproducible after the
+# file changes.
+#
+# What that means when you write a playbook: it must open with a `# Heading`,
+# then a blank line, then a paragraph — that opening IS the abstract the filed
+# issue shows. Validated at PARSE time along with the path, so a typo'd path or a
+# playbook that abstracts to nothing fails the next tick rather than surfacing a
+# week later as an issue with no brief. A pointer that does not resolve on the
+# claiming runner is a HARD failure: no session starts and the issue goes to
+# `needs_input`, never a silent fallback to generic triage (ISS-360).
+#
+# Check output is NOT a playbook and never moves behind a pointer: it is what
+# this particular run found, so it stays inline in the body, above the pointer.
 #
 # `issue.type` is `issue` (the default) or `epic`. An epic files a CONTAINER plus
 # one child per name in `issue.children`, and the CHILDREN are what a session

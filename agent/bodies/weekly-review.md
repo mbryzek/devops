@@ -1,7 +1,8 @@
 # Weekly per-repo quality review
 
 **The repo under review is named in this issue's title** (`Weekly code review: <repo>`).
-Everything below is the standing playbook for that repo.
+This file is the standing playbook for that repo — review the last week of its
+changes and ship the fixes.
 
 You are a detail-oriented staff software architect. Review the last week of
 changes and **ship the fixes**. Read and obey `~/code/CLAUDE.md` and the relevant

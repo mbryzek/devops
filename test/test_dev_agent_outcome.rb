@@ -267,12 +267,37 @@ class TestDevAgentOutcome < Minitest::Test
     assert_equal fingerprints.uniq.sort, fingerprints.sort, "two producers review the same repo"
   end
 
-  def test_body_file_is_appended_after_the_evidence
+  # The filed body carries a POINTER, never the procedure (ISS-505). Copying the
+  # text froze it: an issue filed on Friday and claimed on Tuesday ran Friday's
+  # playbook, and every improvement pushed in between applied to nothing already
+  # in the queue.
+  def test_the_filed_body_points_at_the_playbook_instead_of_copying_it
     producer = Agent::Producers.load.fetch(:producers).find { |p| p.key == "weekly-review-platform" }
     body = Agent::Tick.allocate.send(:producer_body, producer, "")
-    assert_match(/files on a schedule/, body, "the evidence line must survive")
-    assert_operator body.index("files on a schedule"), :<, body.index("full-auto"),
-                    "the playbook must come AFTER this run's evidence"
+
+    assert_match(/^Playbook: `agent\/bodies\/weekly-review\.md`$/, body, "the pointer line is the contract")
+    refute_match(/full-auto/, body, "the procedure must NOT be copied into the filed issue")
+    assert_match(%r{https://github\.com/mbryzek/devops/blob/main/agent/bodies/weekly-review\.md}, body,
+                 "the permalink is what makes the text one click away from /admin/issues/<n>")
+  end
+
+  # Requirement 3: a body that is nothing but a path renders as an empty box in
+  # admin, and the platform has no devops checkout to resolve it server-side.
+  def test_the_filed_body_keeps_a_readable_abstract_inline
+    producer = Agent::Producers.load.fetch(:producers).find { |p| p.key == "weekly-review-platform" }
+    body = Agent::Tick.allocate.send(:producer_body, producer, "")
+    assert_match(/\*\*Weekly per-repo quality review\*\*/, body, "the playbook's heading stays inline")
+    assert_match(/named in this issue's title/, body, "the opening paragraph stays inline")
+  end
+
+  # Run-specific evidence is NOT a playbook and must never move behind a pointer:
+  # it is what this particular run found, and it stays where it was found.
+  def test_the_check_output_stays_inline_and_comes_before_the_pointer
+    producer = Agent::Producers.load.fetch(:producers).find { |p| p.key == "weekly-review-platform" }
+    body = Agent::Tick.allocate.send(:producer_body, producer, "invariant x: 4 rows")
+    assert_match(/invariant x: 4 rows/, body, "the check's stdout IS the brief and stays inline")
+    assert_operator body.index("invariant x: 4 rows"), :<, body.index("Playbook: `agent/bodies"),
+                    "the pointer must come AFTER this run's evidence"
   end
 
   # Indentation-preserving so the assertion survives the heredoc's dedent.
