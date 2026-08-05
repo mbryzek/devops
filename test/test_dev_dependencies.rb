@@ -248,3 +248,95 @@ class TestDependenciesSbtCmd < Minitest::Test
     end
   end
 end
+
+# The origin every sweep clones from, and the credential it clones with. This
+# used to be an SSH remote, which assumes a GitHub key on every box that runs a
+# sweep; the agent runner has a gh token and no key at all, so the whole nightly
+# dependency run died at clone (ISS-469 / ISS-475).
+class TestGithubOrigin < Minitest::Test
+  include DevTestSupport
+
+  def test_origin_is_https_for_every_dependencies_app
+    Dependencies::Updates::APPS.each do |app, slug|
+      origin = github_origin(slug)
+      assert_equal "https://github.com/#{slug}.git", origin, "#{app} must clone over https"
+    end
+  end
+
+  # The regression itself. An unattended sweep may only depend on a credential
+  # that is unconditionally present, and an SSH identity is not one — on
+  # 2026-08-05 it was there at 03:48 and gone at 03:50 inside a single run.
+  def test_origin_is_never_ssh
+    refute_includes github_origin("mbryzek/acumen"), "git@github.com",
+                    "an unattended sweep must not depend on an SSH identity"
+  end
+end
+
+class TestCloneRepoCredentials < Minitest::Test
+  include DevTestSupport
+
+  # Captures the argv clone_repo would hand git.
+  def clone_cmd(origin: "https://github.com/mbryzek/acumen.git")
+    captured = nil
+    stub_global(:run_step, lambda { |cmd, _path, _verbose, _log|
+      captured = cmd
+      [true, ""]
+    }) do
+      clone_repo(origin, "acumen", "/wd", false, +"")
+    end
+    captured
+  end
+
+  def test_clone_carries_the_gh_credential_helper
+    assert_includes clone_cmd.each_cons(2).to_a,
+                    ["-c", "credential.https://github.com.helper=!gh auth git-credential"]
+  end
+
+  # `-c` on clone persists into the new repo's config, so the fetch and the PR
+  # push that follow inherit the same login. A clone that authenticates and a
+  # push that then fails is the failure this ordering exists to prevent.
+  def test_credential_config_precedes_the_url_so_git_persists_it
+    cmd = clone_cmd
+    assert cmd.index("-c") < cmd.index("https://github.com/mbryzek/acumen.git")
+    assert_equal ["git", "clone"], cmd.first(2)
+  end
+
+  def test_returns_nil_when_git_fails
+    stub_global(:run_step, ->(_cmd, _p, _v, _l) { [false, "boom"] }) do
+      assert_nil clone_repo("https://github.com/mbryzek/acumen.git", "acumen", "/wd", false, +"")
+    end
+  end
+end
+
+class TestDependenciesClone < Minitest::Test
+  include DevTestSupport
+
+  def test_returns_path_and_no_error_on_success
+    stub_global(:clone_repo, ->(_o, name, workdir, _v, _log) { File.join(workdir, name) }) do
+      clone, err = dependencies_clone("acumen", "/wd")
+      assert_equal "/wd/acumen", clone
+      assert_nil err
+    end
+  end
+
+  # A bare "clone failed" reads identically for a renamed repo, a dead network,
+  # and a missing SSH key — which is exactly why ISS-469 needed an investigation
+  # instead of being readable off the report.
+  def test_failure_carries_git_output
+    git_says = "Cloning into '/wd/acumen'...\n\ngit@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n"
+    stub_global(:clone_repo, ->(_o, _n, _w, _v, log) { log << git_says; nil }) do
+      clone, err = dependencies_clone("acumen", "/wd")
+      assert_nil clone
+      assert_equal :error, err[:status]
+      assert_includes err[:error], "Permission denied (publickey)"
+      refute_includes err[:error], "\n\n", "blank lines are dropped so the tail is all signal"
+    end
+  end
+
+  def test_failure_with_no_output_still_reports
+    stub_global(:clone_repo, ->(_o, _n, _w, _v, _log) { nil }) do
+      _, err = dependencies_clone("acumen", "/wd")
+      assert_equal "clone failed", err[:error]
+    end
+  end
+end

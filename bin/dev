@@ -5403,8 +5403,25 @@ def codegen_workdir(run_id)
   File.join(CODEGEN_WORKDIR_ROOT, "#{CODEGEN_WORKDIR_PREFIX}.#{run_id}")
 end
 
+# Clone URL for a repo slug. HTTPS, deliberately — never `git@github.com:`.
+#
+# Every sweep that clones (codegen sync, dependencies check/upgrade) runs
+# unattended, so it may only depend on a credential that is unconditionally
+# present. An SSH key is not that credential: the agent runner has no GitHub
+# private key at all (`~/.ssh` holds only authorized_keys and known_hosts), and
+# even where an agent socket exists it can be empty by the time a nightly run
+# starts. ISS-475 caught it mid-flight on 2026-08-05 — platform cloned at 03:48
+# and acumen failed at 03:50 in the SAME run. That intermittency is worse than a
+# hard failure: it silently drops a different subset of repos each night, and
+# every one of them reports the same "clone failed".
+#
+# `gh`'s token is that credential. It is already a hard dependency of these
+# paths (they shell out to `gh pr list` / `gh pr create`), it is what actually
+# authenticates on this box, and pairing it with GH_CREDENTIAL_CONFIG below
+# makes clone, fetch AND the push the upgrade session ends with all work off
+# the same login. See ISS-469 (the nightly dependency epic this took down).
 def github_origin(repo_slug)
-  "git@github.com:#{repo_slug}.git"
+  "https://github.com/#{repo_slug}.git"
 end
 
 # `Codegen::ApiConfig.load` runs `pkl eval` under the hood (via the top-level
@@ -6006,6 +6023,24 @@ def dependencies_detect(app, clone, workdir, denylist)
   Dependencies::Updates.apply_policy(updates, denylist, app).merge(status: :ok)
 end
 
+# Clone one dependencies repo, returning [path, error_result]. Exactly one of
+# the two is nil.
+#
+# The error carries git's own output, the way the fetch/branch steps below
+# already do. A bare "clone failed" is unactionable: it reads identically
+# whether the repo was renamed, the network was down, or — as in ISS-469 — the
+# box had no SSH key, and every repo in the sweep failed the same way with
+# nothing to say which. Detection failures are diagnosable from the report;
+# clone failures were not.
+def dependencies_clone(app, workdir)
+  log = +""
+  clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, log)
+  return [clone, nil] if clone
+
+  tail = log.split("\n").reject { |l| l.strip.empty? }.last(5).join("\n")
+  [nil, { status: :error, error: tail.empty? ? "clone failed" : "clone failed:\n#{tail}" }]
+end
+
 def cmd_dependencies_check(argv)
   apps = parse_dependencies_args(argv, "dependencies check")
   denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
@@ -6014,13 +6049,8 @@ def cmd_dependencies_check(argv)
   results = {}
   apps.each do |app|
     puts "  #{app}: cloning + running sbt dependencyUpdates…"
-    clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
-    results[app] =
-      if clone
-        dependencies_detect(app, clone, workdir, denylist)
-      else
-        { status: :error, error: "clone failed" }
-      end
+    clone, clone_err = dependencies_clone(app, workdir)
+    results[app] = clone ? dependencies_detect(app, clone, workdir, denylist) : clone_err
   end
   puts ""
   puts Util.underline("dependencies check")
@@ -6045,8 +6075,8 @@ end
 # session that must end with a review-ready PR. Mirrors codegen's run_repo.
 def dependencies_upgrade_one(app, workdir, branch, denylist, &announce)
   note = ->(msg) { announce&.call(msg) }
-  clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, +"")
-  return { status: :error, error: "clone failed" } unless clone
+  clone, clone_err = dependencies_clone(app, workdir)
+  return clone_err unless clone
 
   if (pr = open_pr_with_prefix(clone, DEPS_BRANCH_PREFIX))
     return { status: :skipped, error: "an open dep-upgrade PR already exists (#{pr}) — merge or close it first" }
@@ -7234,6 +7264,14 @@ def cmd_prune_plans(args)
   puts "#{CLAUDE_ROOT} picks the deletions up on its next pull."
 end
 
+# Authenticate git-over-https with the gh token. `git clone -c` persists into
+# the new repo's config, so the fetch and the PR push that follow in that clone
+# inherit it too — the point is that ONE login covers the whole run, rather than
+# the clone succeeding and the push failing later on ambient keychain state.
+# Scoped to github.com, and additive (credential.<url>.helper is multi-valued),
+# so a box with a working helper of its own keeps it.
+GH_CREDENTIAL_CONFIG = ["-c", "credential.https://github.com.helper=!gh auth git-credential"].freeze
+
 # Shared shallow-clone-into-workdir idiom used by both `browserslist update`
 # and `codegen sync`: wipe any stale directory left from a prior run, then
 # `git clone --depth=1 --quiet`. Returns the clone path on success, nil on
@@ -7241,7 +7279,8 @@ end
 def clone_repo(origin, name, workdir, verbose, captured)
   clone_path = File.join(workdir, name)
   FileUtils.rm_rf(clone_path) if File.directory?(clone_path)
-  ok, _ = run_step(["git", "clone", "--depth=1", "--quiet", origin, clone_path], workdir, verbose, captured)
+  cmd = ["git", "clone", *GH_CREDENTIAL_CONFIG, "--depth=1", "--quiet", origin, clone_path]
+  ok, _ = run_step(cmd, workdir, verbose, captured)
   ok ? clone_path : nil
 end
 

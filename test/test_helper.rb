@@ -150,6 +150,28 @@ module DevTestSupport
     ApiClient.define_singleton_method(:request, orig_request)
     ApiClient.define_singleton_method(:session_id_for, orig_sid)
   end
+
+  # Replace a singleton method (`Open3.capture2e`, …) for the duration of a
+  # block. Minitest's own `Object#stub` is NOT available here — minitest 6
+  # stopped loading `minitest/mock` from `minitest/autorun` — so tests that
+  # reach for it fail with "undefined method 'stub'". This is the substitute.
+  def stub_singleton(obj, name, impl)
+    original = obj.method(name)
+    obj.define_singleton_method(name, &impl)
+    yield
+  ensure
+    obj.define_singleton_method(name, original)
+  end
+
+  # Same, for a top-level `dev` function (they land as private methods on
+  # Object, so a test calls them as bare methods and this replaces them).
+  def stub_global(name, impl)
+    original = method(name)
+    Object.send(:define_method, name, &impl)
+    yield
+  ensure
+    Object.send(:define_method, name, original)
+  end
 end
 
 Minitest::Test.prepend(DevTestSupport::GuardEveryTest)
