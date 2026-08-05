@@ -2619,6 +2619,86 @@ class TestDevIssues < Minitest::Test
     assert_match(/--parent NUMBER/, usage_for("issues create"))
   end
 
+  # ---- `issues parent`, end to end ----
+  #
+  # It had no test below the helper level, which is how all three of the bugs
+  # below survived: the arg order, the missing self-check, and the dropped
+  # repositories.
+
+  def test_parent_accepts_the_flag_before_the_positional_number
+    out, status = capture_stderr_and_exit { cmd_issues_parent(["--epic", "140", "343"]) }
+    assert_equal 1, status
+    # Reaching the credential guard is the proof that arg validation accepted it.
+    refute_match(/unexpected argument/, out)
+    refute_match(/pass exactly one of/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  def test_parent_accepts_the_positional_number_before_the_flag
+    out, status = capture_stderr_and_exit { cmd_issues_parent(["343", "--epic", "140"]) }
+    assert_equal 1, status
+    refute_match(/unexpected argument/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  def test_parent_rejects_an_issue_as_its_own_parent
+    out, status = capture_stderr_and_exit { cmd_issues_parent(["343", "--epic", "343"]) }
+    assert_equal 1, status
+    assert_match(/cannot be its own parent/, out)
+  end
+
+  def test_parent_rejects_an_issue_as_its_own_parent_across_padding
+    out, status = capture_stderr_and_exit { cmd_issues_parent(["0343", "--epic", "343"]) }
+    assert_equal 1, status
+    assert_match(/cannot be its own parent/, out)
+  end
+
+  # The round trip is a FULL-REPLACE PUT: spec/issues.json's issue_update_form
+  # says "an omitted optional field (severity, body, club_id, apps,
+  # repositories) clears it". So every editable field the issue already has must
+  # come back out unchanged, or re-parenting quietly deletes it.
+  #
+  # repositories is the one that was missing. Losing it is not cosmetic: the
+  # executor clones the named repos and pre-creates the attempt's branch in
+  # them, and an issue with none has its session clone for itself and pick its
+  # own branch name -- which is how a PR stops being findable (ISS-365).
+  def parentable_issue
+    {
+      "number" => "343", "category" => "feature", "type" => "issue",
+      "title" => "CourtReserve write executor", "body" => "the brief",
+      "severity" => "medium", "apps" => ["platform"],
+      "repositories" => %w[devops platform],
+      "club" => { "id" => "clb-1" },
+    }
+  end
+
+  def test_parent_sends_every_editable_field_back_so_the_put_clears_nothing
+    sent = nil
+    stubs = {
+      "GET /playbook/issues/343" => parentable_issue,
+      "PUT /playbook/issues/343" => ->(body) { sent = body; parentable_issue },
+    }
+    capture_io { with_stubbed_api(stubs) { cmd_issues_parent(["343", "--epic", "140"]) } }
+    assert_equal %w[devops platform], sent[:repositories], "re-parenting must not clear the issue's repos"
+    assert_equal ["platform"], sent[:apps]
+    assert_equal "medium", sent[:severity]
+    assert_equal "the brief", sent[:body]
+    assert_equal "clb-1", sent[:club_id]
+    assert_equal "140", sent[:parent_number]
+  end
+
+  # Detaching goes through the same form, so it drops the same fields.
+  def test_detach_preserves_the_editable_fields_too
+    sent = nil
+    stubs = {
+      "GET /playbook/issues/343" => parentable_issue,
+      "PUT /playbook/issues/343" => ->(body) { sent = body; parentable_issue },
+    }
+    capture_io { with_stubbed_api(stubs) { cmd_issues_parent(["343", "--detach"]) } }
+    assert_equal %w[devops platform], sent[:repositories]
+    refute sent.key?(:parent_number), "detach is the absence of parent_number"
+  end
+
   def test_list_path_carries_the_parent_number
     path = issues_list_path(statuses: [], parent_number: "140")
     assert_match(/parent_number=140/, path)
