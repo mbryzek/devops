@@ -22,10 +22,25 @@
 #
 # file_when:
 #   check_fails   file when the check exits 1
-#   always        file unconditionally (for a chore with no cheap check — the
-#                 review IS the work). The only form that may omit `check`.
+#   always        file unconditionally and let the CLAIMING SESSION decide. Two
+#                 shapes use it: a chore with no cheap check (the review IS the
+#                 work), and a check that needs a git workspace, which its
+#                 playbook runs as its FIRST step and dismisses the issue on
+#                 when it comes back clean (ISS-525). The only form that may
+#                 omit `check`.
 #   never         the check acts directly and files nothing. Must not carry an
 #                 `issue` block.
+#
+# A `check` BELONGS HERE ONLY IF IT IS CHEAP AND RUNS ANYWHERE. It executes
+# inline in the tick, on whichever machine won the run, under the work lock and
+# with no timeout — so a check that clones repos, installs packages or
+# regenerates code is the work wearing a check's clothes, and every other
+# producer plus the claim path queues behind it. Push that kind of check into
+# the playbook and file unconditionally: the claiming session already has a
+# workspace, a lease, a heartbeat and a retry, and it dismisses the issue itself
+# when the check says clean. The cost is a no-op issue per cycle; what it buys
+# is that a producer never needs a machine with a git checkout, which is what
+# lets producer scheduling move server-side at all (epic ISS-519).
 #
 # CHECK EXIT CODES ARE A CONTRACT:
 #   0  clean, nothing to do
@@ -33,7 +48,8 @@
 #   >1 the check itself broke -> recorded as `check_failed`, never as `filed`
 # A crashing check is not evidence of a problem in the thing being checked, and
 # collapsing the two turns a broken producer into a nightly stream of bogus
-# issues.
+# issues. The same three codes are what a playbook-run check reports to its
+# session, so a check that moves out of this file keeps its contract.
 #
 # `issue.body_file` is an OPTIONAL playbook the issue POINTS AT, resolved
 # relative to `agent/`. Use it wherever the brief is longer than a title —
@@ -138,15 +154,6 @@ producers:
       severity: high
       title: Run dev invariants and fix as necessary
       fingerprint: invariants:acumen
-
-  - key: codegen-sync
-    schedule: daily at 3:00am
-    check: dev codegen sync --check
-    file_when: check_fails
-    issue:
-      category: infrastructure
-      title: Sync generated code
-      fingerprint: codegen:sync
 
   # Reconciles directly and files nothing. This is the scheduled backstop for
   # "the agent died after opening a PR but before recording `fixed`" — the merge
@@ -291,36 +298,36 @@ producers:
       fingerprint: weekly-review:hoa-frontend
       body_file: bodies/weekly-review.md
 
-  # ---- machine chores that act directly (ISS-395) -----------------------------
+  # ---- machine chores that acted directly (ISS-395) — ALL GONE ----------------
   #
-  # Each of these was an openclaw cron whose prompt ran one command and parsed its
-  # stdout into a morning-briefing status file. `file_when: never` is the right
+  # This section is a tombstone: nothing is left in it, and the two reasons the
+  # four chores that lived here left are worth keeping together, because between
+  # them they are the whole argument that a producer never needs a machine.
+  #
+  # Each was an openclaw cron whose prompt ran one command and parsed its stdout
+  # into a morning-briefing status file. `file_when: never` looked like the right
   # shape — the command IS the work and there is nothing to file — so the status
-  # file moved INTO the command (lib/briefing.rb). The code that knows what
-  # happened now writes what happened, instead of a prose runbook re-deriving it
-  # with a regex.
+  # file moved INTO the command (lib/briefing.rb), where the code that knows what
+  # happened writes what happened.
   #
-  # Schedules are the crons' schedules, preserved.
-  #
-  # `aidirs-prune`, `docker-prune` and `agent-gc` USED TO BE HERE and are not
-  # producers at all (ISS-520). Every producer, including a `file_when: never`
-  # one, runs behind the daily compare-and-set in POST /agent/producers/:key/runs
-  # — so with N runners exactly one machine won each lock per day. That is the
-  # right arbitration for work whose output is an ISSUE (one issue for the fleet,
-  # not N) and the wrong arbitration for work whose output is FREE DISK ON THE
+  # `aidirs-prune`, `docker-prune` and `agent-gc` LEFT BECAUSE THE LOCK WAS WRONG
+  # FOR THEM (ISS-520). Every producer, including a `file_when: never` one, runs
+  # behind the daily compare-and-set in POST /agent/producers/:key/runs — so with
+  # N runners exactly one machine won each lock per day. That is the right
+  # arbitration for work whose output is an ISSUE (one issue for the fleet, not
+  # N) and the wrong arbitration for work whose output is FREE DISK ON THE
   # MACHINE THAT RAN IT: N-1 machines never collected a log, never pruned a
-  # feature dir and never pruned an image, invisibly, until a disk filled.
-  #
-  # They are now runner-local maintenance inside the tick — see
+  # feature dir and never pruned an image, invisibly, until a disk filled. They
+  # are now runner-local maintenance inside the tick — see
   # lib/agent/maintenance.rb — on each machine's own cadence, with no server run
   # and no lock, plus a disk-pressure trigger that does not wait for a schedule.
   # Every machine prunes itself; the platform's job is noticing when one stops,
   # which is the `agent_runner_maintenance_stale` invariant, not a lock.
-
-  - key: browserslist-update
-    schedule: weekly on monday at 4:13am
-    check: dev browserslist update
-    file_when: never
+  #
+  # `browserslist-update` LEFT BECAUSE THE WORK WAS NOT A CHORE (ISS-525). It
+  # cloned every JS repo, ran the updater and pushed straight to main from inside
+  # the tick — a code change with no review, no PR and nothing to look at
+  # afterwards but a briefing file. It is a filed issue now, below.
 
   # ---- chores that file for a claiming session --------------------------------
 
@@ -377,18 +384,85 @@ producers:
         fingerprint: "api-lint:{child}"
         body_file: bodies/api-lint-repo.md
 
-  # The scan is cheap and its verdict is its exit code; the FIX is a session's
-  # work. That split is the whole producer contract, and it replaces the openclaw
-  # cron's fire-and-forget `claude --print` dispatch, which nothing watched.
+  # ---- ISS-525: the checks that need a git workspace ---------------------------
+  #
+  # These three were the LAST producers whose check needed a MACHINE. Two of them
+  # need a git workspace to clone into — `codegen sync --check` clones every
+  # codegen-consuming repo and regenerates it, `browserslist update --check`
+  # clones every JS repo and runs update-browserslist-db — and `depsguard` reads
+  # config that exists only on a developer box. As long as they carried a
+  # `check`, the platform could not own producer scheduling without also building
+  # a server -> runner dispatch path ("here is a check, run it, report an exit
+  # code") — an entire transport, its retries and its failure modes, for three
+  # jobs that fire once a day or once a week. Epic ISS-519 concluded that path is
+  # not worth building.
+  #
+  # So the check moved from this file into the PLAYBOOK, and all three file
+  # unconditionally. Every playbook's first step is the same check with the same
+  # exit-code contract, run by the claiming session in the workspace it was
+  # already given; a clean run closes the issue `dismissed` and stops, without a
+  # PR. That is the same shape as every other `file_when: always` producer here,
+  # for the same reason: DECIDING IS THE WORK, and the session is the thing that
+  # already has somewhere to do it.
+  #
+  # The cost is a handful of no-op issues a week that dismiss themselves. What it
+  # buys is that no producer anywhere in the registry needs a machine.
+  #
+  # `dismissed`, specifically, and not `fixed` — a clean run must leave a
+  # TERMINAL issue. `fixed` and `deployed` are both non-terminal for the dedup
+  # below, so closing a no-op run `fixed` would suppress every subsequent run
+  # until a human clicked verify: the daily check would go quiet for a week at a
+  # time with nothing reporting that it had.
+  #
+  # The fingerprints stay UNDATED for the opposite reason. Each names a standing
+  # condition ("generated code is out of sync"), so while a fix PR is open the
+  # issue sits at `fixed`, non-terminal, and tomorrow's run files nothing on top
+  # of it. Dating them would open a second issue against the same open PR every
+  # night.
+
+  # Was `check: dev codegen sync --check`. The check clones every
+  # codegen-consuming repo, regenerates each against the backends' merged specs
+  # and diffs the result — minutes of work and gigabytes of clones, run inline in
+  # the tick under the work lock. The playbook runs the identical command first
+  # and dismisses on exit 0.
+  - key: codegen-sync
+    schedule: daily at 3:00am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: Sync generated code
+      fingerprint: codegen:sync
+      body_file: bodies/codegen-sync.md
+
+  # Was `check: dev depsguard`. The scan itself is genuinely cheap — the reason
+  # it moves is that it reads machine-global config (`~/.npmrc`, `~/.bunfig.toml`,
+  # `~/.config/uv/uv.toml`), so its verdict describes the box that ran it and
+  # nothing a server could evaluate. Scanning inside the session that will do the
+  # fixing also makes the two agree: the old split could file against one
+  # machine's config and hand the fix to another's.
   - key: depsguard
     schedule: weekly on monday at 5:13am
-    check: dev depsguard
-    file_when: check_fails
+    file_when: always
     issue:
       category: infrastructure
       title: Fix failing supply-chain config checks
       fingerprint: depsguard:scan
       body_file: bodies/depsguard-fix.md
+
+  # Was `file_when: never` with `check: dev browserslist update` — a producer
+  # that cloned every JS repo, ran update-browserslist-db and PUSHED STRAIGHT TO
+  # MAIN from inside the tick, with no review and nothing to look at afterwards
+  # but a briefing file. As a filed issue it is a session that runs
+  # `dev browserslist update --check`, dismisses a week with no new caniuse-lite
+  # data, and opens a normal PR per repo when there is some.
+  - key: browserslist-update
+    schedule: weekly on monday at 4:13am
+    file_when: always
+    issue:
+      category: infrastructure
+      title: Update caniuse-lite across the JS repos
+      fingerprint: browserslist:update
+      body_file: bodies/browserslist-update.md
 
   # ---- nightly work that has no cheap check (ISS-397 through ISS-401) ---------
   #
