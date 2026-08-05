@@ -105,11 +105,16 @@ moment things are already broken.
 
 What the platform does own is NOTICING that a machine stopped. Failures ride the
 existing error channel (`Agent::Errors`, sources `agent_gc` / `aidirs_prune` /
-`docker_prune`, escalating at 3 in a row), and the registry report carries
+`docker_prune`, escalating at 3 in a row), and the runner heartbeat carries
 `last_maintenance_at` plus this machine's headroom — because an error log can
-only report a run that broke, never one that never happened. The
+only report a run that broke, never one that never happened. Both ride the
+HEARTBEAT rather than the registry report: they describe the machine, and the
+reported registry is deleted at the server-side-scheduling cutover. The
 `agent_runner_maintenance_stale` invariant is what files a single issue naming
-any live runner that has gone quiet or is out of headroom.
+any live, unpaused runner that has gone quiet or is out of headroom; the same
+numbers reach `/admin/agents` per machine as `is_maintenance_stale` /
+`is_disk_low`, computed server-side off the invariant's own constants so the
+board and the check cannot disagree.
 
 ## One push reaches the fleet
 
