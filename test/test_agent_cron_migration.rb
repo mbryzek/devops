@@ -47,8 +47,10 @@ class TestAgentCronMigration < Minitest::Test
   # claude-issues/default-body.md and does generic triage — a different job than
   # the one the producer was written to schedule (ISS-360).
   #
-  # `invariants-*` and `codegen-sync` are deliberately exempt: their check's
-  # stdout IS the brief, so the failure list arrives as the evidence block.
+  # `invariants-*` are deliberately exempt: their check's stdout IS the brief, so
+  # the failure list arrives as the evidence block. `codegen-sync` was exempt for
+  # the same reason until ISS-525 moved its check into a playbook — a producer
+  # that files without running a check has no evidence block to stand in for one.
   def test_every_migrated_producer_that_files_ships_a_playbook
     MIGRATED.each_value do |key|
       p = producer(key)
@@ -70,13 +72,26 @@ class TestAgentCronMigration < Minitest::Test
     end
   end
 
-  # The chores that act directly must NOT carry an issue block: they are the work,
-  # and filing an issue for a completed chore is queue noise.
-  def test_the_direct_chores_file_nothing
-    %w[browserslist-update].each do |key|
-      assert_equal "never", producer(key).file_when, "#{key}: acts directly, so it must file nothing"
-      refute_nil producer(key).check, "#{key}: file_when never needs a check to run"
-    end
+  # `file_when: never` — a producer that acts directly and files nothing — no
+  # longer has a single user, and the two ways the four chores that used it left
+  # are the whole argument that a producer never needs a machine.
+  #
+  # ISS-520 took `aidirs-prune`, `docker-prune` and `agent-gc` off the registry
+  # because the fleet-wide lock was wrong for work whose output is free disk on
+  # the machine that ran it (RUNNER_LOCAL, below). ISS-525 took
+  # `browserslist-update` off it because cloning every JS repo and pushing to
+  # main from inside the tick is not a chore, it is a code change with no review
+  # — its assertions live in test_agent_workspace_producers.rb now.
+  #
+  # What is left is `issue-reconcile`, and it is the one thing the shape still
+  # fits: it acts on the PLATFORM's own data, not on the machine that ran it and
+  # not on a repo, so one runner per period doing it is exactly right.
+  def test_the_only_direct_producer_left_acts_on_the_platform
+    direct = producers.select { |p| p.file_when == "never" }.map(&:key)
+    assert_equal %w[issue-reconcile], direct,
+                 "a `file_when: never` producer does work on ONE machine behind a fleet-wide lock. " \
+                 "Runner-local housekeeping belongs in lib/agent/maintenance.rb (ISS-520); anything " \
+                 "that touches a git repo belongs in a playbook a session claims (ISS-525)."
   end
 
   # ---- ISS-520: housekeeping is runner-local, not a producer ------------------
@@ -141,13 +156,15 @@ class TestAgentCronMigration < Minitest::Test
     end
   end
 
-  # depsguard is the split the producer contract is built for: a cheap scan whose
-  # verdict is its exit code, and an expensive fix that happens as claimed work.
+  # depsguard files, and it does not fix: the fix is a session's work. ISS-525
+  # moved the scan itself out of the tick and into the playbook (the scan reads
+  # this machine's own config, so its verdict describes whichever box ran it) —
+  # test_agent_workspace_producers.rb owns that half.
   def test_depsguard_detects_and_files_but_does_not_fix
     p = producer("depsguard")
-    assert_equal "dev depsguard", p.check
-    assert_equal "check_fails", p.file_when
+    assert_equal "always", p.file_when
     assert_equal "depsguard:scan", p.fingerprint
+    assert_includes p.body_text, "dev depsguard", "the scan must still be the playbook's first step"
   end
 
   # Every fingerprint the registry can file, epics and children included. A

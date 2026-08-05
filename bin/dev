@@ -72,7 +72,7 @@ INVOCATIONS = {
   "docker prune"        => 'docker prune [--days N] [--keep-tags N] [--apply] [--keep-named-volumes]',
   "aidirs prune"        => 'aidirs prune [--days N] [--apply]',
   "prune plans"         => 'prune plans [--days N] [--apply]',
-  "browserslist update" => 'browserslist update [--app NAME] [--verbose] [--keep-tmp-dir]',
+  "browserslist update" => 'browserslist update [--app NAME] [--check] [--verbose] [--keep-tmp-dir]',
   "depsguard scan"      => 'depsguard [scan]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
@@ -412,8 +412,16 @@ USAGE = <<~USAGE
         runs (a failed run keeps its clones) are deleted first, so at most one
         run's worth of node_modules is ever on disk. Quiet by default; use
         --verbose to stream full output.
+        --check detects without changing anything: it clones and runs the updater
+        exactly as above, then reports the repos whose caniuse-lite data WOULD
+        change and commits/pushes nothing. Its verdict is its exit code — 0
+        nothing to update, 1 repos need updating (listed on stdout), 2 the check
+        itself could not run — and it is the first step of the
+        `browserslist-update` producer's playbook (agent/bodies/browserslist-update.md),
+        which fixes what it finds as a normal PR per repo. Nothing schedules the
+        pushing form any more; it stays for running the sweep by hand.
         Writes data/browserslist-status.md in the openclaw workspace, which the
-        morning briefing reads.
+        morning briefing reads — in both modes, so the section does not go dark.
 
     #{INVOCATIONS["depsguard scan"]}
         Run `depsguard scan` over the supply-chain config files and report the
@@ -7388,6 +7396,24 @@ def run_step(cmd, path, verbose, captured_log, env: {})
     captured_log << out
     [status.success?, out]
   end
+rescue Errno::ENOENT, Errno::EACCES => e
+  # A missing or unexecutable binary is a FAILED STEP, not an exception thrown
+  # out of the sweep. `capture2e` raises where `system` merely returns nil, so
+  # without this the two modes disagree and one absent tool (`npx` on a box with
+  # no node) aborts the loop mid-repo, discarding every result already collected
+  # and every one still to come.
+  #
+  # It also decides an exit code now. `dev browserslist update --check` is the
+  # first step of a playbook (ISS-525) and its codes are a contract: an ENOENT
+  # escaping here left the process at 1, which in that contract reads "these
+  # repos need updating" — sending a session to open PRs for repos nothing ever
+  # examined. As a step failure it lands in `failures` and comes back as 2,
+  # "nothing was concluded", which is what actually happened. The producer
+  # registry got this right for the same reason: checks run through /bin/sh so a
+  # missing binary arrives as exit 127 rather than an ENOENT out of the tick.
+  message = "#{cmd.first}: #{e.message}\n"
+  captured_log << message
+  [false, message]
 end
 
 # Last `n` non-blank lines of a captured subprocess log: enough to say WHY a step
@@ -7990,9 +8016,46 @@ def clone_failed_error(log)
   tail.empty? ? "clone failed" : "clone failed: #{tail}"
 end
 
+# `--check`'s verdict, in the exit-code contract every producer check speaks
+# (0 clean / 1 findings / >1 the check itself broke). It survives the move out of
+# producers.yml and into the playbook: the claiming session reads these codes the
+# same way the tick used to.
+#
+# Findings beat uncheckable deliberately, for the reason codegen's check gives:
+# a repo that demonstrably regenerated to a diff is a real finding worth a PR
+# even when a sibling failed to clone, and exit 2 would drop it on the floor
+# until next Monday. Nothing examined at all is never evidence of "up to date".
+BROWSERSLIST_EXIT_CLEAN       = 0
+BROWSERSLIST_EXIT_FINDINGS    = 1
+BROWSERSLIST_EXIT_UNCHECKABLE = 2
+
+def browserslist_check_exit_code(pending:, no_changes:, failures:)
+  return BROWSERSLIST_EXIT_FINDINGS unless pending.empty?
+  return BROWSERSLIST_EXIT_UNCHECKABLE unless failures.empty?
+  return BROWSERSLIST_EXIT_UNCHECKABLE if no_changes.empty?
+
+  BROWSERSLIST_EXIT_CLEAN
+end
+
+# The check's stdout is what the claiming session reads to decide what to do, so
+# it names the repos rather than just reporting that there is drift.
+def browserslist_check_verdict(pending:, no_changes:, failures:, code:)
+  case code
+  when BROWSERSLIST_EXIT_CLEAN
+    "caniuse-lite is up to date in all #{no_changes.length} repo(s) — nothing to update"
+  when BROWSERSLIST_EXIT_FINDINGS
+    "caniuse-lite is out of date in #{pending.length} repo(s): #{pending.sort.join(', ')}\n" \
+      "Update each one on a branch and open a PR — never push to main."
+  else
+    "browserslist update --check could not complete#{failures.empty? ? ' — no repo was examined' : ": #{failures.join(', ')}"}\n" \
+      "Nothing was concluded about caniuse-lite in any repo."
+  end
+end
+
 def cmd_browserslist_update(args)
   verbose = false
   keep_tmp = false
+  check = false
   app_filter = nil
   i = 0
   rest = []
@@ -8001,6 +8064,7 @@ def cmd_browserslist_update(args)
     case a
     when "--verbose", "-v" then verbose = true; i += 1
     when "--keep-tmp-dir"  then keep_tmp = true; i += 1
+    when "--check"         then check = true; i += 1
     when "--app"
       app_filter = args[i + 1]
       usage_exit("--app requires a value", example: usage_for("browserslist update")) if app_filter.nil?
@@ -8018,15 +8082,23 @@ def cmd_browserslist_update(args)
     .select { |path| File.directory?(path) && File.exist?(File.join(path, "package.json")) && File.directory?(File.join(path, ".git")) }
     .sort
 
+  # Both "nothing to work on" paths exit UNCHECKABLE in check mode rather than
+  # reporting clean: an empty repo list means nothing was examined, which is
+  # never evidence that caniuse-lite is current. `exit_with_error`'s own status
+  # is 1, which in this contract would mean "found repos needing an update".
   if app_filter
     source_repos = source_repos.select { |p| File.basename(p) == app_filter }
     if source_repos.empty?
-      Util.exit_with_error("No repo named '#{app_filter}' with package.json + .git under #{code_root}")
+      message = "No repo named '#{app_filter}' with package.json + .git under #{code_root}"
+      Util.exit_with_error(message) unless check
+      warn message
+      exit BROWSERSLIST_EXIT_UNCHECKABLE
     end
   end
 
   if source_repos.empty?
     puts "No repos with package.json + .git under #{code_root}"
+    exit BROWSERSLIST_EXIT_UNCHECKABLE if check
     return
   end
 
@@ -8042,6 +8114,7 @@ def cmd_browserslist_update(args)
 
   failures = []
   updated = []
+  pending = []
   no_changes = []
   no_remote = []
   logs = {}
@@ -8084,6 +8157,16 @@ def cmd_browserslist_update(args)
       next
     end
 
+    # The detector stops here: the updater rewrote something, which IS the
+    # finding. Committing or pushing it is the fix, and the fix belongs to the
+    # session that claims the issue this exit code files.
+    if check
+      pending << name
+      report_repo_line(name, "needs update", nil, verbose)
+      puts "" if verbose
+      next
+    end
+
     msg = "Update caniuse-lite via update-browserslist-db"
     ok, _ = run_step(["git", "-C", clone_path, "commit", "-am", msg], clone_path, verbose, captured)
     unless ok
@@ -8110,7 +8193,11 @@ def cmd_browserslist_update(args)
 
   puts ""
   puts Util.underline("Summary")
-  puts "  updated + pushed: #{updated.empty? ? '(none)' : updated.join(', ')}"
+  if check
+    puts "  needs update:     #{pending.empty? ? '(none)' : pending.join(', ')}"
+  else
+    puts "  updated + pushed: #{updated.empty? ? '(none)' : updated.join(', ')}"
+  end
   puts "  no changes:       #{no_changes.join(', ')}" unless no_changes.empty?
   puts "  no remote:        #{no_remote.join(', ')}" unless no_remote.empty?
   puts "  failed:           #{failures.join(', ')}" unless failures.empty?
@@ -8134,22 +8221,42 @@ def cmd_browserslist_update(args)
     puts "Kept #{workdir} for inspection (failures present)"
   end
 
-  write_browserslist_briefing_status(updated: updated, no_changes: no_changes, failures: failures, logs: logs)
+  write_browserslist_briefing_status(updated: updated, pending: pending, no_changes: no_changes,
+                                     failures: failures, logs: logs, check: check)
 
-  exit 1 unless failures.empty?
+  unless check
+    exit 1 unless failures.empty?
+    return
+  end
+
+  code = browserslist_check_exit_code(pending: pending, no_changes: no_changes, failures: failures)
+  puts ""
+  puts browserslist_check_verdict(pending: pending, no_changes: no_changes, failures: failures, code: code)
+  exit code
 end
 
 # The morning briefing's "Browserslist Update" section (item 12) reads this file
 # and skips it unless `Last run:` is today AND something was updated or failed.
 # Failure output goes in verbatim: a repo that has been failing to push for three
 # weeks is the whole reason the section exists.
-def write_browserslist_briefing_status(updated:, no_changes:, failures:, logs:)
-  body = +"Last run: #{Briefing.today}\n"
-  if updated.empty? && failures.empty?
+#
+# BOTH modes write it, and after ISS-525 the check is the mode that normally
+# does: nothing schedules the pushing sweep any more, so if only that one wrote
+# here the section would render for the last time on the day this shipped and
+# then go dark for good — the exact silent-stop failure the briefing exists to
+# catch. The wording distinguishes them, because "needs update" and "pushed to
+# main" are not the same news: the first is a PR somebody still has to ship.
+def write_browserslist_briefing_status(updated:, pending:, no_changes:, failures:, logs:, check:)
+  changed = check ? pending : updated
+  body = +"Last run: #{Briefing.today}#{check ? ' (check only, nothing pushed)' : ''}\n"
+  if changed.empty? && failures.empty?
     body << "All #{no_changes.length} projects up to date, no changes.\n"
   else
     body << "\n"
-    body << "Updated (pushed to main): #{updated.join(', ')}\n" unless updated.empty?
+    unless changed.empty?
+      label = check ? "Needs update (no PR opened yet)" : "Updated (pushed to main)"
+      body << "#{label}: #{changed.join(', ')}\n"
+    end
     body << "No changes: #{no_changes.length} projects\n" unless no_changes.empty?
     failures.each do |name|
       log = logs[name.split(" ").first]

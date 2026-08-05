@@ -180,6 +180,15 @@ Every playbook therefore opens `# Heading`, blank line, paragraph — that openi
 is the abstract the filed issue renders, and `producers.yml` validates it at
 parse time along with the path.
 
+**A check that needs a machine belongs in the playbook, not in `producers.yml`**
+(ISS-525). A `check` runs inline in the tick, on whichever machine won the run,
+under the work lock and with no timeout — so one that clones repos, installs
+packages or reads a developer box's own config is the work wearing a check's
+clothes. Those producers set `file_when: always` and their playbook runs the
+check as its FIRST step, closing the issue `dismissed` when it comes back clean.
+`codegen-sync`, `depsguard` and `browserslist-update` are the three, and they
+were the last reason a producer needed a runner at all.
+
 ## Two phases, two locks
 
 Phase A is **vitals** — the devops self-update, the runner heartbeat, lease

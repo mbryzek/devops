@@ -559,9 +559,21 @@ end
 # The regression this whole flag exists for (ISS-359): the producer invoked a
 # flag `dev codegen` did not have, so the nightly check exited 1 on a usage
 # error every night and filed an issue that said only "unknown option --check".
+#
+# ISS-525 moved that command out of producers.yml and into the playbook, which
+# makes this test MORE load-bearing rather than less: an invocation written in
+# prose has nothing validating it, and the failure has moved from a nightly
+# stream of bogus issues to a claimed session that cannot run its first step. The
+# command is read back out of the playbook — the first `dev` invocation in it —
+# so the test follows the command wherever it is written rather than pinning a
+# literal that could drift from the file the session actually reads.
 class TestCodegenProducerContract < Minitest::Test
-  CHECK = YAML.load_file(File.expand_path('../agent/producers.yml', __dir__))
-              .fetch("producers").find { |p| p["key"] == "codegen-sync" }.fetch("check")
+  PLAYBOOK = File.read(File.expand_path('../agent/bodies/codegen-sync.md', __dir__)).freeze
+  CHECK = PLAYBOOK.lines.map(&:strip).find { |line| line.start_with?("dev ") }.to_s.freeze
+
+  def test_the_playbook_still_carries_a_command_to_run
+    refute_empty CHECK, "the codegen-sync playbook names no `dev` command — its first step is prose"
+  end
 
   # Parsed exactly as bin/dev's dispatcher parses it — `dev` and the command are
   # consumed by the shell/dispatch, then the subcommand, then the flags.
@@ -738,6 +750,22 @@ class TestDevCodegenEncoding < Minitest::Test
       assert status.success?, "run_step under empty locale crashed: #{out}"
       assert_includes out, "ENCODING_OK"
     end
+  end
+
+  # A missing binary is a FAILED STEP, not an exception out of the sweep. Every
+  # caller loops over repos and handles a false; none of them handles ENOENT, so
+  # one absent tool used to abort mid-loop and discard both the results already
+  # collected and the repos not yet reached. It also decides `dev browserslist
+  # update --check`'s exit code (ISS-525): an escaping ENOENT left the process at
+  # 1, which in the check contract reads "these repos need updating" rather than
+  # "nothing was concluded".
+  def test_run_step_reports_a_missing_binary_instead_of_raising
+    log = +""
+    ok, out = run_step(["definitely-not-a-real-binary-i525"], Dir.pwd, false, log)
+    refute ok, "a missing binary must come back as a failed step"
+    assert_includes out.to_s, "definitely-not-a-real-binary-i525"
+    assert_includes log, "definitely-not-a-real-binary-i525",
+                    "the reason must reach the captured log the caller reports from"
   end
 
   def test_file_read_survives_missing_locale
