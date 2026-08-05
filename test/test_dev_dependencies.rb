@@ -146,6 +146,24 @@ class TestDependenciesDenylist < Minitest::Test
   def test_shipped_denylist_parses
     assert_kind_of Array, U.load_denylist(DEPS_DENYLIST_PATH)
   end
+
+  # guice 7 is jakarta.inject-only and play-guice 3.0.x is javax.inject, so the
+  # bump cannot be green in ANY repo until Play 3.1.0 ships stable. Denying it
+  # per-app would let a lib-ai release push guice 7 onto platform/acumen
+  # transitively, so this asserts every watched app is covered — and that 6.0.0
+  # (the version that reads both javax and jakarta) is still allowed through.
+  def test_shipped_denylist_holds_guice_7_everywhere
+    deny = U.load_denylist(DEPS_DENYLIST_PATH)
+    %w[guice guice-assistedinject].each do |artifact|
+      group = artifact == "guice" ? "com.google.inject" : "com.google.inject.extensions"
+      Dependencies::Updates::APPS.each_key do |app|
+        assert U.denied_by(deny, app, group, artifact, "7.0.0"),
+               "#{group}:#{artifact} 7.0.0 must be denied for #{app}"
+        refute U.denied_by(deny, app, group, artifact, "6.0.0"),
+               "#{group}:#{artifact} 6.0.0 must stay allowed for #{app}"
+      end
+    end
+  end
 end
 
 class TestDependenciesPrompt < Minitest::Test
