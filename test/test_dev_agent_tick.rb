@@ -236,6 +236,84 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- the machine's error log on the heartbeat (ISS-527) ----
+  #
+  # It used to ride the registry report, which is a surface that goes away entirely once scheduling
+  # moves server-side (ISS-526). The error log is about the MACHINE, and the machine survives that
+  # cutover, so it belongs on the heartbeat.
+
+  def test_the_error_log_rides_the_heartbeat_rather_than_the_registry_report
+    with_agent_home do
+      register_identity
+      Agent::Errors.record("checkout_pull", "pull failed")
+
+      errors = heartbeat_once.fetch(:errors)
+      assert_equal ["checkout_pull"], errors.map { |e| e["source"] }
+      assert_equal ["pull failed"], errors.map { |e| e["message"] }
+    end
+  end
+
+  def test_a_machine_with_nothing_wrong_reports_an_empty_error_log_rather_than_omitting_it
+    with_agent_home do
+      register_identity
+      assert_equal [], heartbeat_once.fetch(:errors)
+    end
+  end
+
+  # The point of the whole re-home. The ten-minute floor is a rate limit, and an infra failure that
+  # sits unreported for up to ten minutes is exactly the failure someone is trying to see. The
+  # registry report this used to ride was not rate-limited the same way, so moving it naively would
+  # have introduced a delay that did not exist before.
+  def test_a_new_error_reports_immediately_instead_of_waiting_out_the_ten_minute_floor
+    with_agent_home do
+      register_identity
+      start = Time.now
+      refute_nil heartbeat_once(now: start), "the first heartbeat always sends"
+      assert_nil heartbeat_once(now: start + 60), "nothing changed inside the floor"
+
+      Agent::Errors.record("checkout_pull", "pull failed")
+      sent = heartbeat_once(now: start + 61)
+      refute_nil sent, "an error recorded inside the floor must not wait for the next window"
+      assert_equal ["checkout_pull"], sent.fetch(:errors).map { |e| e["source"] }
+    end
+  end
+
+  # Recovery is news too. Agent::Errors.clear on success is the ONLY way a machine says "this
+  # stopped failing" and the platform replaces the list wholesale, so a clear that waited out the
+  # floor would leave a fixed machine looking broken on the fleet board.
+  def test_clearing_a_source_reports_immediately_too
+    with_agent_home do
+      register_identity
+      Agent::Errors.record("checkout_pull", "pull failed")
+      start = Time.now
+      assert_equal 1, heartbeat_once(now: start).fetch(:errors).size
+
+      Agent::Errors.clear("checkout_pull")
+      sent = heartbeat_once(now: start + 60)
+      refute_nil sent, "a recovery inside the floor must not wait for the next window"
+      assert_equal [], sent.fetch(:errors)
+    end
+  end
+
+  # Escalation is local — it fires out of update_checkout, not out of the reporting path — so it
+  # must cross 3-in-a-row on the tick that gets there regardless of when the heartbeat window falls.
+  # update_checkout also runs BEFORE heartbeat_runner in phase_a, so the third failure is reported
+  # by the same tick that escalates it rather than by the next one.
+  def test_escalation_at_three_in_a_row_does_not_wait_on_the_heartbeat_window
+    with_agent_home do
+      register_identity
+      2.times { Agent::Errors.record("checkout_pull", "pull failed") }
+      start = Time.now
+      assert_equal 2, heartbeat_once(now: start).fetch(:errors).size
+
+      # The third failure, recorded well inside the floor.
+      Agent::Errors.record("checkout_pull", "pull failed")
+      assert_equal Agent::Tick::CHECKOUT_PULL_ESCALATE_AT, Agent::Errors.count("checkout_pull")
+      assert_equal 3, heartbeat_once(now: start + 5).fetch(:errors).size,
+                   "the streak that triggers escalation must be visible on the platform at once"
+    end
+  end
+
   def test_a_failed_heartbeat_leaves_the_change_pending_so_the_next_tick_retries_it
     with_agent_home do
       register_identity
