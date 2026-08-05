@@ -85,7 +85,7 @@ INVOCATIONS = {
   "issues block"        => 'issues block <number> --on NUMBER [--remove] [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
-  "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
+  "issues claim"        => 'issues claim [--category CATEGORY] [--number 078,080] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--duplicate-of NUMBER] [--app APP --baseline-version VERSION] [--localhost]',
   "issues fix"          => 'issues fix <number> --url URL [--comment "TEXT"] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
@@ -558,7 +558,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["issues block"]}
         Record that NUMBER cannot be worked until --on NUMBER has shipped, and stop
         the queue handing it out until then: a blocked issue is never offered by
-        `issues claim` or to the autonomous fleet, and naming it with --issues is
+        `issues claim` or to the autonomous fleet, and naming it with --number is
         REFUSED with its blockers listed rather than silently skipped. An issue
         counts as blocked while any blocker is still live work; it becomes
         claimable on its own the moment the last one reaches fixed, deployed,
@@ -593,7 +593,7 @@ USAGE = <<~USAGE
         press enter), or `none`. It then atomically claims the selection and writes
         ONE plan per ISSUE claimed to
         ~/code/claude/plans/<date>-issue-<number>-<slug>.md — a plan is what one
-        subagent gets handed, so it is one unit of work. Pass --issues 078,080 to
+        subagent gets handed, so it is one unit of work. Pass --number 078,080 to
         select by issue number without the prompt, --yes to take everything a sweep
         takes, or --category CATEGORY to scope to a single category. `suggestion` is
         swept like every other category, but its plan runs as an INVESTIGATION, not
@@ -2618,7 +2618,7 @@ def issue_ordered_open(open, present)
   present.flat_map { |cat| open.select { |c| c["category"] == cat } }
 end
 
-# Resolves the --issues values against the open issues on offer. Accepts a number
+# Resolves the --number values against the open issues on offer. Accepts a number
 # as displayed or as typed ("078", "78", "ISS-078"); anything that names no open
 # issue is an error naming what IS on offer, rather than a claim that silently
 # covers less than asked for.
@@ -3594,7 +3594,7 @@ def issue_filed_open(issue)
   puts "Left #{issue_label(issue)} open — nobody is working it."
   puts ""
   puts "Pick it up later with:"
-  puts "  dev issues claim --issues #{number}"
+  puts "  dev issues claim --number #{number}"
   issue
 end
 
@@ -4100,10 +4100,16 @@ def cmd_issues_claim(args)
       category = rest[i + 1]
       usage_exit("--category requires a value", example: usage_for("issues claim")) if category.nil?
       i += 2
-    when "--issues"
+    when "--number"
       requested = rest[i + 1]
-      usage_exit("--issues requires a value (e.g. --issues 078,080)", example: usage_for("issues claim")) if requested.nil?
+      usage_exit("--number requires a value (e.g. --number 078,080)", example: usage_for("issues claim")) if requested.nil?
       i += 2
+    when "--issues"
+      # Renamed: `dev issues claim --issues 538` said "issues" twice. Falling
+      # through to leftover would report it as "unexpected argument(s): --issues,
+      # 538", which reads like a parse confusion rather than a rename — and plans
+      # written before the rename still spell it the old way (ISS-540).
+      usage_exit("--issues was renamed to --number (e.g. --number 078,080)", example: usage_for("issues claim"))
     when "--yes", "-y"
       assume_yes = true
       i += 1
@@ -4211,7 +4217,7 @@ def cmd_issues_claim(args)
         # defaulting to `all` would claim the whole queue on a run that never asked
         # to. Make the caller say which it wants.
         unless $stdin.tty?
-          Util.exit_with_error("Nothing to read the selection from (stdin is not a terminal). Pass --issues NUMBERS or --yes.")
+          Util.exit_with_error("Nothing to read the selection from (stdin is not a terminal). Pass --number NUMBERS or --yes.")
         end
         issue_ask_selection(ordered, auto)
       end
