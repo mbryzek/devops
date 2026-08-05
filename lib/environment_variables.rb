@@ -109,12 +109,31 @@ class EnvironmentVariables
     end
 
     private
+
+    # Both serializations below are SHELL, and their whole contract is that the
+    # caller evals them (`eval "$(bin/env --format sh)"`, and `dotenv` emits
+    # `export`). The values are the git-crypt'd app secrets -- passwords, tokens,
+    # connection strings -- so quoting them is not cosmetic.
+    #
+    # Single quotes with the standard '\'' break-out, rather than double quotes:
+    # inside double quotes the shell still expands $VAR, `cmd` and \, so a
+    # password containing a $ silently eval'd to the wrong value and one
+    # containing a backtick ran a command. Inside single quotes nothing is
+    # special except the single quote itself, which this closes, escapes and
+    # reopens.
+    # The block form of gsub is load-bearing: in a replacement STRING, `\'` is a
+    # backreference meaning "everything after the match", so the obvious
+    # `gsub("'", "'\\''")` silently produces garbage rather than an escape.
+    def sh_quote(value)
+      "'#{value.to_s.strip.gsub("'") { "'\\''" }}'"
+    end
+
     def format_for_sh(all)
-      all.keys.sort.map { |k| "%s='%s'" % [k.strip, all[k].to_s.strip] }.join(" ")
+      all.keys.sort.map { |k| "#{k.strip}=#{sh_quote(all[k])}" }.join(" ")
     end
 
     def dotenv(all)
-      all.keys.sort.map { |k| "export #{k.strip}=\"#{all[k].to_s.strip}\"" }.join("\n")
+      all.keys.sort.map { |k| "export #{k.strip}=#{sh_quote(all[k])}" }.join("\n")
     end
 
     def EnvironmentVariables.from_file(app_name, filename)
