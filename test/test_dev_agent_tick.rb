@@ -540,6 +540,55 @@ class TestDevAgentTick < Minitest::Test
     assert_match(/invariant x: 4 rows/, filed[:body], "the check's stdout IS the brief")
   end
 
+  # `{date}` used to be resolved on the epic path only, so a plain nightly
+  # producer filed the literal "pr:auto-merge:{date}" — one issue, forever, with
+  # every later run skipping in flight behind it and nothing anywhere saying so.
+  def test_a_plain_producer_resolves_the_date_token_in_its_fingerprint
+    filed = nil
+    dated = Agent::Producers::Producer.new(
+      key: "probe", schedule: Agent::Schedule.parse("daily at 6:45am"),
+      schedule_text: "daily at 6:45am", check: nil, file_when: "always",
+      timezone: "America/New_York",
+      issue: { "title" => "t", "category" => "infrastructure", "fingerprint" => "pr:auto-merge:{date}" },
+    )
+    with_agent_home do
+      register_identity
+      with_ai_token do
+        stubs = {
+          ISSUES_PATH => [],
+          "POST /playbook/issues" => ->(body) { filed = body; { "number" => 201, "occurrence_count" => 1 } },
+        }
+        with_stubbed_api(stubs) do
+          # 6:45am America/New_York is 10:45 UTC — the date must be the LOCAL one.
+          capture_stdout { tick(dry_run: false, now: Time.utc(2026, 8, 5, 10, 45)).file_issue(dated, nil) }
+        end
+      end
+    end
+    assert_equal "pr:auto-merge:2026-08-05", filed[:fingerprint]
+  end
+
+  # And the same run's fingerprint still dedups, so a double fire on one night
+  # files once rather than twice.
+  def test_a_dated_fingerprint_still_blocks_a_refile_within_the_same_day
+    dated = Agent::Producers::Producer.new(
+      key: "probe", schedule: Agent::Schedule.parse("daily at 6:45am"),
+      schedule_text: "daily at 6:45am", check: nil, file_when: "always",
+      timezone: "America/New_York",
+      issue: { "title" => "t", "category" => "infrastructure", "fingerprint" => "pr:auto-merge:{date}" },
+    )
+    result = nil
+    with_agent_home do
+      register_identity
+      with_ai_token do
+        stubs = { ISSUES_PATH => [{ "fingerprint" => "pr:auto-merge:2026-08-05", "status" => "claimed" }] }
+        with_stubbed_api(stubs) do
+          capture_stdout { result, _number = tick(dry_run: false, now: Time.utc(2026, 8, 5, 10, 45)).file_issue(dated, nil) }
+        end
+      end
+    end
+    assert_equal "skipped_in_flight", result
+  end
+
   def test_a_non_terminal_issue_with_the_same_fingerprint_blocks_a_refile
     result = run_producer_with(
       "exit 1",

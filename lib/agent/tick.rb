@@ -522,7 +522,9 @@ module Agent
     def file_issue(producer, output)
       existing = Agent::Api.issues(statuses: NON_TERMINAL_STATUSES, use_localhost: @use_localhost)
       return file_epic(producer, output, existing) if producer.epic?
-      return ["skipped_in_flight", nil] if Agent::Producers.in_flight?(existing, producer.fingerprint)
+
+      fingerprint = producer.fingerprint_at(@now)
+      return ["skipped_in_flight", nil] if Agent::Producers.in_flight?(existing, fingerprint)
 
       spec = producer.issue
       # `claim_on_create: false`, not `status: "open"` — the create form has no
@@ -532,7 +534,7 @@ module Agent
       form = {
         title: spec.fetch("title"),
         category: spec.fetch("category"),
-        fingerprint: spec.fetch("fingerprint"),
+        fingerprint: fingerprint,
         body: producer_body(producer, output),
         claim_on_create: false,
       }
