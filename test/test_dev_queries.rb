@@ -89,15 +89,11 @@ class TestDevQueriesInvestigate < Minitest::Test
 
   # Drive the prompt with a canned answer and a stubbed tty, and record whether
   # anything was filed. Returns the form passed to the filing helper, or nil.
-  # Stands in for $stdin: the offer asks it whether it is a terminal, and Ask is
-  # stubbed alongside, so nothing here reads real input.
-  FakeStdin = Struct.new(:is_tty) do
-    def tty? = is_tty
-  end
-
+  # The offer only asks $stdin whether it is a terminal, and Ask is stubbed
+  # alongside, so nothing here reads real input.
   def offer(stats, answer:, tty: true)
     filed = nil
-    with_stdin(FakeStdin.new(tty)) do
+    with_stdin("", tty: tty) do
       stub_singleton(Ask, :for_string, ->(_msg, _opts = {}) { answer }) do
         stub_global(:require_playbook_session!, ->(_local) { nil }) do
           stub_global(:issue_endpoint, ->(_local) { "endpoint" }) do
@@ -112,39 +108,6 @@ class TestDevQueriesInvestigate < Minitest::Test
       end
     end
     filed
-  end
-
-  def with_stdin(io)
-    original = $stdin
-    $stdin = io
-    yield
-  ensure
-    $stdin = original
-  end
-
-  def stub_singleton(obj, name, impl)
-    original = obj.method(name)
-    obj.define_singleton_method(name, &impl)
-    yield
-  ensure
-    obj.define_singleton_method(name, original)
-  end
-
-  def stub_global(name, impl)
-    original = method(name)
-    Object.send(:define_method, name, &impl)
-    yield
-  ensure
-    Object.send(:define_method, name, original)
-  end
-
-  def capture_stdout
-    original = $stdout
-    $stdout = StringIO.new
-    yield
-    $stdout.string
-  ensure
-    $stdout = original
   end
 
   # Piping the ranking must print and exit. A prompt here would block on input

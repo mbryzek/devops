@@ -70,6 +70,8 @@ end
 # path. When the prompt named it relatively the model found nothing at the cwd and fell
 # back to scanning the filesystem for it on every batch.
 class TestDevChangelogSkillPath < Minitest::Test
+  include DevTestSupport
+
   # Run changelog_run_claude with the subprocess replaced, and return what it would
   # have handed `claude`: [prompt, spawn options].
   def spawn_args(workdir: "/tmp/scratch")
@@ -77,7 +79,7 @@ class TestDevChangelogSkillPath < Minitest::Test
     done = Object.new
     def done.pid = 4242
     def done.value = nil
-    Open3.stub(:popen2e, lambda { |*args, **opts|
+    stub_singleton(Open3, :popen2e, lambda { |*args, **opts|
       captured = [args.last, opts]
       [StringIO.new, StringIO.new("done"), done]
     }) do
@@ -227,6 +229,8 @@ end
 # session per BATCH rather than per version, and that every evaluated version is
 # reported to the API including the ones the model found nothing to say about.
 class TestDevChangelogBuild < Minitest::Test
+  include DevTestSupport
+
   def setup
     # changelog_pending skips an app with no checkout, so the fake one has to look
     # like a git repo even though every git read below is stubbed.
@@ -237,26 +241,11 @@ class TestDevChangelogBuild < Minitest::Test
     @missing = %w[]
     @entries_by_version = {}
     @commits_by_version = Hash.new { [] }
-    @real_methods = {}
     stub_world!
   end
 
   def teardown
     FileUtils.remove_entry(@checkout)
-    # Every stub lands on Object, so one left behind is visible to every later test in
-    # the process, not just this class — restore them all.
-    @real_methods.each { |name, m| Object.send(:define_method, name, m) }
-  end
-
-  # Replace a global for the duration of one test, remembering the real one so teardown
-  # can put it back.
-  def stub_global(name, &body)
-    @real_methods[name] ||= begin
-      Object.instance_method(name)
-    rescue NameError
-      nil
-    end
-    Object.send(:define_method, name, body)
   end
 
   def pending_version(version, released_at, commits = [])
@@ -276,33 +265,33 @@ class TestDevChangelogBuild < Minitest::Test
     commits_by_version = @commits_by_version
     entries_by_version = @entries_by_version
 
-    stub_global(:platform_endpoint) { |_localhost| { name: "test" } }
+    stub_global_for_test(:platform_endpoint) { |_localhost| { name: "test" } }
     # The ISS map is keyed by repo slug, the app is playbook-admin: the build has to
     # bridge the two, so pin the mapping rather than depending on a generated dist/.
-    stub_global(:changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
-    stub_global(:changelog_app_repo) { |_app| "legacy-admin" }
+    stub_global_for_test(:changelog_issue_map) { |_localhost| { "legacy-admin#412" => "034" } }
+    stub_global_for_test(:changelog_app_repo) { |_app| "legacy-admin" }
 
     # The server's answer to "what still needs notes", plus the git reads the build
     # makes to rebuild each pending version's commit list.
     released_at = -> (v) { (@released_at || {}).fetch(v, "2026-07-20T14:00:00-04:00") }
-    stub_global(:changelog_status) do |_endpoint|
+    stub_global_for_test(:changelog_status) do |_endpoint|
       { "playbook-admin" => { "application" => "playbook-admin", "max_version" => missing.last,
                               "versions_missing_notes" => missing.dup } }
     end
-    stub_global(:changelog_tags) { |_checkout| missing.dup }
-    stub_global(:changelog_commits) { |_checkout, range| commits_by_version[range.split("..").last] }
-    stub_global(:changelog_git_out) do |*cmd|
+    stub_global_for_test(:changelog_tags) { |_checkout| missing.dup }
+    stub_global_for_test(:changelog_commits) { |_checkout, range| commits_by_version[range.split("..").last] }
+    stub_global_for_test(:changelog_git_out) do |*cmd|
       cmd.include?("--format=%cI") ? released_at.call(cmd.last) : ""
     end
     checkout = @checkout
-    stub_global(:changelog_app_checkout) { |_app| checkout }
+    stub_global_for_test(:changelog_app_checkout) { |_app| checkout }
 
-    stub_global(:changelog_post_batches) do |_endpoint, path, _key, records|
+    stub_global_for_test(:changelog_post_batches) do |_endpoint, path, _key, records|
       posted << [path, records]
       records.length
     end
 
-    stub_global(:changelog_run_claude) do |_workdir, input_path, version_count|
+    stub_global_for_test(:changelog_run_claude) do |_workdir, input_path, version_count|
       input = JSON.parse(File.read(input_path))
       inputs << input
       raise "version_count disagrees with the payload" unless version_count == input["versions"].length
@@ -376,7 +365,7 @@ class TestDevChangelogBuild < Minitest::Test
   # A session that returns without writing a file must not be reported as built.
   def test_versions_left_unwritten_fail_the_command
     2.times { |i| pending_version("0.3.#{i}", "2026-07-#{20 + i}T14:00:00-04:00") }
-    stub_global(:changelog_run_claude) { |_w, _input_path, _count| "claude timed out" }
+    stub_global_for_test(:changelog_run_claude) { |_w, _input_path, _count| "claude timed out" }
     assert_raises(SystemExit) { build }
     assert_empty posted_notes
   end
@@ -391,6 +380,8 @@ end
 # The wiring around changelog_capture_gap: capture has to re-read the count AFTER sending,
 # and a gap has to reach the user on stderr rather than only in the scan line.
 class TestDevChangelogCapture < Minitest::Test
+  include DevTestSupport
+
   def setup
     @checkout = Dir.mktmpdir("changelog-checkout")
     FileUtils.mkdir_p(File.join(@checkout, ".git"))
@@ -399,22 +390,11 @@ class TestDevChangelogCapture < Minitest::Test
     @tags = %w[0.3.0 0.3.1 0.3.2]
     @max_version = nil
     @release_count = 0
-    @real_methods = {}
     stub_world!
   end
 
   def teardown
     FileUtils.remove_entry(@checkout)
-    @real_methods.each { |name, m| Object.send(:define_method, name, m) }
-  end
-
-  def stub_global(name, &body)
-    @real_methods[name] ||= begin
-      Object.instance_method(name)
-    rescue NameError
-      nil
-    end
-    Object.send(:define_method, name, body)
   end
 
   attr_reader :tags, :max_version, :release_count
@@ -425,20 +405,20 @@ class TestDevChangelogCapture < Minitest::Test
     test = self
     posted = @posted
     checkout = @checkout
-    stub_global(:platform_endpoint) { |_localhost| { name: "test" } }
-    stub_global(:changelog_app_repo) { |_app| "playbook-admin" }
-    stub_global(:changelog_app_checkout) { |_app| checkout }
-    stub_global(:changelog_tags) { |_checkout| test.tags.dup }
-    stub_global(:changelog_commits) { |_checkout, _range| [] }
-    stub_global(:changelog_git_out) { |*_cmd| "2026-07-20T14:00:00-04:00" }
-    stub_global(:changelog_status) do |_endpoint|
+    stub_global_for_test(:platform_endpoint) { |_localhost| { name: "test" } }
+    stub_global_for_test(:changelog_app_repo) { |_app| "playbook-admin" }
+    stub_global_for_test(:changelog_app_checkout) { |_app| checkout }
+    stub_global_for_test(:changelog_tags) { |_checkout| test.tags.dup }
+    stub_global_for_test(:changelog_commits) { |_checkout, _range| [] }
+    stub_global_for_test(:changelog_git_out) { |*_cmd| "2026-07-20T14:00:00-04:00" }
+    stub_global_for_test(:changelog_status) do |_endpoint|
       test.record_status_read
       { "playbook-admin" => { "application" => "playbook-admin",
                               "max_version" => test.max_version,
                               "release_count" => test.release_count,
                               "versions_missing_notes" => [] } }
     end
-    stub_global(:changelog_post_batches) do |_endpoint, path, _key, records|
+    stub_global_for_test(:changelog_post_batches) do |_endpoint, path, _key, records|
       posted << [path, records]
       records.length
     end

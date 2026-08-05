@@ -102,8 +102,8 @@ class TestDbAppsGcReap < Minitest::Test
 
   def test_session_db_ages_parses_name_and_seconds
     a = app
-    a.stub(:sess_prefix, "platformdb_sess_") do
-      DbImages.stub(:psql_query, ["platformdb_sess_a|345600", "platformdb_sess_b|60"]) do
+    stub_singleton(a, :sess_prefix, ->(*) { "platformdb_sess_" }) do
+      stub_singleton(DbImages, :psql_query, ->(*) { ["platformdb_sess_a|345600", "platformdb_sess_b|60"] }) do
         assert_equal({ "platformdb_sess_a" => 345_600, "platformdb_sess_b" => 60 },
                      a.session_db_ages(5432))
       end
@@ -113,13 +113,14 @@ class TestDbAppsGcReap < Minitest::Test
   # A failed query returns no rows, which must yield "no ages known" (keep
   # everything), not an exception and not a silent empty-means-reap.
   def test_session_db_ages_is_empty_when_the_query_fails
-    DbImages.stub(:psql_query, []) do
+    stub_singleton(DbImages, :psql_query, ->(*) { [] }) do
       assert_empty app.session_db_ages(5432)
     end
   end
 
   def test_session_db_ages_skips_malformed_rows
-    DbImages.stub(:psql_query, ["platformdb_sess_ok|100", "garbage-no-separator", "platformdb_sess_x|"]) do
+    stub_singleton(DbImages, :psql_query,
+                   ->(*) { ["platformdb_sess_ok|100", "garbage-no-separator", "platformdb_sess_x|"] }) do
       assert_equal({ "platformdb_sess_ok" => 100 }, app.session_db_ages(5432))
     end
   end

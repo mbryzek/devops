@@ -1,12 +1,15 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
 require_relative '../lib/common'
+require_relative 'test_helper'
 
 class TestUtilRegistryLogin < Minitest::Test
+  include DevTestSupport
+
   def test_runs_doctl_registry_login
     cmds = []
-    Util.stub(:assert_installed, nil) do
-      Util.stub(:run, ->(cmd, *) { cmds << cmd }) do
+    stub_singleton(Util, :assert_installed, ->(*) {}) do
+      stub_singleton(Util, :run, ->(cmd, *) { cmds << cmd }) do
         Util.registry_login
       end
     end
@@ -17,8 +20,8 @@ class TestUtilRegistryLogin < Minitest::Test
   # credential, never a forever token.
   def test_never_passes_never_expire
     cmds = []
-    Util.stub(:assert_installed, nil) do
-      Util.stub(:run, ->(cmd, *) { cmds << cmd }) do
+    stub_singleton(Util, :assert_installed, ->(*) {}) do
+      stub_singleton(Util, :run, ->(cmd, *) { cmds << cmd }) do
         Util.registry_login
       end
     end
@@ -27,8 +30,8 @@ class TestUtilRegistryLogin < Minitest::Test
 
   def test_requires_doctl_installed
     checked = []
-    Util.stub(:assert_installed, ->(cmd, *) { checked << cmd }) do
-      Util.stub(:run, nil) do
+    stub_singleton(Util, :assert_installed, ->(cmd, *) { checked << cmd }) do
+      stub_singleton(Util, :run, ->(*) {}) do
         Util.registry_login
       end
     end
