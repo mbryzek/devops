@@ -242,6 +242,19 @@ class TestDevAgentToolchain < Minitest::Test
     assert_includes named, "browserslist-update"
   end
 
+  # `api` is the prerequisite that used to be documented in the prompt of the
+  # `codegen-sync-weekly` openclaw cron, which ISS-396 retired as a duplicate of
+  # the `codegen-sync` producer. Deleting a prompt deletes what it knew, so the
+  # requirement moved here. Without it every backend in the sweep comes back
+  # `api failed in .` and every frontend that depends on one is skipped
+  # (2026-07-08), on a box where `dev` itself starts perfectly well — the plist
+  # invokes it by absolute path.
+  def test_the_codegen_sweeps_regen_binary_is_declared
+    api = T::TOOLS.find { |t| t.name == "api" }
+    refute_nil api, "codegen sync shells out to `api`; a runner without it regenerates nothing"
+    assert api.required?, "a missing `api` fails the whole sweep, not one optional feature"
+  end
+
   def test_every_tool_carries_an_install_command_and_a_reason
     T::TOOLS.each do |t|
       refute_empty t.install.to_s, "#{t.name}: no install command — the one question a broken box asks"
