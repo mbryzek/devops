@@ -1146,10 +1146,10 @@ def cmd_auth_logout(args)
   puts "Logged out"
 end
 
-# The AI actor. Claude sessions authenticate as "Otto AI" (user id `ai`) with an API token
-# instead of borrowing Mike's session, so anything the AI writes is attributed to the AI.
-AI_USER_ID = "ai".freeze
-AI_USER_LABEL = "Otto AI".freeze
+# The AI actor -- see `ApiClient`, which owns the identity alongside its token file because the
+# library has to name it on the 401 path too.
+AI_USER_ID = ApiClient::AI_USER_ID
+AI_USER_LABEL = ApiClient::AI_USER_LABEL
 
 # Only these flags; anything else is a typo worth reporting rather than ignoring.
 def parse_auth_flags(args, command, allow: [])
@@ -1738,10 +1738,12 @@ def cmd_invariants_check(args)
       begin
         data = ApiClient.request(endpoint, :get, invariant_checks_path)
         { endpoint: endpoint, data: data, error: nil }
-      rescue SessionExpired => e
-        { endpoint: endpoint, data: nil, error: "session expired - run 'dev auth login'" }
-      rescue ApiError => e
-        { endpoint: endpoint, data: nil, error: e.message }
+      # One arm, because every failure here reports the same way: whatever the error says. The
+      # SessionExpired arm used to substitute a fixed "session expired - run 'dev auth login'" and
+      # throw the real message away, so an autonomous session -- which has no session and no
+      # terminal -- was told to log in when the server had actually said `User ai does not belong to
+      # platform` (ISS-474). ApiClient now words a 401 for the credential it presented; do not
+      # re-word it here.
       rescue => e
         { endpoint: endpoint, data: nil, error: e.message }
       end

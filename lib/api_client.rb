@@ -55,6 +55,17 @@ class ApiClient
     id.empty? ? nil : id
   end
 
+  # The AI actor. Claude sessions authenticate as "Otto AI" (user id `ai`) with an API token instead
+  # of borrowing Mike's session, so anything the AI writes is attributed to the AI.
+  #
+  # These live here, beside the token file and `ai_session?`, rather than in `bin/dev` where they
+  # started: `unauthorized_message` has to name the identity it authenticated as, and a top-level
+  # constant in `bin/dev` only resolves in processes that loaded `bin/dev` -- every other entry point
+  # requiring this library would have raised NameError on the error path, which is the one path that
+  # never gets exercised before it ships.
+  AI_USER_ID = "ai".freeze
+  AI_USER_LABEL = "Otto AI".freeze
+
   # The AI actor's own API token ("Otto AI", user id `ai`). Kept beside the session files, one per
   # target, since a prod token is meaningless against localhost.
   AI_TOKEN_FILE = File.expand_path("~/.platform/devops_ai").freeze
@@ -154,17 +165,23 @@ class ApiClient
 
     req = klass.new(uri.request_uri)
     req["Content-Type"] = "application/json"
+    # Which credential we actually presented. A 401 means something different for each, and only
+    # the caller knows which one went out -- see `unauthorized_message`.
+    credential = :none
     if auth_required && as_token
       req["Authorization"] = "Basic #{Base64.strict_encode64("#{as_token}:")}"
+      credential = :explicit_token
     elsif auth_required
       header, value = auth_header_for(endpoint[:app], use_localhost: use_localhost)
       if header
         req[header] = value
+        credential = :ai_token
       else
         cfg = SESSION_CONFIG.fetch(endpoint[:app])
         sid = session_id_for(endpoint[:app], use_localhost: use_localhost) or
           raise SessionExpired, "No session for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
         req[cfg[:header]] = sid
+        credential = :session
       end
     end
     req.body = body.is_a?(String) ? body : JSON.generate(body) if body
@@ -175,9 +192,65 @@ class ApiClient
     when 200..299
       res.body && !res.body.empty? ? JSON.parse(res.body) : nil
     when 401
-      raise SessionExpired, "Session expired or invalid for #{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}. Run '#{login_cmd}'."
+      raise SessionExpired, unauthorized_message(
+        credential: credential, endpoint: endpoint, use_localhost: use_localhost,
+        login_cmd: login_cmd, body: res.body
+      )
     else
       raise ApiError.new("HTTP #{code} #{method.to_s.upcase} #{path}: #{res.body}", code: code)
     end
+  end
+
+  # What a 401 means depends on the credential that went out, and the server says which of the two
+  # kinds it is -- so both go into the message.
+  #
+  # This used to report "Session expired or invalid ... Run 'dev auth login'" for every 401 and drop
+  # the response body on the floor. That is what kept ISS-474 invisible: an autonomous session
+  # authenticates as Otto AI with an API token, never a session, so it was being told to run an
+  # interactive login it has no terminal for, about a credential it was not using, when the server
+  # had plainly said `User ai does not belong to platform` -- an authorization failure, not an
+  # expired one. `dev queries top` and `dev invariants check` both failed this way for months and
+  # read as a routine auth hiccup.
+  #
+  # No attempt is made to classify authn-vs-authz by pattern-matching the server's text. The body is
+  # quoted verbatim and the remedy is chosen from the credential, which we know for certain; a
+  # brittle string match on messages the platform is free to reword would be a worse guess than the
+  # server's own words.
+  def self.unauthorized_message(credential:, endpoint:, use_localhost:, login_cmd:, body:)
+    target = "#{endpoint[:app]}#{use_localhost ? ' (localhost)' : ''}"
+    said = server_message(body)
+    remedy =
+      case credential
+      when :ai_token
+        "This process authenticates as #{AI_USER_LABEL} (user `#{AI_USER_ID}`) with the API token in " \
+          "#{ai_token_file(use_localhost)}, not with a session, so `#{login_cmd}` is not the fix and there is " \
+          "nobody to run it. Either the endpoint does not admit the AI identity (an authorization failure -- " \
+          "the server's message above says which), or the token was revoked and a human must re-run " \
+          "`dev auth ai provision --rotate#{use_localhost ? ' --localhost' : ''}`."
+      when :explicit_token
+        "The API token presented for this call was rejected."
+      when :session
+        "Session expired or invalid. Run '#{login_cmd}'."
+      else
+        "The request was sent with no credential."
+      end
+    ["HTTP 401 for #{target}", said && "server said: #{said}", remedy].compact.join(" -- ")
+  end
+
+  # The `message` out of the platform's error envelope, e.g.
+  # `{"discriminator":"unauthorized","message":"User ai does not belong to platform"}`. Falls back to
+  # the raw body for anything that is not that shape (a proxy's HTML 401, say), and to nil for an
+  # empty one, so the caller can omit the clause entirely rather than print "server said: ".
+  def self.server_message(body)
+    text = body.to_s.strip
+    return nil if text.empty?
+
+    parsed = begin
+      JSON.parse(text)
+    rescue JSON::ParserError
+      nil
+    end
+    message = parsed.is_a?(Hash) ? parsed["message"].to_s.strip : ""
+    message.empty? ? text : message
   end
 end
