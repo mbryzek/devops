@@ -86,6 +86,7 @@ INVOCATIONS = {
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--duplicate-of NUMBER] [--app APP --baseline-version VERSION] [--localhost]',
+  "issues fix"          => 'issues fix <number> --url URL [--comment "TEXT"] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
   "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
@@ -620,6 +621,33 @@ USAGE = <<~USAGE
         `--status dismissed`, and `issues duplicate` is the shorter way to say it. The generated plan tells
         the fix session to call this so no session token is written into the plan file.
 
+        THIS IS THE FIRST FIX ONLY. fixed -> deployed -> verified is a one-way
+        ladder and the server refuses a move back down it, so `--status fixed` on an
+        issue already deployed or verified comes back 422 rather than silently
+        un-verifying it. A SECOND PR on an already-shipped issue is `issues fix`
+        below. Reopening is unaffected — `--status open` is how a regression is
+        recorded, and the comment is what says so.
+
+    #{INVOCATIONS["issues fix"]}
+        Record an ADDITIONAL fix on an issue that has already shipped — "this also
+        shipped in devops PR #314" — leaving its status exactly where it is. Use it
+        whenever the work landed in more than one PR and the issue is already fixed,
+        deployed or verified.
+        --url is the merged PR (or a document); --comment says why you are recording
+        it; --app and --baseline-version TOGETHER name the deployable, the same pair
+        `issues status` takes, and on an issue still at `fixed` they become what
+        `issues reconcile` watches.
+
+        Never name a status to do this. `issues status --status fixed --url ...` on
+        an issue at `verified` or `deployed` walks it BACKWARD: on 2026-08-05 one
+        sweep recording second PRs that way un-verified ten issues in eleven seconds,
+        six needed hand-walking forward, and three of Mike's verifications were
+        destroyed outright — the one thing here nothing automated can reproduce
+        (ISS-536). The server now refuses that write, and this is the command it
+        refuses it in favour of. Do NOT fall back to a bare --comment either: a url
+        in prose is invisible to `issues show`'s fix list, to `issues reconcile` and
+        to the merge webhook, which is the same loss somewhere quieter.
+
     #{INVOCATIONS["issues duplicate"]}
         Record NUMBER as a duplicate of --of NUMBER: it is dismissed, both issues
         get a note, and each one shows the link from then on (`issues show`, and a
@@ -890,7 +918,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent block duplicate workaround claim show status snooze reconcile resume],
+  "issues"       => %w[create list parent block duplicate workaround claim show status fix snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -3063,6 +3091,11 @@ def issue_plan_closing(category, number)
       - Fixed by a document (process/manual fix, e.g. a Google Doc) →
         `dev issues status #{number} --status fixed --url "<doc URL>"`
         (no app/baseline: nothing to detect, so `deployed` is set by hand later)
+      - A SECOND PR on an issue already fixed/deployed/verified →
+        `dev issues fix #{number} --url "<PR URL>" [--app <app> --baseline-version <version>]`
+        (never `--status fixed` again: that walks the issue backward out of
+        deployed/verified, and the server refuses it. Never a bare --comment either —
+        a url in prose is invisible to `dev issues reconcile` and to the fix list.)
       - Needs a human decision, or not actionable / already fixed →
         `dev issues status #{number} --status needs_input --comment "<question or reason>"`
         (every comment you write is an INTERNAL note to the team — never a reply
@@ -4271,18 +4304,7 @@ def cmd_issues_status(args)
   body[:duplicate_of_number] = duplicate_of if duplicate_of && !duplicate_of.empty?
 
   if has_app
-    registry = Work::Registry.load
-    # deploy_tracked, not deployable: a fix can ship in an app (e.g. playbook-app)
-    # that has no pingable prod URL, and reconcile reads its live version from k8s.
-    # Intersected with ISSUE_APPS because the registry is the wider set — it tracks
-    # every deployable under ~/code, and naming one the `issue_app` enum does not
-    # have is a 422 from the server rather than a message from here.
-    app = registry.deploy_tracked.find { |a| a.name == target_app && ISSUE_APPS.include?(a.name) }
-    unless app
-      valid = registry.deploy_tracked.map(&:name).select { |n| ISSUE_APPS.include?(n) }.sort.join(", ")
-      Util.exit_with_error("Unknown --app '#{target_app}'. Valid apps: #{valid}")
-    end
-    body[:app] = target_app
+    body[:app] = issue_app!(target_app)
     body[:baseline_version] = baseline_version
   end
 
@@ -4296,6 +4318,97 @@ def cmd_issues_status(args)
     puts "  target app: #{target_app} (baseline #{baseline_version})" if has_app
     print_duplicate_link(res)
   end
+end
+
+# Record an ADDITIONAL fix url on an issue that has already shipped, without naming a
+# status.
+#
+# This exists because `issues status` was the only door and taking it was destructive.
+# `--status` is required there (see cmd_issues_status), so a session holding "this also
+# shipped in PR #90" had two options and both lost something: a bare --comment, which
+# records prose and no fix url, or `--status fixed --url ...`, which records the url and
+# walks the issue BACKWARD if it had moved past `fixed`. On 2026-08-05 one sweep took the
+# second option ten times in eleven seconds — three of Mike's verifications were destroyed
+# and six issues had to be hand-walked forward (ISS-536). The two calls are one word apart
+# and nothing warned about the difference.
+#
+# The url is what makes this worth a command of its own: it lands in the fix list that
+# `issues show`, `issues reconcile` and the merge webhook all read, where a sentence in a
+# comment is invisible to every one of them.
+def cmd_issues_fix(args)
+  rest, target_app, use_localhost = parse_common_flags(args)
+  comment = nil
+  url = nil
+  baseline_version = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--comment"
+      comment = rest[i + 1]
+      usage_exit("--comment requires a value", example: usage_for("issues fix")) if comment.nil?
+      i += 2
+    when "--url"
+      url = rest[i + 1]
+      usage_exit("--url requires a value", example: usage_for("issues fix")) if url.nil?
+      i += 2
+    when "--baseline-version"
+      baseline_version = rest[i + 1]
+      usage_exit("--baseline-version requires a value", example: usage_for("issues fix")) if baseline_version.nil?
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  number = leftover.shift
+  has_app = !(target_app.nil? || target_app.empty?)
+  has_baseline = !(baseline_version.nil? || baseline_version.empty?)
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 034)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  # The whole point of the command: there is no fix to record without one.
+  problems << "--url is required (the merged PR, or a document describing the fix)" if url.nil? || url.empty?
+  # Same deploy-detection pair as `issues status`: one without the other detects nothing.
+  problems << "--app requires --baseline-version (the app's live release tag at fix time)" if has_app && !has_baseline
+  problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
+  report_arg_problems("issues fix", problems, usage_for("issues fix"))
+
+  body = { url: url }
+  body[:comment] = comment if comment && !comment.empty?
+  if has_app
+    body[:app] = issue_app!(target_app)
+    body[:baseline_version] = baseline_version
+  end
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    res = ApiClient.request(issue_endpoint(use_localhost), :post,
+                            issues_path("/#{URI.encode_www_form_component(number)}/fixes"),
+                            body: body)
+    puts "#{issue_label(res)}: fix recorded, status left at #{res['status']}"
+    puts "  #{url}"
+    puts "  target app: #{target_app} (baseline #{baseline_version})" if has_app
+  end
+end
+
+# The `--app` value as the issues API will accept it, or exit naming the valid ones.
+#
+# deploy_tracked, not deployable: a fix can ship in an app (e.g. playbook-app) that has no
+# pingable prod URL, and reconcile reads its live version from k8s. Intersected with
+# ISSUE_APPS because the registry is the wider set — it tracks every deployable under
+# ~/code, and naming one the `issue_app` enum does not have is a 422 from the server rather
+# than a message from here.
+def issue_app!(name)
+  registry = Work::Registry.load
+  app = registry.deploy_tracked.find { |a| a.name == name && ISSUE_APPS.include?(a.name) }
+  unless app
+    valid = registry.deploy_tracked.map(&:name).select { |n| ISSUE_APPS.include?(n) }.sort.join(", ")
+    Util.exit_with_error("Unknown --app '#{name}'. Valid apps: #{valid}")
+  end
+  app.name
 end
 
 # The link as the server actually stored it, which is not always the number that was
@@ -4498,21 +4611,37 @@ def cmd_issues_snooze(args)
   end
 end
 
-# The deploy-detection info of the most recent fix, or nil when the latest fix
-# shipped without one (a document fix, or a webhook fix whose repo platform could
-# not name — see issue_fix_repo).
+# The deploy-detection info this issue's deploy pass watches: the most recent fix that
+# CARRIES one, or nil when no fix does (a document fix, or a webhook fix whose repo
+# platform could not name — see issue_fix_repo).
+#
+# The most recent one carrying a deployment, not simply the last fix. Recording an
+# additional fix no longer implies a status change (`dev issues fix`, ISS-536), so an
+# issue at `fixed` legitimately accumulates later fixes with no app — a devops PR that
+# releases nothing, a document beside the code fix. Reading the last row would answer
+# "no app recorded" for an issue whose real, watchable fix sits one row above, and the
+# no-app branch's shortcut ("devops releases nothing, so the merge is the release")
+# would then call the whole issue live before its app shipped. That mirrors
+# IssueDeployReconciler.watchedFix, deliberately: the two run the same decision.
 def issue_fix_deployment(issue)
-  (issue["fixes"] || []).last&.fetch("deployment", nil)
+  (issue["fixes"] || []).reverse.find { |f| f["deployment"] }&.fetch("deployment", nil)
 end
 
-# The repo the most recent fix shipped from, parsed out of its PR url, or nil when
-# the fix is not a PR (a document link). Repo-keyed rather than app-keyed on purpose:
-# the registry answers "does this repo release anything?" by repo_name, and the same
-# parse-the-url technique already keys the changelog's ISS map.
+# Every repo this issue's fixes shipped from, parsed out of their PR urls, oldest first
+# and deduped; a fix that is not a PR (a document link) contributes nothing. Repo-keyed
+# rather than app-keyed on purpose: the registry answers "does this repo release
+# anything?" by repo_name, and the same parse-the-url technique already keys the
+# changelog's ISS map.
+def issue_fix_repos(issue)
+  (issue["fixes"] || []).filter_map do |fix|
+    m = fix["url"].to_s.match(%r{\Ahttps://github\.com/[^/]+/([^/]+)/pull/\d+})
+    m && m[1]
+  end.uniq
+end
+
+# The repo the most recent fix shipped from — what a one-line explanation names.
 def issue_fix_repo(issue)
-  url = (issue["fixes"] || []).last&.fetch("url", nil).to_s
-  m = url.match(%r{\Ahttps://github\.com/[^/]+/([^/]+)/pull/\d+})
-  m && m[1]
+  issue_fix_repos(issue).last
 end
 
 # ---------- claimed -> fixed, adopted from merged PRs ----------
@@ -4775,19 +4904,29 @@ def cmd_issues_reconcile(args)
         # deployable the tracker has no enum value for (acumen, rallyd, lib-* — which
         # really do release, so calling the merge "live" would be a claim the
         # auto-verifier acts on). Promote only the first kind.
-        repo = issue_fix_repo(c)
-        if repo && issue_repo_releases_nothing?(registry, repo)
+        # EVERY repo the issue shipped from has to release nothing, not just the last
+        # one: an issue fixed across a devops PR and an acumen PR is not live because
+        # devops releases nothing (ISS-536 made multi-PR issues ordinary here).
+        repos = issue_fix_repos(c)
+        releasing = repos.reject { |r| issue_repo_releases_nothing?(registry, r) }
+        phrase = "#{repos.join(' and ')} #{repos.length == 1 ? 'releases' : 'release'} nothing"
+        if repos.any? && releasing.empty?
           if apply
             ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
                               body: { status: "deployed", visibility: "internal",
-                                      comment: "#{repo} releases nothing, so the merge is the release; awaiting verification." })
-            puts "  deployed #{issue_link(c)}: #{repo} releases nothing"
+                                      comment: "#{phrase}, so the merge is the release; awaiting verification." })
+            puts "  deployed #{issue_link(c)}: #{phrase}"
           else
-            puts "  would deploy #{issue_link(c)}: #{repo} releases nothing"
+            puts "  would deploy #{issue_link(c)}: #{phrase}"
           end
           deployed += 1
         else
-          reason = repo ? "#{repo} releases, but no app was recorded — advance once it ships" : "document fix — advance manually"
+          reason =
+            if releasing.any?
+              "#{releasing.join(', ')} releases, but no app was recorded — advance once it ships"
+            else
+              "document fix — advance manually"
+            end
           puts "  skip #{issue_link(c)}: #{reason}"
           skipped += 1
         end
@@ -10323,6 +10462,7 @@ when "issues"
   when "resume"     then cmd_issues_resume(argv)
   when "claim"      then cmd_issues_claim(argv)
   when "status"     then cmd_issues_status(argv)
+  when "fix"        then cmd_issues_fix(argv)
   when "snooze"     then cmd_issues_snooze(argv)
   when "reconcile"  then cmd_issues_reconcile(argv)
   when nil          then require_subcommand("issues")
