@@ -1,12 +1,14 @@
 require 'fileutils'
+require 'set'
 require 'time'
+require 'agent/jobs'
 require 'agent/paths'
 require 'agent/workspace'
 
-# Retention (design §4.3.1). One rule per kind, applied by `dev agent gc`, which
-# runs as a producer at 4:00am through the same registry as everything else —
-# retention is a producer, not a cron, so it inherits the run history and mutual
-# exclusion the rest of the system has.
+# Retention (design §4.3.1). One rule per kind, applied by `dev agent gc` and by
+# the tick's runner-local maintenance pass (Agent::Maintenance) — every machine
+# collects its own logs and workspaces, because these are files on THIS disk and
+# nothing another machine does frees them (ISS-520).
 #
 #   tick/, producers/                       30 days
 #   issues/<n>/ for a terminal issue        14 days after completion
@@ -25,6 +27,18 @@ module Agent
     TERMINAL_ISSUE_DAYS = 14
     FAILED_ISSUE_DAYS = 30
     WORKSPACE_DAYS = 7
+
+    # What `workspace_days` drops to when the machine is under disk pressure
+    # (Agent::Maintenance). Only the WORKSPACE window shortens: a feature dir is
+    # several full clones plus node_modules and is exactly what fills a disk,
+    # while the log windows above hold a few MB and are the post-mortem record.
+    # Trading the record for megabytes would be a bad bargain in the one moment
+    # someone is most likely to need it.
+    #
+    # One day is still far outside a live job's reach: the hard timeout is 4
+    # hours (Agent::Jobs::TIMEOUT_SECONDS), and `workspaces` refuses to collect a
+    # slug with a live pid regardless.
+    PRESSURE_WORKSPACE_DAYS = 1
 
     # Outcomes that end an issue's work. Anything else (a failure, a give-up)
     # keeps the longer post-mortem window.
@@ -45,8 +59,8 @@ module Agent
     def age_days(time, now) = (now - time) / 86_400.0
 
     # [[path, reason], ...] — everything a run would delete right now.
-    def plan(now: Time.now)
-      rotated_logs(now) + issue_dirs(now) + workspaces(now)
+    def plan(now: Time.now, workspace_days: WORKSPACE_DAYS)
+      rotated_logs(now) + issue_dirs(now) + workspaces(now, workspace_days)
     end
 
     def rotated_logs(now)
@@ -80,15 +94,28 @@ module Agent
       end
     end
 
-    def workspaces(now)
+    # Slugs a LIVE session is working in. mtime alone is not enough to answer
+    # "is anyone using this": a job clones its repos in the first minute and then
+    # works inside them for hours, so the feature dir's own mtime stops moving
+    # while the session is still very much running. At the 7-day default that
+    # gap is unreachable, but `workspace_days` shortens under disk pressure and
+    # "we were low on disk" is the worst possible reason to delete a running
+    # session's working tree out from under it.
+    def live_slugs
+      Agent::Jobs.all.select { |r| Agent::Jobs.alive?(r["pid"]) }.map { |r| r["slug"] }.compact.to_set
+    end
+
+    def workspaces(now, days = WORKSPACE_DAYS)
       root = Agent::Paths.workspace_root
       return [] unless Dir.exist?(root)
+      live = live_slugs
       Dir.children(root).sort.filter_map do |name|
         next unless name.match?(AGENT_SLUG)
+        next if live.include?(name)
         path = File.join(root, name)
         next unless File.directory?(path)
-        next unless age_days(File.mtime(path), now) > WORKSPACE_DAYS
-        [path, "agent workspace idle #{age_days(File.mtime(path), now).round} days (keep #{WORKSPACE_DAYS})"]
+        next unless age_days(File.mtime(path), now) > days
+        [path, "agent workspace idle #{age_days(File.mtime(path), now).round} days (keep #{days})"]
       end
     end
 

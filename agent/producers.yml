@@ -288,16 +288,21 @@ producers:
   # with a regex.
   #
   # Schedules are the crons' schedules, preserved.
-
-  - key: aidirs-prune
-    schedule: daily at 6:00am
-    check: dev aidirs prune --apply
-    file_when: never
-
-  - key: docker-prune
-    schedule: daily at 5:08am
-    check: dev docker prune --days 7 --apply
-    file_when: never
+  #
+  # `aidirs-prune`, `docker-prune` and `agent-gc` USED TO BE HERE and are not
+  # producers at all (ISS-520). Every producer, including a `file_when: never`
+  # one, runs behind the daily compare-and-set in POST /agent/producers/:key/runs
+  # — so with N runners exactly one machine won each lock per day. That is the
+  # right arbitration for work whose output is an ISSUE (one issue for the fleet,
+  # not N) and the wrong arbitration for work whose output is FREE DISK ON THE
+  # MACHINE THAT RAN IT: N-1 machines never collected a log, never pruned a
+  # feature dir and never pruned an image, invisibly, until a disk filled.
+  #
+  # They are now runner-local maintenance inside the tick — see
+  # lib/agent/maintenance.rb — on each machine's own cadence, with no server run
+  # and no lock, plus a disk-pressure trigger that does not wait for a schedule.
+  # Every machine prunes itself; the platform's job is noticing when one stops,
+  # which is the `agent_runner_maintenance_stale` invariant, not a lock.
 
   - key: browserslist-update
     schedule: weekly on monday at 4:13am
@@ -522,10 +527,3 @@ producers:
       title: Weekly meta-review of producer runs and recent issues
       fingerprint: meta-review:weekly:{date}
       body_file: bodies/meta-review.md
-
-  # Retention is a producer, not a cron, so log purging gets the same history,
-  # visibility and mutual exclusion as everything else on the tick (§4.3.1).
-  - key: agent-gc
-    schedule: daily at 4:00am
-    check: dev agent gc
-    file_when: never

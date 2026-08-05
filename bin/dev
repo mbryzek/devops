@@ -40,6 +40,7 @@ require 'depsguard'
 # inlined here because the pieces that decide anything — schedule due-ness,
 # outcome classification, retention — are pure functions that get real tests.
 require 'agent/gc'
+require 'agent/maintenance'
 require 'agent/tick'
 
 # Single source of truth for each command's invocation line, keyed by the command
@@ -115,6 +116,7 @@ INVOCATIONS = {
   "agent refresh"       => 'agent refresh <issue> [--comment "TEXT"] [--localhost]',
   "agent release"       => 'agent release <issue> [--localhost]',
   "agent gc"            => 'agent gc [--dry-run]',
+  "agent maintenance"   => 'agent maintenance [--dry-run] [--force]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -810,7 +812,15 @@ USAGE = <<~USAGE
     #{INVOCATIONS["agent gc"]}
         Apply the retention rules: tick/producer logs 30 days, a terminal issue's
         logs 14 days, a failed one's 30 (the post-mortem window), agent
-        workspaces 7 days. Runs daily at 4am as a producer.
+        workspaces 7 days. One third of what `agent maintenance` runs.
+
+    #{INVOCATIONS["agent maintenance"]}
+        This machine's own housekeeping — `agent gc`, `aidirs prune` and
+        `docker prune` — and what the tick runs once a day, plus immediately
+        whenever free space falls under the floor. Runner-local by design: these
+        delete files on THIS disk, so every machine runs its own (ISS-520).
+        Prints when it last ran, this machine's headroom, and whether a run is
+        due. --dry-run says what it would do; --force runs regardless of cadence.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -858,7 +868,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs pause resume runners producers runs refresh release gc],
+  "agent"        => %w[tick status logs pause resume runners producers runs refresh release gc maintenance],
 }.freeze
 
 def levenshtein(a, b)
@@ -9933,6 +9943,53 @@ def cmd_agent_gc(args)
   puts "Removed #{Agent::Gc.apply(entries)} path(s)."
 end
 
+# The operator handle on runner-local housekeeping (ISS-520). Its real job is
+# ANSWERING, not running: "did this machine prune, and does it have headroom" is
+# the question, and before this it could only be answered by ssh-ing in and
+# reading `df` by hand — which is precisely why N-1 machines starving went
+# unnoticed. The tick runs the same code on its own; this is how a human sees it.
+def cmd_agent_maintenance(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent maintenance", [app_filter].compact) if app_filter
+  dry_run = false
+  force = false
+  leftover = []
+  rest.each do |arg|
+    case arg
+    when "--dry-run" then dry_run = true
+    when "--force"   then force = true
+    else                  leftover << arg
+    end
+  end
+  reject_unknown_args("agent maintenance", leftover)
+
+  free, total = Agent::Maintenance.disk
+  last = Agent::Maintenance.last_run_at
+  puts "Disk: #{free ? "#{docker_format_size(free)} free of #{docker_format_size(total)}" : 'unknown (df failed)'}" \
+       " (pressure floor #{docker_format_size(Agent::Maintenance::PRESSURE_FLOOR_BYTES)})"
+  puts "Last run: #{last ? last.localtime.strftime('%Y-%m-%d %H:%M %Z') : 'never'}"
+
+  trigger = Agent::Maintenance.due(now: Time.now, free_bytes: free)
+  if trigger.nil? && !force
+    puts "Not due (cadence #{Agent::Maintenance::CADENCE_SECONDS / 3600}h). Pass --force to run anyway."
+    return
+  end
+  trigger ||= :forced
+
+  if dry_run
+    puts "Would run (#{trigger}):"
+    Agent::Maintenance.plan(trigger).each { |line| puts "  #{line}" }
+    return
+  end
+
+  puts "Running (#{trigger})..."
+  result = Agent::Maintenance.run(trigger: trigger)
+  result.outcomes.each { |o| puts "  #{o.ok ? 'ok  ' : 'FAIL'} #{o.source} — #{o.message}" }
+  reclaimed = result.reclaimed_bytes
+  puts "Reclaimed: #{reclaimed ? docker_format_size(reclaimed) : 'unknown'} (observed change in free space)"
+  exit 1 unless result.outcomes.all?(&:ok)
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -10116,7 +10173,8 @@ when "agent"
   when "runs"      then cmd_agent_runs(argv)
   when "refresh"   then cmd_agent_refresh(argv)
   when "release"   then cmd_agent_release(argv)
-  when "gc"        then cmd_agent_gc(argv)
+  when "gc"          then cmd_agent_gc(argv)
+  when "maintenance" then cmd_agent_maintenance(argv)
   else                  unknown("agent subcommand", sub, SUBCOMMANDS["agent"])
   end
 when "changelog"

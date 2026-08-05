@@ -80,9 +80,15 @@ module Agent
     #
     # Deliberately carries NO error log: that moved to runner_heartbeat in
     # ISS-527. See its comment for why.
-    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:)
-      request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost,
-                                                    body: { devops_sha: devops_sha, producers: producers })
+    #
+    # `maintenance` is Agent::Maintenance.report (ISS-520): last_maintenance_at,
+    # maintenance_reclaimed_bytes, disk_free_bytes, disk_total_bytes. Merged
+    # rather than nested so each is a column the staleness invariant can query
+    # directly, and OMITTED when unknown — a machine that has never pruned has no
+    # last_maintenance_at, and that absence is exactly what the invariant reads.
+    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:, maintenance: {})
+      body = { devops_sha: devops_sha, producers: producers }.merge(maintenance)
+      request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost, body: body)
     end
 
     def reported_registries(token:, use_localhost:)

@@ -235,7 +235,11 @@ class TestDevAgentOutcome < Minitest::Test
     keys = registry.fetch(:producers).map(&:key)
     assert_includes keys, "invariants-platform"
     assert_includes keys, "issue-reconcile"
-    assert_includes keys, "agent-gc", "retention must run as a producer, not a cron"
+    # Retention is NOT here. It deletes logs and workspaces on the machine that
+    # runs it, and a producer's fleet-wide daily lock let exactly one machine per
+    # day do that (ISS-520) — see Agent::Maintenance and
+    # TestAgentCronMigration#test_runner_local_housekeeping_is_not_a_producer.
+    refute_includes keys, "agent-gc"
     registry.fetch(:producers).each do |producer|
       assert_kind_of Hash, producer.schedule, "#{producer.key}: schedule failed to parse"
       next unless producer.files_issue?

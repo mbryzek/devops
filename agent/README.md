@@ -28,6 +28,7 @@ dev agent runs [<key>] [--issue N] producer run history and lease attempts
 dev agent refresh <issue>         re-open a fixed issue for rebase / review feedback
 dev agent release <issue>         force-release a stuck lease
 dev agent gc                      purge logs and workspaces per the retention table
+dev agent maintenance             this machine's housekeeping: gc + aidirs/docker prune
 ```
 
 `dev agent tick --dry-run` prints every decision a real tick would make and
@@ -73,9 +74,42 @@ Local state, all under `~/.platform/` and all of it a **cache**: `agent.identity
 re-registration plus some orphaned processes whose leases expire within ten
 minutes.
 
-Retention (`dev agent gc`, daily at 4:00am as a producer): tick and producer logs
-30 days; a terminal issue's directory 14 days; a failed or gave-up one 30 days —
-the post-mortem window; workspaces deleted on success and after 7 days otherwise.
+`agent-maintenance` joins that list: when this machine last ran its own
+housekeeping, and how it went.
+
+Retention (`dev agent gc`): tick and producer logs 30 days; a terminal issue's
+directory 14 days; a failed or gave-up one 30 days — the post-mortem window;
+workspaces deleted on success and after 7 days otherwise.
+
+## Housekeeping is runner-local, not a producer
+
+`agent gc`, `aidirs prune` and `docker prune` run once a day inside the tick, on
+each machine's own cadence, with **no server run and no lock** (ISS-520,
+`lib/agent/maintenance.rb`). They used to be producers, and that was wrong in a
+way that only showed up with more than one runner: every producer runs behind a
+fleet-wide daily compare-and-set, so exactly ONE machine per day won the right to
+delete *its own* logs, feature dirs and images. The other N-1 never pruned
+anything, silently, until a disk filled — which kills Docker and then surfaces as
+unrelated spec failures on the box nobody is watching.
+
+A producer FILES work and its output is an issue, so deduplicating it across the
+fleet is the entire point. This DOES work and its output is free disk on the
+machine that ran it, so there is nothing to deduplicate.
+
+Two triggers: the daily **cadence**, and **disk pressure** — under 50GB free it
+runs immediately with shorter windows (feature dirs and images to 1 day), subject
+to an hour's cooldown so a machine that is genuinely full does not prune on a
+loop. Nothing here talks to the platform: if the platform is unreachable for a
+week every machine still prunes, because the moment you most need headroom is the
+moment things are already broken.
+
+What the platform does own is NOTICING that a machine stopped. Failures ride the
+existing error channel (`Agent::Errors`, sources `agent_gc` / `aidirs_prune` /
+`docker_prune`, escalating at 3 in a row), and the registry report carries
+`last_maintenance_at` plus this machine's headroom — because an error log can
+only report a run that broke, never one that never happened. The
+`agent_runner_maintenance_stale` invariant is what files a single issue naming
+any live runner that has gone quiet or is out of headroom.
 
 ## One push reaches the fleet
 
