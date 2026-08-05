@@ -1102,6 +1102,118 @@ class TestDevIssues < Minitest::Test
     assert_match(/Unknown --app 'not-an-app'/, out)
   end
 
+  # ---- cmd_issues_fix: recording an additional fix without naming a status ----
+  #
+  # ISS-536. `issues status` requires --status, so a session holding "this also shipped in
+  # PR #90" had two options and both lost something: a bare --comment (prose, no fix url)
+  # or `--status fixed --url ...`, which on an issue past `fixed` walked it BACKWARD — ten
+  # issues un-verified in eleven seconds on 2026-08-05, three human verifications gone.
+  # This command is the third option, and the server-side guard refuses the destructive one
+  # in favour of it.
+
+  def test_fix_requires_number
+    out, status = capture_stderr_and_exit { cmd_issues_fix(["--url", "https://pr/1"]) }
+    assert_equal 1, status
+    assert_match(/missing issue number/, out)
+  end
+
+  def test_fix_requires_url_because_that_is_the_whole_point
+    out, status = capture_stderr_and_exit { cmd_issues_fix(["034"]) }
+    assert_equal 1, status
+    assert_match(/--url is required/, out)
+  end
+
+  def test_fix_rejects_unexpected_positional
+    out, status = capture_stderr_and_exit { cmd_issues_fix(["034", "extra", "--url", "https://pr/1"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument/, out)
+  end
+
+  # A status has no meaning here: the command exists precisely so a caller never names one.
+  def test_fix_rejects_a_status_flag
+    out, status = capture_stderr_and_exit { cmd_issues_fix(["034", "--url", "https://pr/1", "--status", "fixed"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument/, out)
+  end
+
+  def test_fix_app_without_baseline_version_is_rejected
+    out, status = capture_stderr_and_exit do
+      cmd_issues_fix(["034", "--url", "https://pr/1", "--app", "playbook-app"])
+    end
+    assert_equal 1, status
+    assert_match(/--app requires --baseline-version/, out)
+  end
+
+  def test_fix_baseline_version_without_app_is_rejected
+    out, status = capture_stderr_and_exit do
+      cmd_issues_fix(["034", "--url", "https://pr/1", "--baseline-version", "0.1.4"])
+    end
+    assert_equal 1, status
+    assert_match(/--baseline-version requires --app/, out)
+  end
+
+  def test_fix_rejects_unknown_app
+    out, status = capture_stderr_and_exit do
+      cmd_issues_fix(["034", "--url", "https://pr/1", "--app", "not-an-app", "--baseline-version", "0.1.4"])
+    end
+    assert_equal 1, status
+    assert_match(/Unknown --app 'not-an-app'/, out)
+  end
+
+  # A document fix (or a devops PR that releases nothing) carries no app/baseline and must
+  # not be forced to invent one. Stops at the credential guard, so arg validation is proven
+  # to pass without reaching the network.
+  def test_fix_with_url_alone_passes_arg_validation
+    out, status = capture_stderr_and_exit { cmd_issues_fix(["034", "--url", "https://docs.google.com/d/1"]) }
+    refute_match(/--url is required/, out)
+    refute_match(/requires --app/, out)
+    assert_equal 1, status
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  # The url has to reach the FIXES endpoint, not the status one: the whole failure this
+  # fixes was a fix url travelling on a status write.
+  def test_fix_posts_the_url_to_the_fixes_endpoint_and_names_no_status
+    sent = nil
+    out, = capture_io do
+      with_stubbed_api("POST #{issues_path('/520/fixes')}" => lambda { |body|
+        sent = body
+        { "number" => "520", "status" => "verified", "title" => "x" }
+      }) do
+        cmd_issues_fix(["520", "--url", "https://github.com/mbryzek/devops/pull/314", "--comment", "Also shipped in devops PR #314."])
+      end
+    end
+    assert_equal "https://github.com/mbryzek/devops/pull/314", sent[:url]
+    assert_equal "Also shipped in devops PR #314.", sent[:comment]
+    refute sent.key?(:status), "a fix must never carry a status: that is the write that un-verified ten issues"
+    assert_match(/ISS-520/, out)
+    assert_match(/status left at verified/, out)
+  end
+
+  def test_fix_sends_the_deploy_pair_when_given
+    sent = nil
+    capture_io do
+      with_stubbed_api("POST #{issues_path('/034/fixes')}" => lambda { |body|
+        sent = body
+        { "number" => "034", "status" => "fixed", "title" => "x" }
+      }) do
+        cmd_issues_fix(["034", "--url", "https://pr/2", "--app", "playbook-app", "--baseline-version", "0.1.4"])
+      end
+    end
+    assert_equal "playbook-app", sent[:app]
+    assert_equal "0.1.4", sent[:baseline_version]
+  end
+
+  def test_fix_usage_documents_the_url_flag
+    assert_match(/--url URL/, usage_for("issues fix"))
+  end
+
+  # A session that cannot find the command falls back to `issues status --status fixed`,
+  # which is the write this whole change exists to stop.
+  def test_fix_is_a_dispatchable_issues_subcommand
+    assert_includes SUBCOMMANDS["issues"], "fix"
+  end
+
   # ---- issue_fix_deployment ----
 
   def test_fix_deployment_reads_the_latest_fix
@@ -1491,6 +1603,95 @@ class TestDevIssues < Minitest::Test
       end
     end
     assert_match(/skip ISS-034: document fix — advance manually/, out)
+  end
+
+  # ---- deploy pass: issues carrying SEVERAL fixes ----
+  #
+  # ISS-536 made these ordinary: `dev issues fix` appends a url without a status write, so
+  # an issue at `fixed` accumulates fixes, and the later ones routinely carry no app (a
+  # devops PR that releases nothing, a document beside the code fix). Reading the LAST fix
+  # would misread both directions — skipping an issue whose watchable fix is one row above,
+  # or promoting one whose real app has not released.
+
+  def fixed_via_fixes(*fixes)
+    graph_issue.merge("status" => "fixed", "fixed_at" => "2026-07-30T15:00:00Z", "fixes" => fixes)
+  end
+
+  def test_fix_deployment_skips_a_later_fix_that_carries_no_app
+    issue = fixed_via_fixes(
+      { "url" => "https://github.com/mbryzek/platform/pull/1", "deployment" => { "app" => "platform", "baseline_version" => "0.9.0" } },
+      { "url" => "https://github.com/mbryzek/devops/pull/314" },
+    )
+    assert_equal({ "app" => "platform", "baseline_version" => "0.9.0" }, issue_fix_deployment(issue))
+  end
+
+  def test_fix_repos_lists_every_repo_a_fix_shipped_from
+    issue = fixed_via_fixes(
+      { "url" => "https://github.com/mbryzek/platform/pull/1" },
+      { "url" => "https://github.com/mbryzek/devops/pull/314" },
+      { "url" => "https://docs.google.com/document/d/abc" },
+    )
+    assert_equal %w[platform devops], issue_fix_repos(issue)
+  end
+
+  # The app-carrying fix still drives the wait: an appended devops PR must not turn "waiting
+  # on a platform release" into "the merge is the release", which would call the fix live
+  # and start the 7-day auto-verify clock before it shipped. The app-keyed branch is what
+  # the `(platform` line proves it took — reading that app's live version is what cannot
+  # succeed in a test, and either outcome of the read prints the app.
+  def test_deploy_pass_keeps_watching_the_app_when_a_later_fix_names_none
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" => [
+                           fixed_via_fixes(
+                             { "url" => "https://github.com/mbryzek/platform/pull/1", "deployment" => { "app" => "platform", "baseline_version" => "0.9.0" } },
+                             { "url" => "https://github.com/mbryzek/devops/pull/314" },
+                           ),
+                         ]) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    refute_match(/releases nothing/, out)
+    refute_match(/advance manually/, out)
+    assert_match(/ISS-034 \(platform/, out)
+  end
+
+  # Every repo has to release nothing, not just the last one.
+  def test_deploy_pass_promotes_only_when_no_fix_repo_releases_anything
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" => [
+                           fixed_via_fixes(
+                             { "url" => "https://github.com/mbryzek/devops/pull/313" },
+                             { "url" => "https://github.com/mbryzek/schema-evolution-manager/pull/9" },
+                           ),
+                         ]) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/would deploy ISS-034: devops and schema-evolution-manager release nothing/, out)
+  end
+
+  def test_deploy_pass_skips_when_one_fix_repo_still_releases
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                         "GET #{issues_list_path(statuses: 'fixed')}" => [
+                           fixed_via_fixes(
+                             { "url" => "https://github.com/mbryzek/devops/pull/313" },
+                             { "url" => "https://github.com/mbryzek/acumen/pull/130" },
+                           ),
+                         ]) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/skip ISS-034: acumen releases, but no app was recorded/, out)
+    refute_match(/would deploy/, out)
   end
 
   # ---- playbook tenant login wiring ----

@@ -88,6 +88,20 @@ class TestAgentCloseOutContract < Minitest::Test
            "instructions.md names `#{COMMAND}` but bin/dev has no cmd_issues_workaround"
   end
 
+  # Property 2 of this file's own preamble, generalised past the one contract: EVERY
+  # `dev issues <sub>` the standing instructions name has to be a real subcommand.
+  # These instructions are part 1 of every session's prompt, so a command that does
+  # not exist is not a typo, it is an instruction no session can execute — the exact
+  # thing the close-out contract exists to surface. ISS-536 added `dev issues fix`
+  # here as the non-destructive way to record a second PR, and a session that cannot
+  # run it falls back to the write that un-verified ten issues.
+  def test_every_issues_subcommand_the_instructions_name_exists
+    named = instructions.scan(/dev issues ([a-z-]+)/).flatten.uniq
+    refute_empty named, "the instructions name no issues subcommand — the guard would pass vacuously"
+    unknown = named.reject { |sub| SUBCOMMANDS.fetch("issues").include?(sub) }
+    assert_empty unknown, "agent/instructions.md names issues subcommand(s) bin/dev does not have"
+  end
+
   # Each flag the contract tells a session to pass, against the command's own
   # invocation line. A flag renamed on one side and not the other leaves every
   # session running a command that exits on arg validation.
