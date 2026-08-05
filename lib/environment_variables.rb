@@ -17,12 +17,53 @@ class EnvironmentVariables
         @vars[name]
     end
 
+    # The env file backing one (app, environment) pair. Every reader here goes
+    # through this so the layout is stated once.
+    def EnvironmentVariables.file_path(app_name, filename)
+        File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env")
+    end
+
     # True when the app has env files for this environment (load exits when
     # they are missing — callers that want to skip instead probe here first).
     def EnvironmentVariables.configured?(app_name, environment)
         [environment, 'common'].all? { |f|
-            File.exist?(File.join(DIR, "../../env/apps/#{app_name}/env/#{f}.env"))
+            File.exist?(EnvironmentVariables.file_path(app_name, f))
         }
+    end
+
+    # One variable, read WITHOUT the auto-unlock `load` performs.
+    #
+    # `load` is release tooling: it runs from a human's terminal, and unlocking
+    # git-crypt on the way past is a convenience there. Asking it for a single
+    # key would inherit that side effect, and a command whose job is "tell me
+    # whether this secret is set" must not decrypt the secrets repo to answer.
+    # Agent sessions are forbidden from unlocking it at all, so a locked file is
+    # a reportable state rather than something to fix silently.
+    #
+    # Returns [:present, value], [:missing, nil], [:locked, nil] or
+    # [:no_file, nil]. Same precedence as `load`: the environment file wins over
+    # common.env.
+    #
+    # :no_file is separate from :missing on purpose. They call for opposite
+    # responses — one is "add the variable", the other is "you are not looking at
+    # the env repo at all" (DIR resolves ../../env relative to THIS checkout, so
+    # a devops clone inside a feature dir has no sibling env/). Collapsing them
+    # reports a wrong diagnosis with total confidence.
+    def EnvironmentVariables.lookup(app_name, environment, key)
+        seen = false
+        [environment, 'common'].each do |filename|
+            path = EnvironmentVariables.file_path(app_name, filename)
+            next unless File.exist?(path)
+            seen = true
+            return [:locked, nil] if File.binread(path, 10).to_s.start_with?("\x00GITCRYPT")
+            File.readlines(path).each do |line|
+                k, v = line.strip.split("=", 2)
+                next unless k.to_s.strip == key
+                value = v.to_s.strip
+                return [:present, value] unless value.empty?
+            end
+        end
+        seen ? [:missing, nil] : [:no_file, nil]
     end
 
     # Password for the app's database, parsed from CONF_DB_PROD_URL (format:
@@ -77,7 +118,7 @@ class EnvironmentVariables
     end
 
     def EnvironmentVariables.from_file(app_name, filename)
-        env_path = File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env")
+        env_path = EnvironmentVariables.file_path(app_name, filename)
         if !File.exist?(env_path)
             Util.exit_with_error("Environment file '#{env_path}' not found.")
         end
