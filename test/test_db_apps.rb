@@ -183,9 +183,10 @@ class TestDbApps < Minitest::Test
     stubs = {
       :cwd_name => lambda { |_dir = nil| name },
       # Config lookup, which needs this box's env/apps and ~/code checkouts.
-      :load => lambda { |n, repo_dir: nil|
+      :load => lambda { |n, repo_dir: nil, repo_source: nil|
         DbApp.new(:name => n, :database => "#{n}db", :role => "api",
-                  :repo_dir => repo_dir || "/code/#{n}-postgresql")
+                  :repo_dir => repo_dir || "/code/#{n}-postgresql",
+                  :repo_source => repo_source || (repo_dir ? :explicit : :default))
       }
     }
     originals = stubs.keys.map { |m| [m, DbApp.method(m)] }
@@ -257,6 +258,58 @@ class TestDbApps < Minitest::Test
                      DbApp.resolve(:name => "platform", :dir => app_dir).repo_dir
       end
     end
+  end
+
+  # ── where the checkout came from ──────────────────────────────────────────
+  #
+  # `claude-db` replaces the fallback checkout with a clone it keeps at
+  # origin/main, and it may replace ONLY that one: the other three are a choice
+  # the caller made and can hold a migration in progress that exists nowhere
+  # else. Path alone cannot tell them apart — standing in
+  # ~/code/platform-postgresql and falling back to it produce the same string —
+  # so the provenance is recorded rather than inferred.
+  def test_repo_source_records_which_rule_chose_the_checkout
+    Dir.mktmpdir do |feature|
+      sibling = schema_repo(feature, "platform-postgresql")
+      app_dir = File.join(feature, "platform")
+      FileUtils.mkdir_p(app_dir)
+      with_cwd_name("platform") do
+        assert_equal :cwd, DbApp.resolve(:dir => sibling).repo_source
+        assert_equal :sibling, DbApp.resolve(:name => "platform", :dir => app_dir).repo_source
+        assert_equal :explicit,
+                     DbApp.resolve(:name => "platform", :repo_dir => "/elsewhere", :dir => app_dir).repo_source
+      end
+    end
+  end
+
+  # The one nobody chose, and the only one safe to swap out.
+  def test_repo_source_is_default_when_nothing_pointed_anywhere
+    Dir.mktmpdir do |dir|
+      with_cwd_name(nil) do
+        app = DbApp.resolve(:name => "platform", :dir => dir)
+        assert_equal "/code/platform-postgresql", app.repo_dir
+        assert_equal :default, app.repo_source
+      end
+    end
+  end
+
+  # An unrecognised source is not inert — `claude-db` gates the substitution on
+  # `== :default`, so a typo would silently switch it off and bring the stale
+  # checkout back.
+  def test_an_unknown_repo_source_is_rejected
+    assert_raises(ArgumentError) do
+      DbApp.new(:name => "x", :database => "xdb", :role => "api",
+                :repo_dir => "/tmp/x", :repo_source => :deafult)
+    end
+  end
+
+  def test_with_repo_dir_keeps_the_app_and_moves_the_checkout
+    moved = platform.with_repo_dir("/mirrors/platform-postgresql", :repo_source => :mirror)
+    assert_equal "platformdb", moved.database
+    assert_equal "/mirrors/platform-postgresql", moved.repo_dir
+    assert_equal :mirror, moved.repo_source
+    # And the original is untouched.
+    assert_equal "/tmp/platform-postgresql", platform.repo_dir
   end
 
   # Nothing to infer is the one case where --app is genuinely required.
@@ -344,6 +397,70 @@ class TestDbApps < Minitest::Test
     with_psql("to_regclass" => ["t"]) do
       assert app.sem_tracking?(5555, "xdb_sess_a")
     end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  # ── drift of the CHECKOUT against main ────────────────────────────────────
+  #
+  # The second staleness gap, and the one that survives a sync: syncing matches
+  # the database to a checkout, so a checkout missing main's migrations leaves
+  # the database missing them too — identical failures, one level up (ISS-545).
+  #
+  # Measured in scripts rather than commits on purpose. A checkout twenty
+  # commits behind on README edits runs a perfectly good suite; one commit
+  # behind on a migration does not, and only the script list can tell those
+  # apart.
+
+  # A real clone of a real origin: every property here is a git property.
+  def with_clone_of_origin(origin_scripts)
+    Dir.mktmpdir do |root|
+      origin = File.join(root, "origin.git")
+      seed   = File.join(root, "seed")
+      system("git", "init", "--quiet", "--bare", "--initial-branch=main", origin,
+             :out => File::NULL, :err => File::NULL)
+      system("git", "clone", "--quiet", origin, seed, :out => File::NULL, :err => File::NULL)
+      system("git", "config", "user.email", "test@example.com", :chdir => seed)
+      system("git", "config", "user.name", "test", :chdir => seed)
+      FileUtils.mkdir_p(File.join(seed, "scripts"))
+      origin_scripts.each { |n| File.write(File.join(seed, "scripts", n), "select 1;\n") }
+      system("git", "add", "-A", :chdir => seed, :out => File::NULL, :err => File::NULL)
+      system("git", "commit", "--quiet", "-m", "scripts", :chdir => seed,
+             :out => File::NULL, :err => File::NULL)
+      system("git", "push", "--quiet", "origin", "main", :chdir => seed,
+             :out => File::NULL, :err => File::NULL)
+
+      checkout = File.join(root, "platform-postgresql")
+      system("git", "clone", "--quiet", origin, checkout, :out => File::NULL, :err => File::NULL)
+      yield DbApp.new(:name => "platform", :database => "platformdb", :role => "api",
+                      :repo_dir => checkout)
+    end
+  end
+
+  def test_missing_scripts_vs_origin_is_what_main_has_and_the_checkout_lacks
+    with_clone_of_origin(["20260101000000.sql", "20260202000000.sql"]) do |app|
+      assert_empty app.missing_scripts_vs_origin
+      FileUtils.rm(File.join(app.repo_dir, "scripts", "20260202000000.sql"))
+      assert_equal ["20260202000000.sql"], app.missing_scripts_vs_origin
+    end
+  end
+
+  # One-directional: a script the checkout has and main does not is this
+  # branch's own migration, which is the normal case and not drift.
+  def test_a_branchs_own_migration_is_not_drift
+    with_clone_of_origin(["20260101000000.sql"]) do |app|
+      File.write(File.join(app.repo_dir, "scripts", "20260303000000.sql"), "select 1;\n")
+      assert_empty app.missing_scripts_vs_origin
+    end
+  end
+
+  # Nothing to compare against must read as "cannot tell", never as "you are
+  # missing nothing" — the caller turns this into a refusal, and an unknown that
+  # reads green is the exact false green being removed.
+  def test_missing_scripts_vs_origin_is_nil_without_a_resolvable_origin_main
+    app, dir = repo_with_scripts(["20260101000000.sql"])
+    assert_nil app.origin_scripts
+    assert_nil app.missing_scripts_vs_origin
   ensure
     FileUtils.remove_entry(dir) if dir
   end

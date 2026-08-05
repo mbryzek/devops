@@ -194,6 +194,15 @@ assigned by the executor; do not rename either.
   a JVM per subproject:
   `eval "$(claude-db start --app platform --port "$(claude-db next-port)" | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')" && sbt test`
   Never hardcode a port. Never `:5432`.
+  The migrations it applies come from a schema checkout, and which one it picks
+  matters. With no `<app>-postgresql` clone in your workspace it uses one the
+  tooling owns and pins to `origin/main`, so you get main's schema without doing
+  anything — you do **not** need a sync step of your own. **If you DO clone
+  `<app>-postgresql` into your workspace, that clone wins**, because it may
+  carry your branch's own migration — so keep it rebased on `origin/main`.
+  `claude-db` refuses to hand you a `CONF_DB_DEV_URL` for a database it can
+  prove is missing migrations main has, and tells you what to run; that refusal
+  is a stale checkout, never your branch (ISS-545).
 - `sbt` on platform needs a large heap (`-Xmx12G`); platform has no sbt CI and
   `main` can be red, so before blaming your change on a failure, confirm it also
   fails on an unmodified `origin/main` (use `git worktree add`, never

@@ -7606,6 +7606,25 @@ end
 
 AI_ROOT = File.expand_path("~/code/ai")
 
+# The feature dirs under `root` that prune is allowed to consider.
+#
+# Symlinks are skipped because deleting one removes the link and not the target.
+# DOTTED entries are skipped because they are the session tooling's own state
+# rather than anybody's work: .claude-db-ports.json records which host port
+# belongs to which container, and .claude-db-schema holds the schema clone
+# `claude-db` keeps pinned at origin/main. Both live here because ~/code/ai is
+# the one root every session — human or agent — can agree on. Neither has a
+# branch or a PR behind it, so classifying them as feature dirs puts a line in
+# the daily briefing for something nobody is working on, and reaping one throws
+# away a cache that then has to be re-cloned.
+def prunable_ai_dirs(root)
+  Dir.children(root)
+     .reject { |c| c.start_with?(".") }
+     .map { |c| File.join(root, c) }
+     .select { |p| !File.symlink?(p) && File.directory?(p) }
+     .sort
+end
+
 def git_repo?(path)
   File.exist?(File.join(path, ".git"))
 end
@@ -7816,10 +7835,7 @@ def cmd_aidirs_prune(args)
   end
 
   cutoff = Time.now - days * 24 * 60 * 60
-  dirs = Dir.children(AI_ROOT)
-            .map { |c| File.join(AI_ROOT, c) }
-            .select { |p| !File.symlink?(p) && File.directory?(p) }
-            .sort
+  dirs = prunable_ai_dirs(AI_ROOT)
   pr_state = method(:gh_pr_state)
 
   keep = []

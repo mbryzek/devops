@@ -40,6 +40,16 @@
 # relation, or a not-null violation on a column main already dropped. That cost
 # two hours on 2026-08-03 (ISS-276). `sync` is why they no longer happen.
 #
+# AND SO IS THE CHECKOUT SYNC READS. `sync` matches the database to a checkout,
+# so a checkout behind main leaves the database behind main by exactly the
+# scripts it has not pulled — the same wall of red, one level up. Two things
+# close that gap. A caller with no checkout of their own gets one this tooling
+# owns and pins to origin/main (SchemaMirror), instead of ~/code/<app>-postgresql
+# which no session may write to and therefore no session can pull. A caller whose
+# OWN checkout is missing migrations main has is refused rather than warned: a
+# warning followed by a working-looking CONF_DB_DEV_URL is a warning that gets
+# scrolled past (ISS-545).
+#
 #   claude-db end [--app APP]
 #                      Drop this session's database, from whichever container
 #                      holds it. Without --app, every app is checked.
@@ -95,8 +105,11 @@ def show_usage
                                    rebasing onto a main that carries schema changes,
                                    or after adding a script on this branch.
                                    The checkout is the one you are standing in when
-                                   that is <app>-postgresql, else
-                                   ~/code/<app>-postgresql; --repo-dir overrides.
+                                   that is <app>-postgresql, else a clone of it beside
+                                   your feature dir, else a clone this tooling keeps
+                                   at origin/main; --repo-dir overrides all three.
+                                   Refuses when the checkout it used is itself
+                                   missing migrations origin/main has.
 
       end [--app APP]              Drop this session's database(s).
 
@@ -359,27 +372,16 @@ def do_sync(app)
   end
 
   pending = app.pending_scripts(port, db)
-  puts "Schema repo : #{app.repo_dir} @ #{app.repo_head}"
+  puts "Schema repo : #{app.repo_dir} @ #{app.repo_head}#{app.repo_source == :mirror ? '  (tooling clone, pinned to origin/main)' : ''}"
 
-  # "In sync" only ever means in sync WITH THIS CHECKOUT. A checkout behind main
-  # leaves the database behind main by exactly the scripts it has not pulled, and
-  # that gap looks identical to the one this command just closed.
+  # "In sync" only ever means in sync WITH THIS CHECKOUT, so the checkout has to
+  # be measured against main before anything here can be called up to date.
+  # Fetched now, read after the apply — see assert_matches_origin!.
   fetched = app.repo_fetch_origin
-  behind = app.repo_behind_origin
-  if behind && behind > 0
-    floor = fetched ? "" : "at least "
-    Util.warning(
-      "#{app.repo_dir} is #{floor}#{behind} commit(s) behind origin/main.\n" \
-      "Syncing matches this database to THAT CHECKOUT, so any migration merged to\n" \
-      "main since it was last pulled is still missing — the same wall of red, one\n" \
-      "level up. Either update the checkout, or sync from a fresh clone:\n\n" \
-      "  claude-db sync --app #{app.name} --repo-dir <fresh-clone-of-#{app.name}-postgresql>" \
-      "#{fetched ? '' : "\n\n(The fetch failed, so this count is read from the last one the checkout\ndid — the real number can be higher.)"}"
-    )
-  end
 
   if pending.empty?
     puts "Schema      : up to date with the checkout (#{app.repo_scripts.length} scripts applied)."
+    assert_matches_origin!(app, db, fetched)
     return
   end
 
@@ -417,6 +419,60 @@ def do_sync(app)
 
   puts ""
   puts "Applied #{pending.length} migration(s) to #{db} in #{container}."
+  assert_matches_origin!(app, db, fetched)
+end
+
+# Refuse to report success over a database that is provably missing migrations
+# main already has.
+#
+# `sync` matched the database to a CHECKOUT. That closes the first staleness gap
+# (template -> checkout) and says nothing about the second one (checkout ->
+# main), which looks identical from inside the database and produces exactly the
+# same failures: a missing relation, a not-null violation on a column main
+# dropped. This used to be a warning, and `start` printed a working-looking
+# CONF_DB_DEV_URL underneath it — a warning followed by a URL is a warning that
+# gets scrolled past, and the run continues into a wall of red that reads like
+# the branch's fault. Eight tests on 2026-08-05, twelve missing migrations
+# (ISS-545).
+#
+# The measure is the SCRIPT list, not the commit count: a checkout twenty
+# commits behind on README edits runs a perfectly good suite, while one commit
+# behind on a migration does not. Nothing to compare against (no origin, no
+# main, offline with refs never fetched) means no refusal — an unknown must
+# never become a block.
+#
+# Nothing here fires for the fallback checkout any more: that one is the
+# tooling's own clone, pinned to origin/main before it is used (SchemaMirror).
+# What is left is a checkout the CALLER owns and only the caller can move, so
+# the remedy is theirs and the message names it.
+def assert_matches_origin!(app, db, fetched)
+  # The mirror was pinned to origin/main moments ago, so measuring it against
+  # origin again buys nothing and can only produce a false alarm: a migration
+  # merged DURING this sync would read as drift in a checkout the caller does
+  # not own, cannot rebase, and is not responsible for. The next start or sync
+  # picks it up. Only checkouts the caller owns are measured, because those are
+  # the ones that go stale and stay stale.
+  return if app.repo_source == :mirror
+
+  missing = app.missing_scripts_vs_origin
+  return if missing.nil? || missing.empty?
+
+  behind = app.repo_behind_origin
+  context = behind && behind > 0 ? " (#{fetched ? '' : 'at least '}#{behind} commit(s) behind)" : ""
+  Util.exit_with_error(
+    "#{db} is synced to #{app.repo_dir}, and THAT CHECKOUT is missing " \
+    "#{missing.length} migration(s) that origin/main has#{context}:\n" \
+    "#{missing.map { |f| "  #{f}" }.join("\n")}\n\n" \
+    "So the database is missing them too. A test suite run against it fails in " \
+    "ways that look like code defects rather than like a stale database, which " \
+    "is why this stops here instead of warning.\n\n" \
+    "Update the checkout, then re-run:\n" \
+    "  git -C #{app.repo_dir} fetch origin && git -C #{app.repo_dir} rebase origin/main\n" \
+    "  claude-db sync --app #{app.name}\n\n" \
+    "Or sync from a checkout that is current:\n" \
+    "  claude-db sync --app #{app.name} --repo-dir <path-to-#{app.name}#{DbApp::POSTGRESQL_SUFFIX}>" \
+    "#{fetched ? '' : "\n\n(The fetch failed, so this is read from the last one the checkout did — there can be more.)"}"
+  )
 end
 
 # ── end ────────────────────────────────────────────────────────────────────
@@ -719,7 +775,35 @@ def require_app(opts, command: "start")
       "  claude-db #{command} --app platform#{command == 'start' ? " --port \"$(claude-db next-port)\"" : ""}"
     )
   end
-  app_from(opts)
+  with_current_schema(app_from(opts))
+end
+
+# The checkout `start` and `sync` read migration scripts out of — with the
+# last-resort one replaced by a clone this tooling keeps at origin/main.
+#
+# Only :default is replaced, and that is the whole safety argument. The other
+# three sources are a CHOICE: the caller is standing in that schema repo, has a
+# clone of it beside their feature dir, or named it with --repo-dir. Any of
+# those may hold a migration in progress that exists nowhere else, so swapping
+# it for main would silently drop exactly the script the caller is testing.
+# :default is the one nobody chose — ~/code/<app>-postgresql, assumed because
+# there was nothing else to go on — and on the agent runner it is a tree no
+# session is allowed to write to and therefore no session can pull, so it only
+# ever gets staler (ISS-545).
+#
+# Read-only and reclaiming commands (status, gc, end) do not come through here:
+# they touch no migration scripts, and none of them should clone or fetch as a
+# side effect of being asked what exists.
+def with_current_schema(app)
+  return app if app.nil? || app.repo_source != :default
+
+  dir = SchemaMirror.checkout(app.name, :origin_from => app.repo_dir)
+  if dir.nil?
+    puts "NOTE: could not refresh the tooling's clone of #{app.name}#{DbApp::POSTGRESQL_SUFFIX} " \
+         "(offline?) — falling back to #{app.repo_dir}, which may be behind main."
+    return app
+  end
+  app.with_repo_dir(dir, :repo_source => :mirror)
 end
 
 # The app AND the schema checkout its scripts come from.
@@ -730,7 +814,8 @@ end
 # standing in the schema it is developing against, which is exactly what `sync`
 # should apply and what the drift count should be measured from. Anywhere else
 # (a feature dir root, ~/code) nothing is inferred and ~/code/<app>-postgresql is
-# used as before. --repo-dir overrides both.
+# assumed — which is what `start` and `sync` then swap for a current clone; see
+# with_current_schema. --repo-dir overrides both.
 def app_from(opts)
   DbApp.resolve(:name => opts[:app], :repo_dir => opts[:repo_dir])
 end
