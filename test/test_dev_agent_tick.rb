@@ -819,19 +819,112 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
-  # A diverged checkout must STOP, not merge: merging here would invent a
-  # fleet-wide code state that exists in no repo and in no review. And the
-  # failure must never be fatal — the machine keeps running the code it has.
-  def test_a_diverged_checkout_is_refused_and_never_crashes_the_tick
+  # A checkout that has diverged with a CLEAN tree on main has no local
+  # explanation left for the refused fast-forward — the only remaining cause is
+  # upstream history that no longer fast-forwards from here (a rebase, a
+  # force-push). `pull` recovers automatically via fetch + reset --hard, so this
+  # is NOT reported as a failure at all.
+  def test_a_clean_diverged_checkout_on_main_recovers_via_reset
     with_agent_home do |root|
       with_devops_clone(root) do |origin, checkout|
         write_commit(origin, "agent/producers.yml", "# theirs\n")
         write_commit(checkout, "agent/producers.yml", "# ours\n")
+        register_identity
+        out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
+        refute_match(/devops pull failed/, out)
+        assert_equal head_of(origin), head_of(checkout), "a clean, diverged checkout on main must recover onto origin/main"
+      end
+    end
+  end
+
+  # A DIRTY tree must never be touched, no matter what the pull refused for —
+  # that's Mike (or a claimed session) doing interactive work in this exact
+  # checkout, and the fallback reset would bulldoze it.
+  def test_a_dirty_checkout_is_left_completely_alone
+    with_agent_home do |root|
+      with_devops_clone(root) do |origin, checkout|
+        write_commit(origin, "agent/producers.yml", "# theirs\n")
+        File.write(File.join(checkout, "agent/producers.yml"), "# uncommitted local edit\n")
         local = head_of(checkout)
         register_identity
         out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
         assert_match(/devops pull failed/, out)
-        assert_equal local, head_of(checkout), "--ff-only must leave a diverged checkout exactly where it was"
+        assert_equal local, head_of(checkout), "a dirty checkout must never be reset"
+        assert_equal "# uncommitted local edit\n", File.read(File.join(checkout, "agent/producers.yml")),
+                     "a dirty checkout's working tree must be left exactly as the human left it"
+        assert_empty Agent::Errors.list, "a benign skip (dirty tree) must never be recorded as a reportable failure"
+      end
+    end
+  end
+
+  # A checkout on a branch other than main, with a refused fast-forward, is the
+  # same story as a dirty tree — interactive work in progress — and must be
+  # left alone rather than reset. (A clean checkout out on some other branch
+  # name that CAN fast-forward is not this case at all: `git pull origin main`
+  # merges into whatever branch is checked out, so that just succeeds.)
+  def test_a_checkout_not_on_main_is_left_completely_alone
+    with_agent_home do |root|
+      with_devops_clone(root) do |origin, checkout|
+        write_commit(origin, "agent/producers.yml", "# theirs\n")
+        system("git", "-C", checkout, "checkout", "-qb", "feature", out: File::NULL, err: File::NULL)
+        write_commit(checkout, "agent/producers.yml", "# ours, on feature\n")
+        local = head_of(checkout)
+        register_identity
+        out = with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
+        assert_match(/devops pull failed/, out)
+        assert_equal local, head_of(checkout), "a checkout on another branch must never be reset"
+        assert_empty Agent::Errors.list, "a benign skip (wrong branch) must never be recorded as a reportable failure"
+      end
+    end
+  end
+
+  # A real failure — clean, on main, and even the fetch+reset fallback fails
+  # (no remote reachable) — must be durably recorded, and must escalate exactly
+  # once it crosses 3 consecutive failures.
+  def test_three_consecutive_real_pull_failures_notify_and_file_an_issue
+    with_agent_home do |root|
+      origin = File.join(root, "devops-origin")
+      init_repo(origin)
+      write_commit(origin, "agent/producers.yml", "timezone: America/New_York\nproducers: []\n")
+      checkout = File.join(root, "devops-checkout")
+      system("git", "clone", "-q", origin, checkout, out: File::NULL, err: File::NULL)
+      previous = ENV["DEV_AGENT_DEVOPS_REPO"]
+      ENV["DEV_AGENT_DEVOPS_REPO"] = checkout
+      # A remote that no longer exists: `git pull --ff-only` AND the fetch+reset
+      # fallback both fail, for a reason that has nothing to do with the local
+      # tree — exactly the "real failure" case.
+      system("git", "-C", checkout, "remote", "set-url", "origin", File.join(root, "does-not-exist"))
+      register_identity
+      filed = nil
+      with_ai_token do
+        stubs = fleet_responses.merge("POST /playbook/issues" => ->(body) { filed = body; { "number" => 999, "occurrence_count" => 1 } })
+        with_stubbed_api(stubs) do
+          capture_stdout { tick(dry_run: false).update_checkout }
+          capture_stdout { tick(dry_run: false).update_checkout }
+          assert_nil filed, "must not escalate before the 3rd consecutive failure"
+          capture_stdout { tick(dry_run: false).update_checkout }
+        end
+      end
+      assert_equal 3, Agent::Errors.count("checkout_pull")
+      refute_nil filed, "the 3rd consecutive failure must file an issue"
+      assert_equal "bug", filed[:category]
+      assert_match(/checkout_pull:\d{4}-\d{2}-\d{2}/, filed[:fingerprint])
+      refute filed[:claim_on_create]
+    ensure
+      ENV["DEV_AGENT_DEVOPS_REPO"] = previous
+    end
+  end
+
+  # A success after a streak — even one short of escalation — must clear it, so
+  # a machine that recovers on its own never accumulates toward a stale streak.
+  def test_a_successful_pull_clears_a_prior_failure_streak
+    with_agent_home do |root|
+      with_devops_clone(root) do |origin, checkout|
+        register_identity
+        Agent::Errors.record("checkout_pull", "prior failure", now: Time.now)
+        assert_equal 1, Agent::Errors.count("checkout_pull")
+        with_stubbed_api(fleet_responses) { capture_stdout { tick(dry_run: false).update_checkout } }
+        assert_equal 0, Agent::Errors.count("checkout_pull"), "a clean success must clear the streak"
       end
     end
   end

@@ -2,6 +2,7 @@ require 'open3'
 require 'time'
 require 'agent/api'
 require 'agent/checkout'
+require 'agent/errors'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/host'
@@ -53,6 +54,15 @@ module Agent
     # complement of TERMINAL_ISSUE_STATUSES so adding a status to the spec cannot
     # silently make a producer re-file over live work.
     NON_TERMINAL_STATUSES = %w[open claimed needs_review needs_input fixed deployed].freeze
+
+    # Agent::Errors source name for a real (non-benign) devops checkout pull
+    # failure. Fixed rather than derived so Agent::Errors.count and the
+    # escalation below always agree on what they are counting.
+    CHECKOUT_PULL_ERROR_SOURCE = "checkout_pull".freeze
+
+    # File an issue the moment consecutive failures CROSS this threshold, not
+    # on every tick once past it — see `update_checkout`.
+    CHECKOUT_PULL_ESCALATE_AT = 3
 
     attr_reader :decisions
 
@@ -115,13 +125,61 @@ module Agent
         result = Agent::Checkout.pull
         if result.ok?
           log("devops checkout: #{result.message}") if result.changed?
+          # Clears the streak on every success, including one that only
+          # succeeded via the fetch+reset fallback — a recovered pull is not a
+          # failure and must not keep counting toward escalation.
+          Agent::Errors.clear(CHECKOUT_PULL_ERROR_SOURCE)
         else
           # NEVER fatal. A machine that cannot pull keeps running the code it
           # has; the sha it reports is what makes that visible in admin rather
           # than leaving it silently stale.
           decide("checkout", "devops pull failed (#{result.message}) — staying on #{Agent::Checkout.short(Agent::Checkout.head_sha)}")
+          record_checkout_pull_failure(result) unless result.benign?
         end
       end
+    end
+
+    # A benign skip (dirty tree, or a branch other than main — see
+    # Agent::Checkout) never reaches here: it is Mike's own interactive work in
+    # this checkout, not a reportable failure. Only a real failure — the
+    # fetch+reset fallback was tried and still failed, or the checkout is
+    # broken outright — is worth a durable count and, eventually, an issue.
+    def record_checkout_pull_failure(result)
+      entries = Agent::Errors.record(CHECKOUT_PULL_ERROR_SOURCE, result.message, now: @now)
+      count = entries.count { |e| e["source"] == CHECKOUT_PULL_ERROR_SOURCE }
+      # Only fire exactly on the tick that crosses the threshold. A streak that
+      # is already past it must not re-notify or re-file every 30 seconds.
+      escalate_checkout_pull_failure(result, count) if count == CHECKOUT_PULL_ESCALATE_AT
+    end
+
+    def escalate_checkout_pull_failure(result, count)
+      hostname = `hostname`.strip rescue "unknown"
+      summary = "dev-agent: devops checkout pull has failed #{count} times in a row on #{hostname} (#{result.message})"
+      Agent::Notify.once("checkout_pull_failing", Agent::Checkout.devops_repo, now: @now) do
+        Agent::Notify.event(summary)
+      end
+      return if @dry_run
+
+      Agent::Api.create_issue(
+        {
+          title: "dev-agent: devops checkout pull failing on #{hostname}",
+          category: "bug",
+          fingerprint: "#{CHECKOUT_PULL_ERROR_SOURCE}:#{@now.utc.strftime('%Y-%m-%d')}",
+          body: "The `#{CHECKOUT_PULL_ERROR_SOURCE}` source has failed #{count} times in a row on #{hostname}.\n\n" \
+                "Last error:\n\n```\n#{result.message}\n```\n\n" \
+                "This machine's devops checkout (Agent::Checkout.devops_repo) could not fast-forward from " \
+                "`origin/main`, and the automatic `git fetch` + `git reset --hard origin/main` recovery " \
+                "attempted in Agent::Checkout.pull also failed. The tick keeps running the code it already " \
+                "has, but producer schedule and prompt changes pushed to devops will not reach this machine " \
+                "until the checkout is fixed by hand.",
+          claim_on_create: false,
+        },
+        use_localhost: @use_localhost,
+      )
+    rescue SessionExpired, ApiError => e
+      # Escalation must never take down the rest of Phase A (heartbeat,
+      # report_registry) — the same reasoning as phase_a's own top-level rescue.
+      log("checkout_pull escalation: could not file an issue (#{e.message})")
     end
 
     # What this machine reads producers.yml to be: every producer, its cadence,
@@ -151,7 +209,7 @@ module Agent
       end
 
       Agent::Api.report_registry(identity.runner_id, devops_sha: sha, producers: producers,
-                                 token: identity.token, use_localhost: @use_localhost)
+                                 errors: Agent::Errors.list, token: identity.token, use_localhost: @use_localhost)
       Agent::Paths.write_json(Agent::Paths.registry_report_file,
                               { "devops_sha" => sha, "at" => @now.utc.iso8601 }, mode: 0600)
       log("registry reported: #{producers.length} producers @ #{Agent::Checkout.short(sha)}")
