@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require_relative 'test_helper'
 require 'tmpdir'
 require 'fileutils'
 require_relative '../lib/common'

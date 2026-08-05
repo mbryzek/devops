@@ -46,6 +46,34 @@ module DevTestSupport
     end
   end
 
+  # NetworkGuard covers `dev`. ApibuilderClient is the OTHER HTTP client in this
+  # repo -- a separate class, used by `bin/api`, that never routes through
+  # ApiClient -- so none of the above touched it and it talked to
+  # api.apibuilder.io unguarded.
+  #
+  # Guarding it means guarding `build_http`, not the three public entry points:
+  # `raw_request`, `download` and `anonymous_init` each build their own request
+  # object but all three obtain their connection here, so this is the one place
+  # that cannot be bypassed by adding a fourth. Same rule as ISS-034 -- block the
+  # REQUEST, not the credential, because there is always another credential.
+  module ApibuilderGuard
+    def self.install
+      return unless defined?(ApibuilderClient)
+      @saved = ApibuilderClient.instance_method(:build_http)
+      ApibuilderClient.define_method(:build_http) do |uri|
+        raise DevTestSupport::NetworkBlocked,
+              "test attempted a live apibuilder request: #{uri} - " \
+              "stub it rather than letting it reach the network"
+      end
+    end
+
+    def self.uninstall
+      return unless defined?(ApibuilderClient) && @saved
+      ApibuilderClient.define_method(:build_http, @saved)
+      @saved = nil
+    end
+  end
+
   # The same reasoning as NetworkGuard, for the machine instead of the network.
   #
   # `dev agent tick` now runs runner-local housekeeping (Agent::Maintenance,
@@ -60,19 +88,38 @@ module DevTestSupport
   # test about the tick's OTHER behaviour should not have to know this exists. A
   # test that wants the real shell path opts back in with
   # `stub_singleton(Agent::Maintenance, :run_shell) { ... }`.
+  # `run_gc` is guarded for the SAME reason and is the sharper edge of the two:
+  # the shell-outs at least go through `dev`, but run_gc calls Agent::Gc.apply
+  # directly, which is a bare `FileUtils.rm_rf` over Agent::Paths.workspace_root
+  # -- and that root defaults to the developer's real ~/code/ai whenever
+  # DEV_AGENT_WORKSPACE_ROOT is unset. It is scoped by Gc::AGENT_SLUG
+  # (/\Ai\d+_[a-z0-9]{3}\z/), which is narrower than "everything" and wider than
+  # "nothing": ~/code/ai/i576_yuz on this box matches it today.
+  #
+  # Nothing is deleted right now only because the one test file that calls
+  # Agent::Maintenance.run happens to wrap every call in its own with_agent_home.
+  # That is a property of that file, not of the guard, and the next test to call
+  # `run` (or cmd_agent_maintenance) without repeating the override deletes for
+  # real. Guarding both chores is what makes the safety structural.
   module MaintenanceGuard
+    STUBBED = "stubbed by DevTestSupport::MaintenanceGuard".freeze
+
     def self.install
       return unless defined?(Agent::Maintenance)
-      @saved = Agent::Maintenance.method(:run_shell)
+      @saved = { :run_shell => Agent::Maintenance.method(:run_shell),
+                 :run_gc => Agent::Maintenance.method(:run_gc) }
       Agent::Maintenance.define_singleton_method(:run_shell) do |source, _trigger|
-        Agent::Maintenance::Outcome.new(source: source, label: source.tr("_", " "), ok: true,
-                                        message: "stubbed by DevTestSupport::MaintenanceGuard")
+        Agent::Maintenance::Outcome.new(source: source, label: source.tr("_", " "), ok: true, message: STUBBED)
+      end
+      Agent::Maintenance.define_singleton_method(:run_gc) do |_now, _trigger|
+        Agent::Maintenance::Outcome.new(source: Agent::Maintenance::GC_SOURCE, label: "agent gc",
+                                        ok: true, message: STUBBED)
       end
     end
 
     def self.uninstall
       return unless defined?(Agent::Maintenance) && @saved
-      Agent::Maintenance.define_singleton_method(:run_shell, @saved)
+      @saved.each { |name, original| Agent::Maintenance.define_singleton_method(name, original) }
       @saved = nil
     end
   end
@@ -145,6 +192,7 @@ module DevTestSupport
     def before_setup
       super
       DevTestSupport::NetworkGuard.install
+      DevTestSupport::ApibuilderGuard.install
       DevTestSupport::MaintenanceGuard.install
       DevTestSupport::ToolchainGuard.install
       DevTestSupport::CredentialsGuard.install
@@ -156,6 +204,7 @@ module DevTestSupport
       DevTestSupport::CredentialsGuard.uninstall
       DevTestSupport::ToolchainGuard.uninstall
       DevTestSupport::MaintenanceGuard.uninstall
+      DevTestSupport::ApibuilderGuard.uninstall
       DevTestSupport::NetworkGuard.uninstall
       super
     end
