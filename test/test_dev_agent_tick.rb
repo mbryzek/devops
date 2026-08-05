@@ -76,6 +76,26 @@ class TestDevAgentTick < Minitest::Test
                     dry_run: dry_run, now: now, verbose: true)
   end
 
+  # ---- the environment a session is spawned with ----
+
+  # The credential plumbing, asserted at the tick rather than only inside
+  # Agent::Credentials: `resolve` returning the right hash is worth nothing if
+  # nothing merges it into the spawn, which is exactly the state ISS-570 found —
+  # the key sat in the env repo beside the checkout for the whole history of the
+  # fleet and no session ever received it.
+  #
+  # The value is CredentialsGuard's stand-in, not a real secret.
+  def test_a_spawned_session_is_given_the_external_api_credentials
+    with_agent_home do
+      env = tick.send(:child_env)
+      assert_equal "stub-PLAYBOOK_CLAUDE_KEY", env["PLAYBOOK_CLAUDE_KEY"]
+      refute_includes env.keys, "ANTHROPIC_API_KEY",
+                      "that variable reconfigures the `claude` CLI the session runs as"
+      # ...without displacing what was already there.
+      assert_equal Agent::Paths.githooks_dir, env["GIT_CONFIG_VALUE_0"]
+    end
+  end
+
   # ---- dry run, end to end ----
 
   def test_dry_run_walks_every_phase_and_executes_nothing

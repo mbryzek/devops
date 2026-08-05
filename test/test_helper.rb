@@ -109,6 +109,35 @@ module DevTestSupport
     end
   end
 
+  # The same reasoning once more, for the external-API credentials a claimed
+  # session is handed (Agent::Credentials, ISS-570).
+  #
+  # Left real, `probe` reads the env repo BESIDE THE DEVOPS CHECKOUT the suite is
+  # running from — so a prompt test would render "available" on Mike's machine
+  # and "NOT available" in a feature-dir clone with no sibling env/, and a tick
+  # test would pull a live API key into a spawn environment for no reason. The
+  # stand-in is a healthy machine, matching ToolchainGuard.
+  #
+  # `probe` is the one stub because it is the single read behind both public
+  # faces: stubbing it keeps `check` and `resolve` agreeing, which stubbing them
+  # separately would not. A test that is ABOUT this module opts out with
+  # `uninstall` and stubs `probe` (or `EnvironmentVariables.lookup`) itself.
+  module CredentialsGuard
+    def self.install
+      return unless defined?(Agent::Credentials)
+      @saved = Agent::Credentials.method(:probe)
+      Agent::Credentials.define_singleton_method(:probe) do |credential, **_opts|
+        [:present, "stub-#{credential.name}", :env_repo]
+      end
+    end
+
+    def self.uninstall
+      return unless defined?(Agent::Credentials) && @saved
+      Agent::Credentials.define_singleton_method(:probe, @saved)
+      @saved = nil
+    end
+  end
+
   # Wraps every test in every class that loads this helper. `before_setup` /
   # `after_teardown` rather than `setup` / `teardown` so a test class defining
   # its own setup cannot silently drop the guard.
@@ -118,11 +147,13 @@ module DevTestSupport
       DevTestSupport::NetworkGuard.install
       DevTestSupport::MaintenanceGuard.install
       DevTestSupport::ToolchainGuard.install
+      DevTestSupport::CredentialsGuard.install
     end
 
     def after_teardown
       DevTestSupport.restore_stubbed_globals(@dev_test_stubbed_globals)
       @dev_test_stubbed_globals = nil
+      DevTestSupport::CredentialsGuard.uninstall
       DevTestSupport::ToolchainGuard.uninstall
       DevTestSupport::MaintenanceGuard.uninstall
       DevTestSupport::NetworkGuard.uninstall

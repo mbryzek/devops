@@ -207,6 +207,18 @@ assigned by the executor; do not rename either.
   `claude-db` refuses to hand you a `CONF_DB_DEV_URL` for a database it can
   prove is missing migrations main has, and tells you what to run; that refusal
   is a stale checkout, never your branch (ISS-545).
+- **Live external APIs:** work whose subject is an external API's *behaviour* can
+  only be closed out on a runner that holds a credential for that API. Which ones
+  this machine has is stated in your assignment block, under "Live external-API
+  credentials on this runner" — **read it while you are still planning**, because
+  an absent credential looks exactly like one you have not thought to look for
+  yet, and the cost of finding out late is a request shape you designed against
+  the documentation and cannot test (ISS-565). If the one you need is present it
+  is already exported into your environment; pass it explicitly to what you are
+  verifying. If it is absent, say so up front, do the offline work in full, state
+  plainly in the PR which part is unverified, and file it with `dev issues
+  workaround`. Either way a credential is never yours to print, echo, commit, or
+  paste into a PR, an issue comment, a plan or a test fixture.
 - `sbt` on platform needs a large heap (`-Xmx12G`); platform has no sbt CI and
   `main` can be red, so before blaming your change on a failure, confirm it also
   fails on an unmodified `origin/main` (use `git worktree add`, never
