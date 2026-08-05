@@ -24,6 +24,17 @@ uptime-checker.sc https://idempotent.io/_internal_/healthcheck
 ./generate-json.rb
 ```
 
+Evaluates every `*.pkl` under `../env/apps` into `dist/*.config.json`, which is
+gitignored and is what every `bin/` script reads app config from.
+
+Rebuilding it needs a sibling `env` checkout, so a scratch clone (an agent
+workspace, per `agent/instructions.md` §3, may not unlock `env`) has no `dist/`
+at all. Those checkouts read through to `~/code/devops/dist` instead and print
+one line on stderr saying so — the file is generated, non-secret output
+(hostnames, ports, usernames; no credentials) that is already on the box. A
+checkout with its own populated `dist/` always wins, so a deploy box's prebuilt
+copy is never overridden.
+
 ## Using pkl
 
 ```
