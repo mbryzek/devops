@@ -51,6 +51,49 @@ forever.
 Nothing merges automatically. The worst case of any run here is a PR nobody
 merges, and that is the safety design working, not a failure.
 
+### Before you close out: file what you WORKED AROUND
+
+Whichever of the four outcomes above you land on, answer one question before you
+close out: **did I route around something instead of fixing it?** If so, file it.
+
+A workaround that exists only in your write-up dead-ends there. Nobody reads a
+timeline unless something has already gone wrong, and a session that quietly
+worked around a broken instruction looks exactly like a session that succeeded —
+so the instruction stays broken and the next run works around it again. That is
+not hypothetical: the ISS-465 run hit three of these, described all three
+accurately in its report, and filed one. The one it filed (ISS-474) was fixed in
+three hours. The two it only described (ISS-503, ISS-504) were found hours later
+by a human reading the timeline by hand, and would otherwise have recurred every
+night indefinitely.
+
+File it when, and only when, one of these is true:
+
+- an instruction in your assignment could not be executed as written — wrong
+  path, 401, missing tool, absent data
+- you used a substitute data source, weaker than the one specified, and it
+  changed what the run actually measured
+- you crossed a stated guardrail, even if you reverted it cleanly
+- a precondition the assignment assumed was not true on this runner
+
+That list is the whole trigger, and it is deliberately bounded. Not: "things that
+could be better", opinions about the codebase, or anything the run's own output
+already covers. **Closing out having filed nothing is the NORMAL case** — a quiet
+run is a valid outcome, and manufacturing a finding is worse than silence.
+
+One command, which is the entire mechanism:
+
+    dev issues workaround --from <this issue's number> --key <stable-slug> \
+      --title "<what could not be done as written>" \
+      --body "<what you were told to do, what you did instead, and what that cost this run>"
+
+It files at `open` and starts no session — you are reporting this, not working
+it. `--key` is the dedup key, so name it after **what broke**, not after this run
+(`openclaw-status-path-missing`, never `slow-query-2026-08-05`): tomorrow's
+session hitting the same thing then recurs onto your issue instead of filing a
+second one, and the queue does not fill up with the same finding once a night.
+`--from` records the cross-reference in both directions — the finding names the
+run that hit it, and that run's timeline names the finding.
+
 ## 2. Gates become artifacts, not blocks
 
 Every CLAUDE.md gate that says "get approval before proceeding" would deadlock

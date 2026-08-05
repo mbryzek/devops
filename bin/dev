@@ -85,6 +85,7 @@ INVOCATIONS = {
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--duplicate-of NUMBER] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
+  "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
@@ -584,6 +585,25 @@ USAGE = <<~USAGE
         leaves the two records unconnected, so the canonical issue never learns it
         absorbed anything.
 
+    #{INVOCATIONS["issues workaround"]}
+        File something this session ROUTED AROUND rather than fixed — an
+        instruction it could not execute as written, a weaker substitute data
+        source, a guardrail it crossed, a precondition that was not true on this
+        runner. The close-out contract in devops/agent/instructions.md §1 is the
+        authority on when to reach for it; the short version is that a workaround
+        described only in a report dead-ends there, because a session that
+        quietly worked around a broken instruction looks exactly like one that
+        succeeded. Filing nothing is the normal outcome.
+
+        Files at `open` and starts no session: the caller is reporting this, not
+        working it. --key is the dedup key and must name WHAT BROKE, not the run
+        that hit it (`openclaw-status-path-missing`, not
+        `slow-query-2026-08-05`), so the next session hitting the same thing
+        recurs onto the same issue instead of filing a second one. --from is the
+        issue the session was working; it is recorded in the new issue's body and
+        as a comment on that issue's timeline, so the link reads in both
+        directions.
+
     #{INVOCATIONS["issues snooze"]}
         Defer an issue for --days N: it drops out of the queue, out of
         `issues claim`, and out of the daily nudge email until then, keeping its
@@ -815,7 +835,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent duplicate claim show status snooze reconcile resume],
+  "issues"       => %w[create list parent duplicate workaround claim show status snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -3230,6 +3250,180 @@ def issue_filed_open(issue)
   puts "Pick it up later with:"
   puts "  dev issues claim --issues #{number}"
   issue
+end
+
+# ---- issues workaround: the session close-out contract (ISS-507) ----
+#
+# A session that ROUTES AROUND a broken instruction produces the same artifacts
+# as one that succeeded — a PR, a fixed issue, a clean report — so the broken
+# instruction survives and the next run works around it again. The ISS-465
+# slow-query run hit three of these and filed one; the two it merely described in
+# prose were found hours later by a human reading the timeline, and would have
+# recurred nightly otherwise.
+#
+# This is `issues create` with every field a reporting session must not get wrong
+# already decided, because each of them has a known failure mode:
+#
+#   status open       `claimed` would make the finding unpickupable — the session
+#                     filing it is closing out, not working it. Sessions get this
+#                     wrong often enough that `--status` had to become required
+#                     on `create` (ISS-149/151).
+#   no session        nothing to spawn: this is a report.
+#   fingerprint       the ONLY thing standing between a nightly producer and one
+#                     copy of the same finding per night. Server-side, a create
+#                     carrying a fingerprint that already exists non-terminally is
+#                     a recurrence (occurrence_count++, comment) rather than a
+#                     duplicate — this command exists largely to make that
+#                     mechanism reachable from a session, since `issues create`
+#                     has no way to set one.
+#   both directions   the finding names the run that hit it, and that run's
+#                     timeline names the finding.
+WORKAROUND_FINGERPRINT_PREFIX = "workaround:".freeze
+
+# Lowercase words joined by hyphens, nothing else. The key IS the dedup identity,
+# so a DIFFERENT session on a DIFFERENT night has to reproduce it from the same
+# facts: "Openclaw status path missing", "openclaw_status_path_missing" and
+# "openclaw-status-path-missing" would otherwise be three issues for one finding.
+# Narrow enough that there is only one way to write any given key.
+WORKAROUND_KEY_RE = /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/.freeze
+
+WORKAROUND_KEY_HINT =
+  "lowercase words joined by hyphens, naming WHAT BROKE rather than the run that hit it " \
+  "(openclaw-status-path-missing, not slow-query-2026-08-05) — a key that changes nightly " \
+  "dedups against nothing and files the same finding again every night".freeze
+
+def cmd_issues_workaround(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  from = nil
+  key = nil
+  title = nil
+  body = nil
+  category = nil
+  severity = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--from"
+      from = rest[i + 1]
+      usage_exit("--from requires an issue number", example: usage_for("issues workaround")) if from.nil?
+      i += 2
+    when "--key"
+      key = rest[i + 1]
+      usage_exit("--key requires a value", example: usage_for("issues workaround")) if key.nil?
+      i += 2
+    when "--title"
+      title = rest[i + 1]
+      usage_exit("--title requires a value", example: usage_for("issues workaround")) if title.nil?
+      i += 2
+    when "--body"
+      body = rest[i + 1]
+      usage_exit("--body requires a value", example: usage_for("issues workaround")) if body.nil?
+      i += 2
+    when "--category"
+      category = rest[i + 1]
+      usage_exit("--category requires a value", example: usage_for("issues workaround")) if category.nil?
+      i += 2
+    when "--severity"
+      severity = rest[i + 1]
+      usage_exit("--severity requires a value", example: usage_for("issues workaround")) if severity.nil?
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  # A workaround IS a defect in the instruction that could not be executed, so
+  # `bug` is the default rather than a prompt. Named categories stay available:
+  # ISS-505 (a playbook copied instead of pointed at) was an improvement.
+  category = "bug" if category.nil? || category.empty?
+  problems = workaround_problems(from: from, key: key, title: title, body: body,
+                                 category: category, severity: severity, leftover: leftover)
+  report_arg_problems("issues workaround", problems, usage_for("issues workaround"))
+
+  require_playbook_session!(use_localhost)
+
+  form = {
+    title: title,
+    category: category,
+    fingerprint: "#{WORKAROUND_FINGERPRINT_PREFIX}#{key}",
+    body: workaround_body(body, from),
+    # Never claimed: whoever picks this up is not this session.
+    claim_on_create: false,
+  }
+  form[:severity] = severity if severity
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    issue = ApiClient.request(endpoint, :post, issues_path, body: form)
+    recurrence = issue["occurrence_count"].to_i > 1
+    if recurrence
+      puts "#{issue_label(issue)}: already tracked (occurrence #{issue['occurrence_count']}) — no duplicate filed."
+    else
+      puts "Filed #{issue_label(issue)} (#{category}) — open, nobody is working it."
+    end
+    puts "  fingerprint: #{form[:fingerprint]}"
+    workaround_note_on_source(endpoint, from, issue, title: title, recurrence: recurrence)
+    issue
+  end
+end
+
+def workaround_problems(from:, key:, title:, body:, category:, severity:, leftover:)
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  if from.nil? || from.empty?
+    problems << "--from is required (the issue this session is working — the run that hit the workaround)"
+  elsif !/\A\d+\z/.match?(from)
+    problems << "--from must be an issue number (465, or zero-padded 0465), not '#{from}'"
+  end
+  if key.nil? || key.empty?
+    problems << "--key is required: #{WORKAROUND_KEY_HINT}"
+  elsif !WORKAROUND_KEY_RE.match?(key)
+    problems << "--key '#{key}' is not a valid dedup key: #{WORKAROUND_KEY_HINT}"
+  end
+  problems << "--title is required (what could not be done as written)" if title.nil? || title.strip.empty?
+  if body.nil? || body.strip.empty?
+    problems << "--body is required (what you were told to do, what you did instead, and what that cost this run)"
+  end
+  unless ISSUE_MANUAL_CATEGORIES.include?(category)
+    problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')}"
+  end
+  problems << "--severity must be one of: #{ISSUE_SEVERITIES.join(', ')}" if severity && !ISSUE_SEVERITIES.include?(severity)
+  problems
+end
+
+# The finding's half of the cross-reference, appended rather than asked for: the
+# session writing the brief is describing what broke, and which run it broke on
+# is the caller's bookkeeping, not the reporter's prose.
+def workaround_body(body, from)
+  "#{body.strip}\n\n---\n\nWorked around during ISS-#{from} rather than fixed there, and filed " \
+    "under the close-out contract in devops/agent/instructions.md §1 — the session that hit this " \
+    "is not working it."
+end
+
+# The run's half. Load-bearing on a RECURRENCE specifically: nothing new is
+# created that night, so without this the run that hit the workaround again shows
+# no trace of it at all — the exact invisibility this command exists to remove.
+#
+# Best-effort, and deliberately after the create: the issue is the artifact worth
+# protecting, and losing the back-reference must not also lose the finding (or,
+# worse, leave a caller retrying a create that already succeeded).
+def workaround_note_on_source(endpoint, from, issue, title:, recurrence:)
+  note =
+    if recurrence
+      "Worked around during this run, not fixed. Already tracked as #{issue_label(issue)} " \
+        "(occurrence #{issue['occurrence_count']}): #{title}"
+    else
+      "Worked around during this run, not fixed. Filed as #{issue_label(issue)}: #{title}"
+    end
+  ApiClient.request(endpoint, :post, issues_path("/#{URI.encode_www_form_component(from)}/comments"),
+                    body: { body: note, visibility: "internal" })
+  puts "  noted on ISS-#{from}"
+rescue SessionExpired, ApiError => e
+  warn "#{issue_label(issue)} is filed, but ISS-#{from} could not be noted (#{e.message}). " \
+       "The finding is recorded; only the back-reference from ISS-#{from} is missing — " \
+       "say it in that issue's close-out comment instead: #{note}"
 end
 
 # Adopt an existing issue onto an epic, or detach it. The four ISS-314 follow-ups
@@ -9618,18 +9812,19 @@ when "scripts"
 when "issues"
   sub = argv.shift
   case sub
-  when "create"    then cmd_issues_create(argv)
-  when "list"      then cmd_issues_list(argv)
-  when "parent"    then cmd_issues_parent(argv)
-  when "duplicate" then cmd_issues_duplicate(argv)
-  when "show"      then cmd_issues_show(argv)
-  when "resume"    then cmd_issues_resume(argv)
-  when "claim"     then cmd_issues_claim(argv)
-  when "status"    then cmd_issues_status(argv)
-  when "snooze"    then cmd_issues_snooze(argv)
-  when "reconcile" then cmd_issues_reconcile(argv)
-  when nil         then require_subcommand("issues")
-  else               unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
+  when "create"     then cmd_issues_create(argv)
+  when "list"       then cmd_issues_list(argv)
+  when "parent"     then cmd_issues_parent(argv)
+  when "duplicate"  then cmd_issues_duplicate(argv)
+  when "workaround" then cmd_issues_workaround(argv)
+  when "show"       then cmd_issues_show(argv)
+  when "resume"     then cmd_issues_resume(argv)
+  when "claim"      then cmd_issues_claim(argv)
+  when "status"     then cmd_issues_status(argv)
+  when "snooze"     then cmd_issues_snooze(argv)
+  when "reconcile"  then cmd_issues_reconcile(argv)
+  when nil          then require_subcommand("issues")
+  else                unknown("issues subcommand", sub, SUBCOMMANDS["issues"])
   end
 when "autonomy"
   sub = argv.shift

@@ -2352,4 +2352,150 @@ class TestDevIssues < Minitest::Test
     assert_match(/Warm session stalls/, section)
     assert_match(/reopening this issue clears the link/, section)
   end
+
+  # ---- issues workaround (the session close-out contract, ISS-507) ----
+
+  def workaround_args(overrides = {})
+    args = {
+      "--from" => "465",
+      "--key" => "openclaw-status-path-missing",
+      "--title" => "The status file path does not exist on the runner",
+      "--body" => "Told to write /Users/mbryzek/...; wrote the report to the issue instead.",
+    }.merge(overrides)
+    args.reject { |_flag, value| value.nil? }.flat_map { |flag, value| [flag, value] }
+  end
+
+  def filed_workaround(occurrence_count: 1)
+    { "id" => "iss-w", "number" => "506", "category" => "bug", "status" => "open",
+      "title" => "The status file path does not exist on the runner",
+      "occurrence_count" => occurrence_count }
+  end
+
+  # The whole point of the command: a session filing a finding it is NOT going to
+  # work must not claim it. A claimed issue is invisible to `dev issues claim`, so
+  # getting this wrong makes real work unpickupable — which is why `create`
+  # requires --status off a terminal in the first place.
+  def test_workaround_files_open_and_never_claims
+    sent = nil
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(body) { sent = body; filed_workaround },
+      "POST #{issues_path('/465/comments')}" => ->(_body) { {} },
+    ) { capture_stdout { cmd_issues_workaround(workaround_args) } }
+    assert_equal false, sent[:claim_on_create]
+    assert_equal "bug", sent[:category]
+  end
+
+  # Without a fingerprint a nightly producer files the same finding every night,
+  # which is the failure mode that makes a queue untrustworthy. `issues create`
+  # cannot set one at all; that gap is most of why this command exists.
+  def test_workaround_namespaces_the_dedup_key_into_a_fingerprint
+    sent = nil
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(body) { sent = body; filed_workaround },
+      "POST #{issues_path('/465/comments')}" => ->(_body) { {} },
+    ) { capture_stdout { cmd_issues_workaround(workaround_args) } }
+    assert_equal "workaround:openclaw-status-path-missing", sent[:fingerprint]
+  end
+
+  def test_workaround_body_carries_the_run_that_hit_it
+    sent = nil
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(body) { sent = body; filed_workaround },
+      "POST #{issues_path('/465/comments')}" => ->(_body) { {} },
+    ) { capture_stdout { cmd_issues_workaround(workaround_args) } }
+    assert_match(/wrote the report to the issue instead/, sent[:body])
+    assert_match(/Worked around during ISS-465/, sent[:body])
+  end
+
+  # The other direction. Read the note the SOURCE issue gets, not just that one
+  # was posted: it is what a human scanning ISS-465's timeline actually sees.
+  def test_workaround_notes_the_finding_on_the_source_issue
+    note = nil
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(_body) { filed_workaround },
+      "POST #{issues_path('/465/comments')}" => ->(body) { note = body; {} },
+    ) { capture_stdout { cmd_issues_workaround(workaround_args) } }
+    assert_match(/Filed as ISS-506/, note[:body])
+    assert_match(/not fixed/, note[:body])
+    assert_equal "internal", note[:visibility]
+  end
+
+  # A recurrence creates NOTHING new server-side, so the note on the run is the
+  # only trace that tonight's session hit it again. Dropping it would leave the
+  # second night looking exactly like a night that went fine.
+  def test_workaround_notes_the_source_issue_on_a_recurrence_too
+    note = nil
+    out = with_stubbed_api(
+      "POST #{issues_path}" => ->(_body) { filed_workaround(occurrence_count: 4) },
+      "POST #{issues_path('/465/comments')}" => ->(body) { note = body; {} },
+    ) { capture_stdout { cmd_issues_workaround(workaround_args) } }
+    assert_match(/already tracked \(occurrence 4\)/, out)
+    assert_match(/no duplicate filed/, out)
+    assert_match(/Already tracked as ISS-506 \(occurrence 4\)/, note[:body])
+  end
+
+  # The finding is the artifact worth protecting: a failed back-reference must not
+  # look like a failed filing, or the caller retries a create that already worked.
+  def test_workaround_keeps_the_filing_when_the_source_note_fails
+    out, err = capture_io do
+      with_stubbed_api(
+        "POST #{issues_path}" => ->(_body) { filed_workaround },
+        "POST #{issues_path('/465/comments')}" => ->(_body) { raise ApiError, "404 not found" },
+      ) { cmd_issues_workaround(workaround_args) }
+    end
+    assert_match(/Filed ISS-506/, out)
+    assert_match(/ISS-506 is filed, but ISS-465 could not be noted/, err)
+  end
+
+  # ---- arg validation (no network: these exit before the credential guard) ----
+
+  def test_workaround_requires_from_key_title_and_body
+    out, status = capture_stderr_and_exit { cmd_issues_workaround([]) }
+    assert_equal 1, status
+    assert_match(/--from is required/, out)
+    assert_match(/--key is required/, out)
+    assert_match(/--title is required/, out)
+    assert_match(/--body is required/, out)
+  end
+
+  # A key that varies with the run dedups against nothing. Rejecting the shapes
+  # that carry a date or a timestamp is not cosmetic — an accepted
+  # `slow-query-2026-08-05` files a fresh issue every single night.
+  def test_workaround_rejects_a_key_that_is_not_a_stable_slug
+    ["Openclaw Status Path", "openclaw_status_path", "workaround:openclaw", "openclaw--status"].each do |bad|
+      out, status = capture_stderr_and_exit { cmd_issues_workaround(workaround_args("--key" => bad)) }
+      assert_equal 1, status, "expected #{bad.inspect} to be rejected"
+      assert_match(/is not a valid dedup key/, out)
+    end
+  end
+
+  def test_workaround_key_hint_names_what_makes_a_key_stable
+    assert_match(/naming WHAT BROKE rather than the run that hit it/, WORKAROUND_KEY_HINT)
+  end
+
+  def test_workaround_rejects_a_non_numeric_from
+    out, status = capture_stderr_and_exit { cmd_issues_workaround(workaround_args("--from" => "ISS-465")) }
+    assert_equal 1, status
+    assert_match(/--from must be an issue number/, out)
+  end
+
+  def test_workaround_rejects_an_unknown_category
+    out, status = capture_stderr_and_exit { cmd_issues_workaround(workaround_args("--category" => "worker")) }
+    assert_equal 1, status
+    assert_match(/--category must be one of: feature, bug, improvement/, out)
+  end
+
+  def test_workaround_rejects_stray_arguments
+    out, status = capture_stderr_and_exit { cmd_issues_workaround(workaround_args + ["--status", "open"]) }
+    assert_equal 1, status
+    assert_match(/unexpected argument\(s\): --status, open/, out)
+  end
+
+  # Valid args reach the credential guard, which proves the arg validation passed.
+  def test_workaround_with_valid_args_passes_arg_validation
+    out, status = capture_stderr_and_exit { cmd_issues_workaround(workaround_args) }
+    assert_equal 1, status
+    refute_match(/is required/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
 end
