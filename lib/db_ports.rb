@@ -50,6 +50,32 @@ module DbPorts
   # 10000 — out of range — and would either fail or restart the scan from the
   # bottom every time. Scanning forward from last_issued keeps it monotonic
   # within a lap and terminating across laps.
+  # Serialise the read-compute-write on the history file across concurrent
+  # sessions.
+  #
+  # The file exists so that parallel sessions do not hand out the same port
+  # twice, and until this lock it did not actually deliver that: `allocate!` and
+  # `record` both load, compute and save with nothing holding the file in
+  # between, so two `claude-db start`/`next-port` calls landing in the same
+  # window read the same `last_issued`, computed the same candidate, and both
+  # wrote it back. The `bound` probe does not close the gap either -- TCPServer
+  # is opened and closed to test the port, not held.
+  #
+  # Same shape as SchemaMirror.locked, which serialises the other piece of
+  # shared state under ~/code/ai for exactly the same reason.
+  #
+  # NOT re-entrant: flock is per open file description, so a second `locked`
+  # inside a first would deadlock in the same process. `allocate!` and `record`
+  # are both called at the top level from bin/claude-db and neither calls the
+  # other -- keep it that way.
+  def DbPorts.locked(path = HISTORY_PATH)
+    FileUtils.mkdir_p(File.dirname(path)) unless File.directory?(File.dirname(path))
+    File.open("#{path}.lock", File::CREAT | File::RDWR, 0o644) do |f|
+      f.flock(File::LOCK_EX)
+      yield
+    end
+  end
+
   def DbPorts.load_history(path = HISTORY_PATH)
     return empty_history unless File.exist?(path)
     raw = JSON.parse(File.read(path))
@@ -79,28 +105,32 @@ module DbPorts
   # Record that `port` was issued for `container`, and remember it as the point
   # the next scan starts from.
   def DbPorts.record(port:, schema_tag:, container:, session_id:, path: HISTORY_PATH, now: Time.now)
-    history = load_history(path)
-    history["allocations"] << {
-      "port" => port,
-      "schema_tag" => schema_tag,
-      "container" => container,
-      "session_id" => session_id,
-      "allocated_at" => now.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    }
-    history["last_issued"] = port
-    save_history(history, path)
+    locked(path) do
+      history = load_history(path)
+      history["allocations"] << {
+        "port" => port,
+        "schema_tag" => schema_tag,
+        "container" => container,
+        "session_id" => session_id,
+        "allocated_at" => now.utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+      }
+      history["last_issued"] = port
+      save_history(history, path)
+    end
   end
 
   # Forget every allocation for `container` (its container is gone). Ports are
   # freed for reuse; `last_issued` is left alone so the sequence keeps moving
   # forward rather than immediately recycling a just-released port.
   def DbPorts.release_container(container, path: HISTORY_PATH)
-    history = load_history(path)
-    before = history["allocations"].length
-    history["allocations"] = history["allocations"].reject { |a| a["container"] == container }
-    released = before - history["allocations"].length
-    save_history(history, path) if released > 0
-    released
+    locked(path) do
+      history = load_history(path)
+      before = history["allocations"].length
+      history["allocations"] = history["allocations"].reject { |a| a["container"] == container }
+      released = before - history["allocations"].length
+      save_history(history, path) if released > 0
+      released
+    end
   end
 
   # ── liveness ──────────────────────────────────────────────────────────────
@@ -188,12 +218,14 @@ module DbPorts
   # racing to `start` — is not.
   def DbPorts.allocate!(path: HISTORY_PATH, container_exists: nil, bound: nil)
     container_exists ||= ->(name) { DbImages.container_exists?(name.to_s) }
-    history = load_history(path)
-    taken = reserved_ports(history, :container_exists => container_exists)
-    port = next_free_port(:last_issued => history["last_issued"], :taken => taken, :bound => bound)
-    return nil if port.nil?
-    history["last_issued"] = port
-    save_history(history, path)
-    port
+    locked(path) do
+      history = load_history(path)
+      taken = reserved_ports(history, :container_exists => container_exists)
+      port = next_free_port(:last_issued => history["last_issued"], :taken => taken, :bound => bound)
+      next nil if port.nil?
+      history["last_issued"] = port
+      save_history(history, path)
+      port
+    end
   end
 end

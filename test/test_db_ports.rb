@@ -217,6 +217,43 @@ class TestDbPorts < Minitest::Test
     end
   end
 
+  # The test above proves SEQUENTIAL callers differ, which is what its name has
+  # always claimed but not what the file is for: the history exists so that
+  # parallel sessions -- separate processes that cannot see each other's shells
+  # -- never get the same port. That needs real concurrency to test, so this
+  # forks.
+  #
+  # Without the lock, `allocate!` loads, computes and saves with nothing holding
+  # the file in between, and N processes starting together all read the same
+  # `last_issued` and return the same port. (The `bound` probe does not save it:
+  # TCPServer is opened and closed to test a port, not held.) Hand two sessions
+  # the same port and one ends up talking to the other's database, which is the
+  # whole hazard this file exists to prevent.
+  def test_parallel_processes_are_never_handed_the_same_port
+    with_history_file do |path|
+      readers, writers = 8.times.map { IO.pipe }.transpose
+      pids = 8.times.map do |i|
+        fork do
+          readers.each(&:close)
+          # A barrier: without it the children serialise by luck of scheduling
+          # and the race never opens, so the test would pass either way.
+          sleep 0.05
+          port = DbPorts.allocate!(:path => path, :container_exists => ->(_n) { true },
+                                   :bound => NOTHING_BOUND)
+          writers[i].write(port.to_s)
+          writers[i].close
+          exit!(0)
+        end
+      end
+      writers.each(&:close)
+      ports = readers.map { |r| v = r.read; r.close; v.to_i }
+      pids.each { |pid| Process.wait(pid) }
+
+      assert_equal ports.length, ports.uniq.length, "two processes were handed the same port: #{ports.sort}"
+      assert_equal ports.sort, (MIN...MIN + 8).to_a, "the allocations must be a contiguous run"
+    end
+  end
+
   def test_allocate_skips_a_port_held_by_a_live_container
     history = {
       "last_issued" => nil,
