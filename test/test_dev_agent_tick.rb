@@ -471,6 +471,135 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- claim-time playbook resolution (ISS-505) ----
+  #
+  # The producer files a POINTER; the runner reads the playbook off its own
+  # checkout when it claims. That is the entire point — an issue filed on Friday
+  # and claimed on Tuesday must run TUESDAY's procedure — so what these prove is
+  # that the read happens here, that what was read is recorded, and that a
+  # pointer which does not resolve stops the claim instead of starting a session
+  # that would do something else.
+
+  CLAIM_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".freeze
+
+  # Drives one real claim with Jobs.spawn_session stubbed: everything up to and
+  # including the prompt is exercised, and no `claude` is launched.
+  def claim_one(body:, number: 707, errors: [], branch: "main", dirty: false)
+    seen = { comments: [], statuses: [], released: [], prompt: nil, spawned: false }
+    with_agent_home do
+      register_identity
+      Agent::Errors.write(errors) unless errors.empty?
+      with_ai_token do
+        stubs = {
+          "POST /playbook/issue/leases" => { "lease" => { "id" => "lse-1", "issue_number" => number } },
+          "GET /playbook/issues/#{number}" =>
+            { "number" => number, "title" => "Weekly code review: platform", "category" => "infrastructure",
+              "body" => body },
+          "GET /playbook/issues/#{number}/comments?limit=101&offset=0" => [],
+          "POST /playbook/issues/#{number}/comments" => ->(b) { seen[:comments] << b[:body]; {} },
+          "PUT /playbook/issues/#{number}/status" => ->(b) { seen[:statuses] << b; {} },
+          "DELETE /playbook/issue/leases/lse-1" => ->(_b) { seen[:released] << "lse-1"; {} },
+        }
+        spawn = lambda do |argv:, prompt:, workspace:, number:, env: {}|
+          seen[:prompt] = prompt
+          seen[:spawned] = true
+          Process.pid
+        end
+        # The stand-in devops checkout is deliberately not a git repo, so what
+        # `git` would answer about it is stubbed rather than reached for.
+        stub_singleton(Agent::Checkout, :head_sha, ->(*_args) { CLAIM_SHA }) do
+          stub_singleton(Agent::Checkout, :current_branch, ->(*_args) { branch }) do
+            stub_singleton(Agent::Checkout, :dirty?, ->(*_args) { dirty }) do
+              stub_singleton(Agent::Jobs, :spawn_session, spawn) do
+                with_stubbed_api(stubs) do
+                  seen[:out] = capture_stdout do
+                    tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: 1))
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    seen
+  end
+
+  POINTER = "Playbook: `agent/bodies/weekly-review.md`".freeze
+
+  def test_the_session_is_handed_the_playbook_read_at_claim_time
+    seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n")
+    assert seen[:spawned], "the session must still start"
+    assert_match(/^# Playbook — agent\/bodies\/weekly-review\.md @ #{CLAIM_SHA[0, 8]}$/, seen[:prompt],
+                 "the prompt gets the resolved playbook, labelled with the sha it was read at")
+    assert_match(/Posture: full-auto/, seen[:prompt], "the FULL procedure reaches the session")
+    assert_operator seen[:prompt].index("# Playbook —"), :<, seen[:prompt].index("# Issue comments"),
+                    "comments stay last so the most recent instruction is read last"
+  end
+
+  # Requirement 2: the run has to stay reproducible after the file changes, so
+  # WHAT was read and at WHICH sha go on the timeline, with a permalink.
+  def test_the_first_comment_records_the_playbook_and_the_sha_it_was_read_at
+    seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n")
+    comment = seen[:comments].first
+    assert_match(/^Claimed by /, comment, "the claim line still leads")
+    assert_match(/^Playbook: agent\/bodies\/weekly-review\.md @ #{CLAIM_SHA[0, 8]}$/, comment)
+    assert_match(%r{https://github\.com/mbryzek/devops/blob/#{CLAIM_SHA}/agent/bodies/weekly-review\.md}, comment)
+  end
+
+  # The inversion ISS-505 names: a runner on a stale checkout reads last month's
+  # playbook while the issue claims to be running the current one, and
+  # `agent_reported_registry` shows that only by comparing machines after the
+  # fact. A runner CAN see why its own last pull did not land, so it says so on
+  # the issue whose playbook it just read.
+  def test_a_runner_whose_pull_is_failing_says_so_on_the_issue
+    failing = [{ "source" => "checkout_pull", "message" => "fatal: could not read from remote",
+                 "created_at" => Time.now.utc.iso8601 }]
+    seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n", errors: failing)
+    assert_match(/failed to fast-forward 1 time\(s\) in a row.*may be behind `origin\/main`/m, seen[:comments].first)
+  end
+
+  # A dirty tree and a checkout off `main` are BENIGN skips: the tick leaves them
+  # alone on purpose, because it means a human is working in that checkout. So
+  # they never count toward the ISS-511 escalation and nothing else in the system
+  # reports them — on an unattended mini that is a machine which quietly stops
+  # updating forever, which is exactly the case this note exists for.
+  def test_a_benign_pull_skip_still_warns_because_nothing_else_reports_it
+    dirty = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n", dirty: true)
+    assert_match(/dirty working tree.*may be behind `origin\/main`/m, dirty[:comments].first)
+
+    off_main = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n", branch: "wip")
+    assert_match(/on `wip`, not `main`/, off_main[:comments].first)
+  end
+
+  def test_a_healthy_runner_adds_no_staleness_warning
+    seen = claim_one(body: "Filed by a producer.\n\n#{POINTER}\n")
+    refute_match(/behind `origin\/main`/, seen[:comments].first)
+  end
+
+  # ISS-360: a producer ported without its playbook silently fell back to generic
+  # triage and filed issues instead of shipping PRs for a week. A pointer that
+  # does not resolve reintroduces exactly that, so it must be a HARD stop.
+  def test_a_pointer_that_does_not_resolve_starts_no_session_at_all
+    seen = claim_one(body: "Filed by a producer.\n\nPlaybook: `agent/bodies/never-existed.md`\n")
+    refute seen[:spawned], "a session without its playbook does a different job than the one scheduled"
+    assert_equal ["needs_input"], seen[:statuses].map { |s| s[:status] },
+                 "a human has to fix the path — releasing it would just be re-claimed and re-fail every 30s"
+    assert_match(/did not resolve/, seen[:statuses].first[:comment])
+    assert_equal ["lse-1"], seen[:released], "the lease must not be left held by a session that never started"
+    assert_match(/no session started/, seen[:out])
+  end
+
+  # Every issue a human wrote, and every issue filed before pointers existed,
+  # carries its brief inline. Those must be completely untouched.
+  def test_an_issue_with_no_pointer_claims_exactly_as_before
+    seen = claim_one(body: "Mike wrote this one by hand. The fix is in TaskDao.")
+    assert seen[:spawned]
+    assert_empty seen[:statuses], "nothing to resolve means nothing to fail on"
+    refute_match(/^Playbook:/, seen[:comments].first)
+    refute_match(/# Playbook/, seen[:prompt])
+  end
+
   # ---- runner staleness comes from the server, never recomputed here ----
 
   # Restores the real method rather than removing it — Notify.event is a

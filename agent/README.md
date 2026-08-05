@@ -11,7 +11,7 @@ look. Everything here exists to drain the open issue queue.
 | File | What it is |
 |---|---|
 | `producers.yml` | The schedule registry. The only place a schedule lives — the platform records run history but has no notion of "due". The tick pulls this checkout itself, so one push reaches every machine. |
-| `bodies/` | The playbooks a producer ships with the issue it files (`issue.body_file`). Without one the claiming session gets `claude-issues/default-body.md` and does generic triage instead of the job the producer was written to schedule. A `type: epic` producer ships one shared playbook for all of its children, with `{child}` substituted per child. |
+| `bodies/` | The playbooks a producer's issue POINTS AT (`issue.body_file`) — see "One copy of the plan" below. Without one the claiming session gets `claude-issues/default-body.md` and does generic triage instead of the job the producer was written to schedule. A `type: epic` producer shares one playbook across its children, with `{child}` substituted per child. |
 | `instructions.md` | Part 1 of every session's prompt. Outcome protocol, the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. |
 | `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
 
@@ -91,12 +91,60 @@ one — same heartbeat, same runs — which is why each runner also reports what
 reads: every producer, its cadence, the next-due moment it computed, and the
 devops sha it all came from (`PUT /agent/registry/:runner_id`). Git stays the
 system of record; the platform holds *reports about* git and never evaluates a
-schedule. Comparing those reports is what makes three things visible that run
-history alone cannot show: a producer that is **overdue**, runners on **different
-devops shas**, and a producer **no live runner schedules** at all. `/admin/agents`
-renders all three. Reported on a sha change (so a push shows the tick after it
-lands) and otherwise on the heartbeat cadence, since next-due moves as producers
-run.
+schedule. Comparing those reports is what would make three things visible that
+run history alone cannot show: a producer that is **overdue**, runners on
+**different devops shas**, and a producer **no live runner schedules** at all.
+Reported on a sha change (so a push shows the tick after it lands) and otherwise
+on the heartbeat cadence, since next-due moves as producers run.
+
+**What actually alarms today, as of ISS-505.** The report is stored and nothing
+compares it: `AgentInvariants` covers heartbeat staleness only, there is no
+sha-skew invariant, and there is no `/admin/agents` page (an earlier version of
+this file claimed there was; ISS-521 builds one). What does alarm is the CAUSE
+rather than the symptom — a runner only falls behind because its
+`git pull --ff-only` stopped landing:
+
+| Why the checkout is stale | What reports it |
+|---|---|
+| Pull fails repeatedly (network, credentials, diverged) | `Agent::Errors` counts consecutive failures; the third notifies and files a bug issue (ISS-511) |
+| Working tree dirty, or on a branch other than `main` | Nothing — a benign skip, deliberately left alone. On an unattended mini it is silent forever, so a claim that resolves a playbook says so **on that issue** (`Tick#checkout_staleness_reason`) |
+| Machine is dark | `agent_runner_heartbeat_stale` |
+
+What remains unbuilt is the cross-fleet comparison — one runner cannot see that
+it is the odd one out. Worth building on `agent_runner` rather than on
+`agent_reported_registry`, which ISS-526 deletes.
+
+## One copy of the plan, and it is the current one
+
+A producer files a **pointer** to its playbook, never a copy of it (ISS-505). The
+filed body carries the playbook's heading and opening paragraph, a ``Playbook:
+`agent/bodies/x.md` `` line and a permalink; the claiming runner reads the
+procedure off its own checkout and hands it to the session.
+
+Copying froze it. An issue filed on Friday and claimed on Tuesday ran Friday's
+procedure, and every improvement pushed to `bodies/` in between applied to
+nothing already in the queue — which defeats the reason these are nightly
+producers at all. Resolution happens at CLAIM time, not file time: pinning a sha
+when the issue is filed would recreate the snapshot with extra steps.
+
+Three things fall out of that and none of them is optional:
+
+- **The runner records what it read** — `Playbook: agent/bodies/x.md @ <sha>`
+  plus the permalink, as the issue's first comment. That is what keeps a run
+  reproducible after the file changes, and it is the audit trail for the failure
+  this design invites: a runner on a stale checkout reading last month's
+  playbook. When this machine's own `git pull --ff-only` is failing, the comment
+  says so outright rather than leaving the skew to be spotted by comparing
+  runners in `agent_reported_registry`.
+- **A pointer that does not resolve is a hard stop** — no session, and the issue
+  goes to `needs_input`. Never a fallback: ISS-360 is a week of a producer doing
+  generic triage because its playbook was missing and nothing said so.
+- **Check output stays inline.** A `file_when: check_fails` producer's stdout is
+  what *this run* found, not a standing procedure. It never moves.
+
+Every playbook therefore opens `# Heading`, blank line, paragraph — that opening
+is the abstract the filed issue renders, and `producers.yml` validates it at
+parse time along with the path.
 
 ## Two phases, two locks
 

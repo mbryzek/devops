@@ -1,19 +1,24 @@
 require 'agent/paths'
 
-# The prompt fed to a session on stdin (design §4.3.2). Exactly three parts, in
-# this order:
+# The prompt fed to a session on stdin (design §4.3.2). Four parts, in this
+# order:
 #
 #   1. Standing instructions — devops/agent/instructions.md, versioned in git
 #      and reviewed like code. Everything the outcome protocol depends on lives
 #      there, not here.
 #   2. The issue body.
-#   3. EVERY issue comment, oldest first.
+#   3. The PLAYBOOK, when the body points at one — read from this runner's devops
+#      checkout at claim time, not copied into the issue when it was filed
+#      (ISS-505). Absent for every issue that carries its brief inline.
+#   4. EVERY issue comment, oldest first.
 #
-# Part 3 is not optional context — it is how the loops close. A `needs_input`
+# Part 4 is not optional context — it is how the loops close. A `needs_input`
 # issue returns to `open` when Mike answers as a comment, and the next attempt
 # only works because it reads that comment; review feedback flows identically
 # (§4.4.1). Dropping comments would silently break both loops while everything
-# still looked like it ran.
+# still looked like it ran. It stays LAST for the same reason it is sorted
+# oldest-first: the most recent instruction must be the last thing read, which is
+# why the playbook goes above it and not below.
 #
 # The assignment block between the instructions and the body is executor state
 # the session cannot discover for itself: which directory is its workspace,
@@ -28,13 +33,14 @@ module Agent
       File.read(path)
     end
 
-    def build(issue:, comments:, slug:, workspace:, resume_repo: nil)
+    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, playbook: nil)
       [
         instructions.strip,
         assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo),
         issue_section(issue),
+        playbook_section(playbook),
         comments_section(comments),
-      ].join("\n\n---\n\n") + "\n"
+      ].compact.join("\n\n---\n\n") + "\n"
     end
 
     def assignment(issue:, slug:, workspace:, resume_repo: nil)
@@ -76,6 +82,28 @@ module Agent
         # ISS-#{issue['number']}: #{issue['title']}
 
         #{issue['body'].to_s.strip}
+      SECTION
+    end
+
+    # nil when the issue carries no pointer, which `build` drops rather than
+    # rendering an empty section — a heading with nothing under it reads as "your
+    # playbook is missing" to a session whose issue never had one.
+    #
+    # The abstract in the issue body above is a summary of exactly this text, and
+    # saying which one wins matters: the body was written the night the issue was
+    # filed, this was read moments ago.
+    def playbook_section(playbook)
+      return nil if playbook.nil?
+      <<~SECTION.strip
+        # Playbook — #{playbook.label}
+
+        The procedure for this issue, read from `#{playbook.path}` in this runner's devops
+        checkout at the moment the issue was claimed — NOT a copy frozen when the issue was
+        filed. Where it and the abstract in the issue body differ, THIS wins. The sha above
+        is recorded as a comment on the issue, so this exact text stays retrievable at
+        #{playbook.permalink} after the file changes.
+
+        #{playbook.text}
       SECTION
     end
 
