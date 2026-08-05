@@ -87,6 +87,11 @@ applications: Listing<AppGroup>
 /// output root, exactly as running `api` there would. Not recursive: a nested
 /// config's own `nestedConfigs` is ignored, so the repo root stays the one place
 /// that says which roots exist.
+///
+/// A nested root is a second OUTPUT location for the same repo, never a second
+/// repo: every root of a run resolves its specs through ONE chain, anchored on
+/// the repo root. Two roots of the same repo can never generate from different
+/// spec snapshots (ISS-444).
 nestedConfigs: Listing<String>?
 
 // --- Bundle factory functions ---
