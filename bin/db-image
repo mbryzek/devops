@@ -179,6 +179,44 @@ def dump_sem_tracking(port, database, out_file)
        "-t schema_evolution_manager.bootstrap_scripts")
 end
 
+# Every ROW the delta scripts inserted.
+#
+# The schema dump above is --schema-only and carries none of them, while the SEM
+# tracking dump records those same scripts as applied. Without this file a data
+# migration is therefore recorded as done in every session database while its
+# rows are absent, and sem-apply will never re-run it — a silent, permanent gap
+# that looks like a bug in whatever branch happens to be checked out. That is
+# exactly what left agent.agent_producers (ISS-521) and agent.agent_producer_
+# playbooks (ISS-523) empty in every session DB while the two specs reading them
+# failed on unmodified main (ISS-559).
+#
+# The whole database, deliberately NOT a keep-list: this scratch database was
+# built from a --schema-only baseline, so the only rows that exist in it are the
+# ones the delta scripts wrote. No production row can reach the image this way,
+# and a keep-list would reintroduce the same silent gap for the next table
+# nobody thought to name.
+#
+# Exclusions:
+#   - the two schema_evolution_manager tables, dumped and applied at their own
+#     step (dump_sem_tracking).
+#   - `journal` and its per-schema partition schemas (journal_public,
+#     journal_rallyd, ...). journal.settings rides in the journal dump, and the
+#     journal ROWS a migration's own writes produced are an audit trail of the
+#     build: worthless in a session DB, and their partitions are re-based on the
+#     day the container first starts anyway.
+#
+# --disable-triggers because these rows are already the post-trigger state:
+# re-firing updated_at stamps and journal writes on restore would rewrite them,
+# and the journal writes would need partitions the init script has not created
+# yet at that point. It restores as the superuser, which is what the init script
+# runs as.
+def dump_migration_data(port, database, out_file)
+  dump(port, database, out_file, "--data-only", "--no-owner", "--disable-triggers",
+       "-N journal", "-N #{Shellwords.shellescape('journal_*')}",
+       "-T schema_evolution_manager.scripts",
+       "-T schema_evolution_manager.bootstrap_scripts")
+end
+
 # ── snapshot loading ─────────────────────────────────────────────────────────
 
 def load_snapshot(app, port, snapshot, keep)
@@ -314,8 +352,36 @@ def build_incremental(app, tag, committed, tmp)
       out[:journal] = File.join(tmp, "journal-settings.sql")
       dump(port, app.database, out[:journal], "--data-only", "--no-owner", "-t journal.settings")
     end
+
+    out[:migration_data] = File.join(tmp, "migration-data.sql")
+    dump_migration_data(port, app.database, out[:migration_data])
+    puts "==> Rows inserted by the delta scripts: #{migration_data_summary(out[:migration_data])}"
   end
   out
+end
+
+# What the migration-data dump actually captured, printed so a build never
+# silently bakes one nobody looked at — this artifact exists precisely because
+# missing rows are invisible until a spec fails days later.
+#
+# Counted rather than listed: a plain pg_dump emits a `COPY <table> ... FROM
+# stdin;` block for EVERY table it selected, empty ones included, so the blocks
+# themselves say nothing. The rows between the header and the terminating `\.`
+# are the answer.
+def migration_data_summary(file)
+  counts = Hash.new(0)
+  table = nil
+  File.foreach(file) do |line|
+    if table.nil?
+      table = line.split(" ")[1] if line.start_with?("COPY ")
+    elsif line.start_with?("\\.")
+      table = nil
+    else
+      counts[table] += 1
+    end
+  end
+  return "none" if counts.empty?
+  counts.sort_by { |t, n| [-n, t] }.map { |t, n| "#{t} (#{n})" }.join(", ")
 end
 
 # Assemble the docker build context: the generic recipe from devops, plus this
@@ -337,6 +403,13 @@ def assemble_context(artifacts, tmp)
     FileUtils.cp(artifacts[:journal], File.join(ctx, "journal-settings.sql"))
   else
     File.write(File.join(ctx, "journal-settings.sql"), "-- no journal schema in this database\n")
+  end
+  # Same shape: absent at the baseline tag, where there are no delta scripts to
+  # have inserted anything.
+  if artifacts[:migration_data]
+    FileUtils.cp(artifacts[:migration_data], File.join(ctx, "migration-data.sql"))
+  else
+    File.write(File.join(ctx, "migration-data.sql"), "-- built at the baseline tag: no delta scripts\n")
   end
   ctx
 end
