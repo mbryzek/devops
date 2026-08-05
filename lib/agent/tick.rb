@@ -209,7 +209,7 @@ module Agent
       end
 
       Agent::Api.report_registry(identity.runner_id, devops_sha: sha, producers: producers,
-                                 errors: Agent::Errors.list, token: identity.token, use_localhost: @use_localhost)
+                                 token: identity.token, use_localhost: @use_localhost)
       Agent::Paths.write_json(Agent::Paths.registry_report_file,
                               { "devops_sha" => sha, "at" => @now.utc.iso8601 }, mode: 0600)
       log("registry reported: #{producers.length} producers @ #{Agent::Checkout.short(sha)}")
@@ -245,8 +245,14 @@ module Agent
     # exactly what a dead machine looks like too.
     #
     # It also carries the job census, which is the only path by which the platform learns what this
-    # machine is actually RUNNING as opposed to what it was leased. Sent on a change or on the
-    # ten-minute floor, whichever comes first.
+    # machine is actually RUNNING as opposed to what it was leased, and (ISS-527) this machine's
+    # bounded local error log. Sent on a change to EITHER or on the ten-minute floor, whichever
+    # comes first.
+    #
+    # `errors` is gated the same way as the census and for a sharper reason: the ten-minute floor is
+    # a rate limit, and an infra failure that sits unreported for up to ten minutes is exactly the
+    # failure someone is trying to see. update_checkout runs BEFORE this in phase_a, so a failure
+    # recorded this tick is reported by this tick.
     #
     # Phase A's own short lock, held across the read-POST-write so the throttle
     # file actually throttles. It guards nothing else — two concurrent Phase A
@@ -256,13 +262,15 @@ module Agent
       with_lock(Agent::Paths.vitals_lock) do |acquired|
         next unless acquired
         jobs = job_census
+        errors = Agent::Errors.list
         last = Agent::Paths.read_json(Agent::Paths.heartbeat_file)
-        next unless heartbeat_due?(last) || census_changed?(last, jobs)
-        next log("would POST /agent/runners/#{identity.runner_id}/heartbeat (#{jobs.size} job(s))") if @dry_run
-        Agent::Api.runner_heartbeat(identity.runner_id, jobs: jobs, token: identity.token,
+        next unless heartbeat_due?(last) || census_changed?(last, jobs) || errors_changed?(last, errors)
+        next log("would POST /agent/runners/#{identity.runner_id}/heartbeat (#{jobs.size} job(s), #{errors.size} error(s))") if @dry_run
+        Agent::Api.runner_heartbeat(identity.runner_id, jobs: jobs, errors: errors, token: identity.token,
                                                         use_localhost: @use_localhost)
-        Agent::Paths.write_json(Agent::Paths.heartbeat_file, { "at" => @now.utc.iso8601, "jobs" => jobs }, mode: 0600)
-        log("runner heartbeat sent (#{jobs.size} job(s))")
+        Agent::Paths.write_json(Agent::Paths.heartbeat_file,
+                                { "at" => @now.utc.iso8601, "jobs" => jobs, "errors" => errors }, mode: 0600)
+        log("runner heartbeat sent (#{jobs.size} job(s), #{errors.size} error(s))")
       end
     end
 
@@ -299,6 +307,22 @@ module Agent
     # retries it rather than concluding nothing happened.
     def census_changed?(last, jobs)
       (last && last["jobs"]) != jobs
+    end
+
+    # Same comparison, same reasoning, for the error log — and it is what stops the ten-minute floor
+    # from becoming a ten-minute delay on bad news. A failure recorded this tick makes the list
+    # differ from what was last sent, so the heartbeat fires now rather than at the next window.
+    #
+    # Recovery forces a send too, and that is deliberate: Agent::Errors.clear on success is the ONLY
+    # way a machine says "this stopped failing", and the platform replaces the list wholesale. Not
+    # forcing it here would leave a fixed machine showing a stale failure on the fleet board for up
+    # to ten minutes.
+    #
+    # A machine on a checkout that predates the "errors" key wrote a heartbeat file without one; nil
+    # != [] there, so the first tick after the upgrade sends once and then settles. That is correct,
+    # not a bug: the platform has never been told this machine's error state.
+    def errors_changed?(last, errors)
+      (last && last["errors"]) != errors
     end
 
     def heartbeat_leases(identity)

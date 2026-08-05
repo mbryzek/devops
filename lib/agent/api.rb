@@ -55,13 +55,18 @@ module Agent
       request(:get, "/agent/runners", token: token, use_localhost: use_localhost) || []
     end
 
-    # Liveness AND the machine's job census, in one call. `jobs` is the whole list every time (full
-    # desired state), for the same reason report_registry sends every producer: the platform stores
-    # what it is told wholesale, so a session that has finished has to DISAPPEAR from the report
-    # rather than linger looking live forever.
-    def runner_heartbeat(runner_id, jobs:, token:, use_localhost:)
+    # Liveness, the machine's job census, AND its local error log, in one call. Both lists are the
+    # whole list every time (full desired state), for the same reason report_registry sends every
+    # producer: the platform stores what it is told wholesale, so a session that has finished has to
+    # DISAPPEAR from the report rather than linger looking live forever, and a source that recovered
+    # has to disappear rather than show a failure that is over.
+    #
+    # `errors` rides the HEARTBEAT and not the registry report (ISS-527) because it is about the
+    # MACHINE. The reported registry exists only to detect that runners disagree about the schedule,
+    # and it goes away entirely once scheduling moves server-side (ISS-526) — the machine does not.
+    def runner_heartbeat(runner_id, jobs:, token:, use_localhost:, errors: [])
       request(:post, "/agent/runners/#{runner_id}/heartbeat", token: token, use_localhost: use_localhost,
-                                                              body: { jobs: jobs })
+                                                              body: { jobs: jobs, errors: errors })
     end
 
     def update_runner(runner_id, form, token:, use_localhost:)
@@ -73,14 +78,11 @@ module Agent
     # list every time (full desired state) -- a producer deleted from
     # producers.yml has to disappear from the report, not linger looking overdue.
     #
-    # `errors` is Agent::Errors.list — this machine's bounded local error
-    # history (ISS-511) — sent defensively ahead of the platform side landing
-    # (spec/agent.json `AgentReportedRegistry.errors` + `agent_reported_error`).
-    # Until that field exists server-side, an apibuilder-generated form on the
-    # receiving end simply ignores an unknown key, so this can ship first.
-    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:, errors: [])
+    # Deliberately carries NO error log: that moved to runner_heartbeat in
+    # ISS-527. See its comment for why.
+    def report_registry(runner_id, devops_sha:, producers:, token:, use_localhost:)
       request(:put, "/agent/registry/#{runner_id}", token: token, use_localhost: use_localhost,
-                                                    body: { devops_sha: devops_sha, producers: producers, errors: errors })
+                                                    body: { devops_sha: devops_sha, producers: producers })
     end
 
     def reported_registries(token:, use_localhost:)
