@@ -536,6 +536,10 @@ class TestDevAgentTick < Minitest::Test
     assert_equal "filed", result
     assert_equal "infrastructure", filed[:category]
     assert_equal "fp:1", filed[:fingerprint]
+    # Attribution the platform stores as a column: without it, "everything this
+    # producer filed" has to be reconstructed from the run history, which
+    # recurrence (many runs -> one issue) makes unpaginatable.
+    assert_equal "probe", filed[:producer_key]
     refute filed[:claim_on_create], "a producer files for the queue; it never claims"
     assert_match(/invariant x: 4 rows/, filed[:body], "the check's stdout IS the brief")
   end
@@ -697,6 +701,10 @@ class TestDevAgentTick < Minitest::Test
     # issue_form.parent_number is typed `string` on the platform.
     assert_equal %w[101 101], children.map { |c| c[:parent_number] }
     children.each { |c| assert_nil c[:type], "a child is an issue, never a nested epic" }
+    # Epic AND children, so one producer's whole night resolves to one key --
+    # stated on the children rather than left to the platform's inheritance, so
+    # a child detached from its epic keeps its attribution.
+    assert_equal %w[probe probe probe], filed.map { |f| f[:producer_key] }
   end
 
   # Per-child dedup is the whole reason for the split: one repo stuck on an open

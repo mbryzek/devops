@@ -593,6 +593,11 @@ module Agent
         title: spec.fetch("title"),
         category: spec.fetch("category"),
         fingerprint: fingerprint,
+        # Attribution the platform stores as a column, not something anyone has
+        # to reconstruct by joining agent_producer_runs: recurrence means many
+        # runs point at one issue, so "everything this producer filed" cannot be
+        # paginated off the run history.
+        producer_key: producer.key,
         body: producer_body(producer, output),
         claim_on_create: false,
       }
@@ -627,6 +632,7 @@ module Agent
           title: spec.fetch("title"),
           category: spec.fetch("category"),
           fingerprint: fingerprint,
+          producer_key: producer.key,
           body: epic_body(producer, output, children),
           claim_on_create: false,
         },
@@ -642,6 +648,11 @@ module Agent
           # A STRING on the wire: issue_form.parent_number is typed `string`,
           # and an integer here is a 400 the producer would only find at 3:45am.
           parent_number: number.to_s,
+          # Stated rather than left to the platform's parent-inheritance: the
+          # child's attribution then does not depend on the epic having been
+          # resolved, and every issue this producer filed carries the key even if
+          # a child is later detached from its epic.
+          producer_key: producer.key,
           body: child_body(producer, child),
           claim_on_create: false,
         }
