@@ -144,18 +144,104 @@ module Util
     end
 
     # Ensure Docker is authenticated to the DigitalOcean container registry
-    # before a push. `doctl registry login` mints a fresh credential (30-day
-    # default) and writes it to Docker's credential store, so a stale/expired
-    # token can never surface as a `401 Unauthorized` mid-release. We run it
-    # unconditionally before every push: it's idempotent, fast, and — without
-    # --never-expire — produces an ephemeral OAuth credential that is NOT a
-    # never-expiring token and does NOT accumulate in the DO token list.
-    # Requires doctl itself to be authenticated (`doctl auth init`); if that
-    # parent token has expired the login fails loudly here rather than leaving
-    # `docker push` to fail with an opaque 401.
+    # before a push. Every caller here pushes, so this asks for push scope; the
+    # pull-only caller (claude-db) asks RegistryAuth for read-only directly.
+    #
+    # This used to be `doctl registry login`, which writes the credential into
+    # Docker's credential store — and on a machine whose store is the Docker
+    # Desktop helper, that call HANGS FOREVER rather than failing (ISS-578). See
+    # lib/registry_auth.rb for what replaced it and why.
     def Util.registry_login
-      Util.assert_installed("doctl", "https://docs.digitalocean.com/reference/doctl/how-to/install/")
-      Util.run("doctl registry login")
+      RegistryAuth.authenticate!(read_write: true)
+    end
+
+    # Run `cmd` (an argv ARRAY, never a shell string) under a hard deadline.
+    # Returns [stdout_or_nil, :ok | :failed | :timed_out].
+    #
+    # Two things here are load-bearing, both learned from ISS-578:
+    #
+    #   1. THE CHILD GETS ITS OWN PROCESS GROUP, and the deadline kills the
+    #      GROUP. The hang that motivated this was `doctl` blocked on a wedged
+    #      `docker-credential-desktop` child; killing just the pid we spawned
+    #      leaves that grandchild alive holding the same lock, so the retry
+    #      hangs identically. `pgroup: true` + `kill(-pid)` reaps the whole tree.
+    #
+    #   2. stdin is /dev/null. A subprocess that decides to prompt must fail,
+    #      not block: nobody is at the keyboard in a Claude session or a cron
+    #      release, and "waiting for input that will never come" is
+    #      indistinguishable from "working" until someone notices hours later.
+    #
+    # `capture: true` returns stdout instead of streaming it, which is how a
+    # command whose OUTPUT is a credential stays out of the console and out of
+    # the quiet-mode log. Streaming output goes to the log in quiet mode, exactly
+    # like Util.run.
+    #
+    # `capture` protects the OUTPUT, not the command. The argv is echoed, same as
+    # Util.run — so never put a secret in an argument; pass it by file or by
+    # environment.
+    def Util.run_with_timeout(cmd, timeout_seconds:, capture: false, quiet: false)
+      raise ArgumentError, "cmd must be an array, got #{cmd.class}" unless cmd.is_a?(Array)
+
+      printable = cmd.join(" ")
+      if Util.quiet?
+        Util.log("==> #{printable}")
+      elsif !quiet
+        $stderr.puts "==> #{printable}"
+      end
+
+      out_read, out_write = capture ? IO.pipe : [nil, nil]
+
+      # `capture` diverts stdout ONLY. stderr keeps going wherever it would have
+      # anyway — the log in quiet mode, the console otherwise. The reason to
+      # capture at all is that stdout carries a credential; throwing the
+      # subprocess's own diagnostics away with it would leave a failure with
+      # nothing to read.
+      redirect = {}
+      if capture
+        redirect[:out] = out_write
+        redirect[:err] = [Util.log_file, "a"] if Util.quiet?
+      elsif Util.quiet?
+        redirect[[:out, :err]] = [Util.log_file, "a"]
+      end
+
+      pid = Process.spawn(*cmd, **redirect, :in => File::NULL, :pgroup => true)
+      out_write&.close
+      # Drain the pipe concurrently: a child that outgrows the pipe buffer blocks
+      # on write, and waiting for exit before reading would deadlock on it.
+      drain = capture ? Thread.new { out_read.read } : nil
+
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
+      status = nil
+      loop do
+        _, status = Process.waitpid2(pid, Process::WNOHANG)
+        break if status
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          Util.kill_process_group(pid)
+          drain&.kill
+          out_read&.close
+          return [nil, :timed_out]
+        end
+        sleep 0.2
+      end
+
+      stdout = drain&.value
+      out_read&.close
+      [stdout, status.success? ? :ok : :failed]
+    end
+
+    # Kill a process group started with `pgroup: true`, politely then not.
+    def Util.kill_process_group(pid)
+      Process.kill("TERM", -pid)
+      # A wedged process may not be in a state to handle TERM at all, so do not
+      # wait long before escalating.
+      20.times do
+        return if Process.waitpid(pid, Process::WNOHANG)
+        sleep 0.1
+      end
+      Process.kill("KILL", -pid)
+      Process.waitpid(pid)
+    rescue Errno::ESRCH, Errno::ECHILD
+      nil
     end
 
     # params:
