@@ -95,6 +95,57 @@ create unique index on _del_people (id);
 
 do $$ begin raise notice 'Clubs targeted: %', (select count(*) from _del_clubs); end $$;
 
+-- ---- change-journal queues for journaled tables in the delete universe -----
+-- Deleting a club's rows here does NOT clean up journal_<schema>.q_<table> /
+-- journal_<schema>.<table> for any table under `journal.setup(...)` (see e.g.
+-- dao/psql/court_reserve.members.sql). Left behind, those entries later fail their
+-- journal actor's apply step with an FK violation ("Detail: Key (club_id)=(...) is
+-- not present in table clubs") once the parent row here is gone. The actor treats
+-- that as a permanent/poison entry and drops it (BaseJournalActor.dropPoison), so
+-- nothing breaks, but every run of this script otherwise leaves that WARN noise for
+-- the actor to discover later. Purge the queues/history proactively instead.
+--
+-- journal_<schema>.<table>.parent_id = the journaled row's own `id` (its PK), NOT
+-- club_id, so each purge below joins back through an id set scoped to the targeted
+-- clubs. q_<table> only has journal_id (no FK to the journal table, no club_id), so
+-- it must be purged via the journal table's parent_id, in q_ -> journal order (queue
+-- rows would otherwise reference a since-deleted journal row).
+--
+-- Tables here = the intersection of this script's delete universe and every
+-- `journal.setup(...)` call in dao/psql/*.sql as of this writing. If a table gains
+-- journal.setup(...) later, or this script starts deleting from a new journaled
+-- table, add its purge here too.
+create temp table _del_cr_members on commit drop as
+  select id from court_reserve.members where club_id in (select id from _del_clubs);
+create unique index on _del_cr_members (id);
+create temp table _del_cr_memberships on commit drop as
+  select id from court_reserve.memberships where club_id in (select id from _del_clubs);
+create unique index on _del_cr_memberships (id);
+create temp table _del_cr_member_membership_intervals on commit drop as
+  select id from court_reserve.member_membership_intervals where club_id in (select id from _del_clubs);
+create unique index on _del_cr_member_membership_intervals (id);
+
+delete from journal_court_reserve.q_members
+  where journal_id in (select id from journal_court_reserve.members where parent_id in (select id from _del_cr_members));
+delete from journal_court_reserve.members where parent_id in (select id from _del_cr_members);
+
+delete from journal_court_reserve.q_memberships
+  where journal_id in (select id from journal_court_reserve.memberships where parent_id in (select id from _del_cr_memberships));
+delete from journal_court_reserve.memberships where parent_id in (select id from _del_cr_memberships);
+
+delete from journal_court_reserve.q_member_membership_intervals
+  where journal_id in (select id from journal_court_reserve.member_membership_intervals where parent_id in (select id from _del_cr_member_membership_intervals));
+delete from journal_court_reserve.member_membership_intervals where parent_id in (select id from _del_cr_member_membership_intervals);
+
+delete from journal_playbook.q_member_messages
+  where journal_id in (select id from journal_playbook.member_messages where parent_id in (select id from _del_member_messages));
+delete from journal_playbook.member_messages where parent_id in (select id from _del_member_messages);
+
+-- playbook.clubs' own journal entries: parent_id here IS the club id directly.
+delete from journal_playbook.q_clubs
+  where journal_id in (select id from journal_playbook.clubs where parent_id in (select id from _del_clubs));
+delete from journal_playbook.clubs where parent_id in (select id from _del_clubs);
+
 -- ---- Playbook insight cluster (deepest children first) ---------------------
 delete from playbook.insight_work_items            where insight_id in (select id from _del_insights);
 delete from playbook.insight_section_chat_messages where insight_section_chat_id in (select id from _del_insight_section_chats);
