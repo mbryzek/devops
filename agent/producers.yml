@@ -425,6 +425,19 @@ producers:
   # and diffs the result — minutes of work and gigabytes of clones, run inline in
   # the tick under the work lock. The playbook runs the identical command first
   # and dismisses on exit 0.
+  #
+  # THIS IS NOW THE ONLY CODEGEN-DRIFT DETECTOR, and the only thing that runs the
+  # real sync (ISS-396). Until then an openclaw cron, `codegen-sync-weekly`, ran
+  # bare `dev codegen sync` every Wednesday at 04:30: drift this producer filed on
+  # Sunday was silently repaired on Wednesday by a job with no issue, no run
+  # record and nothing for whoever was watching the issue to see. The cron is
+  # retired; remediation is the claimed session in bodies/codegen-sync.md, which
+  # runs the same sweep and hangs its PRs off this issue.
+  #
+  # Two environment facts that cron carried in its prompt, since a deleted prompt
+  # documents nothing: the UTF-8 default (bin/dev forces it at load, lines 1-12)
+  # and `api` on the login PATH (Agent::Toolchain::TOOLS, which now checks it
+  # daily). Both were learned the hard way — 2026-07-15 and 2026-07-08.
   - key: codegen-sync
     schedule: daily at 3:00am
     file_when: always

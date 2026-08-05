@@ -77,6 +77,31 @@ module Agent
         producers: %w[browserslist-update],
         install: "brew install node",
       ),
+      # The one tool here devops SHIPS rather than installs: `api` sits in
+      # `bin/` next to `dev` itself. It is on this list anyway because the plist
+      # runs `~/code/devops/bin/dev` by ABSOLUTE PATH, so `dev` starts fine on a
+      # box whose login PATH never mentions that directory — and then
+      # `run_step(["api"], ...)` inside the codegen sweep ENOENTs, which comes
+      # back as `api failed in .` for every backend and "skipped" for every
+      # frontend that depends on one. That is not hypothetical: it is what the
+      # retired `codegen-sync-weekly` openclaw cron hit on 2026-07-08, and the
+      # prompt of that cron is where the requirement was written down (ISS-396
+      # deleted the cron, so this line is where the knowledge lives now).
+      #
+      # `producers: []` deliberately, even though the `codegen-sync` producer is
+      # what suffers. That producer has no check — it files unconditionally and
+      # the claimed SESSION runs the sweep — so naming it would make the issue
+      # body say it "records check_failed and files nothing", which is the one
+      # thing that does not happen here.
+      Tool.new(
+        name: "api",
+        required_by: "the apibuilder/DAO regen `dev codegen sync` runs in every clone " \
+                     "(bin/dev, `run_step([\"api\"], ...)`) — i.e. all of the `codegen-sync` " \
+                     "session's work, plus any claimed session that reruns codegen",
+        producers: [],
+        install: "ships in devops/bin — put it on the LOGIN PATH: " \
+                 "echo 'export PATH=\"$HOME/code/devops/bin:$PATH\"' >> ~/.zprofile",
+      ),
       Tool.new(
         name: "gh",
         required_by: "every claimed job: clone, push, open the PR, mark it ready",
