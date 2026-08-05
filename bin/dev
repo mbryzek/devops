@@ -10434,6 +10434,7 @@ def cmd_agent_status(args)
     puts "Runner #{identity.runner_id}#{me ? " (#{me['hostname']})" : ''}"
     puts "  concurrency: #{me ? me['max_concurrency'] : '?'}   paused: #{me ? !!me['paused'] : '?'}"
     puts "  last heartbeat: #{me && me['last_heartbeat_at']}"
+    puts "  notifications: #{agent_notify_channel_line}"
 
     jobs = Agent::Jobs.all
     if jobs.empty?
@@ -10447,6 +10448,21 @@ def cmd_agent_status(args)
     tail = File.file?(last_tick) ? File.readlines(last_tick).last&.strip : nil
     puts "\nLast tick: #{tail || '(nothing logged today)'}"
   end
+end
+
+# Whether this machine can push at all, on the status line rather than only in a
+# tick log nobody opens until something has already gone wrong (ISS-535). The
+# absent case names what is lost and what is not, because the honest answer is
+# "attention, not information" — every push has a durable backstop
+# (Agent::Notify::BACKSTOPS) and runner-offline is delivered by the platform.
+def agent_notify_channel_line
+  return "suppressed (DEV_AGENT_NO_NOTIFY is set)" unless Agent::Notify.enabled?
+
+  path = Agent::Notify.channel_path
+  return path if path
+
+  "no `#{Agent::Notify::BINARY}` on this PATH — pushes are no-ops. Nothing is lost: every push has a " \
+    "durable backstop (Agent::Notify::BACKSTOPS) and the runner-offline alert is emailed by the platform."
 end
 
 def agent_job_line(job)

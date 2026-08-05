@@ -227,3 +227,46 @@ block heartbeats on a perfectly healthy machine, tripping the offline invariant
 and, worse, letting leases lapse so `expire_issue_leases` requeues work that is
 still running. Locking is Ruby's `File#flock`; `flock(1)` does not exist on
 macOS.
+
+## Notifications are a nudge, and the platform is the record
+
+`Agent::Notify` shells out to `openclaw`, which **is not installed on the
+runners**. Every push the dispatcher has ever attempted from a mini has been a
+no-op, and nothing said so, because a `false` return went into a caller that
+discarded it (ISS-535 — the same shape as ISS-531's `check_failed`, where a
+check that *could not run* was indistinguishable from one with nothing to say).
+
+That is survivable, and it is survivable for a reason worth stating rather than
+rediscovering: **every kind of push carries the same fact somewhere durable on
+the platform.** `Agent::Notify::BACKSTOPS` is that table — kind → what holds the
+fact when the push does not arrive — and `test_dev_agent_notify.rb` asserts it
+matches the kinds the tick actually pushes, so a new notification cannot be added
+without naming its backstop. A missing `openclaw` therefore costs attention
+sooner, not information.
+
+Two consequences the code now enforces:
+
+- **The runner-offline alert does not come from a runner.** It cannot: an
+  offline machine cannot report itself, and a one-runner fleet has no peer to
+  report it either, so the old fleet-scan in `Agent::Tick#self_runner` reported
+  nothing precisely when it mattered most. The platform owns it —
+  `CheckAgentRunnerHealthProcessor`, queued every 15 minutes by `PeriodicActor`,
+  alerts on the machine that *crosses* into staleness and emails Mike, off the
+  same `AgentInvariants.StaleAfterHours` the runner used to read back as
+  `is_stale`. Do not re-add a local copy; extend the processor.
+- **An attempt that failed does not consume its window.** `Notify.once` used to
+  mark `(kind, subject)` notified *before* the push, so one refusal from
+  `openclaw` silently ate the notification for six hours — the single failure
+  mode a retry could fix was the one guaranteed never to be retried. A `FAILED`
+  push now leaves the window open. `UNAVAILABLE` still closes it: a machine with
+  no channel will not grow one before the next tick, and retrying costs a process
+  every 30 seconds to accomplish nothing.
+
+`dev agent status` prints whether this box has a channel at all, and undelivered
+pushes get a tick-log line naming the backstop that carried the fact instead.
+Both halves are needed: "undelivered" alone reads as lost work, and the backstop
+alone reads as a healthy channel.
+
+`openclaw` stays **optional** on a runner, deliberately. That is not a shrug — it
+follows from the backstop table above, and the day a push is added with no
+durable record behind it, the answer changes and the test is what will say so.
