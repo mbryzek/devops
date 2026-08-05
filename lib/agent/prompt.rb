@@ -33,17 +33,18 @@ module Agent
       File.read(path)
     end
 
-    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, playbook: nil)
+    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], playbook: nil)
       [
         instructions.strip,
-        assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo),
+        assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo,
+                   prepared_repos: prepared_repos),
         issue_section(issue),
         playbook_section(playbook),
         comments_section(comments),
       ].compact.join("\n\n---\n\n") + "\n"
     end
 
-    def assignment(issue:, slug:, workspace:, resume_repo: nil)
+    def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [])
       lines = []
       lines << "# Your assignment"
       lines << ""
@@ -69,6 +70,17 @@ module Agent
         lines << "on that branch. Do NOT open a second PR and do NOT create a new branch: read the"
         lines << "comments below for what is being asked, address it, rerun codegen, push, and the PR"
         lines << "updates in place. Close the issue out with `dev issues status` as usual."
+      elsif prepared_repos.to_a.any?
+        # The repos the issue named, already materialized (ISS-562). Named
+        # explicitly rather than left for the session to discover, because a
+        # session that does not know the checkout is there clones a second copy
+        # beside it and works in the one the executor is not watching.
+        lines << "**The repos this issue names are already cloned in your workspace**, each on branch"
+        lines << "`#{slug}` off the latest `origin/main`: #{prepared_repos.map { |r| "`#{r}`" }.join(', ')}."
+        lines << "Work in those checkouts — do not re-clone them and do not rename the branch. If you need"
+        lines << "a repo that is not listed, clone it into the workspace yourself (`gh repo clone"
+        lines << "<owner>/<repo> #{workspace}/<repo>`) and create the same branch in it. Never edit a"
+        lines << "checkout under ~/code outside this workspace."
       else
         lines << "Your workspace is empty. Clone every repo you need into it (`gh repo clone <owner>/<repo>"
         lines << "#{workspace}/<repo>`), create branch `#{slug}` in each from the latest `origin/main`, and"

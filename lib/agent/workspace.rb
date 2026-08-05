@@ -1,4 +1,5 @@
 require 'fileutils'
+require 'open3'
 require 'securerandom'
 require 'agent/github'
 require 'agent/paths'
@@ -69,8 +70,80 @@ module Agent
       repo
     end
 
+    # GitHub owner every repo an issue can name lives under. One constant rather
+    # than accepting `owner/repo` on the issue: `dev issues create --repo` takes a
+    # bare name, and a slug arriving here would clone something nobody validated.
+    OWNER = "mbryzek".freeze
+
+    # Hard deadline for ONE git/gh call below. The whole point of pre-cloning is
+    # that the session does not have to; a clone wedged on a network read that
+    # never returns would instead hold the tick — and therefore the heartbeat —
+    # until the lease expires under it. A repo that misses the deadline is simply
+    # not prepared, and the session clones it itself exactly as it does today.
+    CLONE_TIMEOUT_SECONDS = 180
+
+    # Materializes the repos the issue names (design: ISS-562, and the CLAUDE.md
+    # "Auto-filing dev issues" instruction that has always described this): each
+    # one cloned into the workspace with the attempt's branch already created off
+    # the latest `origin/main`, so the session opens into a checkout on the branch
+    # the executor recorded rather than cloning for itself and naming its own
+    # branch — the ISS-365 failure, where good work landed on a branch the
+    # executor could not find and read as no work at all.
+    #
+    # Returns the repo names actually prepared, in the order given. Every failure
+    # is silent-but-skipped ON PURPOSE: a repo that will not clone is a slower
+    # session, not a failed attempt, and refusing to start the session over it
+    # would turn a transient network blip into a burned attempt.
+    #
+    # `already_prepared` is the resume path's repo, which [[resume]] has just
+    # cloned and checked out onto the EXISTING branch. Re-preparing it here would
+    # be the one destructive case in this method — see the branch handling below.
+    def prepare(slug, repositories, branch:, already_prepared: nil)
+      names = Array(repositories).map { |r| r.to_s.strip }.reject(&:empty?).uniq
+      return [] if names.empty?
+
+      dir = create(slug)
+      skip = already_prepared.to_s.split("/").last
+      names.filter_map do |repo|
+        next if repo == skip
+        prepare_one(dir, repo, branch) ? repo : nil
+      end
+    end
+
+    def prepare_one(dir, repo, branch)
+      checkout = File.join(dir, repo)
+      unless File.directory?(File.join(checkout, ".git"))
+        return false unless run(["gh", "repo", "clone", "#{OWNER}/#{repo}", checkout], chdir: dir)
+      end
+      return false unless run(["git", "fetch", "origin"], chdir: checkout)
+
+      # NEVER `checkout -B` here. A branch that already exists carries an earlier
+      # attempt's commits, and resetting it to origin/main would destroy work that
+      # is already in a PR — the one irreversible thing this code could do.
+      if run(["git", "rev-parse", "--verify", "--quiet", branch], chdir: checkout)
+        run(["git", "checkout", branch], chdir: checkout)
+      else
+        run(["git", "checkout", "-b", branch, "origin/main"], chdir: checkout)
+      end
+    end
+
     def run(cmd, chdir:)
-      system(*cmd, chdir: chdir, out: File::NULL, err: File::NULL)
+      Open3.popen2e({ "GIT_TERMINAL_PROMPT" => "0" }, *cmd, chdir: chdir) do |stdin, out, wait_thr|
+        stdin.close
+        unless wait_thr.join(CLONE_TIMEOUT_SECONDS)
+          begin
+            Process.kill("KILL", wait_thr.pid)
+          rescue Errno::ESRCH
+            nil
+          end
+          out.read
+          return false
+        end
+        out.read
+        wait_thr.value.success?
+      end
+    rescue Errno::ENOENT
+      false
     end
 
     def delete(slug)

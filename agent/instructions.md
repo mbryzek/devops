@@ -181,7 +181,11 @@ assigned by the executor; do not rename either.
 > what you commit to it, how you rebase it — is ordinary work.
 
 - Clone every repo you need **into your workspace**:
-  `gh repo clone mbryzek/<repo> <workspace>/<repo>`.
+  `gh repo clone mbryzek/<repo> <workspace>/<repo>`. When the issue named its
+  repositories (`dev issues create --repo`), the executor has already cloned them
+  there with your branch created off the latest `origin/main` — your assignment
+  block lists exactly which. Work in those checkouts rather than cloning a second
+  copy beside them.
 - Use **the assigned branch name, verbatim, in every repo** you touch, branched
   off the latest `origin/main` (`git fetch origin` first — never off another
   feature branch, and never a stacked PR; these repos squash-merge).
