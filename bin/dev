@@ -80,6 +80,7 @@ INVOCATIONS = {
   "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
+  "issues block"        => 'issues block <number> --on NUMBER [--remove] [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--issues 078,080] [--localhost] [--yes] [--no-spawn]',
@@ -512,6 +513,23 @@ USAGE = <<~USAGE
         the awaiting-verification queue on its own — its epic becomes the one
         item verified once the whole effort has shipped.
 
+    #{INVOCATIONS["issues block"]}
+        Record that NUMBER cannot be worked until --on NUMBER has shipped, and stop
+        the queue handing it out until then: a blocked issue is never offered by
+        `issues claim` or to the autonomous fleet, and naming it with --issues is
+        REFUSED with its blockers listed rather than silently skipped. An issue
+        counts as blocked while any blocker is still live work; it becomes
+        claimable on its own the moment the last one reaches fixed, deployed,
+        verified or dismissed — nothing has to clear the link. `fixed` is the
+        threshold because that is when the blocker's PR is merged and the code the
+        dependent builds on exists; waiting for a release would stall a whole epic
+        behind a deploy cadence. An edge that would create a cycle is refused with
+        the cycle printed, because a cycle makes every issue on it unclaimable
+        forever with no status change able to clear it and nothing anywhere to say
+        so. --remove drops the edge. Both issues get a timeline note, and both
+        ends show up in `issues show`. Use it instead of writing the ordering in a
+        comment: nothing reads a comment before claiming at 3am.
+
     #{INVOCATIONS["issues show"]}
         Print one issue and its full comment history, oldest first, with the status
         transition each comment recorded. This is the only way to READ a timeline
@@ -835,7 +853,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent duplicate workaround claim show status snooze reconcile resume],
+  "issues"       => %w[create list parent block duplicate workaround claim show status snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -2459,12 +2477,11 @@ end
 # alongside units of work. An epic is a container that `POST /claims` refuses
 # (`type != epic` in InternalIssuesDao.claimOpen), so anything offering work to
 # do must pass "issue".
-def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil, duplicate_of_number: nil, types: nil)
+def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil, types: nil)
   params = { "statuses" => Array(statuses) }
   params["categories"] = category if category
   params["types"] = Array(types) if types
   params["parent_number"] = parent_number if parent_number
-  params["duplicate_of_number"] = duplicate_of_number if duplicate_of_number
   params["is_snoozed"] = is_snoozed unless is_snoozed.nil?
   params["limit"] = limit
   params["offset"] = 0
@@ -2557,14 +2574,64 @@ end
 # refuse (ISS-244). Empty for an awake issue, and for a wake time already past:
 # `snoozed_until` is not cleared when it expires, the server just stops honoring
 # it (see InternalIssuesDao.snoozeClause).
+# One slice of an issue's edges, as the server returns them: every link of this type
+# on this side of the edge, each entry naming the issue at the far end (with its
+# status, which is the whole question for a blocker).
+#
+# The relationships all live on one `links` list with a closed type enum, so every
+# renderer below is this one filter with different arguments — there is no per-
+# relationship field to add a reader for.
+ISSUE_LINK_BLOCKED_BY = "blocked_by".freeze
+ISSUE_LINK_DUPLICATE_OF = "duplicate_of".freeze
+
+def issue_links(issue, type, direction)
+  Array(issue["links"])
+    .select { |l| l["type"] == type && l["direction"] == direction }
+    .map { |l| l.fetch("issue") }
+end
+
+# The issues this one is waiting on; and the issues waiting on it.
+def issue_blockers(issue)  = issue_links(issue, ISSUE_LINK_BLOCKED_BY, "outgoing")
+def issue_blocks(issue)    = issue_links(issue, ISSUE_LINK_BLOCKED_BY, "incoming")
+
+# The canonical this issue was absorbed into; and everything absorbed into it.
+def issue_canonical(issue) = issue_links(issue, ISSUE_LINK_DUPLICATE_OF, "outgoing").first
+def issue_absorbed(issue)  = issue_links(issue, ISSUE_LINK_DUPLICATE_OF, "incoming")
+
+# ISS-<n> (<status>) — how a blocker is named wherever the reason it still blocks
+# matters, which is everywhere a blocker is printed.
+def issue_ref_label(ref)
+  "ISS-#{ref.fetch('number')} (#{ref.fetch('status')})"
+end
+
 # Marks a dismissed issue as absorbed rather than dropped. Without it the two read
 # identically in a list, and "dismissed" is the wrong story for work that moved.
 def issue_duplicate_note(issue)
-  canonical = issue["duplicate_of"]
+  canonical = issue_canonical(issue)
   return "" if canonical.nil?
 
   " (dup of ISS-#{canonical.fetch('number')})"
 end
+
+# A blocked issue is still `open`, so — exactly like a snooze — the status alone
+# reads as claimable when it is not. Say what it is waiting on right there, or a
+# list of eight epic children in numeric order says nothing about what to work
+# next. `is_blocked` is the server's own derived answer, so this can never
+# disagree with what `issues claim` will actually accept.
+def issue_blocked_note(issue)
+  return "" unless issue["is_blocked"]
+
+  live = issue_blockers(issue).reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
+  return " (blocked)" if live.empty?
+
+  " (blocked by #{live.map { |b| "ISS-#{b.fetch('number')}" }.join(', ')})"
+end
+
+# The statuses at which a blocker stops holding its dependents back — the same set
+# InternalIssueLinksDao.UnblockingStatuses applies server-side. Kept here only to
+# say WHICH blockers are still live when rendering; whether an issue is blocked at
+# all is always the server's `is_blocked`, never recomputed from this list.
+ISSUE_UNBLOCKING_STATUSES = %w[fixed deployed verified dismissed].freeze
 
 def issue_snooze_note(issue)
   until_at = issue["snoozed_until"]
@@ -2584,7 +2651,7 @@ def issue_summary_line(issue, index)
   # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
   # No category here: the only caller prints these under a per-category heading.
-  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{title}"
+  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_blocked_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{title}"
 end
 
 # A timeline comment that moved the issue BACK to `open` from anything else is a
@@ -3544,6 +3611,10 @@ def cmd_issues_list(args)
     ) || []
     if issues.empty?
       puts "No issues found."
+    elsif epic
+      # Scoped to one epic, the question is "what do I work next", and the answer is
+      # the READY/BLOCKED split — the same renderer `issues show` uses on the epic.
+      puts issue_epic_children_lines(issues)
     else
       issues.each_with_index { |issue, idx| puts issue_summary_line(issue, idx + 1) }
     end
@@ -3572,27 +3643,97 @@ def cmd_issues_show(args)
     issue = issue_fetch(endpoint, number)
     puts issue_render_item(issue, comments: issue_fetch_comments(endpoint, number))
     puts issue_family_section(endpoint, issue)
-    puts issue_duplicate_section(endpoint, issue)
+    puts issue_links_section(issue)
   end
 end
 
-# Both ends of the duplicate link, because either one changes how the issue should be
-# read: a dismissed duplicate is not work that was dropped, it is work that moved, and a
-# canonical issue that absorbed others is carrying more reports than its own body shows.
-def issue_duplicate_section(endpoint, issue)
-  canonical = issue["duplicate_of"]
+# EVERY edge on the issue, both directions, grouped by type. All four groups matter
+# and each changes how the issue should be read:
+#
+#   blockers      — this is not workable yet, and `issues claim` will refuse it
+#   blocks        — finishing this releases other work; that is a reason to do it
+#   duplicate of  — a dismissed duplicate is not work that was dropped, it moved
+#   absorbed      — the canonical is carrying more reports than its own body shows
+#
+# Read straight off the issue's own `links`: the edges ride along with the record,
+# so nothing here costs a round trip and nothing can render one relationship while
+# silently missing another.
+def issue_links_section(issue)
+  [
+    issue_blockers_lines(issue),
+    issue_blocks_lines(issue),
+    issue_duplicate_lines(issue),
+  ].compact.join
+end
+
+def issue_blockers_lines(issue)
+  blockers = issue_blockers(issue)
+  return nil if blockers.empty?
+
+  # Shipped blockers stay in the list: "why is this claimable now" is the same
+  # question as "why was it not", and dropping them answers neither. The status on
+  # each line is what tells them apart.
+  live = blockers.reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
+  lines = blockers.map { |b| "  - #{issue_ref_label(b)} #{b.fetch('title')}" }.join("\n")
+  header =
+    if live.empty?
+      "\nBLOCKED BY #{blockers.length} issue(s), all shipped — this is claimable now:"
+    else
+      "\nBLOCKED — waiting on #{live.length} of #{blockers.length} blocker(s):"
+    end
+  footer =
+    if live.empty?
+      "\n"
+    else
+      "\n`dev issues claim` will refuse this issue until every blocker reaches fixed, deployed, verified\n" \
+        "or dismissed. Drop an edge that is not really a prerequisite with `dev issues block " \
+        "#{issue.fetch('number').sub(/\A0+/, '')} --on <n> --remove`.\n"
+    end
+  "#{header}\n#{lines}\n#{footer}"
+end
+
+def issue_blocks_lines(issue)
+  blocked = issue_blocks(issue)
+  return nil if blocked.empty?
+
+  lines = blocked.map { |b| "  - #{issue_ref_label(b)} #{b.fetch('title')}" }.join("\n")
+  "\nBLOCKS #{blocked.length} issue(s) — they cannot be claimed until this ships:\n#{lines}\n"
+end
+
+def issue_duplicate_lines(issue)
+  canonical = issue_canonical(issue)
   return "\nDuplicate of ISS-#{canonical.fetch('number')} — #{canonical.fetch('title')} (#{canonical.fetch('status')}).\n" \
          "Work it there; reopening this issue clears the link.\n" if canonical
 
-  # Only ever one level deep, so this single filter reaches every issue absorbed into
-  # this one rather than just the most recent hop.
-  absorbed = ApiClient.request(
-    endpoint, :get, issues_list_path(statuses: [], duplicate_of_number: issue.fetch("number"), limit: 100)
-  ) || []
-  return "" if absorbed.empty?
+  # Only ever one level deep, so the edges on this issue reach every duplicate
+  # absorbed into it rather than just the most recent hop.
+  absorbed = issue_absorbed(issue)
+  return nil if absorbed.empty?
 
   labels = absorbed.map { |d| "ISS-#{d.fetch('number')}" }.join(", ")
   "\nAbsorbed #{absorbed.length} duplicate#{'s' if absorbed.length != 1}: #{labels}.\n"
+end
+
+# An epic's children, split READY vs BLOCKED. A flat list in numeric order says
+# nothing about ORDER, which is the one thing an epic's reader actually needs —
+# ISS-519 shipped with eight children whose every dependency lived in prose. The
+# numbering stays global across both groups so a number always means the same row.
+#
+# Only splits when something is actually blocked: an epic with no edges reads
+# exactly as it did before, with no empty heading to skim past.
+def issue_epic_children_lines(children)
+  positions = children.each_with_index.to_h { |c, i| [c["number"], i + 1] }
+  ready, blocked = children.partition { |c| !c["is_blocked"] }
+  return children.map { |c| issue_summary_line(c, positions[c["number"]]) }.join("\n") if blocked.empty?
+
+  [
+    "  READY (#{ready.length}):",
+    ready.empty? ? "    (nothing — every remaining child is waiting on another)" : nil,
+    *ready.map { |c| issue_summary_line(c, positions[c["number"]]) },
+    "",
+    "  BLOCKED (#{blocked.length}) — not offered by `dev issues claim` until their blockers ship:",
+    *blocked.map { |c| issue_summary_line(c, positions[c["number"]]) },
+  ].compact.join("\n")
 end
 
 # The epic/child context an issue's own record does not carry: an epic's children
@@ -3610,8 +3751,7 @@ def issue_family_section(endpoint, issue)
            "  dev issues create --category <cat> --status claimed --parent #{number} --title \"...\" --no-spawn\n" if children.empty?
 
     done = children.count { |c| %w[deployed verified dismissed].include?(c["status"]) }
-    lines = children.map { |c| issue_summary_line(c, children.index(c) + 1) }
-    "\nEPIC — #{done} of #{children.length} children done:\n#{lines.join("\n")}\n" \
+    "\nEPIC — #{done} of #{children.length} children done:\n#{issue_epic_children_lines(children)}\n" \
       "\nThis epic advances to deployed on its own once every child is done; verifying it closes them all out.\n"
   elsif issue["parent"]
     parent = issue.fetch("parent")
@@ -3647,6 +3787,23 @@ def cmd_issues_resume(args)
       warn "Could not start Claude (#{e.message}). Resume by hand with:  claude --resume #{uuid}"
     end
   end
+end
+
+# The open issues held out of the offer because a prerequisite has not shipped, with
+# what each is waiting on. Printed rather than silently filtered: "nothing to claim"
+# and "everything is waiting on one unwritten scheduler" are different situations,
+# and only one of them means there is no work to do.
+def issue_print_blocked(blocked)
+  return if blocked.empty?
+
+  puts Util.underline("blocked (#{blocked.length}) — not offered")
+  blocked.each do |c|
+    live = issue_blockers(c).reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
+    title = c["title"].to_s.gsub(/\s+/, " ").strip
+    title = "#{title[0, 57]}..." if title.length > 60
+    puts "  #{issue_label(c)} · waiting on #{live.map { |b| issue_ref_label(b) }.join(', ')} · #{title}"
+  end
+  puts ""
 end
 
 def cmd_issues_claim(args)
@@ -3704,15 +3861,23 @@ def cmd_issues_claim(args)
     # unfiltered preview listed epics, and claiming the "all" it offered came
     # back with nothing claimed and no explanation (an epic-only improvement
     # queue read as "every issue listed was taken or deferred").
-    open = ApiClient.request(
+    all_open = ApiClient.request(
       endpoint,
       :get,
       issues_list_path(statuses: "open", category: category, is_snoozed: false, types: "issue"),
     ) || []
+    # Blocked issues are held out of the offer for the same reason snoozed ones and
+    # epics are: `POST /claims` refuses them server-side, so listing them puts work
+    # on the menu that cannot be ordered. They are NOT hidden — they are printed
+    # below with what they are waiting on, because "nothing to claim" and "eight
+    # issues all waiting on one unwritten scheduler" are different situations and a
+    # bare "No open issues" would say the wrong one.
+    open, blocked = all_open.partition { |c| !c["is_blocked"] }
     present = issue_categories_present(open)
     if present.empty?
       puts category ? "No open #{category} issues to claim." : "No open issues to claim."
       puts "(Snoozed issues and epics are not offered — `dev issues list` shows them; `dev issues snooze <n> --wake` brings a snoozed one back, and an epic is worked through its children.)"
+      issue_print_blocked(blocked)
       return
     end
 
@@ -3728,15 +3893,32 @@ def cmd_issues_claim(args)
       issues.each { |c| puts issue_summary_line(c, positions[c["number"]]) }
       puts ""
     end
+    issue_print_blocked(blocked)
 
     selected, hand_picked =
       if requested
         resolved, unknown = issue_resolve_requested(requested, ordered)
         unless unknown.empty?
+          # A blocked issue named by number is REFUSED, naming its blockers — not
+          # folded into the generic "not listed above", which would read as a typo.
+          # The operator asked for this issue specifically, and the answer is not
+          # "that number is wrong", it is "that work is not workable yet". The
+          # server refuses it too; this is the same refusal, one round trip earlier
+          # and with the same reasons.
+          named_blocked, _ = issue_resolve_requested(unknown.join(","), blocked)
+          unless named_blocked.empty?
+            Util.exit_with_error(
+              named_blocked.map { |c|
+                live = issue_blockers(c).reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
+                "#{issue_label(c)} is blocked by #{live.map { |b| issue_ref_label(b) }.join(', ')} — those have to ship first."
+              }.join("\n") +
+              "\nDrop an edge that is not really a prerequisite with `dev issues block <n> --on <m> --remove`."
+            )
+          end
           # "not listed" also covers snoozed and epics — say so, or naming a
           # deferred issue (or a container) looks like the number was wrong.
           Util.exit_with_error(
-            "Not open, snoozed, an epic, or not listed above: #{unknown.join(', ')}. " \
+            "Not open, snoozed, an epic, blocked, or not listed above: #{unknown.join(', ')}. " \
             "On offer: #{ordered.map { |c| c['number'] }.join(', ')}. " \
             "Wake a snoozed issue with `dev issues snooze <n> --wake`; an epic is never " \
             "claimed — claim its children (`dev issues list --epic <n>`)."
@@ -3919,10 +4101,81 @@ end
 # asked for: naming an issue that was itself absorbed links to ITS canonical instead,
 # and saying so here is the only place that collapse is visible.
 def print_duplicate_link(issue)
-  canonical = issue["duplicate_of"]
+  canonical = issue_canonical(issue)
   return if canonical.nil?
 
   puts "  duplicate of ISS-#{canonical['number']}: #{canonical['title']}"
+end
+
+# Record (or drop) "this issue cannot be worked until that one has shipped".
+#
+# The one relationship in the tracker with teeth: `dev issues claim` and the
+# autonomous lease runner both refuse to hand out an issue with a live blocker, so
+# this is the difference between an ordering that holds and an ordering written in a
+# comment nobody reads before claiming at 3am.
+#
+# Blocked-ness is DERIVED from the blocker's current status, so nothing here has to
+# be undone: the issue becomes claimable on its own the moment its last blocker
+# reaches fixed, deployed, verified or dismissed. --remove exists for the other
+# case — the prerequisite turned out not to be one.
+def cmd_issues_block(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  blocker = nil
+  remove = false
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--on"
+      blocker = rest[i + 1]
+      usage_exit("--on requires an issue number", example: usage_for("issues block")) if blocker.nil?
+      i += 2
+    when "--remove"
+      remove = true
+      i += 1
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  number = leftover.shift
+  problems = []
+  problems << "missing issue number (positional argument, e.g. 526)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--on is required (the issue this one is blocked by, e.g. 521)" if blocker.nil? || blocker.empty?
+  # Caught here as well as server-side so the mistake reads as a usage error rather
+  # than a 422. A self-block is the one-hop case of a cycle: it would make the issue
+  # permanently unclaimable with nothing able to clear it.
+  if number && blocker && number.sub(/\A0+/, "") == blocker.sub(/\A0+/, "")
+    problems << "an issue cannot block itself"
+  end
+  report_arg_problems("issues block", problems, usage_for("issues block"))
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    path = issues_path("/#{URI.encode_www_form_component(number)}/blockers")
+    res =
+      if remove
+        ApiClient.request(endpoint, :delete, "#{path}/#{URI.encode_www_form_component(blocker)}")
+      else
+        ApiClient.request(endpoint, :post, path, body: { issue_number: blocker })
+      end
+
+    if remove
+      puts "#{issue_label(res)} is no longer blocked by ISS-#{blocker}."
+    else
+      puts "#{issue_label(res)} is blocked by ISS-#{blocker}."
+    end
+    live = issue_blockers(res).reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
+    if live.empty?
+      puts "  Claimable now — nothing it is waiting on is still open."
+    else
+      puts "  `dev issues claim` will not offer it until #{live.map { |b| issue_ref_label(b) }.join(', ')} ship#{live.length == 1 ? 's' : ''}."
+    end
+  end
 end
 
 # Record one issue as a duplicate of another. Sugar for
@@ -3983,7 +4236,7 @@ def cmd_issues_duplicate(args)
     print_duplicate_link(res)
     puts ""
     puts "The canonical issue now carries a note that it absorbed this one:"
-    puts "  dev issues show #{(res.dig('duplicate_of', 'number') || canonical).sub(/\A0+/, '')}"
+    puts "  dev issues show #{(issue_canonical(res)&.fetch('number') || canonical).sub(/\A0+/, '')}"
   end
 end
 
@@ -9815,6 +10068,7 @@ when "issues"
   when "create"     then cmd_issues_create(argv)
   when "list"       then cmd_issues_list(argv)
   when "parent"     then cmd_issues_parent(argv)
+  when "block"      then cmd_issues_block(argv)
   when "duplicate"  then cmd_issues_duplicate(argv)
   when "workaround" then cmd_issues_workaround(argv)
   when "show"       then cmd_issues_show(argv)

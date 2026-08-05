@@ -2254,11 +2254,51 @@ class TestDevIssues < Minitest::Test
 
   # An issue absorbed into another one: dismissed, but carrying the link that says
   # the work moved rather than being dropped.
+  # Every relationship rides on one `links` list with a closed type enum, so a fixture
+  # is one more entry rather than one more field.
+  def link(type, direction, number, title, status)
+    {
+      "type" => type,
+      "direction" => direction,
+      "issue" => { "id" => "iss-#{number}", "number" => number, "title" => title, "status" => status },
+    }
+  end
+
   def duplicate_issue
     graph_issue.merge(
       "number" => "429",
       "status" => "dismissed",
-      "duplicate_of" => { "id" => "iss-427", "number" => "427", "title" => "Warm session stalls", "status" => "claimed" },
+      "links" => [link("duplicate_of", "outgoing", "427", "Warm session stalls", "claimed")],
+    )
+  end
+
+  # The canonical end of the same edge: it knows what it absorbed without a second query.
+  def canonical_issue
+    graph_issue.merge(
+      "number" => "427",
+      "title" => "Warm session stalls",
+      "links" => [link("duplicate_of", "incoming", "429", "Bars overflow the axis", "dismissed")],
+    )
+  end
+
+  # ISS-526 waiting on ISS-521, exactly the shape ISS-519 carried in prose.
+  def blocked_issue(blocker_status: "open")
+    graph_issue.merge(
+      "number" => "526",
+      "status" => "open",
+      "title" => "Delete the producer path",
+      "is_blocked" => blocker_status != "fixed",
+      "links" => [link("blocked_by", "outgoing", "521", "Build the producer registry", blocker_status)],
+    )
+  end
+
+  def blocker_issue
+    graph_issue.merge(
+      "number" => "521",
+      "status" => "open",
+      "title" => "Build the producer registry",
+      "is_blocked" => false,
+      "links" => [link("blocked_by", "incoming", "526", "Delete the producer path", "open")],
     )
   end
 
@@ -2327,15 +2367,6 @@ class TestDevIssues < Minitest::Test
     assert_match(/--duplicate-of NUMBER/, usage_for("issues status"))
   end
 
-  def test_list_path_carries_the_duplicate_of_number
-    path = issues_list_path(statuses: [], duplicate_of_number: "427")
-    assert_match(/duplicate_of_number=427/, path)
-  end
-
-  def test_list_path_omits_duplicate_of_number_when_absent
-    refute_match(/duplicate_of_number/, issues_list_path(statuses: []))
-  end
-
   # A dismissed duplicate and a dismissed dead end read identically in a list
   # without this tag, and they are not the same outcome.
   def test_summary_line_tags_a_duplicate
@@ -2347,7 +2378,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_show_points_a_duplicate_at_its_canonical
-    section = issue_duplicate_section(nil, duplicate_issue)
+    section = issue_links_section(duplicate_issue)
     assert_match(/Duplicate of ISS-427/, section)
     assert_match(/Warm session stalls/, section)
     assert_match(/reopening this issue clears the link/, section)
@@ -2497,5 +2528,130 @@ class TestDevIssues < Minitest::Test
     assert_equal 1, status
     refute_match(/is required/, out)
     assert_match(/dev auth login --app playbook/, out)
+  end
+
+  # The reverse of the same edge, which used to need a separate list query: the
+  # canonical is carrying more reports than its own body shows.
+  def test_show_lists_what_a_canonical_absorbed
+    section = issue_links_section(canonical_issue)
+    assert_match(/Absorbed 1 duplicate: ISS-429/, section)
+  end
+
+  # ---------- blockers ----------
+
+  def test_block_is_a_registered_subcommand
+    assert_includes SUBCOMMANDS["issues"], "block"
+    assert INVOCATIONS.key?("issues block")
+    assert_match(/dev issues block/, usage_for("issues block"))
+  end
+
+  def test_block_requires_number
+    out, status = capture_stderr_and_exit { cmd_issues_block(["--on", "521"]) }
+    assert_equal 1, status
+    assert_match(/missing issue number/, out)
+  end
+
+  def test_block_requires_on
+    out, status = capture_stderr_and_exit { cmd_issues_block(["526"]) }
+    assert_equal 1, status
+    assert_match(/--on is required/, out)
+  end
+
+  # The one-hop case of a cycle: an issue blocking itself would be unclaimable
+  # forever with nothing able to clear it. Caught here so it reads as a usage error
+  # rather than a round trip that comes back 422.
+  def test_block_rejects_self_block
+    out, status = capture_stderr_and_exit { cmd_issues_block(["526", "--on", "526"]) }
+    assert_equal 1, status
+    assert_match(/cannot block itself/, out)
+  end
+
+  def test_block_rejects_self_block_across_padding
+    out, status = capture_stderr_and_exit { cmd_issues_block(["526", "--on", "0526"]) }
+    assert_equal 1, status
+    assert_match(/cannot block itself/, out)
+  end
+
+  def test_block_accepts_a_valid_pair
+    out, status = capture_stderr_and_exit { cmd_issues_block(["526", "--on", "521"]) }
+    assert_equal 1, status
+    refute_match(/--on is required/, out)
+    refute_match(/cannot block itself/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  def test_block_accepts_remove
+    out, status = capture_stderr_and_exit { cmd_issues_block(["526", "--on", "521", "--remove"]) }
+    assert_equal 1, status
+    refute_match(/unexpected argument/, out)
+    assert_match(/dev auth login --app playbook/, out)
+  end
+
+  # A blocked issue is still `open`, so the status alone reads as claimable. Naming
+  # the blockers on the line is what stops a queue of eight epic children in numeric
+  # order from saying nothing about order.
+  def test_summary_line_names_the_blockers
+    assert_match(/\(blocked by ISS-521\)/, issue_summary_line(blocked_issue, 1))
+  end
+
+  def test_summary_line_has_no_blocked_note_when_clear
+    refute_match(/blocked/, issue_summary_line(blocker_issue, 1))
+  end
+
+  # `is_blocked` is the server's derived answer; a shipped blocker leaves the edge in
+  # place and the note must go away with it, not with the row.
+  def test_summary_line_drops_the_blocked_note_once_the_blocker_ships
+    refute_match(/blocked/, issue_summary_line(blocked_issue(blocker_status: "fixed"), 1))
+  end
+
+  def test_show_renders_blockers_with_their_status
+    section = issue_links_section(blocked_issue)
+    assert_match(/BLOCKED — waiting on 1 of 1 blocker/, section)
+    assert_match(/ISS-521 \(open\) Build the producer registry/, section)
+    assert_match(/`dev issues claim` will refuse this issue/, section)
+  end
+
+  def test_show_renders_shipped_blockers_as_claimable
+    section = issue_links_section(blocked_issue(blocker_status: "fixed"))
+    assert_match(/all shipped — this is claimable now/, section)
+    # The shipped blocker stays listed: "why is this claimable now" is the same
+    # question as "why was it not".
+    assert_match(/ISS-521 \(fixed\)/, section)
+  end
+
+  # The other direction of the same edge. Finishing this issue releases other work,
+  # which is a reason to prioritise it and is invisible from the issue's own body.
+  def test_show_renders_what_an_issue_blocks
+    section = issue_links_section(blocker_issue)
+    assert_match(/BLOCKS 1 issue/, section)
+    assert_match(/ISS-526 \(open\) Delete the producer path/, section)
+  end
+
+  def test_show_renders_nothing_for_an_issue_with_no_edges
+    assert_equal "", issue_links_section(graph_issue)
+  end
+
+  # An epic's children split READY vs BLOCKED — the view that says what to work next.
+  # A flat list in numeric order is what ISS-519 shipped with, and it said nothing.
+  def test_epic_children_split_ready_from_blocked
+    rendered = issue_epic_children_lines([blocker_issue, blocked_issue])
+    assert_match(/READY \(1\):/, rendered)
+    assert_match(/BLOCKED \(1\)/, rendered)
+    # Numbering is global across both groups, so a number always means the same row.
+    assert_match(/1\. ISS-521/, rendered)
+    assert_match(/2\. ISS-526/, rendered)
+  end
+
+  # No split at all when nothing is blocked: an epic with no edges reads exactly as
+  # it did before, with no empty heading to skim past.
+  def test_epic_children_stay_flat_when_nothing_is_blocked
+    rendered = issue_epic_children_lines([blocker_issue])
+    refute_match(/READY/, rendered)
+    refute_match(/BLOCKED/, rendered)
+  end
+
+  def test_epic_children_say_so_when_everything_is_blocked
+    rendered = issue_epic_children_lines([blocked_issue])
+    assert_match(/every remaining child is waiting on another/, rendered)
   end
 end
