@@ -137,6 +137,15 @@ def invariant_checks_path(examples: INVARIANT_EXAMPLES_MAX)
   "/dev/invariant/checks?examples=#{examples}"
 end
 
+# The rollout guard's two dials (ISS-517): how many times to sample
+# /_internal_/version before trusting a FAILING invariant result, and how long
+# after a release the fleet is assumed to be possibly mixed. Declared up here
+# rather than beside the guard because USAGE below interpolates them and USAGE is
+# evaluated when this file loads; the guard and the reasoning for both values are
+# under "rollout guard" further down.
+INVARIANTS_VERSION_PROBES = 5
+INVARIANTS_ROLLOUT_WINDOW_SECS = 15 * 60
+
 USAGE = <<~USAGE
   Usage: dev <command> [subcommand] [options]
 
@@ -215,6 +224,16 @@ USAGE = <<~USAGE
         set of failures is not re-dispatched for 3 days, so a failure that
         persists does not spawn a session every night; any change to the set of
         failing invariant names dispatches immediately.
+
+        Failures are DEFERRED while the app is rolling out. An invariant is SQL
+        that ships inside the app and the check is answered by whichever replica
+        the load balancer picks, so right after a release a pod on the previous
+        version can report a failure its own release already fixed. Before
+        reporting findings the command samples /_internal_/version #{INVARIANTS_VERSION_PROBES} times: two
+        versions at once, or a release less than #{INVARIANTS_ROLLOUT_WINDOW_SECS / 60} minutes old, means the
+        verdict is not trustworthy — nothing is filed, no session is dispatched,
+        and the exit code is 2 (uncheckable) rather than 1 (findings). Passes
+        are never deferred, and an unreachable version endpoint defers nothing.
 
     #{INVOCATIONS["queries top"]}
         Rank the queries the platform ran, with the code that issued each, from
@@ -1558,9 +1577,114 @@ end
 def invariants_failing_apps(results)
   results.sort_by { |r| r[:endpoint][:name] }.filter_map do |r|
     next if r[:error]
+    next if r[:deferred]
     result = r[:data] || {}
     next if (result["non_zero"] || []).empty? && (result["error"] || []).empty?
     [r[:endpoint], result]
+  end
+end
+
+# ---------- rollout guard (ISS-517) ----------
+#
+# An invariant is SQL that ships INSIDE the app, and `/dev/invariant/checks` is
+# answered by whichever replica the load balancer picks. So during a rolling
+# deploy the verdict depends on which pod answered: a pod still on the previous
+# release runs the previous release's invariant SQL. That window opens the moment
+# a release is cut, which is exactly the moment an invariant FIX goes live — and
+# therefore exactly when the previous run was failing and this producer is most
+# likely to fire.
+#
+# That is ISS-509: acumen 0.10.22 carried the fix at 11:04:39Z, the hourly check
+# ran at 11:07:57Z, a 0.10.21 pod answered, and an autonomous session was spent
+# investigating a condition that had already been fixed.
+#
+# The guard is deliberately ASYMMETRIC — it defers FAILURES and never touches a
+# pass. A false pass during a rollout costs one hour (the next run files it); a
+# false failure costs a session and a bogus issue holding the `invariants:<app>`
+# fingerprint. Only one of those is worth spending anything to avoid.
+#
+# It also FAILS OPEN. If the version endpoint cannot be reached, or reports
+# nothing usable, the failures are filed exactly as before. A guard that swallows
+# real invariant failures whenever a probe breaks would be strictly worse than
+# the bug it replaces, because nothing would ever surface it.
+
+# The two dials are declared beside INVARIANT_EXAMPLES_MAX at the top of this
+# file, because USAGE interpolates them. Why they are what they are:
+#
+#   INVARIANTS_VERSION_PROBES — several samples across separate connections
+#   spread over the replicas, and seeing two versions AT ONCE is proof of a
+#   rollout rather than an inference from a timestamp. One sample cannot tell
+#   "settled" from "answered by the pod that has not been replaced yet".
+#
+#   INVARIANTS_ROLLOUT_WINDOW_SECS — the observed race (ISS-509) was 3m18s wide
+#   and a rolling update of these fleets finishes in single-digit minutes. The
+#   cost of being too generous is one hour of delay on a real finding; the cost
+#   of being too tight is a whole autonomous session.
+
+# One endpoint's `/_internal_/version` samples. Threaded: this runs inline in
+# `dev agent tick`, under the work lock, so the probes cost one round trip in
+# wall time rather than five. `fetch_version` never raises — a failed probe comes
+# back as `{ error: ... }` and is simply not evidence either way.
+def invariants_version_samples(endpoint, probes: INVARIANTS_VERSION_PROBES)
+  Array.new(probes) { Thread.new { fetch_version(endpoint[:active_url]) } }.map(&:value)
+end
+
+def invariants_humanize_age(secs)
+  minutes = (secs / 60.0).round
+  return "less than a minute" if minutes < 1
+  "#{minutes} minute#{'s' unless minutes == 1}"
+end
+
+# Why this app's failures cannot be trusted right now, or nil to trust them.
+# Pure — the samples are passed in — because this is the whole decision and it
+# has to be readable against the cases it distinguishes.
+#
+# EVERY arm is bounded by the window, including the one that has proof. A
+# rollout can DEADLOCK: a StatefulSet will not delete a pod until it is Ready, so
+# a pod that crashlooped on release N is never updated by N+1 and sits on the old
+# image indefinitely (that is what lib/rollout_diagnosis.rb exists for). Deferring
+# on "two versions at once" alone would then defer forever and this app's
+# invariants would silently never be filed again — the guard turning into the
+# outage. Past the window a mixed fleet is not a rollout in progress, it is a
+# stuck one; the failure is filed, and the session that picks it up finds the
+# stuck pod. Loud and wrong beats quiet and wrong.
+def invariants_rollout_reason(samples, now: Time.now, window: INVARIANTS_ROLLOUT_WINDOW_SECS)
+  usable = samples.compact.reject { |s| s[:error] }
+  versions = usable.filter_map { |s| blank_to_nil(s["version"]) }.uniq
+  return nil if versions.empty?
+
+  released = usable.filter_map { |s| Time.parse(s["released_at"].to_s) rescue nil }.max
+  return nil if released.nil?
+  age = now - released
+  return nil if age >= window
+
+  return "#{versions.first} was released #{invariants_humanize_age(age)} ago, inside the " \
+         "#{window / 60}-minute rollout window — a pod on the previous release may have " \
+         "served this result" if versions.length == 1
+
+  "the fleet is serving #{versions.sort.join(' and ')} at once and the newest went out " \
+  "#{invariants_humanize_age(age)} ago — a rollout is in progress, so this result may have " \
+  "come from a pod on the older release"
+end
+
+# Endpoint name => reason, for the failing apps whose verdict is not trustworthy.
+#
+# Only FAILING apps are probed: a passing app has nothing to defer, and probing
+# every app on every clean run would add network to the common case for nothing.
+# `--localhost` is skipped outright — there is one local process, nothing rolls
+# out, and a dev restart would defer for no reason.
+def invariants_rollout_deferrals(results, now: Time.now, probe: method(:invariants_version_samples))
+  invariants_failing_apps(results).each_with_object({}) do |(endpoint, _), acc|
+    next if endpoint[:use_localhost]
+    reason = invariants_rollout_reason(probe.call(endpoint), now: now)
+    acc[endpoint[:name]] = reason if reason
+  end
+end
+
+def invariants_apply_deferrals(results, deferrals)
+  results.map do |r|
+    reason = deferrals[r[:endpoint][:name]]
+    reason ? r.merge(deferred: reason) : r
   end
 end
 
@@ -1572,7 +1696,7 @@ end
 # failure without parsing stdout; only the tick tells 1 and 2 apart.
 INVARIANTS_EXIT_CLEAN       = 0 # nothing to do
 INVARIANTS_EXIT_FINDINGS    = 1 # real data problems — file (or increment) the issue
-INVARIANTS_EXIT_UNCHECKABLE = 2 # the check never ran — recorded as `check_failed`, never filed
+INVARIANTS_EXIT_UNCHECKABLE = 2 # no trustworthy verdict — recorded as `check_failed`, never filed
 
 # The verdict for a set of per-app results.
 #
@@ -1588,9 +1712,15 @@ INVARIANTS_EXIT_UNCHECKABLE = 2 # the check never ran — recorded as `check_fai
 # blocks every REAL invariant failure from filing for as long as it sits
 # non-terminal. An expired session would hide the data problems it never looked
 # for, which is exactly what ISS-358 was.
+#
+# A DEFERRED app (mid-rollout — see the rollout guard above) lands in the same
+# bucket for the same reason: this run has no verdict for it. UNCHECKABLE rather
+# than CLEAN so the deferral is visible in the producer run history — if the
+# guard ever misfires and defers forever, `dev agent runs` shows a wall of
+# check_failed instead of a wall of runs that look indistinguishable from green.
 def invariants_exit_code(results)
   return INVARIANTS_EXIT_FINDINGS unless invariants_failing_apps(results).empty?
-  return INVARIANTS_EXIT_UNCHECKABLE if results.any? { |r| r[:error] }
+  return INVARIANTS_EXIT_UNCHECKABLE if results.any? { |r| r[:error] || r[:deferred] }
 
   INVARIANTS_EXIT_CLEAN
 end
@@ -1809,6 +1939,10 @@ def cmd_invariants_check(args)
   puts " done"
   puts ""
 
+  # Before anything is reported as a finding: is the app mid-rollout, and could
+  # this verdict therefore have come from a pod running the previous release?
+  results = invariants_apply_deferrals(results, invariants_rollout_deferrals(results))
+
   results.sort_by { |r| r[:endpoint][:name] }.each do |r|
     endpoint = r[:endpoint]
     if r[:error]
@@ -1826,6 +1960,12 @@ def cmd_invariants_check(args)
       else
         puts Util.underline("#{endpoint[:name]}: #{failure_count} FAILURES (#{total_count} total)")
         print_invariant_failures(result, example_limit: example_limit)
+        if r[:deferred]
+          puts ""
+          puts "  DEFERRED — not filed, no session dispatched."
+          puts "  #{r[:deferred]}."
+          puts "  Re-check once the rollout has finished; the next scheduled run files it if it is real."
+        end
       end
     end
     puts ""
@@ -1839,7 +1979,9 @@ def cmd_invariants_check(args)
     puts "All invariants passed"
     exit INVARIANTS_EXIT_CLEAN
   when INVARIANTS_EXIT_UNCHECKABLE
-    puts "Some invariants could not be checked"
+    puts results.any? { |r| r[:deferred] } && results.none? { |r| r[:error] } ?
+      "Invariant failures deferred while a rollout is in progress" :
+      "Some invariants could not be checked"
     exit INVARIANTS_EXIT_UNCHECKABLE
   else
     puts "Some invariants failed"

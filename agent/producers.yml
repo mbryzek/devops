@@ -106,6 +106,19 @@
 timezone: America/New_York
 
 producers:
+  # An invariant is SQL that ships INSIDE the app, and the check asks whichever
+  # replica the load balancer picks — so during a rolling deploy the verdict
+  # depends on which pod answered. That window opens the moment a release is cut,
+  # which is exactly when an invariant FIX goes live and therefore exactly when
+  # these two producers are most likely to fire. ISS-509 was filed that way: the
+  # fix shipped at 11:04:39Z, the check ran at 11:07:57Z, a pod on the previous
+  # release answered, and a session was spent on an already-fixed condition.
+  #
+  # `dev invariants check` now defers its FAILURES while the fleet may be mixed
+  # and exits 2 instead of 1, which lands on the >1 arm below: recorded, never
+  # filed. Passes are not deferred and an unreachable version endpoint defers
+  # nothing, so the guard can only ever delay a finding by one run — never hide
+  # one. See the rollout guard in bin/dev (ISS-517).
   - key: invariants-platform
     schedule: every 1 hour
     check: dev invariants check --app platform
