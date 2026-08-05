@@ -104,7 +104,7 @@ workspaces deleted on success and after 7 days otherwise.
 
 ## Housekeeping is runner-local, not a producer
 
-`agent gc`, `aidirs prune` and `docker prune` run once a day inside the tick, on
+`agent gc`, `aidirs prune` and `docker prune` run once an hour inside the tick, on
 each machine's own cadence, with **no server run and no lock** (ISS-520,
 `lib/agent/maintenance.rb`). They used to be producers, and that was wrong in a
 way that only showed up with more than one runner: every producer runs behind a
@@ -117,10 +117,12 @@ A producer FILES work and its output is an issue, so deduplicating it across the
 fleet is the entire point. This DOES work and its output is free disk on the
 machine that ran it, so there is nothing to deduplicate.
 
-Two triggers: the daily **cadence**, and **disk pressure** — under 50GB free it
-runs immediately with shorter windows (feature dirs and images to 1 day), subject
-to an hour's cooldown so a machine that is genuinely full does not prune on a
-loop. Nothing here talks to the platform: if the platform is unreachable for a
+Two triggers: the hourly **cadence** (ISS-555 — it was daily, which left up to a
+day between a machine starting to fill and noticing), and **disk pressure** —
+under 50GB free the next pass uses shorter windows (feature dirs and images to 1
+day), subject to an hour's cooldown so a machine that is genuinely full does not
+prune on a loop. Cooldown and cadence are both an hour now, so pressure buys the
+short windows rather than an earlier run. Nothing here talks to the platform: if the platform is unreachable for a
 week every machine still prunes, because the moment you most need headroom is the
 moment things are already broken.
 

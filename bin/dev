@@ -881,9 +881,10 @@ USAGE = <<~USAGE
 
     #{INVOCATIONS["agent maintenance"]}
         This machine's own housekeeping — `agent gc`, `aidirs prune` and
-        `docker prune` — and what the tick runs once a day, plus immediately
-        whenever free space falls under the floor. Runner-local by design: these
-        delete files on THIS disk, so every machine runs its own (ISS-520).
+        `docker prune` — and what the tick runs once an hour, with shorter
+        retention windows whenever free space is under the floor. Runner-local
+        by design: these delete files on THIS disk, so every machine runs its
+        own (ISS-520).
         Prints when it last ran, this machine's headroom, and whether a run is
         due. --dry-run says what it would do; --force runs regardless of cadence.
 

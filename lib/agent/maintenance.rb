@@ -25,16 +25,16 @@ require 'agent/paths'
 #
 # TWO TRIGGERS, and the second is the point:
 #
-#   cadence   the routine path — once a day, like the producers it replaced.
-#   pressure  free space under PRESSURE_FLOOR_BYTES. Runs NOW, with the
-#             retention windows shortened, subject only to a cooldown. Waiting
-#             until 4:00am to react to a disk that is already full is waiting
-#             through the exact failure this exists to prevent.
+#   cadence   the routine path — once an hour (ISS-555).
+#   pressure  free space under PRESSURE_FLOOR_BYTES. Runs with the retention
+#             windows shortened, subject only to a cooldown. Waiting a day to
+#             react to a disk that is already full is waiting through the exact
+#             failure this exists to prevent.
 #
 # The cooldown matters as much as the floor: a machine genuinely out of space
 # stays under the floor after a prune that reclaimed everything reclaimable, and
 # without it that machine would run a full `docker prune` every 30 seconds
-# forever. Pressure buys urgency, not a spin loop.
+# forever. Pressure buys shorter windows, not a spin loop.
 #
 # LIVENESS IS REPORTED, NOT INFERRED. Every run stamps a marker file, and the
 # tick's RUNNER HEARTBEAT carries `last_maintenance_at` plus this machine's disk
@@ -47,11 +47,23 @@ require 'agent/paths'
 # invariant (AgentInvariants.agent_runner_maintenance_stale) is what notices.
 module Agent
   module Maintenance
-    # Once a day, matching the producer schedules this replaced (agent-gc 4:00am,
-    # docker-prune 5:08am, aidirs-prune 6:00am). No wall-clock hour: a runner
-    # local marker gives a machine that was asleep at 4am its run when it wakes,
-    # which is a strict improvement on missing the window entirely.
-    CADENCE_SECONDS = 24 * 3600
+    # Once an hour (ISS-555). It was a day, matching the producer schedules this
+    # replaced (agent-gc 4:00am, docker-prune 5:08am, aidirs-prune 6:00am), and a
+    # day is the wrong unit for the thing being defended: a runner at
+    # max_concurrency can put several GB on disk between two passes, so the gap
+    # between "started filling" and "noticed" was up to 24 hours of a machine
+    # that is still claiming work. Hourly bounds it at one.
+    #
+    # Cost is bounded by the same reasoning. A pass an hour after the last one
+    # finds an hour's worth of aged images, feature dirs and logs — the first
+    # pass after this ships is the expensive one and every later pass is nearly
+    # empty — and it runs at the top of the tick's work phase, so what an
+    # occasional slow pass delays is that tick's claim, not any running job.
+    #
+    # Still no wall-clock hour: a runner-local marker gives a machine that was
+    # asleep its run when it wakes, which is a strict improvement on missing the
+    # window entirely.
+    CADENCE_SECONDS = 60 * 60
 
     # Below this much free space, prune now rather than at the next cadence.
     # Sized off what one job actually costs: a platform clone plus sbt's ivy/
@@ -60,7 +72,19 @@ module Agent
     # "enough headroom for every slot to start", not "nearly empty".
     PRESSURE_FLOOR_BYTES = 50 * 1_000_000_000
 
-    # The floor is a reason to run early, never a reason to run continuously.
+    # The floor is a reason to shorten the windows, never a reason to run
+    # continuously.
+    #
+    # It equals CADENCE_SECONDS since ISS-555, and that is deliberate rather than
+    # an oversight to be tidied up: a full disk now gets its pass at the next
+    # hourly cadence anyway, so what `:pressure` still buys is the SHORTENED
+    # RETENTION WINDOWS (feature dirs and images to a day), not an earlier run.
+    # Dropping it below the cadence would buy minutes at the cost of a machine
+    # that is genuinely full — one that stays under the floor after reclaiming
+    # everything reclaimable — running a full `docker prune` several times an
+    # hour in front of every claim. `due` checks pressure FIRST, so when the two
+    # fire together the run is correctly labelled `:pressure` and takes the short
+    # windows.
     PRESSURE_COOLDOWN_SECONDS = 3600
 
     # Age windows for the two shell chores. The routine numbers are the flags the

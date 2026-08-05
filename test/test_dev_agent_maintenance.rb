@@ -55,10 +55,17 @@ class TestDevAgentMaintenance < Minitest::Test
     with_agent_home { assert_equal :first_run, Agent::Maintenance.due(now: Time.now, free_bytes: nil) }
   end
 
-  def test_the_routine_path_is_once_a_day
+  # The literal value, not the constant: every other cadence assertion here is
+  # written in terms of CADENCE_SECONDS and so cannot notice the constant itself
+  # moving. A day was the wrong unit (ISS-555) — a runner at max_concurrency can
+  # put several GB on disk between two passes, and at 24h the gap between "this
+  # machine started filling" and "this machine pruned" was a day of it still
+  # claiming work.
+  def test_the_routine_path_is_once_an_hour
+    assert_equal 3600, Agent::Maintenance::CADENCE_SECONDS
     now = Time.utc(2026, 8, 5, 12)
     with_agent_home do
-      write_marker(now - 3600)
+      write_marker(now - 60)
       assert_nil Agent::Maintenance.due(now: now, free_bytes: nil)
       write_marker(now - Agent::Maintenance::CADENCE_SECONDS - 1)
       assert_equal :cadence, Agent::Maintenance.due(now: now, free_bytes: nil)
@@ -66,15 +73,17 @@ class TestDevAgentMaintenance < Minitest::Test
   end
 
   # Cadence is the routine path; the floor is the failure actually being
-  # prevented, and it must not wait until 4:00am to react to a disk that is
-  # already full.
+  # prevented. Since ISS-555 the cooldown and the cadence are both an hour, so
+  # what pressure buys is the SHORTENED WINDOWS rather than an earlier run —
+  # which makes the assertion below the load-bearing one: when both are due,
+  # `due` must return :pressure, because the trigger is what picks the windows.
   def test_disk_pressure_overrides_the_cadence
     now = Time.utc(2026, 8, 5, 12)
     with_agent_home do
       write_marker(now - Agent::Maintenance::PRESSURE_COOLDOWN_SECONDS - 1)
       assert_equal :pressure, Agent::Maintenance.due(now: now, free_bytes: 1)
-      assert_nil Agent::Maintenance.due(now: now, free_bytes: Agent::Maintenance::PRESSURE_FLOOR_BYTES + 1),
-                 "a machine with headroom waits for its cadence"
+      assert_equal :cadence, Agent::Maintenance.due(now: now, free_bytes: Agent::Maintenance::PRESSURE_FLOOR_BYTES + 1),
+                   "a machine with headroom takes the routine path, and the routine windows with it"
     end
   end
 
