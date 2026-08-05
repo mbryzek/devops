@@ -9,4 +9,24 @@
 # Held-back bumps are reported by `dev dependencies check` and in the nightly
 # summary, so nothing pinned here silently disappears. When an upgrade session
 # defers a bump, its PR body includes a ready-to-paste entry for this file.
-deny: []
+deny:
+  # guice 7.0.0 dropped javax.inject entirely and reads jakarta.inject only
+  # (7.0.0's pom depends on jakarta.inject-api; 6.0.0's depends on BOTH).
+  # play-guice 3.0.x — what platform (3.0.7) and acumen (3.0.11) are on — is
+  # itself compiled against javax.inject: `grep -a jakarta/inject` over
+  # play-guice_3-3.0.11.jar finds zero references. Under guice 7 Play's OWN
+  # injection points (GuiceInjector, TypedActorRefProvider, PekkoGuiceSupport,
+  # FakeRouterProvider, ...) stop being recognized, so no amount of sweeping
+  # OUR sources javax.inject -> jakarta.inject makes this bump green. The
+  # unblock is Play 3.1.0, whose play-guice is jakarta-only and depends on
+  # guice 7.0.0 — still milestone-only (3.1.0-M9) as of 2026-08-05.
+  # No `apps:` on purpose: platform, acumen and lib-ai all declare guice, and
+  # lib-ai's is transitive onto the two Play apps, so denying it anywhere but
+  # everywhere would just reintroduce guice 7 through a lib release.
+  # Full analysis: ~/code/claude/plans/2026-08-05-guice-7-jakarta-inject.md
+  - artifact: com.google.inject:guice
+    versions: ">= 7.0.0"
+    reason: "guice 7 is jakarta.inject-only; play-guice 3.0.x is javax.inject. Needs Play 3.1.0 stable first (ISS-452, 2026-08-05)"
+  - artifact: com.google.inject.extensions:guice-assistedinject
+    versions: ">= 7.0.0"
+    reason: "must stay lockstep with com.google.inject:guice; see that entry (ISS-452, 2026-08-05)"
