@@ -43,7 +43,11 @@ USAGE = <<~TEXT
                       Use --language to also create a local .api/config.pkl with default
                       code generators. Can be repeated for multiple languages.
     validate <file>   Validate an api.json spec file via server-side validation
-                      (hermetic — nothing is published).
+                      (hermetic — nothing is published). The organization and
+                      application key come from .api/config.pkl, and the file's
+                      imports resolve through the same chain codegen uses, so a
+                      spec validates against exactly what codegen would generate
+                      from. Run it from the repo root that owns the spec.
     lint [<file>]     Remove imports that are declared but never referenced, rewriting
                       the spec files in place. With no <file>, lints every spec in
                       .api/config.pkl; scope it with --app/--group (same as codegen).
@@ -471,9 +475,66 @@ end
 
 # --- Validate Command ---
 
+# The (organization, application) a spec file validates as.
+#
+# The organization is a REGISTRY concept: it appears nowhere in an api.json spec,
+# and it never has. Reading it off the spec (`spec["organization"]["key"]`, with a
+# `"tmp"` default) therefore always took the default, and every `api validate` in
+# every repo failed with `Organization with key 'tmp' not found` — a server-side
+# message that reads like the spec is malformed when the spec is fine (ISS-641).
+# It comes from `.api/config.pkl`, which is exactly where codegen reads it.
+#
+# The application key comes from the same place whenever the config lists the file
+# — that is the key codegen submits, so validate agrees with codegen by
+# construction. A spec not yet wired into the config (write the file, validate it,
+# then add it) has no listed key, so fall back to the key the registry itself would
+# derive from the spec's name.
+def resolve_validate_target(roots, file_path, spec)
+  roots.each do |config, project_root|
+    config.blocks.each do |block|
+      block.applications.each do |app|
+        # File.identical?, not string equality: the path is typed relative to the
+        # cwd while the config's is relative to its root, and a workspace is
+        # routinely reached through a symlink (/var -> /private/var on macOS).
+        return [block.org, app.key] if File.identical?(File.join(project_root, app.file_path), file_path)
+      end
+    end
+  end
+
+  orgs = roots.flat_map { |config, _| config.orgs }.uniq
+  if orgs.size != 1
+    Util.exit_with_error(
+      "#{file_path} is not listed in .api/config.pkl, and this repo configures " \
+      "#{orgs.size} organizations (#{orgs.sort.join(', ')}) — so there is no org to " \
+      "validate it against.\n  Add the application to .api/config.pkl and re-run."
+    )
+  end
+
+  name = spec["name"]
+  if !name.is_a?(String) || apibuilder_key(name).empty?
+    Util.exit_with_error("#{file_path} is not listed in .api/config.pkl and has no usable \"name\" to derive an application key from")
+  end
+  [orgs.first, apibuilder_key(name)]
+end
+
+# The registry's application key for a spec name — how apibuilder slugs a name into
+# a URL key ("ApiBuilder Spec" -> "apibuilder-spec").
+def apibuilder_key(name)
+  name.to_s.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/\A-+|-+\z/, "")
+end
+
 def run_validate(profile, file_path)
   Util.exit_with_error("Usage: api validate <file>") if file_path.nil?
   Util.exit_with_error("File not found: #{file_path}") unless File.exist?(file_path)
+
+  config_path = File.join(Dir.pwd, ".api", "config.pkl")
+  unless File.exist?(config_path)
+    Util.exit_with_error(
+      "No .api/config.pkl found in #{Dir.pwd}.\n" \
+      "  api validate resolves the organization (and the application key) from it, the\n" \
+      "  same way codegen does — run from the repo root that owns the spec."
+    )
+  end
 
   spec = begin
            JSON.parse(IO.read(file_path))
@@ -481,28 +542,33 @@ def run_validate(profile, file_path)
            Util.exit_with_error("Invalid JSON in #{file_path}: #{e.message}")
          end
 
+  roots = resolve_config_roots(Dir.pwd)
+  org, app = resolve_validate_target(roots, file_path, spec)
+
   inject_project_attribute!(spec, read_project_from_build_sbt)
+
+  # Hermetic, like codegen: the file under validation is sent verbatim (it is the
+  # thing being checked, working-tree state and all), and its imports ride along as
+  # context resolved through the same chain codegen uses — this repo, then sibling
+  # clones, then the producer checkouts at origin/main, then the registry. Without
+  # that context every import resolves from the registry (RELEASED code), so a spec
+  # that is valid against the branch fails here and a spec that is broken against
+  # merged main passes.
+  applications = [{ "organization_key" => org, "application_key" => app, "original" => spec }]
+  sources = build_spec_sources(roots)
+  applications += payload_context_entries(applications, sources)
+
+  puts "==> Validating #{file_path} as #{org}/#{app}"
+  sources.announce
 
   client = ApibuilderClient.new(profile)
   batch_client = ApiBatchClient.new(client)
 
-  org = spec["organization"]&.[]("key") || "tmp"
-  app = spec["application"]&.[]("key") || File.basename(file_path, ".json")
-
   # A codegen batch with a payload and no generators is pure hermetic validation:
-  # the server parses and validates the spec (imports resolve from the registry),
-  # generates nothing, and persists nothing. The old form here was an `upload`
-  # batch, which published a version — and moved `latest` — just to validate.
-  form = {
-    "operations" => ["codegen"],
-    "applications" => [
-      {
-        "organization_key" => org,
-        "application_key"  => app,
-        "original"         => spec,
-      }
-    ],
-  }
+  # the server parses and validates the spec, generates nothing, and persists
+  # nothing. The old form here was an `upload` batch, which published a version —
+  # and moved `latest` — just to validate.
+  form = { "operations" => ["codegen"], "applications" => applications }
 
   begin
     batch = batch_client.create_batch(org, form)
@@ -515,7 +581,10 @@ def run_validate(profile, file_path)
     when "error"
       errors = result["errors"] || []
       $stderr.puts "==> #{file_path}: validation failed"
-      errors.each { |e| $stderr.puts "  - #{e["message"]}" }
+      errors.each do |e|
+        label = [e["application_key"], e["generator_key"]].compact.join("/")
+        $stderr.puts(label.empty? ? "  - #{e["message"]}" : "  - #{label}: #{e["message"]}")
+      end
       exit 1
     else
       Util.exit_with_error("Unexpected batch status '#{result["status"]}' for #{file_path}")
