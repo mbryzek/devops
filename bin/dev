@@ -42,6 +42,7 @@ require 'depsguard'
 require 'agent/gc'
 require 'agent/maintenance'
 require 'agent/tick'
+require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/toolchain'
 
@@ -959,6 +960,10 @@ USAGE = <<~USAGE
         the tick (`/bin/zsh -lc`), NOT your interactive shell's, so a tool that
         only nvm/rbenv/asdf provides reads as missing here exactly as it does to
         the agent (ISS-531).
+        Also reports `~/code/.claude`, the directory every session on this
+        machine resolves its rules, skills and subagents through — absent, it
+        costs them all of it silently (ISS-615). The tick creates it; this only
+        reads.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -10946,27 +10951,51 @@ def cmd_agent_doctor(args)
     optional.each { |t| puts "Optional, absent: #{t.name} — #{t.required_by} (`#{t.install}`)" }
   end
 
+  claude_config = agent_doctor_claude_config
   agent_doctor_credentials
 
-  if missing.empty?
+  unless missing.empty?
     puts
-    puts "All #{result.found.count { |f| f.tool.required? }} required tool(s) present."
-    return
+    missing.each do |tool|
+      puts "MISSING #{tool.name} — #{tool.required_by}"
+      puts "  install: #{tool.install}"
+      puts "  blocks producer(s): #{tool.producers.join(', ')}" unless tool.producers.empty?
+    end
+    blocked = result.blocked_producers
+    unless blocked.empty?
+      puts
+      puts "Producer(s) that cannot run on this machine: #{blocked.join(', ')}"
+      puts "They record `check_failed`, file nothing, and look exactly like a quiet week."
+    end
   end
 
-  puts
-  missing.each do |tool|
-    puts "MISSING #{tool.name} — #{tool.required_by}"
-    puts "  install: #{tool.install}"
-    puts "  blocks producer(s): #{tool.producers.join(', ')}" unless tool.producers.empty?
-  end
-  blocked = result.blocked_producers
-  unless blocked.empty?
+  if missing.empty? && claude_config.ok?
     puts
-    puts "Producer(s) that cannot run on this machine: #{blocked.join(', ')}"
-    puts "They record `check_failed`, file nothing, and look exactly like a quiet week."
+    puts "All #{result.found.count { |f| f.tool.required? }} required tool(s) present, " \
+         "and #{Agent::ClaudeConfig.link} resolves."
+    return
   end
   exit 1
+end
+
+# The `.claude` half of the doctor (ISS-615).
+#
+# UNLIKE the credentials section below, this DOES affect the exit code. An
+# absent `~/code/.claude` costs every session on the machine its rules and every
+# skill CLAUDE.md names by name, and costs them silently — a skill that is not
+# there is not an error a session can see. A runner in that state should not
+# pass provisioning.
+#
+# Read-only on purpose: `dev agent tick` is what creates the link (Phase A), and
+# a doctor with a side effect could never tell you the state you were actually
+# in when you ran it.
+def agent_doctor_claude_config
+  state = Agent::ClaudeConfig.state
+  puts
+  puts "Claude config directory (how sessions here find rules, skills and subagents):"
+  puts "  #{state.ok? ? 'ok  ' : 'MISS'} #{state.message}"
+  puts "       fix: #{state.remedy}" unless state.ok?
+  state
 end
 
 # The external-API credentials half of the doctor (ISS-570).
