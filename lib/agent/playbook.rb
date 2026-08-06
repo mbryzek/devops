@@ -390,5 +390,177 @@ module Agent
         (home_paths_in(body, key: key) + write_targets_in(body, key: key)).sort_by(&:line)
       end
     end
+
+    # ---- the write path (`dev agent playbook <key> --write FILE`, ISS-665) ----
+    #
+    # Reading a playbook is a wrapper around a GET. WRITING one is not, and the
+    # difference is what this section exists for: a playbook is an instruction
+    # every future session obeys, which puts it in the same class as
+    # `agent/instructions.md` and the `~/code/claude` rules a pre-push hook
+    # protects. Until this existed, the only devops-side write was a session
+    # hand-rolling `ApiClient.request(..., :post, "/agent/playbooks", ...)` —
+    # a production table edited through a path with no key validation, no diff
+    # and no confirmation (ISS-665, hit while fixing ISS-660).
+    #
+    # Three gates, and each one guards a failure the append-only design makes
+    # PERMANENT rather than merely wrong:
+    #
+    #   the diff        Nobody appends a version without seeing what changes. A
+    #                   playbook has no local copy to `git diff` against — the
+    #                   current version lives only in the platform — so the diff
+    #                   has to be computed here or it does not exist at all.
+    #   --create        A typo'd key does not fail. It starts a NEW lineage that
+    #                   no producer points at, permanently, while the fix the
+    #                   operator meant to make silently never lands and the
+    #                   producer keeps running the old procedure. The one gate
+    #                   that catches a mistake nothing downstream would report.
+    #   --yes           Explicit consent, always. A human at a terminal is
+    #                   prompted; anything else (a session, a pipe, cron) is
+    #                   REFUSED unless --yes was passed, so an autonomous run
+    #                   cannot rewrite the instructions the next autonomous run
+    #                   obeys as a side effect of doing something else.
+
+    # Number of unchanged lines kept on each side of a change. Anything longer is
+    # elided, so a one-line fix to a long playbook reads as a one-line fix.
+    DIFF_CONTEXT = 3
+
+    # Whether two bodies differ in a way worth appending a version for.
+    #
+    # Compared rstrip'd rather than byte for byte because `resolve` strips before
+    # handing the text to a session: a version whose only difference is a trailing
+    # newline changes NOTHING any session reads, and appending it would put a row
+    # in the history that answers "what changed" with "nothing". The round trip
+    # this enables is the point — `dev agent playbook k > k.md`, edit, `--write
+    # k.md` — and an editor that adds a final newline must not make that a write.
+    def changed?(current_body, proposed_body)
+      current_body.to_s.rstrip != proposed_body.to_s.rstrip
+    end
+
+    # The diff an operator confirms against, as an array of display lines.
+    #
+    # Pure Ruby rather than shelling out to diff(1) with two temp files. This is
+    # the LAST thing shown before a permanent append, so it must not depend on a
+    # binary being on PATH, on temp files landing, or on a subprocess exit status
+    # being read correctly — and a playbook is a page of markdown, so the O(n*m)
+    # LCS table is never the cost.
+    def diff_lines(before, after, context: DIFF_CONTEXT)
+      render_diff(diff_ops(body_lines(before), body_lines(after)), context)
+    end
+
+    # Trailing whitespace is stripped for the same reason `changed?` ignores it:
+    # the session reads a stripped body, so a phantom final empty line rendered
+    # as a change would be a change nothing downstream can see.
+    def body_lines(body)
+      text = body.to_s.rstrip
+      text.empty? ? [] : text.split("\n", -1)
+    end
+
+    # [kind, text] pairs (:same / :del / :add) in output order, from the standard
+    # longest-common-subsequence table. Split out from rendering so the alignment
+    # is testable independently of how it is displayed.
+    def diff_ops(before, after)
+      n = before.length
+      m = after.length
+      lcs = Array.new(n + 1) { Array.new(m + 1, 0) }
+      (n - 1).downto(0) do |i|
+        (m - 1).downto(0) do |j|
+          lcs[i][j] = before[i] == after[j] ? lcs[i + 1][j + 1] + 1 : [lcs[i + 1][j], lcs[i][j + 1]].max
+        end
+      end
+
+      ops = []
+      i = 0
+      j = 0
+      while i < n && j < m
+        if before[i] == after[j]
+          ops << [:same, before[i]]
+          i += 1
+          j += 1
+        elsif lcs[i + 1][j] >= lcs[i][j + 1]
+          ops << [:del, before[i]]
+          i += 1
+        else
+          ops << [:add, after[j]]
+          j += 1
+        end
+      end
+      ops.concat(before[i..].map { |line| [:del, line] })
+      ops.concat(after[j..].map { |line| [:add, line] })
+      ops
+    end
+
+    # Unified-diff markers with long unchanged runs elided. Deliberately not real
+    # `@@` hunk headers: line numbers into a body that exists only as a database
+    # column are a number the operator cannot look anything up by, and the count
+    # of elided lines is the thing they actually want ("did I miss a section").
+    MARKERS = { same: "  ", del: "- ", add: "+ " }.freeze
+
+    def render_diff(ops, context)
+      keep = ops.each_index.select do |index|
+        ops[index][0] != :same ||
+          [distance_to_change(ops, index, -1), distance_to_change(ops, index, 1)].min <= context
+      end
+
+      out = []
+      previous = nil
+      keep.each do |index|
+        gap = previous.nil? ? index : index - previous - 1
+        out << elision(gap) if gap.positive?
+        kind, text = ops[index]
+        out << "#{MARKERS.fetch(kind)}#{text}"
+        previous = index
+      end
+      trailing = ops.length - (previous.nil? ? 0 : previous + 1)
+      out << elision(trailing) if trailing.positive?
+      out
+    end
+
+    # One marker per dropped run, so an elision is visible AS an elision. A diff
+    # that silently omits lines is worse than no diff: it looks complete.
+    def elision(count)
+      "  ... #{count} unchanged line#{count == 1 ? '' : 's'}"
+    end
+
+    # Steps from `index` to the nearest changed op in `direction`, or Infinity
+    # when there is none — an unchanged run at the very top or bottom of the file
+    # has no change on that side and is elided rather than kept as context.
+    def distance_to_change(ops, index, direction)
+      i = index + direction
+      steps = 1
+      while i >= 0 && i < ops.length
+        return steps unless ops[i][0] == :same
+        i += direction
+        steps += 1
+      end
+      Float::INFINITY
+    end
+
+    # What the write path is allowed to do: [:append, nil], [:prompt, nil], or
+    # [:refuse, message].
+    #
+    # The default is REFUSE, not prompt. A prompt is only correct when there is
+    # somebody to answer it, and the two callers who are not are exactly the two
+    # this gate exists for: an autonomous session (which would answer its own
+    # prompt) and a pipe or cron (where `$stdin.gets` returns nil and any
+    # "default" is a decision nobody made). `--yes` is the one explicit thing
+    # either of them can pass, which is what makes an autonomous playbook edit a
+    # deliberate act rather than a side effect.
+    def write_gate(assume_yes:, interactive:, ai_session:)
+      return [:append, nil] if assume_yes
+
+      if ai_session
+        return [:refuse, "Refusing to append a playbook version from inside a Claude session without --yes. " \
+                         "A playbook is an instruction every future session obeys, so editing one has to be the " \
+                         "job this session was given, stated explicitly — never a side effect of doing something " \
+                         "else. Re-run with --yes if it is."]
+      end
+
+      unless interactive
+        return [:refuse, "Refusing to append a playbook version without confirmation (stdin is not a terminal). " \
+                         "Pass --yes."]
+      end
+
+      [:prompt, nil]
+    end
   end
 end

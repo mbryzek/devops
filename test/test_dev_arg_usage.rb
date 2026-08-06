@@ -85,6 +85,8 @@ class TestDevArgUsage < Minitest::Test
       "agent tick stray arg"      => [-> { cmd_agent_tick(["--nope"]) },               "dev agent tick [--dry-run]"],
       "agent logs no issue"       => [-> { cmd_agent_logs([]) },                       "dev agent logs <issue>"],
       "agent runs bad limit"      => [-> { cmd_agent_runs(["--limit", "0"]) },         "dev agent runs"],
+      "agent playbooks stray arg" => [-> { cmd_agent_playbooks(["--nope"]) },          "dev agent playbooks"],
+      "agent playbook no key"     => [-> { cmd_agent_playbook([]) },                   "dev agent playbook <key>"],
       "agent refresh no issue"    => [-> { cmd_agent_refresh([]) },                    "dev agent refresh <issue>"],
       "agent release no issue"    => [-> { cmd_agent_release([]) },                    "dev agent release <issue>"],
       "agent gc stray arg"        => [-> { cmd_agent_gc(["--nope"]) },                 "dev agent gc"],
