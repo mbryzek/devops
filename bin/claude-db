@@ -59,13 +59,14 @@
 #                      the session databases inside it.
 #
 #   claude-db gc [--app APP] [--days N] [--apply]
-#                      Drop session databases older than N days (default 3),
-#                      then remove containers left holding none and
+#                      Drop session databases that have gone N days (default 3)
+#                      unused, then remove containers left holding none and
 #                      release their ports. Dry-run unless --apply. Keeps any
-#                      database with a live connection, and this session's own.
-#                      Age, not "nobody is connected right now", is what makes
-#                      this safe to run while other sessions are working — see
-#                      DEFAULT_GC_DAYS.
+#                      database with a live connection, this session's own, and
+#                      anything created within the cutoff. Unused-ness, not "was
+#                      created a while ago" and not "nobody is connected right
+#                      now", is what makes this safe to run while other sessions
+#                      are working — see DEFAULT_GC_DAYS.
 #
 # --app is required only for `start`: creating a database means choosing which
 # app's schema it holds, and there is no safe default. The read-only and
@@ -115,10 +116,11 @@ def show_usage
 
       status [--app APP]           Show every claude container and its session databases.
 
-      gc [--app APP]               Drop session databases older than --days
+      gc [--app APP]               Drop session databases unused for --days
          [--days N] [--apply]      (default #{DEFAULT_GC_DAYS}), then remove containers left
                                    holding none.  Keeps anything with a live
-                                   connection, and this session's own databases.
+                                   connection, anything created inside the
+                                   cutoff, and this session's own databases.
                                    Dry-run unless --apply.  Needs no session id,
                                    so it runs from anywhere.
 
@@ -356,6 +358,13 @@ def do_sync(app)
   end
   container, port = holder
 
+  # Put this session's database on the activity record from the one command
+  # every session runs against it — `start` calls do_sync, so this covers both.
+  # Without it the first thing to see a new database is somebody else's gc, and
+  # a first sighting buys only one cutoff window of protection; with it, the
+  # session that owns the database is what keeps its stamp moving.
+  observe_activity(app, port, app.active_session_dbs(port))
+
   unless app.sem_tracking?(port, db)
     # Bail rather than treat "no tracking table" as "nothing applied": that
     # reading would replay the entire script history against a full schema.
@@ -553,6 +562,11 @@ def do_status(apps)
 
       dbs    = app.list_session_dbs(port)
       active = app.active_session_dbs(port)
+      # Observing costs one round trip and is what keeps the ledger current
+      # between gc runs — see observe_activity. The number it returns is also
+      # the one that decides whether gc may drop each of these, so listing it
+      # here is what makes the reap criterion inspectable before the fact.
+      idle   = observe_activity(app, port, active)
       if dbs.empty?
         puts "  databases  : none"
       else
@@ -560,6 +574,7 @@ def do_status(apps)
         dbs.each do |db|
           flags = [active.include?(db) ? "active" : "idle"]
           flags << "THIS SESSION" if db == current_db
+          flags << "unused #{(idle[db] / 86_400.0).round(1)}d" if idle[db] && idle[db] > 0
           # Drift, stated where the database is listed. Measured against THIS
           # checkout, which is the only schema any of these can be compared to
           # from here. Silent when in sync — the point is to make behind-ness
@@ -568,6 +583,9 @@ def do_status(apps)
           flags << "#{behind} MIGRATION(S) BEHIND" if behind && behind > 0
           puts "    #{db}  [#{flags.join(', ')}]"
         end
+        # The drift count above connected to every one of them. Those are our
+        # connections, not a session's — see absorb_own_connections.
+        absorb_own_connections(app, port)
       end
       puts ""
     end
@@ -590,24 +608,76 @@ end
 
 # ── gc ─────────────────────────────────────────────────────────────────────
 
-# Session databases are reaped on AGE, not on "has no backend connected right
-# now". The old rule dropped every database no other session happened to be
+# Session databases are reaped on how long they have gone UNUSED, not on "has
+# no backend connected right now" and not on how long ago they were created.
+#
+# The connection rule dropped every database no other session happened to be
 # querying at that instant, which is the normal state of a session sitting
 # between test runs: on 2026-08-04, 11 live sessions held ~60 databases and
 # pg_stat_activity was empty for every one of them, so a single `gc` would have
 # destroyed all of them.
 #
-# Age is also what lets gc run from anywhere. Reaping "everything but mine"
-# needs to know which database is mine, which is why gc used to require a
-# session id and abort in ~/code; reaping "everything older than N days" does
-# not, because the current session's database is newer than any sane cutoff.
+# Creation age replaced it and fixed that, but only by swapping one proxy for
+# another: it reaps a session that is STILL RUNNING past the cutoff, which
+# multi-day features and context-handoff continuations legitimately are. Its
+# safety argument — "the current session's database is newer than any sane
+# cutoff" — holds only for the session running gc, and gc deliberately runs from
+# anywhere, against everybody's databases (ISS-583).
+#
+# Both ages are now required, and DbApp::ACTIVITY_TABLE explains where the
+# second one comes from: a database goes only if it was created before the
+# cutoff AND has had no activity since it. Creation age still gates every reap,
+# so nothing the previous rule kept can be dropped by this one.
+#
+# Reaping on age is also what lets gc run from anywhere. Reaping "everything but
+# mine" needs to know which database is mine, which is why gc used to require a
+# session id and abort in ~/code.
 DEFAULT_GC_DAYS = 3
+
+# Fold this instant's per-database counters into a container's activity ledger,
+# and return how many seconds each of its session databases has gone unused.
+#
+# Every command that already holds a running container and its port calls this,
+# so the ledger is written from `start`/`sync` (the session's own database),
+# from `status`, and from `gc` itself. That is a side effect of a read-only
+# command, deliberately: an observation is the whole product here, and one taken
+# by a session merely LOOKING at the box is exactly as good as one taken while
+# reaping. gc taking its own before it decides anything is what makes a lost or
+# clobbered ledger row self-repairing rather than fatal.
+def observe_activity(app, port, active)
+  app.ensure_activity_ledger(port)
+  activity = app.session_db_activity(port)
+  idle, stamps = DbApp.reconcile_activity(activity, :active => active)
+  app.record_session_db_activity(port, stamps, :keep => activity.keys)
+  idle
+end
+
+# A command must never make ANOTHER session's database look used, and `status`
+# is the one that can: its migration-drift count has to run inside each database,
+# so it opens two connections to every session database on the box. Left
+# unaccounted, one `claude-db status` would read to the next gc as activity
+# everywhere at once and hand every database another full cutoff window —
+# switching gc off by the act of looking at it.
+#
+# So status re-records the counts afterwards with each last-used stamp left
+# where it was. `sync` needs no such thing: the only database it connects to is
+# the caller's own, and a session running sync IS using that database. gc never
+# connects to a session database at all, and takes its observation before it
+# touches anything.
+def absorb_own_connections(app, port)
+  counts = app.session_db_activity(port)
+  app.record_session_db_activity(
+    port,
+    counts.transform_values { |sample| sample["connects"] },
+    :keep => counts.keys, :stamp => false
+  )
+end
 
 def do_gc(apps, days, apply)
   puts ""
   puts Util.underline("claude-db gc")
   puts ""
-  puts "Reaping session databases older than #{days} day(s)#{apply ? '' : ' (dry-run — pass --apply to do it)'}."
+  puts "Reaping session databases unused for #{days} day(s)#{apply ? '' : ' (dry-run — pass --apply to do it)'}."
   puts ""
 
   cutoff = days * 86_400
@@ -641,9 +711,10 @@ def do_gc(apps, days, apply)
       dbs    = app.list_session_dbs(port)
       active = app.active_session_dbs(port)
       ages   = app.session_db_ages(port)
+      idle   = observe_activity(app, port, active)
 
       stale = app.reapable_session_dbs(
-        dbs, :active => active, :ages => ages,
+        dbs, :active => active, :ages => ages, :idle => idle,
         :cutoff_seconds => cutoff, :current_db => current_db
       )
 
@@ -653,14 +724,14 @@ def do_gc(apps, days, apply)
       dropped = []
 
       if stale.empty?
-        puts "#{name} (:#{port}): nothing older than #{days} day(s) (#{dbs.length} database(s) kept)."
+        puts "#{name} (:#{port}): nothing unused for #{days} day(s) (#{dbs.length} database(s) kept)."
       else
         verb = apply ? "dropping" : "would drop"
         puts "#{name} (:#{port}): #{verb} #{stale.length} of #{dbs.length} database(s)..."
         stale.each do |db|
-          age_days = (ages[db] / 86_400.0).round(1)
+          ages_label = "#{(idle[db] / 86_400.0).round(1)}d unused, #{(ages[db] / 86_400.0).round(1)}d old"
           unless apply
-            puts "  would drop #{db} (#{age_days}d)"
+            puts "  would drop #{db} (#{ages_label})"
             next
           end
           # Asked again, immediately before the drop. The `active` set above was
@@ -670,7 +741,7 @@ def do_gc(apps, days, apply)
           # backends first, losing that race destroys live work rather than just
           # failing.
           if app.session_db_active?(port, db)
-            puts "  skipped #{db} (#{age_days}d) — became active since the scan"
+            puts "  skipped #{db} (#{ages_label}) — became active since the scan"
             next
           end
           # Terminate lingering connections (safety net — active dbs are kept above).
@@ -679,7 +750,7 @@ def do_gc(apps, days, apply)
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
           )
           DbImages.psql_exec(port, "DROP DATABASE #{db}")
-          puts "  dropped #{db} (#{age_days}d)"
+          puts "  dropped #{db} (#{ages_label})"
           dropped << db
         end
         # A dry run reports what it WOULD drop; only a real run counts.

@@ -506,6 +506,169 @@ class DbApp
     end
   end
 
+  # ── how long a session database has gone UNUSED ────────────────────────────
+  #
+  # Creation age answers "how long has this existed", which is not the question
+  # gc is asking. A feature session legitimately running past the cutoff —
+  # multi-day features and context-handoff continuations are a supported pattern
+  # — has its database reaped by somebody else's gc the moment it happens to be
+  # idle at the instant that gc samples, which is the same failure that made the
+  # pg_stat_activity test unusable, at day granularity instead of second
+  # granularity (ISS-583).
+  #
+  # Postgres records no last-used timestamp. pg_stat_activity shows who is
+  # connected THIS INSTANT and forgets them the moment they disconnect — an
+  # empty result is the normal state of a working session between test runs,
+  # which is exactly why that test had to be abandoned. What Postgres does keep
+  # is a MONOTONIC count of the client connections each database has ever
+  # accepted, and that answers what the instantaneous test cannot: if the count
+  # has not moved since the last time it was written down, then nothing has
+  # connected over the whole interval — however long it is, and however rarely
+  # anyone looked. Sampling frequency therefore does not affect correctness,
+  # only how soon a genuinely dead database is noticed.
+  #
+  # So each container carries a ledger of "count N, observed at time T" for its
+  # own session databases. It lives in that container's `postgres` maintenance
+  # database rather than in a file under ~/code/ai for three reasons: Postgres
+  # serialises the writes that parallel sessions would otherwise race on, the
+  # ledger is scoped to precisely the databases it describes, and it is
+  # destroyed along with the container — so a ledger row outliving the database
+  # it names is not a state this can reach.
+  ACTIVITY_TABLE = "claude_db_session_activity".freeze
+
+  # pg_stat_database.sessions — client connections, and NOT the obvious choice
+  # of xact_commit, which was measured and rejected.
+  #
+  # Autovacuum and autoanalyze run transactions inside every database whether
+  # anyone is using it or not. Sampled 7 minutes apart on 2026-08-05 across 30
+  # session databases with zero connections between them, xact_commit moved on
+  # every single one (+14 each) and so did tup_returned; `sessions` moved on
+  # none of them. A counter that ticks on an abandoned database says "in use"
+  # forever, which is the failure that matters here — it would keep every dead
+  # database alive rather than reap a live one, but it would also make gc
+  # useless, which is the same thing one step removed.
+  #
+  # `sessions` is PG14+; the session-DB image is PG18. On anything older the
+  # query errors, psql_query hands back nothing, and gc degrades into having no
+  # last-used signal — which reapable_session_dbs reads as "keep".
+  ACTIVITY_COUNTER = "d.sessions::bigint".freeze
+
+  # Session database names are built by session_db_name from a sanitised session
+  # id, so they are already [a-z0-9_]. Enforced rather than assumed because these
+  # names are interpolated into SQL: a name that does not match is dropped from
+  # the statement instead of quoted into it.
+  SAFE_DB_NAME = /\A[a-z0-9_]+\z/
+
+  # Create the ledger table if this container has none. Idempotent, and run
+  # before every read because there is no other way to reach a container that is
+  # already running: the image is built once and every container older than this
+  # change starts without the table.
+  def ensure_activity_ledger(port)
+    DbImages.psql_exec_quiet(
+      port,
+      "CREATE TABLE IF NOT EXISTS #{ACTIVITY_TABLE} (" \
+      "datname text PRIMARY KEY, connects bigint NOT NULL, seen_at timestamptz NOT NULL)"
+    )
+  end
+
+  # One entry per session database: its live connection count, the count the
+  # ledger last recorded for it, and how many seconds ago that recording was
+  # made. Never observed before — no ledger row — comes back with both recorded
+  # fields nil, which reconcile_activity reads as "stamp it now".
+  #
+  # A database whose count cannot be read is ABSENT from the result rather than
+  # present with a default, for the same reason session_db_ages drops one: gc
+  # reaps on what is here, so an unreadable signal has to mean keep.
+  def session_db_activity(port)
+    rows = DbImages.psql_query(
+      port,
+      "SELECT d.datname || '|' || #{ACTIVITY_COUNTER} || '|' || " \
+      "COALESCE(l.connects::text, '') || '|' || " \
+      "COALESCE(EXTRACT(EPOCH FROM (now() - l.seen_at))::bigint::text, '') " \
+      "FROM pg_stat_database d LEFT JOIN #{ACTIVITY_TABLE} l ON l.datname = d.datname " \
+      "WHERE d.datname LIKE '#{sess_prefix}%'"
+    )
+    rows.each_with_object({}) do |row, acc|
+      name, connects, recorded, idle = row.split("|", 4)
+      next if name.nil? || connects.nil? || connects.strip.empty?
+      acc[name] = {
+        "connects" => connects.to_i,
+        "recorded" => DbApp.optional_int(recorded),
+        "idle" => DbApp.optional_int(idle)
+      }
+    end
+  end
+
+  # A psql column that may be SQL NULL, which -A renders as an empty field.
+  # nil rather than 0: these are "never observed", and a zero would read as a
+  # real measurement of zero seconds.
+  def DbApp.optional_int(value)
+    value.nil? || value.strip.empty? ? nil : value.to_i
+  end
+
+  # Fold one sample into "how long has each database gone unused".
+  #
+  # Returns [idle_seconds_by_db, stamps_by_db]: what gc reaps on, and the ledger
+  # rows that observation requires rewriting.
+  #
+  # PURE, like reapable_session_dbs and for the same reason — this is the half of
+  # gc's safety story that decides what "unused" means, so it has to be testable
+  # without a live container.
+  #
+  # A database is stamped as used NOW when its connection count has moved since
+  # the ledger was written, when it has no ledger row at all, or when something
+  # is connected to it this instant. That last one is not redundant with the
+  # count: a pooled connection sitting open across a long idle stretch never
+  # reconnects, and a session holding one is unambiguously alive.
+  #
+  # First sight seeds the stamp at NOW rather than at the database's creation
+  # time. That deliberately gives every database one full cutoff window of
+  # protection the first time it is seen — including the ones already on the box
+  # when this shipped, which have no history and about which nothing can honestly
+  # be claimed. It costs one delayed reap per database, once.
+  def DbApp.reconcile_activity(activity, active:)
+    idle = {}
+    stamps = {}
+    activity.each do |db, sample|
+      if sample["recorded"].nil? || sample["recorded"] != sample["connects"] || active.include?(db)
+        stamps[db] = sample["connects"]
+        idle[db] = 0
+      elsif !sample["idle"].nil?
+        idle[db] = sample["idle"]
+      end
+    end
+    [idle, stamps]
+  end
+
+  # Write `counts` (db => connection count) into the ledger, and forget rows for
+  # databases outside `keep`.
+  #
+  # `stamp` is what separates the two things a caller can mean by writing here:
+  #
+  #   true  — an OBSERVATION. Something connected to this database since the
+  #           last recording, so its last-used time becomes now.
+  #   false — claude-db ABSORBING ITS OWN FOOTPRINT. The count moved because
+  #           this tool connected, which is not a session using its database, so
+  #           the new count is recorded and the last-used time is left alone.
+  #           See absorb_own_connections in bin/claude-db.
+  #
+  # One statement, so psql runs it in a single implicit transaction and a
+  # parallel session cannot observe the delete without the insert.
+  def record_session_db_activity(port, counts, keep:, stamp: true)
+    names = keep.select { |db| db =~ SAFE_DB_NAME }
+    rows = counts.select { |db, _| db =~ SAFE_DB_NAME }
+    kept = names.map { |db| "'#{db}'" }.join(", ")
+    sql = ["DELETE FROM #{ACTIVITY_TABLE} WHERE datname LIKE '#{sess_prefix}%'" \
+           "#{kept.empty? ? '' : " AND datname NOT IN (#{kept})"}"]
+    unless rows.empty?
+      values = rows.map { |db, connects| "('#{db}', #{connects.to_i}, now())" }.join(", ")
+      seen_at = stamp ? "EXCLUDED.seen_at" : "#{ACTIVITY_TABLE}.seen_at"
+      sql << "INSERT INTO #{ACTIVITY_TABLE} (datname, connects, seen_at) VALUES #{values} " \
+             "ON CONFLICT (datname) DO UPDATE SET connects = EXCLUDED.connects, seen_at = #{seen_at}"
+    end
+    DbImages.psql_exec_quiet(port, sql.join("; "))
+  end
+
   # Which of `dbs` gc is allowed to drop. Pure, and deliberately separate from
   # the dropping: this predicate IS gc's safety story, so it has to be testable
   # without a live container.
@@ -514,12 +677,21 @@ class DbApp
   # a ranking:
   #   * it belongs to the session running gc (current_db)
   #   * something is connected to it right now (active)
-  #   * it is younger than the cutoff
-  #   * its age could not be read (ages has no entry) — unknown means keep
-  def reapable_session_dbs(dbs, active:, ages:, cutoff_seconds:, current_db: nil)
+  #   * it has been USED within the cutoff (idle)
+  #   * it was CREATED within the cutoff (ages)
+  #   * either of those two could not be read — unknown means keep
+  #
+  # The two ages are ANDed rather than ranked, which is what keeps the last-used
+  # signal from ever being able to condemn a database on its own: it can only
+  # rescue one that creation age would have taken. Nothing that survived the old
+  # rule can be reaped by the new one.
+  def reapable_session_dbs(dbs, active:, ages:, idle:, cutoff_seconds:, current_db: nil)
     dbs.select do |db|
-      age = ages[db]
-      db != current_db && !active.include?(db) && !age.nil? && age >= cutoff_seconds
+      next false if db == current_db
+      next false if active.include?(db)
+      signals = [ages[db], idle[db]]
+      next false if signals.any?(&:nil?)
+      signals.min >= cutoff_seconds
     end
   end
 
