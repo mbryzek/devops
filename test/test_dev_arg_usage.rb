@@ -133,12 +133,28 @@ class TestDevArgUsage < Minitest::Test
       "agent producers"    => -> { cmd_agent_producers(["--typo"]) },
       "agent pause"        => -> { cmd_agent_pause(["--typo"]) },
       "agent resume"       => -> { cmd_agent_resume(["--typo"]) },
+      "schema lint"        => -> { cmd_schema_lint(["--typo"]) },
     }.each do |command, callable|
       out, status = capture_stderr_and_exit { callable.call }
       assert_equal 1, status, "#{command}: expected exit 1 on stray flag"
       assert_includes out, "unknown", "#{command}: expected an unknown-arg error"
       assert_includes out, "  Usage: #{usage_for(command)}", "#{command}: wrong/absent usage line"
     end
+  end
+
+  # `--repo-dir` names ONE app's schema repo, so on its own it is ambiguous
+  # rather than a default — same rule claude-db applies.
+  def test_schema_lint_repo_dir_requires_an_app
+    out, status = capture_stderr_and_exit { cmd_schema_lint(["--repo-dir", "/tmp/x"]) }
+    assert_equal 1, status
+    assert_includes out, "needs --app too"
+    assert_includes out, "  Usage: #{usage_for('schema lint')}"
+  end
+
+  def test_schema_lint_repo_dir_requires_a_value
+    out, status = capture_stderr_and_exit { cmd_schema_lint(["--repo-dir"]) }
+    assert_equal 1, status
+    assert_includes out, "--repo-dir requires a value"
   end
 
   # ---- USAGE / usage_for stay in sync with the INVOCATIONS map ----

@@ -70,6 +70,20 @@ def confirm_contracting_release!(repo_dir, tag)
   Util.exit_with_error("Aborted: deploy the app first, then re-run release-db (or use `dev deploy all`)")
 end
 
+# Refuse to ship scripts that cannot be applied to a database built from scratch.
+#
+# Without this, a collision is discovered by sem-apply ON THE BASTION, against a
+# real database, after the tarball and a production password have already been
+# copied there — and it halts partway, so that database is left having taken some
+# of the release and not the rest. The check is pure text and takes a second, so
+# it runs before Tag.ask, before sem-dist, before anything leaves this machine.
+#
+# It also covers the case ISS-592 actually was: two PRs merged 23 seconds apart,
+# each creating the same three tables from a different draft of the same DAO
+# spec. Nothing between `gh pr merge` and the next `claude-db start` looked at
+# the pair, and a Friday merge would have reached this release first.
+RELEASE_ABORTED = "Nothing has been released. Fix the later script, then re-run release-db.".freeze
+
 args = Args.parse(ARGV, ["app"])
 
 # Determine the postgresql repo directory
@@ -85,6 +99,10 @@ if !File.directory?(repo_dir)
 end
 
 base_app = db_name.sub(/-postgresql$/, '')
+
+# Before the log is redirected and before any prompt: a release that cannot
+# apply must fail where the operator is looking.
+SchemaCollisions.assert_none!(repo_dir, :epilogue => RELEASE_ABORTED)
 
 # The log name carries no version, unlike release-scala's: a database release
 # does not know its tag until Tag.ask, several lines below.

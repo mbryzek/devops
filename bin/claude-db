@@ -396,6 +396,16 @@ def do_sync(app)
   pending.each { |f| puts "  #{f}" }
   puts ""
 
+  # Would these scripts apply to a database built from nothing? Nobody asked
+  # between `gh pr merge` and here, which is why a session running this command
+  # was the first thing in the system to find ISS-592 — and it found it as a
+  # halted sem-apply somewhere inside a wall of psql output, which names the
+  # relation but not the two scripts that own it, nor the fact that every
+  # migration behind them is now blocked too. The apply below cannot succeed
+  # with a collision in front of it, so this refuses a second earlier, in terms
+  # of the pair of PRs that actually has to be reconciled.
+  SchemaCollisions.assert_none!(app.repo_dir)
+
   # 127.0.0.1, not the HOST constant: `localhost` resolves to ::1 first on this
   # box, and sem-apply follows that resolution to a refused connection where
   # plain psql happens to fall back to IPv4.
