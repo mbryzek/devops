@@ -241,6 +241,20 @@ module Agent
               token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost, body: body)
     end
 
+    # An ADDITIONAL fix url on an issue that has already shipped, leaving its
+    # status alone — the API behind `dev issues fix`, and the only non-destructive
+    # way to say "this also shipped in that PR" (ISS-536).
+    #
+    # Idempotent on the url server-side, so re-recording what a session already
+    # recorded adds no second row. 422 on an issue that has NOT shipped: there is
+    # no fix to append to, and `set_status` is what records the first one.
+    def record_fix(number, url, comment: nil, use_localhost:)
+      body = { url: url }
+      body[:comment] = comment if comment && !comment.empty?
+      request(:post, "/#{TENANT}/issues/#{number}/fixes",
+              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost, body: body)
+    end
+
     def create_issue(form, use_localhost:)
       request(:post, "/#{TENANT}/issues", token: ai_token(use_localhost: use_localhost),
                                           use_localhost: use_localhost, body: form)

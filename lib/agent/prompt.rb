@@ -67,12 +67,26 @@ module Agent
       lines << "and the executor classifies your outcome by looking it up — a descriptively-named"
       lines << "branch is one the executor cannot find, and good work on it reads as no work at all."
       lines << ""
+      # The one thing the branch rule on its own cannot express (ISS-657): a run
+      # that produces several INDEPENDENT PRs cannot put them on one branch
+      # without stacking them, which these squash-merge repos forbid. Stated in
+      # the assignment beside the name itself, for the same reason the sentence
+      # above is: a session weighing "verbatim" against a playbook that demands
+      # disjoint PRs improvises, and the ISS-651 run did.
+      lines << "**More than one PR?** `#{slug}` carries the primary one; name every additional PR's"
+      lines << "branch `#{slug}_<suffix>` (≤19 chars, off latest `origin/main`, disjoint files, never"
+      lines << "stacked), title them all `ISS-#{issue['number']}: `, and record the extras with"
+      lines << "`dev issues fix #{issue['number']} --url ...`. A branch that does not START with `#{slug}` is"
+      lines << "invisible to the executor. See §1 of the standing instructions above."
+      lines << ""
       if resume_repo
         lines << "**This is a RESUME, not a fresh attempt.** `#{resume_repo}` is already cloned in your"
         lines << "workspace, checked out on `#{slug}` and rebased onto `origin/main`. An open PR exists"
         lines << "on that branch. Do NOT open a second PR and do NOT create a new branch: read the"
         lines << "comments below for what is being asked, address it, rerun codegen, push, and the PR"
-        lines << "updates in place. Close the issue out with `dev issues status` as usual."
+        lines << "updates in place. Close the issue out with `dev issues status` as usual. That bars"
+        lines << "re-opening THIS work on a fresh branch — not a genuinely independent additional PR,"
+        lines << "which still follows the `#{slug}_<suffix>` rule above."
       elsif prepared_repos.to_a.any?
         # The repos the issue named, already materialized (ISS-562). Named
         # explicitly rather than left for the session to discover, because a

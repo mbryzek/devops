@@ -625,14 +625,19 @@ module Agent
       workspace = Agent::Workspace.path(record.fetch("slug"))
       started = Time.parse(record.fetch("started_at"))
 
-      # Two lookups, not one, and the reason is ISS-365: the branch is only the
-      # branch the executor ASSIGNED, and a session that named its own branch
-      # instead is invisible to it. The `ISS-<n>: ` title prefix is the second,
-      # independent handle on the same PR — it was already proven as
-      # `dev issues reconcile`'s backstop, so the reap uses it directly rather
-      # than misclassifying now and being corrected hours later.
-      pr = Agent::Github.find_pr_in_workspace(workspace, branch, number) ||
-           Agent::Github.search_pr(branch, number)
+      # Three handles on the same work, not one, and each covers a way the others
+      # miss it: the branch the executor ASSIGNED (ISS-365 — a session that named
+      # its own branch is invisible to it), the `ISS-<n>: ` title prefix (already
+      # proven as `dev issues reconcile`'s backstop), and the assigned branch's
+      # `<branch>_<suffix>` FAMILY, because a run that produced several
+      # independent PRs put all but the first on a sibling branch (ISS-657).
+      #
+      # The whole list, not just the winner: classification takes the strongest
+      # PR, and everything else the session delivered is recorded on the issue
+      # below rather than dropped on the floor.
+      prs = Agent::Github.prs_in_workspace(workspace, branch, number)
+      prs = Agent::Github.search_prs(branch, number) if prs.empty?
+      pr = Agent::Github.primary_pr(prs, branch)
       plans = Agent::Github.plans_committed_since?(started)
       attempt = lease_attempts(number, identity)
 
@@ -645,7 +650,8 @@ module Agent
         timed_out: Agent::Jobs.timed_out?(record, now: @now),
         killed: record["killed"],
       )
-      decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status}): #{result.reason}")
+      siblings = prs.length > 1 ? " (#{prs.length} PRs found)" : ""
+      decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status})#{siblings}: #{result.reason}")
       return if @dry_run
 
       # RECLAIM FIRST, then release the lease. Everything `cleanup` reclaims is
@@ -656,7 +662,7 @@ module Agent
       # working tree out from under it. The window was always there for the
       # workspace delete; it is not worth widening it to a database drop.
       cleanup(record, result)
-      apply_outcome(number, record, result, identity)
+      apply_outcome(number, record, result, identity, prs)
       Agent::Jobs.finish(record, { "name" => result.name, "status" => result.status, "reason" => result.reason, "url" => result.url })
     end
 
@@ -670,7 +676,7 @@ module Agent
     # outcome a session declares for itself (§4.4), and a session that closed its
     # own issue out with `dev issues status --status fixed` has already reported
     # a truer answer than a re-classification would.
-    def apply_outcome(number, record, result, identity)
+    def apply_outcome(number, record, result, identity, prs = [])
       comment = "#{result.name} by #{hostname} — #{result.reason}"
 
       issue = begin
@@ -680,13 +686,53 @@ module Agent
       end
       if issue && issue["status"] != "claimed"
         Agent::Api.comment(number, "Session ended; issue already at `#{issue['status']}`. #{comment}", use_localhost: @use_localhost)
+        landed, already = issue["status"], fix_urls(issue)
       else
         Agent::Api.set_status(number, result.status, comment: comment, url: result.url, use_localhost: @use_localhost)
+        landed, already = result.status, fix_urls(issue) + [result.url]
       end
+      record_extra_fixes(number, prs, already) if SHIPPED_STATUSES.include?(landed)
 
       release_lease(record, identity)
       notify_outcome(number, result)
     end
+
+    # The statuses `POST /issues/:number/fixes` accepts: an issue that has not
+    # shipped has no fix to append to, and asking anyway is a 422.
+    SHIPPED_STATUSES = %w[fixed deployed verified].freeze
+
+    def fix_urls(issue) = Array(issue && issue["fixes"]).filter_map { |fix| fix["url"] }
+
+    # Every OTHER PR this run delivered, recorded as an additional fix (ISS-657).
+    #
+    # A status write carries exactly one url, so before this the reap could only
+    # ever name one PR — and a review run routinely ships five or six, each on a
+    # sibling branch, each independently mergeable. The rest were findable only by
+    # a human reading GitHub, which is the same as not findable: `dev issues show`
+    # and the deploy reconciler both read the fix list and nothing else.
+    #
+    # Merged or ready only. A draft is unfinished and a closed-unmerged PR shipped
+    # nothing; recording either as a fix would claim work that does not exist.
+    # `already` keeps the timeline quiet on a re-reap and on the urls the session
+    # recorded for itself — the endpoint dedupes the row, but not its note.
+    #
+    # Best-effort by construction: this is bookkeeping standing between the
+    # outcome write and the lease release, and no failure of it may cost the
+    # release — an unreleased lease strands the issue until it expires.
+    def record_extra_fixes(number, prs, already)
+      Array(prs).select { |pr| Agent::Github.merged?(pr) || Agent::Github.ready?(pr) }
+                .uniq { |pr| pr["url"] }
+                .reject { |pr| pr["url"].nil? || already.include?(pr["url"]) }
+                .each do |pr|
+        Agent::Api.record_fix(number, pr["url"], comment: "Also shipped in #{pr_label(pr)}.",
+                                                 use_localhost: @use_localhost)
+        log("recorded additional fix #{pr['url']} on ISS-#{number}")
+      rescue StandardError => e
+        log("could not record additional fix #{pr['url']} on ISS-#{number} (#{e.message})")
+      end
+    end
+
+    def pr_label(pr) = [pr["repository"], pr["number"]].compact.join("#").then { |l| l.empty? ? pr["url"] : l }
 
     def release_lease(record, identity)
       Agent::Api.release_lease(record["lease_id"], token: identity.token, use_localhost: @use_localhost)

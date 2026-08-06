@@ -164,12 +164,12 @@ class TestDevAgentOutcome < Minitest::Test
     refute Agent::Github.draft?(CLOSED_PR)
   end
 
-  def test_best_pr_prefers_merged_then_open_then_closed
-    assert_equal "MERGED", Agent::Github.best_pr([CLOSED_PR, MERGED_PR, READY_PR])["state"]
-    assert_equal "OPEN", Agent::Github.best_pr([CLOSED_PR, READY_PR])["state"]
-    assert_nil Agent::Github.best_pr([])
+  def test_primary_pr_prefers_merged_then_open_then_closed
+    assert_equal "MERGED", Agent::Github.primary_pr([CLOSED_PR, MERGED_PR, READY_PR])["state"]
+    assert_equal "OPEN", Agent::Github.primary_pr([CLOSED_PR, READY_PR])["state"]
+    assert_nil Agent::Github.primary_pr([])
     newer = READY_PR.merge("number" => 10)
-    assert_equal 10, Agent::Github.best_pr([READY_PR, newer])["number"]
+    assert_equal 10, Agent::Github.primary_pr([READY_PR, newer])["number"]
   end
 
   def test_success_predicate_drives_workspace_cleanup
