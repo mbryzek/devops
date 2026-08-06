@@ -76,6 +76,7 @@ INVOCATIONS = {
   "prune plans"         => 'prune plans [--days N] [--apply]',
   "browserslist update" => 'browserslist update [--app NAME] [--check] [--verbose] [--keep-tmp-dir]',
   "depsguard scan"      => 'depsguard [scan]',
+  "schema lint"         => 'schema [lint] [--app APP] [--repo-dir DIR]',
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
@@ -440,6 +441,18 @@ USAGE = <<~USAGE
         `depsguard`. It fixes nothing: the producer files unconditionally
         (ISS-525) and the claiming session runs this first, dismissing the issue
         on exit 0.
+
+    #{INVOCATIONS["schema lint"]}
+        Replay a schema repo's migration scripts, in the order sem-apply runs
+        them, and report any object created twice — the failure that halts sem
+        and blocks EVERY migration behind it, not just the pair that collided.
+        Pure text, no database, about a second over 900 scripts. With no --app it
+        lints every schema repo checked out under ~/code; inside a feature dir it
+        lints that clone, not Mike's. Exit 0 clean, 1 collisions found.
+        This is the check that was missing when platform-postgresql #506 and #507
+        merged 23 seconds apart, each creating issues.issue_intake_senders from a
+        different draft of the same DAO spec (ISS-592). It also runs by itself as
+        a preflight in `claude-db sync`, `db-image build` and `release-db`.
 
     #{INVOCATIONS["codegen sync"]}
         Regenerate every codegen-consuming repo against the latest generators and
@@ -971,7 +984,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -985,6 +998,7 @@ SUBCOMMANDS = {
   "prune"        => %w[plans],
   "browserslist" => %w[update],
   "depsguard"    => %w[scan],
+  "schema"       => %w[lint],
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
@@ -6104,6 +6118,64 @@ def cmd_depsguard_scan(args)
   exit result.exit_code
 end
 
+# ---------- schema ----------
+#
+# The classification lives in lib/schema_collisions.rb; this is app resolution
+# plus an exit code, the same shape as depsguard.
+#
+# Reads the checkout as it stands, and deliberately does not fetch: a session
+# lints the branch it is about to merge, and a command that quietly measured
+# something other than the tree in front of you would be worse than no command.
+def cmd_schema_lint(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  repo_dir = nil
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--repo-dir"
+      repo_dir = rest[i + 1]
+      usage_exit("--repo-dir requires a value", example: usage_for("schema lint")) if repo_dir.nil?
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+  reject_unknown_args("schema lint", leftover)
+  if repo_dir && app_filter.nil?
+    usage_exit("--repo-dir names one app's schema repo, so it needs --app too", example: usage_for("schema lint"))
+  end
+
+  apps = if app_filter
+           app = DbApp.resolve(:name => app_filter, :repo_dir => repo_dir)
+           usage_exit("Unknown app: #{app_filter}", example: usage_for("schema lint")) if app.nil?
+           [app]
+         else
+           # A schema repo the command was run from (or beside) is what the
+           # caller means, even unnamed. Failing that, every one checked out.
+           resolved = DbApp.resolve
+           resolved ? [resolved] : DbApp.all
+         end
+
+  # Every app is linted before the exit code is decided: one dirty schema repo
+  # must not hide the state of the next one.
+  colliding = apps.select do |app|
+    app.require_repo!
+    found = SchemaCollisions.scan(app.repo_dir)
+    if found.empty?
+      count = SchemaCollisions.scripts(app.repo_dir).length
+      puts "#{app.name}: #{count} script(s) in #{app.repo_dir} — no object created twice."
+    else
+      puts ""
+      puts SchemaCollisions.failure_message(app.repo_dir, found)
+    end
+    !found.empty?
+  end
+
+  exit 1 unless colliding.empty?
+end
+
 def cmd_docker_prune(args)
   opts = parse_docker_prune_args(args)
   apply = opts.apply
@@ -11043,6 +11115,12 @@ when "claude-usage"
   case sub
   when "top" then cmd_claude_usage_top(argv)
   else            unknown("claude-usage subcommand", sub, SUBCOMMANDS["claude-usage"])
+  end
+when "schema"
+  sub = resolve_subcommand(argv, default: "lint")
+  case sub
+  when "lint" then cmd_schema_lint(argv)
+  else             unknown("schema subcommand", sub, SUBCOMMANDS["schema"])
   end
 when "scripts"
   sub = resolve_subcommand(argv, default: "list")

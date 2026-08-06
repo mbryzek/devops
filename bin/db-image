@@ -335,6 +335,12 @@ def build_incremental(app, tag, committed, tmp)
       Util.run("git archive #{Shellwords.shellescape(tag)} scripts | tar -x -C #{Shellwords.shellescape(scripts_dir)}")
     end
 
+    # The tag's scripts as sem-apply will read them. A collision here fails the
+    # image build halfway through a scratch container, and the session that
+    # eventually pulls the image gets no clue why it is missing tables — so it
+    # is named up front instead (ISS-593).
+    SchemaCollisions.assert_none!(scripts_dir)
+
     puts "==> Running sem-apply for the delta scripts..."
     Dir.chdir(scripts_dir) do
       Util.run("sem-apply --url postgresql://#{app.role}@#{SCRATCH_HOST}:#{port}/#{app.database}")
