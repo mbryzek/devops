@@ -100,6 +100,16 @@ Retention (`dev agent gc`): tick logs 30 days; a terminal issue's
 directory 14 days; a failed or gave-up one 30 days — the post-mortem window;
 workspaces deleted on success and after 7 days otherwise.
 
+`dev agent gc` is the **sole** collector of workspaces, and `dev aidirs prune`
+skips every `i<issue>_<suffix>` directory for that reason (ISS-631). Two
+collectors sharing `~/code/ai` disagreed in both directions: prune has no notion
+of a running job, so it deleted a live session's workspace during the window
+between the mkdir and the first clone; and its 3-day cutoff was quietly deleting
+failed jobs' workspaces four days before the post-mortem window above says they
+go. The split is by NAME, which is true from the mkdir onward — a live-pid check
+would still miss that first window, because the job's pid file is written only
+after its repos are prepared.
+
 ## Housekeeping is runner-local, not a producer
 
 `agent gc`, `aidirs prune` and `docker prune` run once an hour inside the tick, on
