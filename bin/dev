@@ -10926,7 +10926,16 @@ def cmd_agent_doctor(args)
              elsif f.tool.optional? then "--  "
              else "MISS"
              end
-    detail = f.present? ? (f.version || f.path) : "not on the agent's PATH"
+    detail = if f.present?
+               f.version || f.path
+             elsif f.tool.absolute?
+               # Chrome is not a PATH binary, so "not on the agent's PATH" would
+               # send whoever is fixing this box editing .zprofile for a browser
+               # that is simply not installed (ISS-608).
+               "not installed at #{f.tool.paths.first}"
+             else
+               "not on the agent's PATH"
+             end
     puts "  #{status} #{f.tool.name.ljust(width)}  #{detail}"
   end
 

@@ -316,9 +316,20 @@ Enough to start without a survey. `~/code` holds independent repos; the
   that started you, launchd plists.
 - **API specs** live in `platform/spec/*.json` and are the contract; the
   generated clients in every consumer come from them.
+- **Seeing a UI change** — `browse <url>` screenshots a running page and dumps its
+  accessibility tree, and you should use it for anything whose deliverable is how
+  something looks. It ships in `devops/bin`, so it is on your PATH already; the
+  implementation and its full flag list are in `~/code/claude/tools/browse/`
+  (`--device mobile`, `--full-page`, `--click`, `--steps` for a multi-step flow).
+  It drives the system Google Chrome. **Do not reach for `npx playwright install`
+  when a browser seems to be missing** — the egress gateway 400s the Playwright
+  CDN, so it cannot download one here, and it exits 0 without saying so when a
+  half-extracted browser is already on disk. If `browse` reports a missing
+  prerequisite it names the command that fixes it; `dev agent doctor` shows the
+  same thing for the whole toolchain (ISS-608).
 
 **Read the rules that apply before writing code**:
-`~/code/.claude/rules/*.mdc` — `scala.general.mdc`, `scala.daos.mdc`,
+`~/code/claude/rules/*.mdc` — `scala.general.mdc`, `scala.daos.mdc`,
 `scala.known.unions.mdc` (match `Known*` exhaustively; never a wildcard or
 `UNDEFINED` arm), `apibuilder.general.mdc`, `database.general.mdc`,
 `sveltekit.mdc`, `elm.general.mdc`.

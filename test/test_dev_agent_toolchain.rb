@@ -117,6 +117,64 @@ class TestDevAgentToolchain < Minitest::Test
     end
   end
 
+  # ---- prerequisites that are not on PATH ------------------------------------
+  #
+  # Google Chrome lives inside an .app bundle and has never been on anybody's
+  # PATH, so a list that could only express "binary on PATH" would have had to
+  # leave out the browser `browse` actually launches — and then report a healthy
+  # machine that cannot render a page (ISS-608).
+
+  def abs_tool(name, path, required: true)
+    T::Tool.new(name: name, required_by: "#{name} things", producers: [],
+                install: "brew install --cask #{name}", required: required, paths: [path])
+  end
+
+  def test_a_tool_at_a_fixed_path_is_found_with_no_path_entry_at_all
+    Dir.mktmpdir do |dir|
+      app = File.join(dir, "Chrome.app", "Contents", "MacOS", "Google Chrome")
+      FileUtils.mkdir_p(File.dirname(app))
+      File.write(app, "#!/bin/sh\n")
+      File.chmod(0755, app)
+
+      result = T.check(tools: [abs_tool("google-chrome", app)], path: "", versions: false)
+      assert result.ok?
+      assert_equal app, result.found.first.path
+    end
+  end
+
+  def test_a_tool_absent_from_its_fixed_path_is_missing
+    Dir.mktmpdir do |dir|
+      result = T.check(tools: [abs_tool("google-chrome", File.join(dir, "nope"))],
+                       path: "", versions: false)
+      refute result.ok?
+      assert_equal %w[google-chrome], result.missing_required.map(&:name)
+    end
+  end
+
+  # The inversion that makes the fixed path worth having: a same-named binary
+  # sitting on PATH must NOT satisfy it. Playwright launches `channel: "chrome"`
+  # by absolute path, so a `google-chrome` shim on PATH would make the doctor
+  # green on a machine where browse still cannot start a browser.
+  def test_a_same_named_binary_on_path_does_not_satisfy_a_fixed_path_tool
+    with_path("google-chrome") do |dir|
+      result = T.check(tools: [abs_tool("google-chrome", File.join(dir, "not-the-app"))],
+                       path: dir, versions: false)
+      refute result.ok?, "resolved off PATH instead of the bundle path browse actually launches"
+    end
+  end
+
+  # "not on the agent's PATH" is the wrong thing to tell someone whose Chrome is
+  # simply not installed — it sends them editing .zprofile.
+  def test_the_issue_body_says_where_a_fixed_path_tool_was_looked_for
+    Dir.mktmpdir do |dir|
+      missing = File.join(dir, "Google Chrome")
+      result = T.check(tools: [abs_tool("google-chrome", missing)], path: "", versions: false)
+      body = T.issue_body(result, "mac-1")
+      assert_includes body, missing
+      assert_includes body, "not on PATH"
+    end
+  end
+
   # ---- required vs optional --------------------------------------------------
 
   # `openclaw` is best-effort by construction (Agent::Notify swallows its
@@ -245,6 +303,42 @@ class TestDevAgentToolchain < Minitest::Test
     api = T::TOOLS.find { |t| t.name == "api" }
     refute_nil api, "codegen sync shells out to `api`; a runner without it regenerates nothing"
     assert api.required?, "a missing `api` fails the whole sweep, not one optional feature"
+  end
+
+  # The visual-inspection path (ISS-608). Both halves are declared or the gap
+  # goes silent again in the exact way it was silent before: `browse` was
+  # `command not found` on the runners for the whole life of CLAUDE.md's "Visual
+  # Inspection" section, and this doctor reported "all required tools present" on
+  # that machine — because a session that cannot render a page does not fail, it
+  # ships a layout change nobody looked at.
+  def test_the_visual_inspection_path_is_declared
+    browse = T::TOOLS.find { |t| t.name == "browse" }
+    refute_nil browse, "without `browse` a UI session verifies a change it never saw, silently"
+    assert browse.required?
+
+    chrome = T::TOOLS.find { |t| t.name == "google-chrome" }
+    refute_nil chrome, "`browse` on PATH is only half of it — it still needs a browser to drive"
+    assert chrome.required?
+  end
+
+  # Copied from playwright-core's registry, not guessed: this is the literal path
+  # Playwright resolves `channel: "chrome"` to on darwin, which is what browse.mjs
+  # launches. If someone "tidies" it to a directory or a PATH lookup, the doctor
+  # goes green on a machine where browse cannot start.
+  def test_chromes_probe_is_the_path_playwright_actually_launches
+    chrome = T::TOOLS.find { |t| t.name == "google-chrome" }
+    assert chrome.absolute?, "Chrome is an .app bundle; a PATH scan reports it missing everywhere"
+    assert_equal ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"], chrome.paths
+  end
+
+  # Chrome's install must not be `npx playwright install`. On this fleet the
+  # egress gateway 400s cdn.playwright.dev, so that command cannot fetch a browser
+  # — and it exits 0 anyway when a half-extracted one is already on disk, which is
+  # how ISS-608 lost twenty minutes to a SIGABRT about a missing dylib.
+  def test_chrome_is_installed_from_the_cask_not_from_the_playwright_cdn
+    chrome = T::TOOLS.find { |t| t.name == "google-chrome" }
+    assert_includes chrome.install, "--cask google-chrome"
+    refute_includes chrome.install, "playwright"
   end
 
   def test_every_tool_carries_an_install_command_and_a_reason

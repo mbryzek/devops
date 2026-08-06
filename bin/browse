@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+# browse — screenshot + accessibility tree of a running web app, so a session can
+# SEE the UI change it just made rather than infer it from unit tests.
+#
+# Usage:
+#   browse <url> [options]        # every flag is browse.mjs's; run --help for them
+#
+# This is a launcher, not the tool. The implementation lives in the claude repo
+# (tools/browse/browse.mjs) and is unchanged by this; what lives here is the one
+# thing that was missing on the runners — a copy of it on the PATH the agent
+# actually has. ~/code/devops/bin is on that PATH by construction, so shipping the
+# launcher beside `api` and `dev` reaches every machine with nothing to install.
+#
+# See lib/browse.rb for what is checked before exec and why (ISS-608).
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+reason = Browse.blocking_reason
+unless reason.nil?
+  warn Browse.message(:reason => reason)
+  exit 1
+end
+
+# exec, not system: browse.mjs owns the exit status, stdout and stderr from here,
+# and a wrapper that buffered them would hide the console errors the tool reports.
+exec("node", Browse.impl_path, *ARGV)
