@@ -1,0 +1,109 @@
+#!/usr/bin/env ruby
+require 'minitest/autorun'
+require_relative 'test_helper'
+load File.expand_path('../bin/dev', __dir__)
+
+# Covers the single-workflow view of `dev autonomy workflows KEY` — the command a
+# playbook tells an autonomous loop to read its OWN envelope from before it acts.
+#
+# The property under test is that the rendering is total: every field the ledger
+# returns on the envelope reaches the output. A hand-picked printer fails silently
+# here, because an omitted field and an unset one look exactly alike, and the loop
+# reading it has no way to tell "gated at reversible" from "not gated at all"
+# (ISS-662 — max_reversibility was never printed at all).
+class TestDevAutonomyWorkflows < Minitest::Test
+  include DevTestSupport
+
+  def envelope(allowed_repos: [], max_diff_lines: nil, required_assertions: [], max_reversibility: nil)
+    { "allowed_repos" => allowed_repos, "max_diff_lines" => max_diff_lines,
+      "required_assertions" => required_assertions, "max_reversibility" => max_reversibility }
+  end
+
+  def workflow(env = envelope)
+    { "key" => "pr_auto_merge", "mode" => "dry_run", "description" => "Merge PRs that are green",
+      "envelope" => env,
+      "budget" => { "max_decisions_per_day" => nil, "max_auto_approved_per_day" => nil } }
+  end
+
+  def show(env)
+    capture_stdout do
+      with_stubbed_api("GET /autonomy/workflows/pr_auto_merge" => workflow(env)) do
+        cmd_autonomy_workflows(["pr_auto_merge"])
+      end
+    end
+  end
+
+  # The bug: the gate this workflow actually turns on was the one field the view
+  # never showed.
+  def test_prints_the_reversibility_ceiling_it_is_gated_at
+    out = show(envelope(max_reversibility: "costly"))
+    assert_match(/^  max rev:    costly and below/, out)
+  end
+
+  # ...and says so as a ceiling. "costly" alone reads as "costly decisions only",
+  # which would have the loop hold every trivial one.
+  def test_spells_out_the_reversibility_ordering
+    assert_includes show(envelope(max_reversibility: "reversible")),
+                    "trivial < reversible < costly < irreversible"
+  end
+
+  # Absent is permissive, not restrictive — the distinction the omission erased.
+  def test_says_when_reversibility_does_not_gate_at_all
+    assert_match(/^  max rev:    does not gate$/, show(envelope))
+  end
+
+  # An empty allowed_repos is "every repo", which a playbook that treats the list
+  # as its work list reads backwards as "no repos" (the ISS-659 run enumerated
+  # every mbryzek repo off this line).
+  def test_an_empty_repo_list_says_it_is_not_a_work_list
+    out = show(envelope)
+    assert_match(/^  repos:      unrestricted — the envelope names no repos, so it is not a work list$/, out)
+  end
+
+  def test_renders_the_constrained_envelope
+    out = show(envelope(allowed_repos: %w[devops platform], max_diff_lines: 400,
+                        required_assertions: %w[ci_green no_schema_migration],
+                        max_reversibility: "trivial"))
+    assert_match(/^  repos:      devops, platform$/, out)
+    assert_match(/^  max diff:   400$/, out)
+    assert_match(/^  asserts:    ci_green, no_schema_migration$/, out)
+    assert_match(/^  max rev:    trivial and below/, out)
+  end
+
+  # The regression guard for the whole class of bug: a field added to
+  # autonomy_envelope that nobody taught this printer about still reaches the
+  # output. Ugly beats invisible — invisible is what shipped for ISS-662.
+  def test_a_field_the_printer_does_not_know_is_still_printed
+    out = show(envelope.merge("max_repos_per_run" => 3, "allowed_hours" => []))
+    assert_match(/^  max_repos_per_run: 3$/, out)
+    assert_match(/^  allowed_hours: not set$/, out)
+  end
+
+  # Unchanged neighbours: the header and the budget line still frame the envelope.
+  def test_still_prints_the_mode_and_the_budget
+    out = show(envelope)
+    assert_match(/^pr_auto_merge \(dry_run\)$/, out)
+    assert_match(/^  budget:     - decisions\/day, - auto-approved\/day$/, out)
+  end
+
+  # A malformed or partial envelope must not take the command down: a loop that
+  # cannot read its gate has to see the gate missing, not a stack trace.
+  def test_a_missing_envelope_renders_every_field_as_unset
+    out = capture_stdout do
+      with_stubbed_api("GET /autonomy/workflows/pr_auto_merge" => workflow(nil)) do
+        cmd_autonomy_workflows(["pr_auto_merge"])
+      end
+    end
+    assert_match(/^  max rev:    does not gate$/, out)
+    assert_match(/^  asserts:    none$/, out)
+  end
+
+  # The list view is a different shape and is not what a loop reads its gate from.
+  def test_the_list_view_is_one_line_per_workflow
+    out = capture_stdout do
+      rows = [workflow.merge("stats" => { "decisions_today" => 66, "blocked_today" => 0, "pending" => 2 })]
+      with_stubbed_api("GET /autonomy/workflows?limit=100" => rows) { cmd_autonomy_workflows([]) }
+    end
+    assert_match(/^pr_auto_merge\s+dry_run\s+decisions today 66\s+blocked 0\s+pending 2$/, out)
+  end
+end
