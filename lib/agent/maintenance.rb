@@ -4,7 +4,8 @@ require 'agent/gc'
 require 'agent/paths'
 
 # Runner-local housekeeping (ISS-520): collect this machine's agent logs, prune
-# this machine's feature dirs, prune this machine's Docker images.
+# this machine's feature dirs, reap this machine's session databases and the
+# containers left holding none (ISS-588), prune this machine's Docker images.
 #
 # WHY THIS IS NOT A PRODUCER. `agent-gc`, `aidirs-prune` and `docker-prune` were
 # registered as producers, which means they ran behind the platform's daily
@@ -98,11 +99,33 @@ module Agent
     PRESSURE_AIDIRS_DAYS = 1
     PRESSURE_DOCKER_DAYS = 1
 
+    # `claude-db gc`'s window, and the one number here that does NOT shorten
+    # under pressure (ISS-588).
+    #
+    # What this chore reclaims is session databases and, once a container holds
+    # none, that container and its host port — and ports are the scarce resource,
+    # not bytes. A Postgres container is a couple of hundred MB, so shortening
+    # this window buys almost no disk while making the one destructive chore on
+    # the machine reach into MORE of other people's live work: everything else
+    # here deletes something reproducible (an image re-pulls, a feature dir
+    # re-clones), and a dropped session database is a session's test data, gone.
+    # A machine short of ports is not helped by a shorter window either — it is
+    # helped by this running at all, which before ISS-588 it never did.
+    #
+    # 3 days matches `claude-db`'s own DEFAULT_GC_DAYS, deliberately: this is the
+    # exact command a human already runs by hand off the port-exhaustion message
+    # in `claude-db next-port`, on a cadence instead of after the range is full.
+    # The constant is restated rather than read from `bin/claude-db` because
+    # `dev` does not load that file; the flag is passed explicitly so the two
+    # cannot silently disagree about what ran.
+    CLAUDE_DB_GC_DAYS = 3
+
     # Agent::Errors sources. Fixed strings rather than derived, for the same
     # reason CHECKOUT_PULL_ERROR_SOURCE is: the recorder, the streak count and
     # the escalation must all agree on what they are counting.
     GC_SOURCE = "agent_gc".freeze
     AIDIRS_SOURCE = "aidirs_prune".freeze
+    CLAUDE_DB_SOURCE = "claude_db_gc".freeze
     DOCKER_SOURCE = "docker_prune".freeze
 
     # One chore's result. `ok` false is what the tick records against
@@ -194,27 +217,34 @@ module Agent
     def plan(trigger, now: Time.now)
       entries = Agent::Gc.plan(now: now, workspace_days: workspace_days(trigger))
       ["#{GC_SOURCE}: collect #{entries.length} path(s) (workspaces kept #{workspace_days(trigger)} day(s))",
-       "#{AIDIRS_SOURCE}: #{shell_command(AIDIRS_SOURCE, trigger).join(' ')}",
-       "#{DOCKER_SOURCE}: #{shell_command(DOCKER_SOURCE, trigger).join(' ')}"]
+       *SHELL_SOURCES.map { |source| "#{source}: #{shell_command(source, trigger).join(' ')}" }]
     end
 
     # ---- running ----
 
-    # THIS checkout's `dev`, never whatever `dev` is on PATH. The tick
-    # fast-forwards Agent::Paths.devops_repo on every Phase A and then runs out
-    # of it; a chore that shelled out to a different copy would be running code
-    # nothing here updates.
-    def dev_bin = File.join(Agent::Paths.devops_repo, "bin", "dev")
+    # Every command run through `run_shell`, in the order `run` runs them —
+    # cheapest first, and `claude-db gc` before `docker prune` because gc is what
+    # REMOVES the emptied session containers that docker prune then reclaims the
+    # space of. Both binaries are THIS checkout's (Agent::Paths), never whatever
+    # is on PATH.
+    #
+    # Every one of these carries `--apply`. That is the whole of ISS-588: the
+    # only automatic caller of `claude-db gc` in the fleet passed no such flag,
+    # and gc has been dry-run-by-default since e87d89e — so nothing on any runner
+    # ever reclaimed a session database, and ports were freed only when a human
+    # noticed the range was full and ran the command by hand.
+    SHELL_SOURCES = [AIDIRS_SOURCE, CLAUDE_DB_SOURCE, DOCKER_SOURCE].freeze
 
     def shell_command(source, trigger)
       case source
-      when AIDIRS_SOURCE then [dev_bin, "aidirs", "prune", "--days", aidirs_days(trigger).to_s, "--apply"]
-      when DOCKER_SOURCE then [dev_bin, "docker", "prune", "--days", docker_days(trigger).to_s, "--apply"]
+      when AIDIRS_SOURCE then [Agent::Paths.dev_bin, "aidirs", "prune", "--days", aidirs_days(trigger).to_s, "--apply"]
+      when CLAUDE_DB_SOURCE then [Agent::Paths.claude_db_bin, "gc", "--days", CLAUDE_DB_GC_DAYS.to_s, "--apply"]
+      when DOCKER_SOURCE then [Agent::Paths.dev_bin, "docker", "prune", "--days", docker_days(trigger).to_s, "--apply"]
       end
     end
 
-    # Runs every chore, and keeps going when one fails: three independent chores
-    # on three independent resources, so a broken Docker daemon must not also
+    # Runs every chore, and keeps going when one fails: independent chores on
+    # independent resources, so a broken Docker daemon must not also
     # stop the log collection. Each failure is reported on its own source, which
     # is what lets Agent::Errors count a streak per chore rather than per run.
     #
@@ -222,7 +252,7 @@ module Agent
     # machine sleeps) has still done the free work.
     def run(now: Time.now, trigger: :cadence)
       free_before, total = disk
-      outcomes = [run_gc(now, trigger), run_shell(AIDIRS_SOURCE, trigger), run_shell(DOCKER_SOURCE, trigger)]
+      outcomes = [run_gc(now, trigger), *SHELL_SOURCES.map { |source| run_shell(source, trigger) }]
       free_after, total_after = disk
       result = Result.new(
         trigger: trigger, at: now, outcomes: outcomes,

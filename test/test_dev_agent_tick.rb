@@ -87,12 +87,97 @@ class TestDevAgentTick < Minitest::Test
   # The value is CredentialsGuard's stand-in, not a real secret.
   def test_a_spawned_session_is_given_the_external_api_credentials
     with_agent_home do
-      env = tick.send(:child_env)
+      env = tick.send(:child_env, "i707_abc")
       assert_equal "stub-PLAYBOOK_CLAUDE_KEY", env["PLAYBOOK_CLAUDE_KEY"]
       refute_includes env.keys, "ANTHROPIC_API_KEY",
                       "that variable reconfigures the `claude` CLI the session runs as"
       # ...without displacing what was already there.
       assert_equal Agent::Paths.githooks_dir, env["GIT_CONFIG_VALUE_0"]
+    end
+  end
+
+  # The runner NAMES the session it spawns, and that name is the whole mechanism
+  # the post-session database reclamation below rests on (ISS-588): `claude-db`
+  # derives a session's database names from CLAUDE_SESSION_ID, so a runner that
+  # set it can drop exactly that session's databases when the process dies —
+  # with no age cutoff, and no way to reach another session's data.
+  def test_a_spawned_session_is_named_after_its_workspace
+    with_agent_home do
+      assert_equal "i707_abc", tick.send(:child_env, "i707_abc")["CLAUDE_SESSION_ID"]
+    end
+  end
+
+  # ---- what a dead session leaves behind ----
+
+  # The line this replaces was `claude-db gc` with NO `--apply`, and gc has been
+  # dry-run-by-default since e87d89e: it sampled, wrote a plan to /dev/null and
+  # exited 0, so no runner in the fleet ever reclaimed a session database
+  # (ISS-588). `--apply` would have been the wrong repair here — gc reaps on AGE
+  # across every session on the machine, and the database this session just
+  # abandoned is minutes old. `end` names one session and takes only its data.
+  def test_a_dead_session_has_its_own_databases_dropped_by_name
+    with_agent_home do
+      seen = []
+      stub_singleton(Open3, :capture2e, lambda { |*args|
+        seen << args
+        ["", Struct.new(:success?, :exitstatus).new(true, 0)]
+      }) do
+        capture_stdout { tick(dry_run: false).send(:drop_session_databases, "i707_abc") }
+      end
+
+      env, *cmd = seen.fetch(0)
+      assert_equal "i707_abc", env["CLAUDE_SESSION_ID"], "the reap must name the session that died"
+      assert_equal [Agent::Paths.claude_db_bin, "end"], cmd
+      refute_includes cmd, "gc", "gc reaps on age across every session — never from this call site"
+    end
+  end
+
+  # Everything `cleanup` reclaims is keyed by the slug, and the slug is reused
+  # verbatim when the issue is resumed — so a lease released first opens a window
+  # in which the next claim starts a session on that slug while this reap is
+  # still dropping its database and deleting its working tree underneath it.
+  def test_the_reap_reclaims_before_it_releases_the_lease
+    with_agent_home do
+      register_identity
+      order = []
+      subject = tick(dry_run: false)
+      record = Agent::Jobs.write("issue" => 707, "pid" => 999_999, "slug" => "i707_abc", "branch" => "i707_abc",
+                                 "lease_id" => "lse-1", "started_at" => (Time.now - 60).utc.iso8601,
+                                 "timeout_at" => (Time.now + 3600).utc.iso8601)
+      stubs = {
+        Agent::Github => { find_pr_in_workspace: ->(*) { nil }, search_pr: ->(*) { nil },
+                           plans_committed_since?: ->(*) { false } },
+        Agent::Api => { issue_lease_history: ->(*) { [] } },
+        subject => { cleanup: ->(*) { order << :cleanup }, apply_outcome: ->(*) { order << :apply_outcome } },
+      }
+      with_stubbed_methods(stubs) do
+        capture_stdout { subject.send(:reap_one, record, Agent::Host.cached_identity) }
+      end
+      assert_equal %i[cleanup apply_outcome], order
+    end
+  end
+
+  # stub_singleton, applied to a whole table at once — six nested blocks say
+  # nothing the table does not.
+  def with_stubbed_methods(table, &block)
+    stub_each(table.flat_map { |obj, methods| methods.map { |name, impl| [obj, name, impl] } }, &block)
+  end
+
+  def stub_each(pairs, &block)
+    return block.call if pairs.empty?
+    obj, name, impl = pairs.first
+    stub_singleton(obj, name, impl) { stub_each(pairs.drop(1), &block) }
+  end
+
+  # A machine with no Docker running still has an outcome to record and a lease
+  # to release, and the hourly `claude-db gc` is the backstop for whatever this
+  # could not drop. What must NOT happen is the tick dying here.
+  def test_a_failing_database_reap_is_logged_and_does_not_stop_the_reap
+    with_agent_home do
+      stub_singleton(Open3, :capture2e, ->(*) { raise Errno::ENOENT, "claude-db" }) do
+        out = capture_stdout { tick(dry_run: false).send(:drop_session_databases, "i707_abc") }
+        assert_match(/claude-db end for i707_abc failed/, out)
+      end
     end
   end
 
@@ -1000,7 +1085,7 @@ class TestDevAgentTick < Minitest::Test
       }) do
         with_stubbed_api({}) { capture_stdout { tick(dry_run: false).run_maintenance } }
       end
-      assert_equal [Agent::Maintenance::AIDIRS_SOURCE, Agent::Maintenance::DOCKER_SOURCE], ran
+      assert_equal Agent::Maintenance::SHELL_SOURCES, ran
       refute_nil Agent::Maintenance.last_run_at, "the pass must stamp its own marker"
     end
   end

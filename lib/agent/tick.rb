@@ -578,9 +578,16 @@ module Agent
       decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status}): #{result.reason}")
       return if @dry_run
 
+      # RECLAIM FIRST, then release the lease. Everything `cleanup` reclaims is
+      # keyed by the slug, and the slug is reused verbatim when this issue is
+      # resumed — so releasing the lease first opens a window in which the next
+      # claim (this runner's own next tick, or another runner's) starts a session
+      # on that slug while this one is still deleting its database and its
+      # working tree out from under it. The window was always there for the
+      # workspace delete; it is not worth widening it to a database drop.
+      cleanup(record, result)
       apply_outcome(number, record, result, identity)
       Agent::Jobs.finish(record, { "name" => result.name, "status" => result.status, "reason" => result.reason, "url" => result.url })
-      cleanup(record, result)
     end
 
     def lease_attempts(number, identity)
@@ -643,13 +650,48 @@ module Agent
     end
 
     def cleanup(record, result)
-      # Session databases outlive a dead process. `gc` (not `end`) is the right
-      # primitive here: `end` drops the CALLING session's database, and the
-      # session that created it is exactly the process that just died. `gc` drops
-      # session databases with no active backend and always preserves live ones.
-      system("claude-db", "gc", out: File::NULL, err: File::NULL)
+      drop_session_databases(record.fetch("slug"))
       return unless Agent::Outcome.success?(result)
       Agent::Workspace.delete(record.fetch("slug"))
+    rescue StandardError => e
+      # Reclamation runs BEFORE the lease is released (see `reap_one`), so it must
+      # never be the thing that stops an outcome being recorded. A workspace this
+      # tick could not delete is one the hourly workspace GC takes later; an
+      # unreleased lease is an issue nobody can claim.
+      log("cleanup for #{record['slug']} failed: #{e.class}: #{e.message}")
+    end
+
+    # The dead session's OWN databases, dropped by name, immediately.
+    #
+    # This was `claude-db gc` with no `--apply`, which reclaimed nothing at all:
+    # gc has been dry-run-by-default since e87d89e, so the line sampled, wrote a
+    # plan to /dev/null and exited 0 for the whole life of the fleet (ISS-588).
+    # Passing `--apply` here would have been the wrong repair. gc reaps on AGE,
+    # across every session on the machine, and the database this session just
+    # abandoned is minutes old — so the one thing this call site is in a position
+    # to reclaim is exactly the thing an age cutoff must never take, while
+    # everything an age cutoff SHOULD take has nothing to do with the session
+    # that happened to die just now.
+    #
+    # Split by what each caller can know, then. Here: `end`, which drops the
+    # databases of ONE session id and touches nothing else. The runner NAMES the
+    # session it spawns (CLAUDE_SESSION_ID in `child_env`), so the runner can
+    # name it again to reclaim it — no cutoff, no sampling, and no way to reach
+    # another session's data even if this one ran for a week. Fleet-wide
+    # reclamation — databases from sessions that never reached this line, and the
+    # containers and ports left holding none — is age-based and belongs on a
+    # cadence, so it runs hourly in Agent::Maintenance instead.
+    #
+    # Failure is logged rather than raised: a machine with no Docker running
+    # still has an outcome to record and a lease to release, and the hourly gc is
+    # the backstop for whatever this could not drop.
+    def drop_session_databases(slug)
+      out, status = Open3.capture2e({ "CLAUDE_SESSION_ID" => slug },
+                                    Agent::Paths.claude_db_bin, "end")
+      return if status.success?
+      log("claude-db end for #{slug} exited #{status.exitstatus}: #{Agent::Maintenance.tail(out)}")
+    rescue StandardError => e
+      log("claude-db end for #{slug} failed: #{e.class}: #{e.message}")
     end
 
     # ---- claim ----
@@ -746,7 +788,7 @@ module Agent
                                    workspace: workspace, resume_repo: resume_repo,
                                    prepared_repos: prepared, playbook: playbook)
       pid = Agent::Jobs.spawn_session(argv: @claude_argv, prompt: prompt, workspace: workspace,
-                                      number: number, env: child_env)
+                                      number: number, env: child_env(slug))
       Agent::Jobs.write(
         "issue" => number,
         "pid" => pid,
@@ -825,8 +867,17 @@ module Agent
     # the spawn and nowhere else. What the session is TOLD about them (present
     # or absent, and why) is `Agent::Credentials.check`, which carries no values
     # and is rendered into the prompt by Agent::Prompt.
-    def child_env
+    # CLAUDE_SESSION_ID is set by the RUNNER, not left to the session, and that is
+    # what makes the reclamation in `cleanup` possible: `claude-db` names a
+    # session's databases after this variable (falling back to the ~/code/ai
+    # directory name), so a runner that names the session can drop exactly that
+    # session's databases when its process dies, without a cutoff and without
+    # touching anyone else's. Left unset it currently resolves to the same string
+    # via the workspace fallback — but only for as long as every session's cwd
+    # stays inside its workspace, which is not something this code controls.
+    def child_env(slug)
       {
+        "CLAUDE_SESSION_ID" => slug,
         "GIT_CONFIG_COUNT" => "1",
         "GIT_CONFIG_KEY_0" => "core.hooksPath",
         "GIT_CONFIG_VALUE_0" => Agent::Paths.githooks_dir,
