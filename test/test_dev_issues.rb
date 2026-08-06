@@ -1639,19 +1639,36 @@ class TestDevIssues < Minitest::Test
     )
   end
 
+  # Answer the deploy pass's merge lookup from a map of url => state, so no test
+  # shells out to `gh` — these urls name real PRs in the real org, and left
+  # unstubbed the assertions would swing on whoever merged what today. A url the
+  # map does not mention reads as unreadable-from-GitHub, which is the fail-closed
+  # case.
+  def with_fix_pr_states(states, &block)
+    with_stubbed_function(:issue_fix_pr, lambda { |url|
+      state = states[url]
+      state && { "url" => url, "state" => state.to_s.upcase, "isDraft" => false }
+    }, &block)
+  end
+
+  # The overwhelmingly common shape: one devops PR, merged.
+  def with_merged_fix_pr(url, &block) = with_fix_pr_states({ url => "merged" }, &block)
+
   # ISS-131's own shape: marked fixed by hand with a devops PR, then stranded,
   # because before ISS-136 this branch skipped everything with no app.
   def test_deploy_pass_promotes_a_hand_recorded_fix_in_a_repo_that_releases_nothing
     out, = capture_io do
       with_merged_prs({}) do
-        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
-                         "GET #{issues_list_path(statuses: 'fixed')}" =>
-                           [fixed_via_pr("https://github.com/mbryzek/devops/pull/248")]) do
-          cmd_issues_reconcile([])
+        with_merged_fix_pr("https://github.com/mbryzek/devops/pull/248") do
+          with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                           "GET #{issues_list_path(statuses: 'fixed')}" =>
+                             [fixed_via_pr("https://github.com/mbryzek/devops/pull/248")]) do
+            cmd_issues_reconcile([])
+          end
         end
       end
     end
-    assert_match(/would deploy ISS-034: devops releases nothing/, out)
+    assert_match(/would deploy ISS-034: devops releases nothing and devops#248 merged/, out)
     assert_match(/1 would deploy, 0 skipped, 1 fixed total\./, out)
     refute_match(/advance manually/, out)
   end
@@ -1661,15 +1678,17 @@ class TestDevIssues < Minitest::Test
   def test_deploy_pass_apply_records_the_merge_is_the_release_transition
     out, = capture_io do
       with_merged_prs({}) do
-        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
-                         "GET #{issues_list_path(statuses: 'fixed')}" =>
-                           [fixed_via_pr("https://github.com/mbryzek/devops/pull/248")],
-                         "PUT #{issues_path('/034/status')}" => graph_issue.merge("status" => "deployed")) do
-          cmd_issues_reconcile(["--apply"])
+        with_merged_fix_pr("https://github.com/mbryzek/devops/pull/248") do
+          with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                           "GET #{issues_list_path(statuses: 'fixed')}" =>
+                             [fixed_via_pr("https://github.com/mbryzek/devops/pull/248")],
+                           "PUT #{issues_path('/034/status')}" => graph_issue.merge("status" => "deployed")) do
+            cmd_issues_reconcile(["--apply"])
+          end
         end
       end
     end
-    assert_match(/deployed ISS-034: devops releases nothing/, out)
+    assert_match(/deployed ISS-034: devops releases nothing and devops#248 merged/, out)
     assert_match(/1 deployed, 0 skipped, 1 fixed total\./, out)
   end
 
@@ -1761,18 +1780,24 @@ class TestDevIssues < Minitest::Test
   def test_deploy_pass_promotes_only_when_no_fix_repo_releases_anything
     out, = capture_io do
       with_merged_prs({}) do
-        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
-                         "GET #{issues_list_path(statuses: 'fixed')}" => [
-                           fixed_via_fixes(
-                             { "url" => "https://github.com/mbryzek/devops/pull/313" },
-                             { "url" => "https://github.com/mbryzek/schema-evolution-manager/pull/9" },
-                           ),
-                         ]) do
-          cmd_issues_reconcile([])
+        with_fix_pr_states("https://github.com/mbryzek/devops/pull/313" => "merged",
+                           "https://github.com/mbryzek/schema-evolution-manager/pull/9" => "merged") do
+          with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                           "GET #{issues_list_path(statuses: 'fixed')}" => [
+                             fixed_via_fixes(
+                               { "url" => "https://github.com/mbryzek/devops/pull/313" },
+                               { "url" => "https://github.com/mbryzek/schema-evolution-manager/pull/9" },
+                             ),
+                           ]) do
+            cmd_issues_reconcile([])
+          end
         end
       end
     end
-    assert_match(/would deploy ISS-034: devops and schema-evolution-manager release nothing/, out)
+    assert_match(
+      /would deploy ISS-034: devops and schema-evolution-manager release nothing and devops#313, schema-evolution-manager#9 merged/,
+      out
+    )
   end
 
   def test_deploy_pass_skips_when_one_fix_repo_still_releases
@@ -1791,6 +1816,141 @@ class TestDevIssues < Minitest::Test
     end
     assert_match(/skip ISS-034: acumen releases, but no app was recorded/, out)
     refute_match(/would deploy/, out)
+  end
+
+  # ---- deploy pass: the merge that IS the release has to have happened ----
+  #
+  # ISS-652. `fixed` does not mean merged here — agent/instructions.md §1 has every
+  # session record `fixed` the moment its PR is READY — so the merge-is-the-release
+  # shortcut above was promoting devops issues whose PR was still open, and the
+  # 7-day auto-verify then closed them out as verified without the code ever
+  # landing. Five issues were one `--apply` away from exactly that on 2026-08-06.
+
+  def reconcile_one_fixed_issue(issue, states)
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(states) do
+          with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                           "GET #{issues_list_path(statuses: 'fixed')}" => [issue]) do
+            cmd_issues_reconcile([])
+          end
+        end
+      end
+    end
+    out
+  end
+
+  def test_deploy_pass_waits_on_a_fix_whose_pr_is_still_open
+    url = "https://github.com/mbryzek/devops/pull/358"
+    out = reconcile_one_fixed_issue(fixed_via_pr(url), url => "open")
+    assert_match(/waiting  ISS-034: devops releases nothing, but devops#358 is still open/, out)
+    refute_match(/would deploy/, out)
+    refute_match(/Re-run with --apply/, out)
+  end
+
+  # A PR closed without merging is not a release either — and it is not a wait a
+  # human has to be told about twice, so it reads the same way.
+  def test_deploy_pass_waits_on_a_fix_whose_pr_was_closed_unmerged
+    url = "https://github.com/mbryzek/devops/pull/248"
+    out = reconcile_one_fixed_issue(fixed_via_pr(url), url => "closed")
+    assert_match(/waiting  ISS-034: devops releases nothing, but devops#248 was closed without merging/, out)
+    refute_match(/would deploy/, out)
+  end
+
+  # Silence must not advance a fix: `gh` missing, unauthenticated or rate-limited
+  # leaves the issue at `fixed` and says so, rather than taking the unknown as a
+  # merge. The next run recovers on its own.
+  def test_deploy_pass_leaves_a_fix_alone_when_github_cannot_be_read
+    url = "https://github.com/mbryzek/devops/pull/358"
+    out = reconcile_one_fixed_issue(fixed_via_pr(url), {})
+    assert_match(%r{skip ISS-034: could not read devops#358 from GitHub — leaving it fixed}, out)
+    refute_match(/would deploy/, out)
+  end
+
+  # A still-OPEN fix blocks even when an earlier one merged: half the fix on main
+  # is not the release, and the open PR is the half nobody has reviewed.
+  def test_deploy_pass_waits_when_any_recorded_fix_is_still_open
+    merged = "https://github.com/mbryzek/devops/pull/313"
+    open_pr = "https://github.com/mbryzek/devops/pull/358"
+    out = reconcile_one_fixed_issue(
+      fixed_via_fixes({ "url" => merged }, { "url" => open_pr }),
+      merged => "merged", open_pr => "open"
+    )
+    assert_match(/waiting  ISS-034: devops releases nothing, but devops#358 is still open/, out)
+  end
+
+  # But a superseded attempt that was CLOSED unmerged must not strand the issue
+  # whose replacement landed — that would be the invisible-forever failure the
+  # adoption pass exists to prevent, reached from the other end.
+  def test_deploy_pass_promotes_when_a_closed_attempt_was_replaced_by_a_merge
+    abandoned = "https://github.com/mbryzek/devops/pull/45"
+    landed = "https://github.com/mbryzek/devops/pull/46"
+    out = reconcile_one_fixed_issue(
+      fixed_via_fixes({ "url" => abandoned }, { "url" => landed }),
+      abandoned => "closed", landed => "merged"
+    )
+    assert_match(/would deploy ISS-034: devops releases nothing and devops#46 merged/, out)
+  end
+
+  # ---- issue_merge_is_release_state ----
+
+  def test_merge_state_reads_any_merge_as_the_release
+    urls = %w[https://github.com/mbryzek/devops/pull/1 https://github.com/mbryzek/devops/pull/2]
+    with_fix_pr_states(urls[0] => "merged", urls[1] => "closed") do
+      assert_equal [:merged, "devops#1"], issue_merge_is_release_state(urls, {})
+    end
+  end
+
+  def test_merge_state_names_the_open_pr_it_is_waiting_on
+    urls = %w[https://github.com/mbryzek/devops/pull/1 https://github.com/mbryzek/devops/pull/2]
+    with_fix_pr_states(urls[0] => "merged", urls[1] => "open") do
+      assert_equal [:unmerged, "devops#2 is still open"], issue_merge_is_release_state(urls, {})
+    end
+  end
+
+  def test_merge_state_is_unknown_when_a_pr_cannot_be_read
+    urls = %w[https://github.com/mbryzek/devops/pull/1]
+    with_fix_pr_states({}) do
+      assert_equal [:unknown, "devops#1"], issue_merge_is_release_state(urls, {})
+    end
+  end
+
+  # One `gh pr view` per url per run, however many issues record it.
+  def test_merge_state_reuses_a_cached_lookup
+    url = "https://github.com/mbryzek/devops/pull/1"
+    calls = 0
+    cache = {}
+    with_stubbed_function(:issue_fix_pr, lambda { |u|
+      calls += 1
+      { "url" => u, "state" => "MERGED", "isDraft" => false }
+    }) do
+      2.times { assert_equal [:merged, "devops#1"], issue_merge_is_release_state([url], cache) }
+    end
+    assert_equal 1, calls
+  end
+
+  # An unreadable url is cached too — a rate limit answers every url the same way,
+  # and re-asking once per issue is how one limit becomes a hundred calls.
+  def test_merge_state_caches_an_unreadable_lookup
+    url = "https://github.com/mbryzek/devops/pull/1"
+    calls = 0
+    cache = {}
+    with_stubbed_function(:issue_fix_pr, lambda { |_u|
+      calls += 1
+      nil
+    }) do
+      2.times { assert_equal [:unknown, "devops#1"], issue_merge_is_release_state([url], cache) }
+    end
+    assert_equal 1, calls
+  end
+
+  def test_fix_pr_urls_ignore_a_document_fix
+    issue = fixed_via_fixes(
+      { "url" => "https://github.com/mbryzek/devops/pull/314" },
+      { "url" => "https://docs.google.com/document/d/abc" },
+    )
+    assert_equal ["https://github.com/mbryzek/devops/pull/314"], issue_fix_pr_urls(issue)
+    assert_equal %w[devops], issue_fix_repos(issue)
   end
 
   # ---- playbook tenant login wiring ----
