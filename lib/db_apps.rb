@@ -462,6 +462,25 @@ class DbApp
     ).to_set
   end
 
+  # Is anything connected to THIS database, right now?
+  #
+  # active_session_dbs is sampled once per container, before gc walks the stale
+  # list and drops them one by one. That sample is already stale by the time any
+  # given DROP runs -- and gc's drop is not a polite one, it
+  # pg_terminate_backend()s first, so a session that reconnected in the gap has
+  # its connection killed and its database destroyed under it rather than
+  # merely losing a race.
+  #
+  # Asked again immediately before the drop, per database, so the window is a
+  # single statement wide instead of the length of a container's whole stale
+  # list.
+  def session_db_active?(port, db)
+    DbImages.psql_query(
+      port,
+      "SELECT 1 FROM pg_stat_activity WHERE datname = '#{db}' LIMIT 1"
+    ).any?
+  end
+
   # Age in seconds of each session database, keyed by database name.
   #
   # Postgres stores no creation timestamp for a database, so this reads the mtime
