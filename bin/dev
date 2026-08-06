@@ -10657,6 +10657,48 @@ AUTONOMY_REVERSIBILITIES = %w[trivial reversible costly irreversible].freeze
 AUTONOMY_TRIGGERS = %w[scheduled manual event].freeze
 AUTONOMY_RUN_STATUSES = %w[completed failed gave_up].freeze
 
+# The single-workflow view is where a loop reads the envelope it is running
+# inside, so it has to show the WHOLE envelope. An omitted field and an unset
+# field print identically -- as nothing -- so a printer that hand-picks fields
+# cannot be read as an answer at all. That is exactly how `max_reversibility`
+# went unprinted from the day it landed on the spec (ISS-662): the one field
+# that gates pr_auto_merge, absent from the command the playbook tells the loop
+# to read it from, with no way to tell "holds everything above reversible" from
+# "does not gate".
+#
+# So the rendering is driven by this table and is TOTAL over what the API
+# returns: a key that is not listed here is printed raw underneath rather than
+# dropped. The next field added to `autonomy_envelope` shows up unlabelled
+# instead of not at all, which is a cosmetic bug rather than a safety one.
+AUTONOMY_ENVELOPE_FIELDS = [
+  { key: "allowed_repos", label: "repos",
+    unset: "unrestricted — the envelope names no repos, so it is not a work list" },
+  { key: "max_diff_lines", label: "max diff", unset: "unrestricted" },
+  { key: "required_assertions", label: "asserts", unset: "none" },
+  # Absent is genuinely permissive here: reversibility gates nothing at all, and
+  # a loop that reads it as "trivial only" holds work it was cleared to do. The
+  # ordering is spelled out because the field is a ceiling, not an equality.
+  { key: "max_reversibility", label: "max rev", unset: "does not gate",
+    show: ->(v) { "#{v} and below (#{AUTONOMY_REVERSIBILITIES.join(' < ')})" } }
+].freeze
+
+# One "  label:      value" line per envelope field, known fields first in the
+# order above, then anything else the API returned.
+def autonomy_envelope_lines(envelope)
+  env = envelope || {}
+  known = AUTONOMY_ENVELOPE_FIELDS.map { |f| [f[:label], autonomy_envelope_value(env[f[:key]], f)] }
+  unknown_keys = (env.keys - AUTONOMY_ENVELOPE_FIELDS.map { |f| f[:key] }).sort
+  extra = unknown_keys.map { |k| [k, autonomy_envelope_value(env[k], { unset: "not set" })] }
+  (known + extra).map { |label, value| format("  %-11s %s", "#{label}:", value) }
+end
+
+def autonomy_envelope_value(value, field)
+  return field[:unset] if value.nil? || (value.respond_to?(:empty?) && value.empty?)
+  return value.join(", ") if value.is_a?(Array)
+
+  field[:show] ? field[:show].call(value) : value.to_s
+end
+
 def autonomy_endpoint(use_localhost)
   ApiClient.endpoints(use_localhost: use_localhost, app_filter: "platform").first
 end
@@ -10835,10 +10877,7 @@ def cmd_autonomy_workflows(args)
       w = ApiClient.request(endpoint, :get, "/autonomy/workflows/#{URI.encode_www_form_component(rest.first)}")
       puts "#{w['key']} (#{w['mode']})"
       puts "  #{w['description']}"
-      env = w["envelope"]
-      puts "  repos:      #{env['allowed_repos'].empty? ? 'unrestricted' : env['allowed_repos'].join(', ')}"
-      puts "  max diff:   #{env['max_diff_lines'] || 'unrestricted'}"
-      puts "  asserts:    #{env['required_assertions'].empty? ? 'none' : env['required_assertions'].join(', ')}"
+      autonomy_envelope_lines(w["envelope"]).each { |line| puts line }
       budget = w["budget"]
       puts "  budget:     #{budget['max_decisions_per_day'] || '-'} decisions/day, #{budget['max_auto_approved_per_day'] || '-'} auto-approved/day"
     end
