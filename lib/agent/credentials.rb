@@ -107,9 +107,13 @@ module Agent
 
     # Status only, for the doctor, the session prompt, and anything else that
     # prints. Returns Array<Found>; never returns a secret.
-    def check(credentials: CREDENTIALS)
+    #
+    # `env` is the process environment to read, and it is a parameter for the
+    # same reason `probe`'s is: the answer depends on TWO sources, and a caller
+    # that can only control one of them cannot control the answer. See `probe`.
+    def check(credentials: CREDENTIALS, env: ENV)
       credentials.map do |credential|
-        status, _value, source = probe(credential)
+        status, _value, source = probe(credential, env: env)
         Found.new(credential: credential, status: status, source: source)
       end
     end
@@ -121,11 +125,11 @@ module Agent
     # omitted: `Process.spawn` merges this hash over an inherited ENV, so the
     # child gets those anyway, and re-listing them would pull a secret through
     # more code for no effect.
-    def resolve(credentials: CREDENTIALS)
-      credentials.each_with_object({}) do |credential, env|
-        status, value, source = probe(credential)
+    def resolve(credentials: CREDENTIALS, env: ENV)
+      credentials.each_with_object({}) do |credential, resolved|
+        status, value, source = probe(credential, env: env)
         next unless status == :present && source == :env_repo
-        env[credential.name] = value
+        resolved[credential.name] = value
       end
     end
 
@@ -134,6 +138,17 @@ module Agent
     #
     # The process environment wins over the env repo so an operator can override
     # one key from `.zprofile` without editing (or unlocking) the secrets repo.
+    #
+    # That precedence makes every result depend on the AMBIENT ENVIRONMENT of
+    # whatever process is asking, which is why `env` is injectable all the way
+    # out to `check` and `resolve` rather than only here. A caller that stubs
+    # `EnvironmentVariables.lookup` but leaves `env` defaulted has not pinned the
+    # answer at all — the process environment short-circuits before the stub is
+    # ever consulted, and the assertion silently becomes a statement about the
+    # machine. Exactly that failed on the agent runners and nowhere else
+    # (ISS-613): ISS-570 exports PLAYBOOK_CLAUDE_KEY into every spawned session,
+    # so the fleet the credential feature was built for is the one fleet whose
+    # environment defeats a test of it.
     def probe(credential, env: ENV)
       inherited = env[credential.name].to_s
       return [:present, inherited, :process_env] unless inherited.empty?
