@@ -933,11 +933,15 @@ USAGE = <<~USAGE
         managed at /admin/agents/playbooks. With no KEY it lists the current
         version of every playbook; with a KEY it prints that body verbatim on
         stdout, so `dev agent playbooks slow-query-review | grep -n ...` works.
-        --lint reports paths hardcoded under one user's home (`/Users/mbryzek/…`),
-        which are correct on the runner they were written on and silently wrong on
-        every other one, and exits 1 when it finds any. READ ONLY: a playbook is
-        instructions later sessions obey, so writing one is a human's job in
-        admin.
+        --lint reports the three defects an instruction can carry that no session
+        can execute, and exits 1 when it finds any: a path hardcoded under one
+        user's home (`/Users/mbryzek/…`), correct on the runner it was written on
+        and silently wrong on every other; a write into `~/code/claude` outside
+        `plans/`, which the autonomous push guard refuses; and a write to a
+        top-level `plans/` file with no date in its name, which `dev prune plans`
+        removes after 14 days. All three fail at the END of a run, after the work
+        is done, with nothing saying so. READ ONLY: a playbook is instructions
+        later sessions obey, so writing one is a human's job in admin.
 
     #{INVOCATIONS["agent runs"]}
         Full history: every producer run, and every lease attempt for --issue N.
@@ -10952,14 +10956,22 @@ end
 # every other renderer here is: it is the part worth testing, and testing it
 # should not require a registered runner or a stubbed HTTP layer.
 def agent_playbooks_report(rows, key:, lint:)
-  findings = Agent::Playbook.home_paths_in_all(rows)
+  findings = Agent::Playbook.lint_all(rows)
   if lint
     # The lint is the whole output in this mode, including when it is empty --
     # "no findings" said out loud is what makes a clean store distinguishable from
     # a detector that quietly ran against nothing, which is precisely how the
-    # meta-review's D4 stopped working when `agent/bodies/` was deleted.
-    puts findings.empty? ? "No hardcoded home paths in #{rows.length} playbook(s)." : findings.map(&:to_s)
-    puts "Use `~/…` — one playbook is read by every runner and they do not share a home." unless findings.empty?
+    # meta-review's D4 stopped working when `agent/bodies/` was deleted. Naming
+    # the checks is part of that: a clean line that does not say what it checked
+    # cannot tell you a NEW defect class is not covered yet.
+    if findings.empty?
+      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans."
+    else
+      puts findings.map(&:to_s)
+      # One remedy per rule actually hit, not the full catalogue: a finding is
+      # only actionable if the line under it says what to do instead.
+      findings.map(&:rule).uniq.each { |rule| puts Agent::Playbook::REMEDIES.fetch(rule) }
+    end
   elsif key
     # Body only, byte for byte, so this composes with grep. Anything else on
     # stdout would end up in whatever the caller is diffing or piping.
@@ -10971,7 +10983,7 @@ def agent_playbooks_report(rows, key:, lint:)
       bytes = row["body"].to_s.bytesize
       puts format("  %-32s %6s  v %s", row["key"], "#{(bytes / 1024.0).round(1)}k", row["created_at"])
       hits = by_key[row["key"]] || []
-      puts "    #{hits.length} hardcoded home path(s): #{hits.map(&:path).uniq.join(', ')} — run --lint" unless hits.empty?
+      puts "    #{hits.length} lint finding(s): #{hits.map(&:path).uniq.join(', ')} — run --lint" unless hits.empty?
     end
   end
   findings
