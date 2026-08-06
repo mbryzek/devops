@@ -3990,7 +3990,6 @@ end
 # speculatively up front.
 def cmd_issues_parent(args)
   rest, _app, use_localhost = parse_common_flags(args)
-  number = rest.shift
   epic = nil
   detach = false
   leftover = []
@@ -4010,10 +4009,19 @@ def cmd_issues_parent(args)
     end
   end
 
+  # AFTER the flag loop, like every sibling subcommand. Shifting it off `rest`
+  # first made the position load-bearing: `issues parent --epic 140 343` bound
+  # number to "--epic", left the loop nothing to recognise, and reported both
+  # "unexpected argument(s): 140, 343" and "pass exactly one of --epic NUMBER or
+  # --detach" about a command line that had passed --epic.
+  number = leftover.shift
   problems = []
   problems << "missing issue number (positional argument, e.g. 343)" if number.nil? || number.empty?
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   problems << "pass exactly one of --epic NUMBER or --detach" unless (epic && !detach) || (detach && !epic)
+  # The one-hop cycle, caught here as `block` and `duplicate` catch theirs, so
+  # the mistake reads as a usage error rather than a 422.
+  problems << "an issue cannot be its own parent" if issue_same_number?(number, epic)
   report_arg_problems("issues parent", problems, usage_for("issues parent"))
 
   require_playbook_session!(use_localhost)
@@ -4023,6 +4031,15 @@ def cmd_issues_parent(args)
     # The update endpoint replaces every editable field, so the issue is read
     # first and its own values are sent back unchanged alongside the new parent.
     # Sending a partial form here would silently clear severity, body and club.
+    #
+    # `issue_update_form` in the platform's spec/issues.json names the whole
+    # editable set -- "an omitted optional field (severity, body, club_id, apps,
+    # repositories) clears it" -- so every one of them has to be listed here.
+    # `repositories` became settable AFTER this round-trip was written and was
+    # never added, so re-parenting silently dropped an issue's repo attribution:
+    # the executor then had nothing to clone, and the session picked its own
+    # branch name and its PR stopped being findable (ISS-365, the exact failure
+    # --repo exists to prevent).
     issue = ApiClient.request(endpoint, :get, issues_path("/#{number}"))
     form = {
       category: issue.fetch("category"),
@@ -4033,6 +4050,7 @@ def cmd_issues_parent(args)
     form[:severity] = issue["severity"] if issue["severity"]
     form[:club_id] = issue.dig("club", "id") if issue["club"]
     form[:apps] = issue["apps"] if issue["apps"]
+    form[:repositories] = issue["repositories"] if issue["repositories"]
     form[:parent_number] = epic unless detach
 
     updated = ApiClient.request(endpoint, :put, issues_path("/#{number}"), body: form)
@@ -4754,6 +4772,19 @@ def print_duplicate_link(issue)
   puts "  duplicate of ISS-#{canonical['number']}: #{canonical['title']}"
 end
 
+# Do two command-line issue numbers name the same issue? Zero padding is the
+# whole reason this is not `==`: `343` and `0343` are the same issue and both
+# are things people type, so a self-reference check that compares raw strings
+# passes the very mistake it exists to catch.
+#
+# Shared by the three relationship commands (`block`, `duplicate`, `parent`),
+# each of which rejects an issue naming itself.
+def issue_same_number?(a, b)
+  return false if a.nil? || b.nil?
+
+  a.sub(/\A0+/, "") == b.sub(/\A0+/, "")
+end
+
 # Record (or drop) "this issue cannot be worked until that one has shipped".
 #
 # The one relationship in the tracker with teeth: `dev issues claim` and the
@@ -4794,9 +4825,7 @@ def cmd_issues_block(args)
   # Caught here as well as server-side so the mistake reads as a usage error rather
   # than a 422. A self-block is the one-hop case of a cycle: it would make the issue
   # permanently unclaimable with nothing able to clear it.
-  if number && blocker && number.sub(/\A0+/, "") == blocker.sub(/\A0+/, "")
-    problems << "an issue cannot block itself"
-  end
+  problems << "an issue cannot block itself" if issue_same_number?(number, blocker)
   report_arg_problems("issues block", problems, usage_for("issues block"))
 
   require_playbook_session!(use_localhost)
@@ -4861,7 +4890,7 @@ def cmd_issues_duplicate(args)
   problems << "missing issue number (positional argument, e.g. 429)" if number.nil? || number.empty?
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   problems << "--of is required (the issue this one duplicates, e.g. 427)" if canonical.nil? || canonical.empty?
-  problems << "an issue cannot be a duplicate of itself" if number && canonical && number.sub(/\A0+/, "") == canonical.sub(/\A0+/, "")
+  problems << "an issue cannot be a duplicate of itself" if issue_same_number?(number, canonical)
   report_arg_problems("issues duplicate", problems, usage_for("issues duplicate"))
 
   require_playbook_session!(use_localhost)
