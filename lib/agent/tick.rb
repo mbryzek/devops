@@ -2,6 +2,7 @@ require 'open3'
 require 'time'
 require 'agent/api'
 require 'agent/checkout'
+require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/errors'
 require 'agent/gc'
@@ -58,6 +59,12 @@ module Agent
     # escalation below always agree on what they are counting.
     CHECKOUT_PULL_ERROR_SOURCE = "checkout_pull".freeze
 
+    # Agent::Errors source name for a `~/code/.claude` this machine cannot make
+    # resolve on its own — see Agent::ClaudeConfig. Only the states a human has
+    # to clear ever reach it; the ordinary "absent, so create it" path is not a
+    # failure and records nothing.
+    CLAUDE_CONFIG_ERROR_SOURCE = "claude_config".freeze
+
     # File an issue the moment consecutive failures for ANY source CROSS this
     # threshold, not on every tick once past it — see `record_failure`.
     #
@@ -100,6 +107,7 @@ module Agent
       # is the one thing in the tick that works with the platform down, and the
       # sha it lands on is what the registry report below claims.
       update_checkout
+      ensure_claude_config
       identity = ensure_identity
       # The runner heartbeat is REPORTING and the lease heartbeats are the thing
       # that keeps live work alive, so a failure of the former must never cost
@@ -167,6 +175,49 @@ module Agent
                  "attempted in Agent::Checkout.pull also failed. The tick keeps running the code it already " \
                  "has, but producer schedule and prompt changes pushed to devops will not reach this machine " \
                  "until the checkout is fixed by hand.",
+      )
+    end
+
+    # `~/code/.claude`, which is how every Claude Code session on this machine
+    # finds the rules, skills and subagents CLAUDE.md tells it to use. See
+    # Agent::ClaudeConfig for what was measured to be missing without it.
+    #
+    # In Phase A next to update_checkout because it is the same kind of thing:
+    # the machine's READ SURFACE, made correct before any work is claimed
+    # against it. It is cheaper than the pull — a stat and, once in a machine's
+    # life, one `symlink(2)` — and it needs no lock, because the only write is
+    # guarded against losing a race with a concurrent tick.
+    def ensure_claude_config
+      return log("would ensure #{Agent::ClaudeConfig.link} -> #{Agent::ClaudeConfig.target}") if @dry_run
+
+      result = Agent::ClaudeConfig.ensure_link
+      # Only a CHANGE is worth a decision line. A machine whose link is already
+      # right would otherwise say so every 30 seconds forever.
+      decide("claude_config", result.message) if result.linked? || !result.ok?
+      if result.ok?
+        Agent::Errors.clear(CLAUDE_CONFIG_ERROR_SOURCE)
+      else
+        record_claude_config_failure(result)
+      end
+    end
+
+    # Reached only by the states the tick cannot fix for itself: something else
+    # already occupies the path, there is no claude checkout to point at, or the
+    # symlink call failed outright. Never by the ordinary absent-then-created
+    # path, which is a success.
+    def record_claude_config_failure(result)
+      record_failure(
+        CLAUDE_CONFIG_ERROR_SOURCE, result.message,
+        title: ->(hostname) { "dev-agent: #{hostname} has no usable ~/code/.claude" },
+        explain: "Claude Code finds a project's rules, skills and subagents by looking for a `.claude` " \
+                 "directory in the cwd and its ancestors. `#{Agent::ClaudeConfig.link}` is how every " \
+                 "session on this machine reaches the `claude` repo, and CLAUDE.md — which every session " \
+                 "loads — names paths under it more than a dozen times.\n\n" \
+                 "Until it resolves, sessions here silently get NONE of it: no `.claude/rules/*.mdc`, and " \
+                 "none of the skills CLAUDE.md instructs them to use by name (`repo-map`, `session-db`, " \
+                 "`releasing-libraries`, `writing-as-mike`, `context-handoff`). Nothing errors — a skill " \
+                 "that is not there is not a failure a session can see (ISS-615).\n\n" \
+                 "Fix: #{result.remedy}",
       )
     end
 

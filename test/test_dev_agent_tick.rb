@@ -33,6 +33,11 @@ class TestDevAgentTick < Minitest::Test
       }
       FileUtils.mkdir_p(File.join(root, "devops"))
       FileUtils.cp_r(File.expand_path("../agent", __dir__), File.join(root, "devops"))
+      # A stand-in claude checkout, so this fixture models a PROVISIONED machine.
+      # Without it phase_a's Agent::ClaudeConfig step reads `missing_repo` and
+      # every test that walks a phase would be counting a second failing source
+      # it never meant to exercise.
+      FileUtils.mkdir_p(File.join(root, "claude"))
       original = overrides.keys.to_h { |k| [k, ENV[k]] }
       overrides.each { |k, v| ENV[k] = v }
       FileUtils.mkdir_p(ENV["DEV_AGENT_WORKSPACE_ROOT"])
@@ -228,6 +233,39 @@ class TestDevAgentTick < Minitest::Test
       log = Agent::Paths.tick_log(Time.now)
       assert File.file?(log), "expected a tick log at #{log}"
       assert_match(/tick start/, File.read(log))
+    end
+  end
+
+  # ---- the `.claude` link (ISS-615) ----
+  #
+  # Agent::ClaudeConfig has its own tests; what these two prove is the WIRING.
+  # The link is invisible when it is missing — no error, no failed session, just
+  # every rule and every skill CLAUDE.md names silently absent — so a call site
+  # dropped from phase_a is a regression nothing else in this suite would catch.
+
+  def test_phase_a_creates_the_claude_config_link
+    with_agent_home do |root|
+      register_identity
+      link = File.join(root, ".claude")
+      refute File.symlink?(link), "fixture started with the link already in place"
+
+      stubs = fleet_responses.merge(
+        "POST /agent/runners/#{RUNNER_ID}/heartbeat" => ->(_body) { runner_row },
+      )
+      with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false).phase_a } }
+
+      assert_equal "claude", File.readlink(link)
+      assert_equal File.realpath(File.join(root, "claude")), File.realpath(link)
+    end
+  end
+
+  def test_a_dry_run_says_what_it_would_link_and_links_nothing
+    with_agent_home do |root|
+      register_identity
+      out = with_stubbed_api(fleet_responses) { capture_stdout { tick.run } }
+
+      assert_match(/would ensure #{Regexp.escape(File.join(root, '.claude'))}/, out)
+      refute File.symlink?(File.join(root, ".claude")), "dry run created the link"
     end
   end
 
