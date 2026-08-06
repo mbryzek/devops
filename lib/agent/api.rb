@@ -226,6 +226,21 @@ module Agent
               token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost, body: body)
     end
 
+    # Defer an issue to `until_at` and say why on its timeline, in one call. The
+    # status is untouched — a deferred issue is still `open` — so this is what a
+    # dispatcher uses to put work down that is not workable YET, as opposed to
+    # `set_status`, which is for work whose state actually changed.
+    #
+    # Order matters at the call site: `snoozed_until` is cleared by any status
+    # transition, so releasing the lease (claimed -> open) has to happen BEFORE
+    # this and not after, or the deferral is wiped by the write that follows it.
+    def snooze(number, until_at, comment: nil, use_localhost:)
+      body = { snoozed_until: until_at.utc.iso8601 }
+      body[:comment] = comment if comment && !comment.empty?
+      request(:put, "/#{TENANT}/issues/#{number}/snooze",
+              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost, body: body)
+    end
+
     def create_issue(form, use_localhost:)
       request(:post, "/#{TENANT}/issues", token: ai_token(use_localhost: use_localhost),
                                           use_localhost: use_localhost, body: form)

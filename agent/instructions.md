@@ -144,6 +144,37 @@ answer is yes, it is your work — do it. Handing over something you were capabl
 doing is worse than the problem this solves, because it teaches the queue that
 handoffs are noise.
 
+### When you file follow-up work that CANNOT START until your PR merges
+
+The third of the same family, and the one you will hit most often: not something
+you routed around, not something only a human can run, but a follow-up whose
+first line of code cannot be written until the PR you just opened is on `main`.
+
+Say so with a flag, never in a sentence:
+
+    dev issues create --category improvement --status open --no-spawn \
+      --repo <repo>... --title "..." --body "..." \
+      --block-on <the PR this waits on>
+
+`--block-on` takes the pull request itself — `devops#359`, or its full URL — and
+traces it back to its issue through the mandatory `ISS-<n>: ` title prefix; it
+also takes a bare issue number when you have one. Repeat it per dependency. It
+records the same `blocked_by` edge `dev issues block` writes, so the queue stops
+offering the issue, and the dispatcher re-checks the PR against GitHub before it
+ever starts a session on it.
+
+**A dependency written in prose does not work, and the failure is not obvious.**
+ISS-644's body said "Depends on devops#359 merging first, since that is where the
+lint lives". It was dispatched twenty minutes later, with #359 open, and the
+session had three options — file `needs_input` on a healthy PR, re-implement
+somebody else's open diff, or stack on it. It stacked, which CLAUDE.md forbids,
+and the resulting PR could not merge until a human merged the other one in the
+right order (ISS-649). Nothing reads a body before claiming at 3am.
+
+Note that `--block-on` requires `--status open`. Work that cannot start is not
+work you are doing in this session, so there is nothing here to close out: you
+file it and you are done with it.
+
 ## 2. Gates become artifacts, not blocks
 
 Every CLAUDE.md gate that says "get approval before proceeding" would deadlock

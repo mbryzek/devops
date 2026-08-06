@@ -1999,6 +1999,148 @@ class TestDevIssues < Minitest::Test
     assert_includes out, "--status must be one of: open, claimed"
   end
 
+  # ---- dev issues create --block-on (ISS-649) ----
+  #
+  # A follow-up filed the moment its dependency's PR goes up is the single most
+  # common thing this fleet produces, and until now the dependency could only be
+  # written in prose. ISS-644's body said "Depends on devops#359 merging first";
+  # it was claimed twenty minutes later with #359 still open, and the session had
+  # to stack its PR on somebody else's branch. Nothing reads a body before
+  # claiming at 3am — so the ordering has to be an edge, recorded by the same
+  # command that files the issue.
+
+  BLOCKING_PR = { "url" => "https://github.com/mbryzek/devops/pull/359", "number" => 359,
+                  "state" => "OPEN", "title" => "ISS-633: lint the playbook store" }.freeze
+
+  def creating_with(args, pr: BLOCKING_PR)
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    out = nil
+    stub_singleton(Agent::Github, :pr_by_url, ->(_url) { pr }) do
+      with_credentials do
+        with_stdin("Some brief", tty: false) do
+          out = capture_stdout { cmd_issues_create(["--category", "bug", "--status", "open", "--body", "b"] + args) }
+        end
+      end
+    end
+    [captured, out]
+  end
+
+  def test_create_records_a_blocking_issue_number
+    captured, = creating_with(["--block-on", "633"])
+    assert_equal ["633"], captured.fetch(:blockers)
+  end
+
+  # The form that actually shows up at filing time: the filer has the PR it just
+  # opened, not the issue number behind it.
+  def test_create_resolves_a_pull_request_to_the_issue_in_its_title
+    captured, out = creating_with(["--block-on", "devops#359"])
+    assert_equal ["633"], captured.fetch(:blockers)
+    assert_includes out, "devops#359 is ISS-633"
+  end
+
+  def test_create_resolves_a_pull_request_url_too
+    captured, = creating_with(["--block-on", "https://github.com/mbryzek/devops/pull/359"])
+    assert_equal ["633"], captured.fetch(:blockers)
+  end
+
+  def test_create_accepts_the_iss_prefixed_form_and_repeats
+    captured, = creating_with(["--block-on", "ISS-633", "--block-on", "640"])
+    assert_equal %w[633 640], captured.fetch(:blockers)
+  end
+
+  # The `ISS-<n>: ` prefix is mandated, the reap classifies by it and `reconcile`
+  # adopts by it. A PR without one names no issue, and GUESSING would file an
+  # unblocked issue — the exact failure the flag prevents, silently.
+  def test_create_refuses_a_pull_request_whose_title_names_no_issue
+    define_singleton_method(:issue_file_and_start) { |**| flunk("filed an issue with its blocker unresolved") }
+    out, status = capture_stderr_and_exit do
+      stub_singleton(Agent::Github, :pr_by_url, ->(_url) { { "title" => "tidy up the lint", "number" => 359 } }) do
+        with_credentials { with_stdin("b", tty: false) do
+          cmd_issues_create(["--category", "bug", "--status", "open", "--body", "b", "--block-on", "devops#359"])
+        end }
+      end
+    end
+    assert_equal 1, status
+    assert_includes out, "does not start with an `ISS-<n>: ` prefix"
+  end
+
+  def test_create_refuses_a_pull_request_it_cannot_read
+    out, status = capture_stderr_and_exit do
+      stub_singleton(Agent::Github, :pr_by_url, ->(_url) { nil }) do
+        with_credentials { with_stdin("b", tty: false) do
+          cmd_issues_create(["--category", "bug", "--status", "open", "--body", "b", "--block-on", "devops#359"])
+        end }
+      end
+    end
+    assert_equal 1, status
+    assert_includes out, "gh auth status"
+  end
+
+  def test_create_rejects_a_reference_that_is_neither_an_issue_nor_a_pr
+    out, status = capture_stderr_and_exit do
+      cmd_issues_create(["--category", "bug", "--status", "open", "--block-on", "the lint PR"])
+    end
+    assert_equal 1, status
+    assert_includes out, "name an issue (644, ISS-644) or a pull request"
+  end
+
+  # Blocked work is not work you are doing right now. Filing both would claim an
+  # issue the queue is simultaneously being told nobody can start — unpickupable,
+  # which is the state --status exists to prevent, reached from the other side.
+  def test_block_on_requires_an_open_status
+    out, status = capture_stderr_and_exit do
+      cmd_issues_create(["--category", "bug", "--status", "claimed", "--block-on", "633"])
+    end
+    assert_equal 1, status
+    assert_includes out, "--block-on requires --status open"
+  end
+
+  # An epic is already forced to `open`, so it needs no flag to say so.
+  def test_an_epic_may_be_blocked_without_naming_a_status
+    captured, = creating_with(["--epic", "--block-on", "633"])
+    assert_equal ["633"], captured.fetch(:blockers)
+  end
+
+  # The window this closes is the one where the issue is open and unblocked and a
+  # lease runner is ticking: the edge goes on immediately after the create, before
+  # anything else the command does.
+  def test_file_and_start_records_the_blocker_edge_right_after_filing
+    calls = []
+    with_stubbed_api(
+      "POST /playbook/issues" => ->(_b) { calls << :filed; { "number" => "099" } },
+      "POST /playbook/issues/099/blockers" => ->(b) { calls << [:blocked, b[:issue_number]]; { "number" => "099" } },
+      "GET /playbook/issues/099/comments?limit=101&offset=0" => ->(_b) { calls << :comments; [] },
+    ) do
+      capture_stdout do
+        issue_file_and_start(endpoint: { name: "x" }, form: { category: "bug" }, category: "bug",
+                             status: "open", spawn_session: false, blockers: ["633"])
+      end
+    end
+    assert_equal [:filed, [:blocked, "633"], :comments], calls
+  end
+
+  # A failed edge leaves the issue in the queue CLAIMABLE, which is the state the
+  # flag exists to prevent — so it exits naming the repair rather than warning.
+  def test_a_blocker_edge_that_fails_to_record_is_loud_and_names_the_repair
+    out, status = capture_stderr_and_exit do
+      with_stubbed_api(
+        "POST /playbook/issues" => ->(_b) { { "number" => "099" } },
+        "POST /playbook/issues/099/blockers" => ->(_b) { raise ApiError, "422 boom" },
+      ) do
+        capture_stdout do
+          issue_file_and_start(endpoint: { name: "x" }, form: { category: "bug" }, category: "bug",
+                               status: "open", spawn_session: false, blockers: ["633"])
+        end
+      end
+    end
+    assert_equal 1, status
+    assert_includes out, "dev issues block 099 --on 633"
+  end
+
   # ---- dev issues create: the claim reaches the server ----
 
   # The claim has to happen in the create request itself: claiming as a second

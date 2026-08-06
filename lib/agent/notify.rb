@@ -47,6 +47,8 @@ module Agent
       "merged_pr" => "the issue itself moves to `fixed` with the merged PR url",
       "gave_up" => "the issue itself moves to `needs_input` with the attempt history",
       "playbook_unresolved" => "the issue itself moves to `needs_input` with the unresolved playbook path",
+      "dependency_stalled" => "the issue itself moves to `needs_input` naming the PR that has not merged, " \
+                              "after a week of deferrals each recorded on its timeline",
       "toolchain" => "the same check unconditionally files a fingerprinted issue naming the machine and the missing tools",
     }.freeze
 
