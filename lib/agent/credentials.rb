@@ -42,6 +42,29 @@ require 'environment_variables'
 # this secret is set" call must never do as a side effect.
 module Agent
   module Credentials
+    # WHERE a credential is read from. Two layouts exist in the env repo and the
+    # difference is not cosmetic: `apps/<app>/env/*.env` holds what an APP boots
+    # with, `api_keys/<file>` holds what a HUMAN or a tool authenticates with.
+    # Putting a tooling credential in an app's env file is what produced ISS-635
+    # — `NEWRELIC_USER_KEY` sat in `apps/platform/env/production.env`, was read by
+    # no application anywhere, was never rotated with the live key, and answered
+    # 401 to every session that followed the playbook's instruction to source it.
+    #
+    # Both answer with the same four states so `probe` does not care which it got.
+    AppEnv = Struct.new(:app, :environment, keyword_init: true) do
+      def label = "env/apps/#{app}/env (#{environment})"
+      def read(name) = EnvironmentVariables.lookup(app, environment, name)
+    end
+
+    # One credential per file; the whole file IS the value. `file` rather than
+    # `name` because the two differ on purpose — the file is named for the
+    # SERVICE (`newrelic`), the variable for what the service calls the thing
+    # (`NEWRELIC_USER_KEY`).
+    KeyFile = Struct.new(:file, keyword_init: true) do
+      def label = "env/api_keys/#{file}"
+      def read(_name) = EnvRepo.read_secret("api_keys/#{file}")
+    end
+
     # One credential, where it is read from, and what stops working without it.
     #
     # `name` is both the key looked up in the env repo AND the environment
@@ -49,31 +72,54 @@ module Agent
     # reading its assignment can use the name it was told without a translation
     # step.
     #
+    # `usage_example` is per-credential and not decorative: the assignment block
+    # tells a session how to PASS the key, and one API's header is another API's
+    # 401. It must be a shape that carries `$NAME` rather than a value.
+    #
     # There is no `required` flag and no exit code riding on this. A missing
     # credential must not stop a runner from claiming the ninety-odd percent of
     # issues that never touch an external API; what it must do is stop a session
     # from DISCOVERING the gap halfway through, which is what the prompt section
     # is for.
-    Credential = Struct.new(:name, :app, :environment, :required_by, :how_to_provide,
+    Credential = Struct.new(:name, :source, :required_by, :how_to_provide, :usage_example,
                             keyword_init: true) do
-      def source_label = "env/apps/#{app}/env (#{environment})"
+      def source_label = source.label
     end
 
     CREDENTIALS = [
       Credential.new(
         name: "PLAYBOOK_CLAUDE_KEY",
-        app: "platform",
         # `development`, not `production`, and the distinction is not cosmetic
         # even though today both resolve through common.env to the same value:
         # the day someone splits them, a session on a laptop must be the one
         # holding the development key.
-        environment: "development",
+        source: AppEnv.new(app: "platform", environment: "development"),
         required_by: "calling api.anthropic.com directly — the only way a session can VERIFY code " \
                      "whose subject is the Claude API's own behaviour, rather than designing it " \
                      "against the documentation and shipping the request shape unproven (ISS-565)",
         how_to_provide: "set PLAYBOOK_CLAUDE_KEY in the env repo's apps/platform/env/common.env " \
                         "(it is already there in a healthy checkout — an absence usually means the " \
                         "repo is locked or missing, not that the key was never issued)",
+        usage_example: 'curl -H "x-api-key: $PLAYBOOK_CLAUDE_KEY" -H "anthropic-version: 2023-06-01" ...',
+      ),
+      # ISS-635. The playbooks that read production out of NewRelic told the
+      # session to source this key from `bin/env --app platform --env production`,
+      # and that instruction failed twice over: the value there is revoked (401),
+      # and `--format sh` emits bare assignments, so `eval`ing it sets a shell
+      # variable that no child process ever sees. Both failures are SILENT — an
+      # unset key produces an empty NRQL result, which reads exactly like a
+      # healthy graph. Handing the live key down removes the instruction, and
+      # with it both ways of misreading it.
+      Credential.new(
+        name: "NEWRELIC_USER_KEY",
+        source: KeyFile.new(file: "newrelic"),
+        required_by: "querying NewRelic NerdGraph (account 7724695) — the ONLY production signal the " \
+                     "daily error-triage and platform-memory playbooks run on, and an unauthenticated " \
+                     "query returns an empty result set rather than an error (ISS-635)",
+        how_to_provide: "put a live NewRelic USER key (NRAK-...) in the env repo at api_keys/newrelic " \
+                        "— NOT in an app's env file, which no application reads and nobody rotates",
+        usage_example: 'curl -X POST https://api.newrelic.com/graphql ' \
+                       '-H "Content-Type: application/json" -H "API-Key: $NEWRELIC_USER_KEY" ...',
       ),
     ].freeze
 
@@ -97,8 +143,9 @@ module Agent
         when :missing  then "not set in #{credential.source_label}"
         when :locked   then "#{credential.source_label} is git-crypt LOCKED on this machine, and neither " \
                             "the tick nor a session may unlock it"
-        when :no_file  then "no env repo beside this devops checkout (#{credential.source_label} does not exist) " \
-                            "— expected when `dev` runs from a clone inside a feature dir rather than ~/code/devops"
+        when :no_file  then "#{credential.source_label} does not exist — usually no env repo beside this devops " \
+                            "checkout, which is expected when `dev` runs from a clone inside a feature dir " \
+                            "rather than ~/code/devops"
         end
       end
     end
@@ -153,7 +200,7 @@ module Agent
       inherited = env[credential.name].to_s
       return [:present, inherited, :process_env] unless inherited.empty?
 
-      status, value = EnvironmentVariables.lookup(credential.app, credential.environment, credential.name)
+      status, value = credential.source.read(credential.name)
       [status, value, status == :present ? :env_repo : nil]
     end
   end
