@@ -415,6 +415,15 @@ Enough to start without a survey. `~/code` holds independent repos; the
   half-extracted browser is already on disk. If `browse` reports a missing
   prerequisite it names the command that fixes it; `dev agent doctor` shows the
   same thing for the whole toolchain (ISS-608).
+- **Playbooks** — the standing procedures producer-filed issues point at — are
+  append-only rows in the platform, not files in any repo. Read one with `dev
+  agent playbook <key>` and list them with `dev agent playbooks`. If your
+  assignment is to CHANGE one, `dev agent playbook <key> --write FILE --yes`
+  appends a version after showing you the diff; it refuses without `--yes`
+  precisely so that editing the instructions every future session obeys is the
+  job you were given, stated explicitly, and never a side effect. Do not
+  hand-roll a POST to `/agent/playbooks` — that path has no key validation, no
+  diff and no confirmation (ISS-665).
 
 **Read the rules that apply before writing code**:
 `~/code/claude/rules/*.mdc` — `scala.general.mdc`, `scala.daos.mdc`,

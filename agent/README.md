@@ -23,6 +23,8 @@ dev agent pause | resume          kill switch — drains, claims nothing new
 dev agent runners                 the fleet: capabilities, concurrency, last seen
 dev agent producers               the platform's registry: schedule, last run, next due
 dev agent runs [<key>] [--issue N] producer run history and lease attempts
+dev agent playbooks               the catalogue: every playbook's current version
+dev agent playbook <key>          one playbook — read it, --versions, or --write FILE
 dev agent refresh <issue>         re-open a fixed issue for rebase / review feedback
 dev agent release <issue>         force-release a stuck lease
 dev agent gc                      purge logs and workspaces per the retention table
@@ -203,7 +205,43 @@ Resolution happens at CLAIM time, not file time.
 The playbooks themselves are **append-only rows in the platform** (ISS-523), not
 files in this repo — `agent/bodies/` was deleted by ISS-526. Editing one INSERTS
 a new version and `created_at` is the version; nothing is ever updated in place
-and nothing is ever deleted. Manage them at `/admin/agents/playbooks`.
+and nothing is ever deleted. Manage them at `/admin/agents/playbooks`, or from
+the terminal:
+
+```
+dev agent playbooks                        # the catalogue
+dev agent playbook weekly-review > wr.md   # body to stdout, `key @ version` to stderr
+$EDITOR wr.md
+dev agent playbook weekly-review --write wr.md   # diff, then confirm
+dev agent playbook weekly-review --versions      # the history
+dev agent playbook weekly-review --version 2026-07-30   # one past body
+dev agent playbooks --lint                 # check the whole store, exit 1 on a finding
+dev agent playbook weekly-review --lint    # ...or just this one, before a --write
+```
+
+`--lint` is the only mode that is a CHECK rather than a read, so it is the only
+one that fails the shell. It reports the three defects an instruction can carry
+that no session can execute — a path hardcoded under one user's home, a write
+into `~/code/claude` outside `plans/`, and a write to an undated top-level
+`plans/` file (ISS-633, ISS-644). All three fail at the END of a run, after the
+work is done, with nothing saying so, which is why the catalogue also flags them
+inline: a lint you have to know to ask for is one nobody asks for.
+
+The write is gated, and each gate guards a mistake the append-only design makes
+permanent rather than merely wrong (ISS-665). An unchanged body writes nothing —
+a log whose entries may be duplicates cannot answer "what changed and when",
+which is the only question it exists to answer. A key with no history needs
+`--create`, because a typo'd key does not fail: it starts a lineage no producer
+points at, silently, while the edit that was meant to land never does. And the
+append itself needs a yes — a human at a terminal is prompted, and **a Claude
+session, a pipe or cron is refused unless `--yes` is passed**, so no autonomous
+run rewrites the instructions the next autonomous run obeys as a side effect of
+doing something else.
+
+Before this existed there was one READ (`Agent::Api.playbook`, used at claim
+time) and no write at all, so a session told to fix a playbook hand-rolled the
+POST — a production table edited with no key validation, no diff and no
+confirmation.
 
 Three things fall out of that and none of them is optional:
 

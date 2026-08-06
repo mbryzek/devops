@@ -241,17 +241,36 @@ class TestDevAgentPlaybook < Minitest::Test
     { "key" => "broken", "body" => "one\nwrite /Users/mbryzek/code/x\n", "created_at" => VERSION },
   ].freeze
 
-  def report(rows: ROWS, key: nil, lint: false)
+  def report(rows: ROWS, lint: false)
     findings = nil
-    out = capture_stdout { findings = agent_playbooks_report(rows, key: key, lint: lint) }
+    out = capture_stdout { findings = agent_playbooks_report(rows, lint: lint) }
     [out, findings]
   end
 
-  # A body dump is a pipeline input (`| grep -n`), so anything else on stdout ends
-  # up in whatever the caller is grepping.
-  def test_one_key_prints_its_body_and_nothing_else
-    out, = report(rows: [ROWS.first], key: "clean")
-    assert_equal "Write `~/code/x`.\n", out
+  # This renderer describes a SET and never dumps a body. Dumping one is
+  # `dev agent playbook <key>` since ISS-665 split the two commands, and the
+  # stdout/stderr split that makes `> file` safe is asserted over the real command
+  # in test_dev_agent_playbook_cli.rb
+  # (`test_reading_a_playbook_puts_the_body_on_stdout_and_the_version_on_stderr`).
+  # What is worth guarding here is that the catalogue never became a body dump
+  # again: an operator listing 16 playbooks must not get 16 full texts.
+  def test_the_catalogue_describes_each_playbook_without_dumping_it
+    row = { "key" => "multi", "body" => "# Title\n\nBODY-LINE-THREE\n", "created_at" => VERSION }
+    out, = report(rows: [row])
+    assert_match(/multi/, out)
+    # The first non-blank line is the abstract, and identifies the playbook...
+    assert_includes out, "# Title"
+    # ...but the rest of it is not printed. An operator listing 16 playbooks must
+    # not be handed 16 full texts.
+    refute_includes out, "BODY-LINE-THREE"
+  end
+
+  # Not "nothing to see": every producer whose issue points at a playbook is
+  # unclaimable, which is ISS-360's failure fleet-wide.
+  def test_an_empty_store_says_what_it_costs
+    out, findings = report(rows: [])
+    assert_empty findings
+    assert_match(/cannot be claimed/, out)
   end
 
   # "No findings" said out loud is what distinguishes a clean store from a

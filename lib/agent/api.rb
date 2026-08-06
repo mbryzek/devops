@@ -81,8 +81,6 @@ module Agent
       request(:put, "/agent/runners/#{runner_id}", token: token, use_localhost: use_localhost, body: form)
     end
 
-    # Upsert on runner_id: one current report per machine, so re-sending the
-    # same one is a no-op rather than a second row. `producers` is the whole
     # ---- playbooks ----
 
     # The CURRENT version of one playbook, or nil when the key has never existed.
@@ -104,18 +102,44 @@ module Agent
       nil
     end
 
-    # The CURRENT version of EVERY playbook, one row per key. Bounded by the
-    # number of producers, so no limit/offset -- the same reasoning as
-    # GET /agent/runners.
+    # The catalogue: the CURRENT version of every playbook, one row per key,
+    # ordered by key. No limit/offset because the set is bounded by the number of
+    # producers — the same reasoning as GET /agent/runners.
     #
-    # Read-only on purpose, and the absence of a write here is deliberate. The
-    # store is append-only and a write is authoring INSTRUCTIONS every later
-    # session obeys, which is not a thing a runner should be able to do to itself
-    # in passing; playbooks are written at /admin/agents/playbooks by a human. What
-    # a runner needs is to READ the store — to resolve a pointer, and to check the
-    # store for defects it can otherwise only find by running into them (ISS-633).
+    # What a runner needs from this store is to READ it — to resolve a pointer,
+    # and to check the store for defects it can otherwise only find by running
+    # into them (ISS-633).
     def playbooks(token:, use_localhost:)
       request(:get, "/agent/playbooks", token: token, use_localhost: use_localhost) || []
+    end
+
+    # Every version of one key, newest first. An unknown key is an empty list
+    # rather than a 404: this operation asks "what has this key ever been", and
+    # "nothing" is an answer to it.
+    def playbook_versions(key, token:, use_localhost:, limit: 100, offset: 0)
+      params = { "limit" => limit, "offset" => offset }
+      request(:get, "/agent/playbooks/#{URI.encode_www_form_component(key)}/versions?#{URI.encode_www_form(params)}",
+              token: token, use_localhost: use_localhost) || []
+    end
+
+    # THE write, and it is always an INSERT. There is no update and no delete on
+    # this resource in the API, which is the guarantee rather than a gap: the
+    # version a run recorded stays readable after any number of later edits.
+    #
+    # A write here is authoring INSTRUCTIONS every later session obeys, which is
+    # not something a runner may do to itself in passing. That is why this
+    # transport method is never called from the tick: the only caller is
+    # `dev agent playbook --write`, which shows a diff, refuses an unchanged
+    # body, refuses to start a new lineage without `--create`, and refuses
+    # outright from inside a Claude session or a pipe without `--yes`.
+    #
+    # A body byte-identical to the current version is a server-side no-op that
+    # returns the current row, so this is safe to retry — but `dev agent playbook
+    # --write` still checks locally, because "nothing changed" is something the
+    # operator should be told BEFORE a write, not discover from a response.
+    def save_playbook(key, body, token:, use_localhost:)
+      request(:post, "/agent/playbooks", token: token, use_localhost: use_localhost,
+                                         body: { key: key, body: body })
     end
 
     # ---- producers ----
