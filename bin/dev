@@ -8023,8 +8023,48 @@ end
 # local commits never match main and look "unpushed" — is recognized as landed and
 # deleted even though it was just touched. `gh` is consulted ONLY for recent dirs;
 # aged-out dirs reap regardless of PR state, so the lookup would change nothing.
+#
+# ONE EXCEPTION, and it is about OWNERSHIP rather than about safety heuristics
+# (ISS-631). ~/code/ai holds two kinds of feature dir with two different
+# lifecycles: the ones a human makes, which this command owns, and the ones the
+# autonomous executor materializes for a job, which `Agent::Gc` owns. Agent
+# workspaces are named `i<issue>_<suffix>` (Agent::Workspace::SLUG) and NOTHING
+# else here is, so the two sets are distinguishable by name rather than by guess.
+# This command skips them outright — see `agent_workspace_dir?`.
 
 AI_ROOT = File.expand_path("~/code/ai")
+
+# A directory the autonomous executor created for a job, which this command must
+# never consider. `Agent::Gc` is the sole collector of these, and the two rules
+# were disagreeing in both directions:
+#
+#  - PRUNE DELETED A LIVE ONE. The executor creates the workspace before the
+#    session clones into it, so every job has a window — minutes wide, longer
+#    when its first step is slow — where its only writable directory is empty.
+#    An empty dir has no at-risk git state, so `classify_ai_dir` fell straight
+#    through to `:delete` even on the recent path, and an hourly prune reaped
+#    ISS-609's workspace out from under a running session at 13 minutes old.
+#    `Agent::Gc` never had this bug: it refuses to collect a slug with a live pid
+#    (`Gc.live_slugs`). But even that guard would not close the whole window,
+#    because the job's pid file is written AFTER the clones are prepared — so the
+#    fix has to be by name, which is true from the mkdir onward.
+#  - PRUNE ALSO UNDERCUT THE POST-MORTEM WINDOW. A successful job deletes its own
+#    workspace immediately (Tick#cleanup); what survives is a FAILURE, which
+#    `Agent::Gc` deliberately keeps for WORKSPACE_DAYS (7) because a failure is
+#    what someone comes looking for a week later. Prune's 3-day cutoff was
+#    quietly deleting those on day 3, and nothing said so.
+#
+# Both windows shorten together under disk pressure (Gc::PRESSURE_WORKSPACE_DAYS
+# and Maintenance::PRESSURE_AIDIRS_DAYS are both 1 day), so handing these dirs to
+# `Agent::Gc` costs nothing on a machine that is actually short of disk — which is
+# the only time the extra four days of retention would matter.
+#
+# The pattern is taken from Agent::Workspace rather than restated, for the reason
+# stated at its definition: it has to mean "what the executor mints", and a second
+# copy could drift into matching a hand-made feature dir.
+def agent_workspace_dir?(dir)
+  File.basename(dir).match?(Agent::Workspace::SLUG)
+end
 
 # The feature dirs under `root` that prune is allowed to consider.
 #
@@ -8140,6 +8180,11 @@ end
 # be deleted even though it was touched today. gh is ONLY called for recent dirs —
 # aged-out dirs reap regardless of PR state, so the lookup would change nothing.
 def classify_ai_dir(dir, cutoff_time:, pr_state:)
+  # Not ours to reap, at any age and in any git state — `Agent::Gc` owns these.
+  # First, before the cutoff and before any git or gh call, because the case this
+  # exists for (ISS-631) is a workspace with no git state at all.
+  return [:keep, "agent workspace (collected by `dev agent gc`)", []] if agent_workspace_dir?(dir)
+
   repos = ai_dir_repos(dir)
   recent = ai_dir_last_activity(dir, repos) >= cutoff_time
 
@@ -8268,6 +8313,7 @@ def cmd_aidirs_prune(args)
   puts "Scanned #{dirs.length} dir(s) under #{AI_ROOT}."
   puts "Deleting any dir idle > #{days} day(s), including dirs holding work not on a remote (uncommitted, stashed, detached, loose files, or local-only commits) — the reason below names what each one is losing."
   puts "Keeping dirs touched within #{days} day(s) (recent work is fully protected, and a landed merged/closed PR still lets a recent dir be deleted)."
+  puts "Skipping agent workspaces (i<issue>_<suffix>) at any age — `dev agent gc` collects those, and it is the one that knows which are still running."
   puts ""
   puts "Keeping #{keep.length}:"
   keep.each { |d, r, _| puts "  #{File.basename(d)}  (#{r})" }

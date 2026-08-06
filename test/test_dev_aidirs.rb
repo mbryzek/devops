@@ -318,6 +318,78 @@ class TestDevAidirs < Minitest::Test
   end
 
   # ================================================================
+  # AGENT WORKSPACES (ISS-631): never this command's to reap, at any
+  # age and in any git state. `Agent::Gc` owns i<issue>_<suffix> dirs.
+  # ================================================================
+
+  # A feature dir NAMED like an executor workspace, inside a throwaway root.
+  def workspace_dir(root, name = "i631_lbb")
+    dir = File.join(root, name)
+    FileUtils.mkdir_p(dir)
+    dir
+  end
+
+  # The exact ISS-631 failure: the executor mkdirs the workspace before the
+  # session clones into it, so every job has a window where its only writable
+  # directory is empty. Empty + recent used to fall straight through to :delete,
+  # and an hourly prune reaped ISS-609's workspace at 13 minutes old.
+  def test_live_empty_agent_workspace_is_kept
+    Dir.mktmpdir do |root|
+      action, reason = classify_ai_dir(workspace_dir(root), cutoff_time: RECENT_CUTOFF, pr_state: NO_PR)
+      assert_equal :keep, action, "an empty agent workspace is a session waiting for its first clone"
+      assert_match(/agent workspace/, reason)
+    end
+  end
+
+  # The same dir aged past the cutoff. What survives a run is a FAILED job's
+  # workspace, which Agent::Gc keeps for its 7-day post-mortem window on purpose
+  # — prune's 3-day cutoff was quietly deleting those on day 3.
+  def test_aged_agent_workspace_is_kept_for_gc_to_collect
+    Dir.mktmpdir do |root|
+      dir = workspace_dir(root)
+      make_repo(dir, "platform", remote: true) # clean + pushed: prune would delete this
+      action, reason = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :keep, action
+      assert_match(/dev agent gc/, reason)
+    end
+  end
+
+  # A merged PR is what lets a RECENT dir be deleted — it must not reach into an
+  # agent workspace either, and gh must not be consulted to find that out.
+  def test_agent_workspace_with_merged_pr_is_still_kept_without_gh
+    Dir.mktmpdir do |root|
+      dir = workspace_dir(root)
+      make_repo(dir, "platform") # local-only commits
+      pr = ->(_s, _b) { flunk "an agent workspace must be skipped before any gh call" }
+      action, = classify_ai_dir(dir, cutoff_time: RECENT_CUTOFF, pr_state: pr)
+      assert_equal :keep, action
+    end
+  end
+
+  # The control: an identically-shaped dir whose name is a human's feature dir
+  # still reaps exactly as before. Without this the fix could be "keep everything".
+  def test_human_feature_dir_of_same_shape_still_reaps
+    Dir.mktmpdir do |root|
+      dir = workspace_dir(root, "cr-backfill-coord")
+      make_repo(dir, "platform", remote: true)
+      action, = classify_ai_dir(dir, cutoff_time: AGED_CUTOFF, pr_state: NO_PR)
+      assert_equal :delete, action
+    end
+  end
+
+  # The name test is the whole guard, so pin what it does and does not match.
+  # It comes from Agent::Workspace::SLUG rather than a local copy — a second copy
+  # could drift into matching a hand-made feature dir, which this command deletes.
+  def test_agent_workspace_dir_matches_only_executor_minted_slugs
+    %w[i631_lbb i9_a1b i1234_zzz].each do |name|
+      assert agent_workspace_dir?("/code/ai/#{name}"), "#{name} is an executor slug"
+    end
+    %w[i631 i631_ i631_lbbx i631_LB1 cr-backfill-coord platform hoa-metrics-be].each do |name|
+      refute agent_workspace_dir?("/code/ai/#{name}"), "#{name} is not an executor slug"
+    end
+  end
+
+  # ================================================================
   # helpers
   # ================================================================
 
