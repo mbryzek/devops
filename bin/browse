@@ -1,0 +1,18 @@
+#!/usr/bin/env ruby
+# browse — visual inspection of a running web app: screenshot + accessibility
+# tree, so a session can SEE the page it just changed.
+#
+# Usage:
+#   browse <url> [options]     # everything browse.mjs takes; run `browse --help`
+#   browse --check             # can this machine run it? reports and exits 1 if not
+#
+# A shim, not an implementation: the tool itself is browse.mjs in the `claude`
+# repo. This file exists because devops/bin is on the agent's login PATH and
+# nothing ever put browse on any PATH, so `browse` was `command not found` on
+# every runner (ISS-658). See lib/browse_tool.rb for why it lives here and what
+# it needs.
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+exit BrowseTool.main(ARGV)

@@ -1,6 +1,7 @@
 require 'open3'
 require 'time'
 require 'agent/paths'
+require 'util'
 
 # The host prerequisites a runner needs, as CODE instead of prose (ISS-531).
 #
@@ -46,9 +47,21 @@ module Agent
     # `install` is a literal command, not a description. The single question this
     # file answers on a broken machine is "what do I type", and a prose hint is
     # how the plist comment failed.
-    Tool = Struct.new(:name, :required_by, :producers, :install, :required, keyword_init: true) do
+    #
+    # `verify` is for the tools `which` cannot judge: arguments appended to the
+    # resolved binary to make it prove it can do its job. A non-zero exit means
+    # present-but-unusable, which this module treats exactly as missing, and THE
+    # LAST NON-EMPTY LINE OF ITS OUTPUT IS THE REASON — the sentence the doctor
+    # prints and the filed issue leads with. It exists because `browse` is a shim
+    # devops SHIPS, so it resolves by construction on any box where devops/bin is
+    # on the login PATH, and still cannot render a page on a runner with no
+    # Chrome. Resolving is not the same as working, and a check that conflates
+    # them recreates the silence this whole file is about.
+    Tool = Struct.new(:name, :required_by, :producers, :install, :required, :verify, keyword_init: true) do
       def required? = required != false
       def optional? = !required?
+      def verifiable? = !Array(verify).empty?
+      def verify_command = [name, *Array(verify)].join(" ")
     end
 
     # Everything the dispatcher, its producers and its claimed sessions shell out
@@ -102,6 +115,30 @@ module Agent
         install: "ships in devops/bin — put it on the LOGIN PATH: " \
                  "echo 'export PATH=\"$HOME/code/devops/bin:$PATH\"' >> ~/.zprofile",
       ),
+      # The second tool devops ships rather than installs, and the first with a
+      # `verify` — because presence tells you nothing about it. `browse` is a shim
+      # in bin/, so `which` finds it on every box where `api` is found; what it
+      # actually needs is the `claude` checkout it delegates to and a system
+      # Google Chrome to drive. Neither is on this PATH, so neither was ever
+      # checked, and a runner missing them looks identical to a runner with them.
+      #
+      # It is REQUIRED, not optional, and that is the point of ISS-658. A runner
+      # without it claims frontend issues anyway — six of the seven UI repos are
+      # frontends — and ships UI changes nobody has ever looked at, with the only
+      # trace being a PR that says its evidence was structural. `openclaw` is
+      # optional because its absence is swallowed by design; this one's absence is
+      # swallowed by nothing, which is exactly why it has to fail the doctor.
+      Tool.new(
+        name: "browse",
+        required_by: "the visual inspection CLAUDE.md asks of every session — screenshot a " \
+                     "running app and look at it before calling a UI change done (ISS-658)",
+        producers: [],
+        install: "ships in devops/bin — put it on the LOGIN PATH: " \
+                 "echo 'export PATH=\"$HOME/code/devops/bin:$PATH\"' >> ~/.zprofile; " \
+                 "it drives the SYSTEM Chrome (the Playwright CDN is blocked here), " \
+                 "so also: brew install --cask google-chrome. Then `browse --check`",
+        verify: %w[--check],
+      ),
       Tool.new(
         name: "gh",
         required_by: "every claimed job: clone, push, open the PR, mark it ready",
@@ -140,13 +177,26 @@ module Agent
     # first tick rather than a day into pretending to work.
     CADENCE_SECONDS = 24 * 3600
 
-    Found = Struct.new(:tool, :path, :version, keyword_init: true) do
-      def present? = !path.nil?
-      def missing? = path.nil?
+    # `problem` is set only when the binary RESOLVED and its `verify` refused. A
+    # tool in that state is unusable, so `missing?` covers it and every consumer
+    # — the doctor's exit code, the daily check, the filed issue — treats it as
+    # absent without being taught about it separately. What the distinction buys
+    # is the SENTENCE: "missing browse" would send whoever is fixing the runner
+    # looking for a binary that is sitting right there, and the actual answer is
+    # `brew install --cask google-chrome`.
+    Found = Struct.new(:tool, :path, :version, :problem, keyword_init: true) do
+      def resolved? = !path.nil?
+      def present? = resolved? && problem.nil?
+      def missing? = !present?
+      def unusable? = resolved? && !problem.nil?
+
+      # The one line that says what is wrong, whichever of the two it is.
+      def reason = unusable? ? problem : "not on the agent's PATH"
     end
 
     Result = Struct.new(:at, :path, :found, keyword_init: true) do
-      def missing_required = found.select { |f| f.missing? && f.tool.required? }.map(&:tool)
+      def failing = found.select { |f| f.missing? && f.tool.required? }
+      def missing_required = failing.map(&:tool)
       def missing_optional = found.select { |f| f.missing? && f.tool.optional? }.map(&:tool)
       def ok? = missing_required.empty?
 
@@ -199,11 +249,34 @@ module Agent
       nil
     end
 
-    def check(tools: TOOLS, now: Time.now, path: nil, versions: true)
+    # A tool that will not answer at all is a tool that cannot be used, and an
+    # unbounded wait here would be worse than a wrong answer: the daily re-check
+    # runs inside `dev agent tick` while it holds the work lock, so one wedged
+    # subprocess would stall everything that machine was going to claim.
+    VERIFY_TIMEOUT_SECONDS = 120
+
+    # Only ever called on a binary that RESOLVED. Verifying one that did not would
+    # report a launch failure as the reason a tool is missing, and send whoever is
+    # fixing the machine after the wrong thing.
+    def verify_problem(tool, binary)
+      out, outcome = Util.run_with_timeout([binary, *Array(tool.verify)],
+                                           timeout_seconds: VERIFY_TIMEOUT_SECONDS,
+                                           capture: true, quiet: true)
+      case outcome
+      when :ok then nil
+      when :timed_out then "`#{tool.verify_command}` did not answer within #{VERIFY_TIMEOUT_SECONDS}s"
+      else out.to_s.lines.map(&:strip).reject(&:empty?).last || "`#{tool.verify_command}` exited non-zero"
+      end
+    end
+
+    def check(tools: TOOLS, now: Time.now, path: nil, versions: true, verify: true)
       resolved = path || agent_path
       found = tools.map do |tool|
         binary = which(tool.name, path: resolved)
-        Found.new(tool: tool, path: binary, version: binary && versions ? version(binary) : nil)
+        problem = binary && verify && tool.verifiable? ? verify_problem(tool, binary) : nil
+        Found.new(tool: tool, path: binary,
+                  version: binary && versions ? version(binary) : nil,
+                  problem: problem)
       end
       Result.new(at: now, path: resolved, found: found)
     end
@@ -248,8 +321,11 @@ module Agent
 
     def issue_fingerprint(result, hostname) = "toolchain:#{hostname}:#{missing_key(result)}"
 
+    # "cannot use" rather than "is missing", because a tool can now fail here
+    # while sitting on the PATH in plain sight — `browse` with no Chrome behind
+    # it. A title that says missing would start the fix in the wrong place.
     def issue_title(result, hostname)
-      "dev-agent: #{hostname} is missing #{result.missing_required.map(&:name).sort.join(', ')}"
+      "dev-agent: #{hostname} cannot use #{result.missing_required.map(&:name).sort.join(', ')}"
     end
 
     # The body is written to be actionable without an ssh session: what is
@@ -258,9 +334,11 @@ module Agent
     # sees a quiet producer, and the whole finding is that quiet and healthy look
     # identical from there.
     def issue_body(result, hostname)
-      lines = ["`#{hostname}` is missing #{result.missing_required.length} required tool(s).", ""]
-      result.missing_required.each do |tool|
+      lines = ["`#{hostname}` cannot use #{result.missing_required.length} required tool(s).", ""]
+      result.failing.each do |f|
+        tool = f.tool
         lines << "- **#{tool.name}** — needed by #{tool.required_by}"
+        lines << "  - #{f.unusable? ? "on PATH at `#{f.path}` but unusable: #{f.problem}" : 'not on the agent PATH'}"
         lines << "  - install: `#{tool.install}`"
         lines << "  - blocks producer(s): #{tool.producers.map { |k| "`#{k}`" }.join(', ')}" unless tool.producers.empty?
       end

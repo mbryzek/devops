@@ -54,9 +54,20 @@ class TestDevAgentToolchain < Minitest::Test
     end
   end
 
-  def tool(name, required: true, producers: [])
+  # A PATH holding one executable whose body, and therefore whose exit code and
+  # output, the test dictates — which is what a `verify` probe is judged on.
+  def with_script(name, body)
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, name)
+      File.write(path, "#!/bin/sh\n#{body}\n")
+      File.chmod(0755, path)
+      yield dir
+    end
+  end
+
+  def tool(name, required: true, producers: [], verify: nil)
     T::Tool.new(name: name, required_by: "#{name} things", producers: producers,
-                install: "brew install #{name}", required: required)
+                install: "brew install #{name}", required: required, verify: verify)
   end
 
   # ---- resolution ------------------------------------------------------------
@@ -114,6 +125,89 @@ class TestDevAgentToolchain < Minitest::Test
   def test_agent_path_falls_back_to_this_process_when_the_login_shell_cannot_be_asked
     stub_singleton(Open3, :capture2, ->(*_args) { raise Errno::ENOENT }) do
       assert_equal "/sentinel/bin", T.agent_path(env: { "PATH" => "/sentinel/bin" })
+    end
+  end
+
+  # ---- resolving is not the same as working ----------------------------------
+  #
+  # Every assertion in this block is about the SECOND costume of the same
+  # silence. `which` answering yes is the whole of what this module used to
+  # check, and for `browse` that answer is guaranteed and meaningless: the shim
+  # ships in devops/bin, so it resolves on any box where `api` resolves, and it
+  # still cannot render a page on a runner with no Chrome (ISS-658).
+
+  def test_a_tool_whose_own_check_passes_is_present
+    with_script("browse", "exit 0") do |dir|
+      result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+      assert result.ok?
+      assert result.found.first.present?
+      assert_nil result.found.first.problem
+    end
+  end
+
+  # The failure this whole change exists for: on PATH, in plain sight, unusable.
+  # It must count as missing — the doctor's exit code and the daily filed issue
+  # both hang off that — while still SAYING what is actually wrong.
+  def test_a_tool_that_resolves_but_fails_its_own_check_is_unusable
+    with_script("browse", "echo '  FAIL browser'; echo 'browse cannot run: no chrome'; exit 1") do |dir|
+      result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+      refute result.ok?
+      found = result.found.first
+      assert found.resolved?, "the binary was on PATH; reporting it as absent sends the fix to the wrong place"
+      assert found.unusable?
+      assert_equal "browse cannot run: no chrome", found.problem
+      assert_equal %w[browse], result.missing_required.map(&:name)
+    end
+  end
+
+  # The contract with the probe: its LAST non-empty line is the reason. A check
+  # that prints a per-requirement table cannot lead with its summary, so the
+  # summary goes last and this is what reads it.
+  def test_the_reason_is_the_last_non_empty_line_of_the_checks_output
+    with_script("browse", "echo 'first'; echo ''; echo 'the actual reason'; echo ''; exit 1") do |dir|
+      result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+      assert_equal "the actual reason", result.found.first.problem
+    end
+  end
+
+  def test_a_check_that_says_nothing_still_reports_something
+    with_script("browse", "exit 3") do |dir|
+      result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+      assert_equal "`browse --check` exited non-zero", result.found.first.problem
+    end
+  end
+
+  # A tool that never answers is a tool that cannot be used, and waiting on it is
+  # worse than saying so: the daily re-check runs inside `dev agent tick` holding
+  # the work lock, so one wedged subprocess stalls everything that machine would
+  # have claimed.
+  def test_a_check_that_never_answers_is_bounded_rather_than_waited_on
+    with_script("browse", "exit 0") do |dir|
+      stub_singleton(Util, :run_with_timeout, ->(*_args, **_kwargs) { [nil, :timed_out] }) do
+        result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+        refute result.ok?
+        assert_includes result.found.first.problem, "did not answer within"
+      end
+    end
+  end
+
+  # Verifying a binary that was never found would report a launch failure as the
+  # reason a tool is absent — the same wrong-place mistake the non-executable case
+  # above guards against, from the other side.
+  def test_a_tool_that_did_not_resolve_is_never_verified
+    with_path do |dir|
+      stub_singleton(Util, :run_with_timeout, ->(*_args, **_kwargs) { flunk "verified a binary that was not there" }) do
+        result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+        assert_nil result.found.first.problem
+        assert_equal "not on the agent's PATH", result.found.first.reason
+      end
+    end
+  end
+
+  def test_a_tool_with_no_verify_is_judged_on_resolution_alone
+    with_script("depsguard", "exit 1") do |dir|
+      result = T.check(tools: [tool("depsguard")], path: dir, versions: false)
+      assert result.ok?, "a tool that declares no check must not be run and judged by one"
     end
   end
 
@@ -186,6 +280,21 @@ class TestDevAgentToolchain < Minitest::Test
     end
   end
 
+  # Someone reading this issue on their phone must not go looking for a binary
+  # that is sitting on the PATH. The title and the body both have to name the
+  # real problem, which for an unusable tool is not its absence.
+  def test_an_unusable_tool_is_not_described_as_missing
+    with_script("browse", "echo 'no chrome on this box'; exit 1") do |dir|
+      result = T.check(tools: [tool("browse", verify: %w[--check])], path: dir, versions: false)
+      title = T.issue_title(result, "mac-1")
+      body = T.issue_body(result, "mac-1")
+      refute_includes title, "missing"
+      assert_includes title, "cannot use browse"
+      assert_includes body, "no chrome on this box"
+      assert_includes body, "on PATH at"
+    end
+  end
+
   # ---- cadence ---------------------------------------------------------------
 
   # A machine that has never checked checks on its first tick. Provisioning a
@@ -245,6 +354,20 @@ class TestDevAgentToolchain < Minitest::Test
     api = T::TOOLS.find { |t| t.name == "api" }
     refute_nil api, "codegen sync shells out to `api`; a runner without it regenerates nothing"
     assert api.required?, "a missing `api` fails the whole sweep, not one optional feature"
+  end
+
+  # The gap ISS-658 found: CLAUDE.md tells every session to `browse` the page it
+  # changed, nothing ever put browse on a PATH, and six of the seven UI repos are
+  # frontends. Dropping this entry restores the state where a runner that cannot
+  # look at a page is indistinguishable from one that can — and it must carry a
+  # `verify`, because the shim ships in devops/bin and therefore RESOLVES on any
+  # machine whether or not there is a browser behind it.
+  def test_visual_inspection_is_declared_and_proves_itself
+    browse = T::TOOLS.find { |t| t.name == "browse" }
+    refute_nil browse, "a runner without browse ships UI changes nobody has looked at"
+    assert browse.required?, "frontends are six of the seven UI repos; this is not a nice-to-have"
+    assert browse.verifiable?, "`which browse` always answers yes — presence proves nothing here"
+    assert_includes browse.install, "google-chrome"
   end
 
   def test_every_tool_carries_an_install_command_and_a_reason

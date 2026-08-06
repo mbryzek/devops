@@ -10854,7 +10854,7 @@ def cmd_agent_doctor(args)
              elsif f.tool.optional? then "--  "
              else "MISS"
              end
-    detail = f.present? ? (f.version || f.path) : "not on the agent's PATH"
+    detail = f.present? ? (f.version || f.path) : f.reason
     puts "  #{status} #{f.tool.name.ljust(width)}  #{detail}"
   end
 
@@ -10874,8 +10874,13 @@ def cmd_agent_doctor(args)
   end
 
   puts
-  missing.each do |tool|
-    puts "MISSING #{tool.name} — #{tool.required_by}"
+  # Iterates the FOUNDs, not the tools, so a tool that resolved and then failed
+  # its own check is labelled as what it is. "MISSING browse" on a box where
+  # `which browse` answers is the sort of line that costs an hour.
+  result.failing.each do |f|
+    tool = f.tool
+    puts "#{f.unusable? ? 'UNUSABLE' : 'MISSING '} #{tool.name} — #{tool.required_by}"
+    puts "  at #{f.path}, but: #{f.problem}" if f.unusable?
     puts "  install: #{tool.install}"
     puts "  blocks producer(s): #{tool.producers.join(', ')}" unless tool.producers.empty?
   end
