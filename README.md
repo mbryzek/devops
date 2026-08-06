@@ -2,6 +2,29 @@
 
 We are using [Apple's Pkl](https://github.com/apple/pkl) to manage our configuration files.
 
+## Running the tests
+
+```
+rake test
+```
+
+That is the whole suite — every `test/test_*.rb`, in one process, from the repo
+root. It exits non-zero on the first failure, so it is also the answer to "did
+this branch break anything" for anything automated.
+
+Two things it deliberately does not do:
+
+- **It does not run `test/env-stdout-is-evalable.sh`.** That guard shells into the
+  sibling `env` checkout, so what it reports depends on whether this machine has
+  one and whether it is unlocked. Run it by hand with `rake test:env_stdout`.
+- **It does not run `test/PlatformMetricsSpec.sc`**, which needs `scala-cli` (see
+  [Platform metrics CLI](#tests) below).
+
+**Merging a PR here deploys it.** Every agent runner fast-forwards its
+`~/code/devops` checkout at the top of every tick, so `main` is what the fleet is
+running within seconds — there is no separate deploy step to catch a mistake
+between. Nothing autonomous merges into this repo; see `agent/README.md`.
+
 ## Deploying Scala applications to Kubernetes
 
 ```
