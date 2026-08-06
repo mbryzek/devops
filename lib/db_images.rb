@@ -154,6 +154,41 @@ module DbImages
     system("docker image inspect #{Shellwords.shellescape(image)} > /dev/null 2>&1")
   end
 
+  # A schema image is a few tens of MB and the registry is a CDN, so a pull
+  # still running after this long is stuck, not slow.
+  PULL_TIMEOUT_SECONDS = 600
+
+  # Pull `image` from the registry. Returns whether it succeeded; aborts loudly
+  # on a timeout, which is never a "the image is not there" answer.
+  #
+  # BOUNDED IS THE POINT (ISS-578). Authentication is minted here first and
+  # deliberately does NOT go through Docker's credential store, because that
+  # store is what used to make this hang: `doctl registry login` and the
+  # `docker pull` after it both blocked forever on a wedged
+  # docker-credential-desktop, with no output and no failure. A session that
+  # hangs here loses its ENTIRE run and leaves no artifact anyone can read
+  # afterwards — the report that prompted this was 25 minutes of exactly that.
+  # Failing loudly with the remediation command costs one retry.
+  #
+  # Pull-only credentials: nothing on this path pushes. The one caller that does
+  # (the self-heal build) re-mints push scope for itself.
+  def DbImages.pull(image)
+    RegistryAuth.authenticate!(:read_write => false)
+    _, outcome = Util.run_with_timeout(["docker", "pull", image], :timeout_seconds => PULL_TIMEOUT_SECONDS)
+    return true if outcome == :ok
+    return false if outcome == :failed
+
+    Util.exit_with_error(
+      "Timed out after #{PULL_TIMEOUT_SECONDS}s pulling #{image}, and killed the pull.\n\n" \
+      "Credentials were minted successfully, so this is the transfer itself: a\n" \
+      "dead network route to registry.digitalocean.com, or a Docker daemon that\n" \
+      "has stopped making progress. Check the daemon first:\n\n" \
+      "    docker version\n\n" \
+      "then retry the pull on its own:\n\n" \
+      "    docker pull #{image}"
+    )
+  end
+
   # ── containers ────────────────────────────────────────────────────────────
 
   # Container naming, and the list of an app's containers, live on DbApp — they

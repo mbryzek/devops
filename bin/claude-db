@@ -305,11 +305,7 @@ def ensure_image(app, desired_image, schema_tag)
   end
 
   puts "Image not in local cache — pulling from registry..."
-  Util.run("doctl registry login --expiry-seconds 3600", :ignore_error => true)
-
-  if system("docker pull #{Shellwords.shellescape(desired_image)}")
-    return
-  end
+  return if DbImages.pull(desired_image)
 
   # Pull failed — image not in registry.  Build and push it now.
   puts ""
@@ -321,7 +317,8 @@ def ensure_image(app, desired_image, schema_tag)
   )
   puts ""
   puts "Pulling freshly built image..."
-  Util.run("docker pull #{desired_image}")
+  return if DbImages.pull(desired_image)
+  Util.exit_with_error("docker pull #{desired_image} failed even after building and pushing it.")
 end
 
 # ── sync ───────────────────────────────────────────────────────────────────
