@@ -260,7 +260,10 @@ class TestDevAgentPlaybook < Minitest::Test
   def test_a_clean_lint_says_how_many_playbooks_it_read
     out, findings = report(rows: [ROWS.first], lint: true)
     assert_empty findings
-    assert_match(/No hardcoded home paths in 1 playbook\(s\)/, out)
+    assert_match(/No findings in 1 playbook\(s\)/, out)
+    # And it names the checks: a clean line that does not say WHAT it checked
+    # cannot tell you that a defect class you just thought of is not covered.
+    assert_match(/hardcoded homes, unpushable writes, reaped plans/, out)
   end
 
   def test_the_lint_names_the_key_the_line_and_the_path
@@ -276,7 +279,175 @@ class TestDevAgentPlaybook < Minitest::Test
     out, = report
     assert_match(/Playbook store: 2 playbook\(s\)/, out)
     assert_match(/broken.*v #{Regexp.escape(VERSION)}/, out)
-    assert_match(/1 hardcoded home path\(s\): \/Users\/mbryzek/, out)
-    refute_match(/clean\n.*hardcoded/, out)
+    assert_match(/1 lint finding\(s\): \/Users\/mbryzek/, out)
+    refute_match(/clean\n.*lint finding/, out)
+  end
+
+  # ---- writes no unattended session can land (ISS-644) ----
+  #
+  # The sibling of the hardcoded home. That one is an instruction that works on
+  # ONE runner; these two work on NO runner, and both fail at the END of a run —
+  # after the session has done the thinking and written the file — so a run that
+  # recorded nothing looks exactly like a run with nothing to record. ISS-632 is
+  # the worked example: `daily-perf-prs` pointed its dedup ledger at
+  # `~/code/claude/perf-ledger.md` and no unattended run recorded an entry for
+  # weeks, dedupping nothing.
+  #
+  # The whole design problem here is the FALSE POSITIVE, not the catch. Half the
+  # store legitimately points at `~/code/claude/rules/*.mdc` and at design docs
+  # under `plans/`, and a lint with a standing false positive is one nobody runs
+  # twice — so the bulk of these tests are of paths that must stay clean.
+
+  def targets(body)
+    Agent::Playbook.write_targets_in(body, key: "pb").map(&:to_s)
+  end
+
+  def rules_of(body)
+    Agent::Playbook.write_targets_in(body, key: "pb").map(&:rule)
+  end
+
+  # ---- 1. unpushable: outside plans/, which the push guard refuses ----
+
+  # Verbatim the shape ISS-632 shipped for weeks.
+  def test_a_ledger_at_the_repo_root_is_unpushable
+    assert_equal ["pb:1: ~/code/claude/perf-ledger.md — outside `plans/` — the push guard refuses " \
+                  "this write from an unattended session"],
+                 targets("Append the entry to `~/code/claude/perf-ledger.md` before finishing.")
+  end
+
+  # The other half of the same defect, and the form with no prose verb anywhere:
+  # the repo and the path are separate arguments of a command that is a write by
+  # construction.
+  def test_git_add_names_its_path_as_a_separate_argument
+    assert_equal [:unpushable], rules_of("    git -C ~/code/claude add perf-ledger.md")
+    assert_equal [:unpushable], rules_of("    git -C $HOME/code/claude add notes/ledger.md")
+    assert_empty targets("    git -C ~/code/claude add plans/data/perf-ledger.md")
+  end
+
+  # `-A` is not a path. It is its own hazard in a shared checkout, but flagging it
+  # here would mean reporting a flag as a file and the finding would read as
+  # nonsense.
+  def test_git_add_ignores_flags
+    assert_empty targets("    git -C ~/code/claude add -A")
+  end
+
+  def test_every_spelling_of_the_repo_is_the_same_repo
+    ["~", "$HOME", "${HOME}", "/Users/mbryzek", "/Users/athena", "/home/ci"].each do |home|
+      assert_equal [:unpushable], rules_of("Write it to #{home}/code/claude/CLAUDE.md"), home
+    end
+  end
+
+  def test_a_shell_redirect_is_a_write_cue
+    assert_equal [:unpushable], rules_of('    echo "$entry" >> ~/code/claude/ledger.md')
+    assert_equal [:unpushable], rules_of('    printf "%s" "$e" | tee -a ~/code/claude/ledger.md')
+  end
+
+  # ---- the false positives that would make nobody run this twice ----
+
+  # Half the store says exactly this, and the trap is the write verb sitting AFTER
+  # the path in the same sentence, about something else entirely.
+  def test_reading_the_rules_before_writing_code_is_not_a_write
+    assert_empty targets("- Read the relevant `~/code/claude/rules/*.mdc` before writing code — especially")
+    assert_empty targets("conventions, and `~/code/claude/rules/*.mdc` covers each stack in detail.")
+  end
+
+  # A bare mention of the repo is not a target: `git -C ~/code/claude pull` and
+  # the prose explaining the push guard both name it, and neither writes anything
+  # to a path.
+  def test_the_repo_named_without_a_path_is_not_a_target
+    assert_empty targets("    git -C ~/code/claude pull --rebase origin main")
+    assert_empty targets("`~/code/claude` is the one repo an unattended session commits straight to `main`.")
+    assert_empty targets("the push guard refuses any push to `~/code/claude` touching anything else")
+  end
+
+  # A pointer at a document to read, whose sentence then goes on to use a verb the
+  # naive matcher would take. `:` ends the previous clause's reach for the same
+  # reason.
+  def test_a_design_doc_pointer_is_not_a_write
+    assert_empty targets("Design: `~/code/claude/plans/2026-08-04-pr-auto-merge-design.md`. Read it if\n" \
+                         "you are updating the merge order.")
+  end
+
+  # ---- 2. reaped: a top-level plans/ file that `dev prune plans` git rm's ----
+
+  def test_long_lived_state_at_the_top_of_plans_is_reaped
+    assert_equal ["pb:1: ~/code/claude/plans/perf-ledger.md — a top-level `plans/` file with no date " \
+                  "in its name — `dev prune plans` removes it after 14 days"],
+                 targets("Append the entry to `~/code/claude/plans/perf-ledger.md`.")
+  end
+
+  # The fix ISS-632 actually shipped, and the reason a subdirectory was the whole
+  # point: the reaper never descends.
+  def test_a_subdirectory_under_plans_is_never_reaped
+    assert_empty targets("Append the entry to `~/code/claude/plans/data/perf-ledger.md`.")
+    assert_empty targets("Also write a copy to `~/code/claude/plans/data/meta-review-<YYYY-MM-DD>.md`.")
+  end
+
+  # `weekly-review` writes one of these every week and is precisely the file this
+  # check must not flag — a date in the name is what a per-run snapshot always has
+  # and long-lived state never does. Note the wrap: the verb is on the line above.
+  def test_a_dated_snapshot_at_the_top_of_plans_is_fine
+    assert_empty targets("Write the full findings report and PR\n" \
+                         "grouping to `~/code/claude/plans/{child}-weekly-<date>.md`.")
+    assert_empty targets("Write it to `~/code/claude/plans/triage-2026-08-06.md`.")
+    assert_empty targets('    date=$(date +%F); echo x > ~/code/claude/plans/run-$(date +%F).md')
+  end
+
+  # The same sentence with the date taken out is the defect, which is what makes
+  # the placeholder — not the path — the thing being tested.
+  def test_the_same_wrapped_sentence_without_a_date_is_reaped
+    assert_equal [:reaped], rules_of("Write the full findings report and PR\n" \
+                                     "grouping to `~/code/claude/plans/{child}-weekly.md`.")
+  end
+
+  # A list item starts a new thought, so the line above it must not be allowed to
+  # supply the verb — otherwise every path in a bulleted list inherits the cue
+  # from whatever sentence happened to precede the list.
+  def test_a_list_item_does_not_inherit_the_line_above
+    assert_empty targets("Write the report and commit it.\n" \
+                         "- `~/code/claude/rules/scala.general.mdc` covers the style")
+  end
+
+  # A definition names its target first and says what it is for second. This is
+  # the line ISS-632 actually got wrong, and the reason a cue after the path has
+  # to count at all.
+  def test_a_definition_line_counts_its_verb_after_the_path
+    assert_equal [:unpushable], rules_of("- `LEDGER = ~/code/claude/perf-ledger.md` — records terminal outcomes")
+  end
+
+  # A finding that reports the sentence's full stop as part of the filename names
+  # a file that does not exist, and the reader has to work out which one is meant.
+  def test_the_path_reported_is_the_path_without_the_sentences_punctuation
+    assert_equal ["pb:1: ~/code/claude/ledger.md — #{Agent::Playbook::REASONS[:unpushable]}"],
+                 targets("Append it to `~/code/claude/ledger.md`.")
+    assert_equal ["pb:1: ~/code/claude/ledger.md — #{Agent::Playbook::REASONS[:unpushable]}"],
+                 targets("Append it (to ~/code/claude/ledger.md), then push.")
+  end
+
+  def test_the_whole_store_is_linted_for_every_rule_at_once
+    rows = [
+      { "key" => "clean", "body" => "Write `~/code/claude/plans/data/x.md`." },
+      { "key" => "broken", "body" => "one\nwrite /Users/mbryzek/code/claude/x.md\n" },
+    ]
+    # Both detectors fire on that second line, and they are two distinct defects:
+    # the path is wrong on every runner but this one AND unwritable on all of them.
+    assert_equal %i[home_path unpushable], Agent::Playbook.lint_all(rows).map(&:rule)
+  end
+
+  # Every rule a finding can carry has a remedy, so a detector cannot ship without
+  # saying what to do instead — and `REMEDIES.fetch` in the reporter would raise
+  # rather than print a bare finding.
+  def test_every_rule_has_a_remedy
+    rules = [Agent::Playbook::HomePath, Agent::Playbook::WriteTarget]
+             .flat_map { |s| s == Agent::Playbook::HomePath ? [:home_path] : Agent::Playbook::REASONS.keys }
+    rules.each { |rule| assert Agent::Playbook::REMEDIES.key?(rule), "no remedy for #{rule}" }
+  end
+
+  def test_the_lint_prints_one_remedy_per_rule_it_hit
+    rows = [{ "key" => "pb", "body" => "Append it to `~/code/claude/plans/ledger.md`.\n", "created_at" => VERSION }]
+    out, findings = report(rows: rows, lint: true)
+    assert_equal [:reaped], findings.map(&:rule)
+    assert_match(%r{plans/` SUBDIRECTORY}, out)
+    refute_match(/do not share a home/, out)
   end
 end
