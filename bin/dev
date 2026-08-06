@@ -463,6 +463,12 @@ USAGE = <<~USAGE
         nothing is ever published (only `api publish`, from a clean merged main,
         moves the registry). Backends (platform, acumen) regenerate first,
         serially; consumers regenerate in parallel. `sync` is the default subcommand.
+        Where the regen alone does not compile, a bounded Claude session fixes the
+        consuming code — and its PR is then re-checked mechanically: the regen must
+        survive a second `api` run untouched, no generated file may be edited, no
+        @ts-nocheck/eslint-disable added and no build config relaxed, and the pushed
+        tree must build. A PR failing any of those is reverted to draft and the repo
+        lands at needs_attention rather than pr_opened (ISS-630).
         --dry-run reports diffs without spawning Claude or opening PRs;
         --regen-only opens draft PRs but skips the review-completion workflow;
         --full-tests runs the full Scala suite instead of Test/compile.
@@ -6874,11 +6880,24 @@ def run_repo(name, workdir, stack, opts, branch, &announce)
     note.call("build clean — committing + opening PR (no Claude)")
     commit_and_open_pr(clone, branch, draft: false)
   else
-    note.call("build failed — handing to Claude to fix")
+    # Commit the regen BEFORE handing off. That commit is the seam every
+    # post-session check measures against: with it in place the fix session's
+    # own changes are exactly `<regen_sha>..HEAD`, so "did it revert the regen"
+    # and "what did it edit" are one `git diff` each instead of guesswork.
+    note.call("build failed — committing the regen, then handing to Claude to fix")
+    regen_sha, commit_err = commit_regen(clone)
+    return { status: :error, error: commit_err } if commit_err
+    generated = Codegen::Sync.generated_relative_paths(clone)
+
     prompt = Codegen::Sync.fix_prompt(repo: name, branch: branch,
                                       verify_cmd: verify_cmd, regen_only: false,
                                       build_error: verify_log)
-    spawn_claude(clone, prompt)
+    result = spawn_claude(clone, prompt)
+    return result unless result[:status] == :pr_opened
+
+    verify_fix_session(clone, branch, stack, verify_cmd,
+                       regen_sha: regen_sha, generated: generated,
+                       pr_url: result[:pr_url], &announce)
   end
 rescue => e
   { status: :error, error: "run_repo crashed: #{e.class}: #{e.message}" }
@@ -6899,14 +6918,34 @@ def run_verify(clone, stack, verify_cmd)
 end
 
 CODEGEN_COMMIT_MSG = "Sync regenerated apibuilder/DAO code".freeze
+# Build logs and Claude transcripts are unbounded; they land in the summary line
+# and in codegen-sync-status.json, both of which a human reads. Keep the tail —
+# the last lines are where the reason is.
+CODEGEN_ERROR_TAIL_CHARS = 2_000
+
+def tail_chars(text, limit = CODEGEN_ERROR_TAIL_CHARS)
+  s = text.to_s.strip
+  s.length <= limit ? s : "…#{s[-limit..]}"
+end
+
+# Stage and commit the regenerated tree. Returns [sha, nil] or [nil, error].
+# Shared by the clean path (which pushes it straight to a PR) and the Claude
+# path (which commits it first so the fix session's changes are isolable).
+def commit_regen(clone)
+  run_step(["git", "add", "-A"], clone, false, +"")
+  commit_ok, commit_out = run_step(["git", "commit", "-m", CODEGEN_COMMIT_MSG], clone, false, +"")
+  return [nil, "commit failed: #{tail_chars(commit_out)}"] unless commit_ok
+  sha_ok, sha_out = run_step(["git", "rev-parse", "HEAD"], clone, false, +"")
+  return [nil, "could not resolve the regen commit: #{tail_chars(sha_out)}"] unless sha_ok
+  [sha_out.to_s.strip, nil]
+end
 
 # Deterministic clean-regen path (no Claude): stage everything, commit, push the
 # branch, and open a PR. Returns {status: :pr_opened, pr_url:} or an error /
 # needs_attention hash. Never merges. draft: true opens a draft PR (regen-only).
 def commit_and_open_pr(clone, branch, draft:)
-  run_step(["git", "add", "-A"], clone, false, +"")
-  commit_ok, commit_out = run_step(["git", "commit", "-m", CODEGEN_COMMIT_MSG], clone, false, +"")
-  return { status: :error, error: "commit failed: #{commit_out}" } unless commit_ok
+  _sha, commit_err = commit_regen(clone)
+  return { status: :error, error: commit_err } if commit_err
   push_ok, push_out = run_step(["git", "push", "-u", "origin", branch], clone, false, +"")
   return { status: :error, error: "push failed: #{push_out}" } unless push_ok
   # --head: the clone is single-branch (--depth=1), so its fetch refspec only
@@ -6920,6 +6959,108 @@ def commit_and_open_pr(clone, branch, draft:)
     return { status: :needs_attention, error: "PR create failed (clone left at #{clone}): #{create_out.to_s.strip}" }
   end
   { status: :pr_opened, pr_url: url }
+end
+
+# A PR whose post-session checks failed must not sit in the queue looking
+# mergeable. Converting it back to draft is the only signal a reviewer sees in
+# the PR list itself — the sweep's summary and status json scroll past, and a
+# nightly reviewer reads the list. Best effort: a gh failure here must not
+# change the verdict we already reached.
+def demote_pr_to_draft(clone, pr_url)
+  run_step(["gh", "pr", "ready", "--undo", pr_url], clone, false, +"")
+end
+
+# Everything the bounded fix session claims, re-established mechanically.
+#
+# `spawn_claude` returning a PR URL only proves a session ran and printed one.
+# properties#45 (ISS-630) exited that way having reverted the regeneration,
+# prepended `// @ts-nocheck` to three generated files, added a hand-written
+# `.d.ts` shim beside them and set `noImplicitAny: false` — reported as
+# `pr_opened`, indistinguishable in the summary from a clean sync, and merging
+# it would have left the repo drifted. So nothing the session says is taken on
+# trust; the four properties the sweep actually wants are each asserted:
+#
+#   1. the pushed tree IS the tree we are inspecting (regen commit still in
+#      history, nothing uncommitted, remote branch at our HEAD);
+#   2. the session stayed inside its job — no generated file touched, no
+#      suppression directive, no loosened build config;
+#   3. the regen SURVIVED — wiping and rerunning `api` on the pushed tree is a
+#      no-op. This is the property the whole sweep exists to guarantee, and it
+#      independently re-catches (2) for anything the generator owns;
+#   4. it builds.
+#
+# Any failure is `:needs_attention` carrying the PR URL, which the playbook
+# already handles well — a repo the sweep cannot fix cleanly is a repo for a
+# human, and that is a far better outcome than a green-looking PR that undoes
+# the thing it claims to do.
+def verify_fix_session(clone, branch, stack, verify_cmd, regen_sha:, generated:, pr_url:, &announce)
+  note = ->(msg) { announce&.call(msg) }
+  reject = lambda do |reason|
+    demote_pr_to_draft(clone, pr_url)
+    { status: :needs_attention, pr_url: pr_url,
+      error: "fix session rejected — PR reverted to draft (clone left at #{clone}): #{reason}" }
+  end
+
+  note.call("checking the fix session's work…")
+
+  ancestor_ok, _ = run_step(["git", "merge-base", "--is-ancestor", regen_sha, "HEAD"], clone, false, +"")
+  unless ancestor_ok
+    return reject.call("the regen commit #{regen_sha[0, 8]} is no longer in the branch — the session " \
+                       "amended, reset, reverted or rebased away the regeneration it was handed")
+  end
+
+  porcelain, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
+  porcelain = Util.to_utf8(porcelain)
+  unless Codegen::Sync.classify_diff(porcelain) == :in_sync
+    return reject.call("the session left the tree dirty, so the PR is not what it verified:\n#{tail_chars(porcelain)}")
+  end
+
+  head_ok, head_sha = run_step(["git", "rev-parse", "HEAD"], clone, false, +"")
+  return reject.call("could not resolve HEAD: #{tail_chars(head_sha)}") unless head_ok
+  head_sha = head_sha.to_s.strip
+  # What GitHub shows is the remote branch, not this clone. A session that
+  # pushed and then kept committing leaves a PR nothing here has checked.
+  remote_ok, remote_out = run_step(["git", "ls-remote", "origin", "refs/heads/#{branch}"], clone, false, +"")
+  remote_sha = remote_out.to_s[/\A([0-9a-f]{40})/, 1]
+  return reject.call("could not read origin/#{branch}: #{tail_chars(remote_out)}") unless remote_ok && remote_sha
+  unless remote_sha == head_sha
+    return reject.call("origin/#{branch} is at #{remote_sha[0, 8]} but the checked tree is #{head_sha[0, 8]} — " \
+                       "the PR is not the tree these checks ran against")
+  end
+
+  range = "#{regen_sha}..HEAD"
+  ns_ok, name_status = run_step(["git", "diff", "--name-status", range], clone, false, +"")
+  return reject.call("could not list the session's changes: #{tail_chars(name_status)}") unless ns_ok
+  # --unified=0: only the lines the session actually added, so an untouched
+  # suppression sitting near a real edit is never read as a new one.
+  d_ok, diff = run_step(["git", "diff", "--unified=0", range], clone, false, +"")
+  return reject.call("could not diff the session's changes: #{tail_chars(diff)}") unless d_ok
+  violations = Codegen::Sync.fix_session_violations(name_status: name_status, diff_text: diff, generated: generated)
+  unless violations.empty?
+    return reject.call("it took shortcuts the next regen would wipe:\n  - #{violations.join("\n  - ")}")
+  end
+
+  note.call("re-running api to prove the regeneration survived…")
+  Codegen::Sync.generated_paths(clone).each { |p| File.delete(p) if File.exist?(p) }
+  codegen_api_dirs(clone).each do |dir|
+    log = +""
+    ok, _ = run_step(["api"], dir, false, log)
+    rel = dir == clone ? "." : dir.sub("#{clone}#{File::SEPARATOR}", "")
+    return reject.call("api failed re-running in #{rel}: #{tail_chars(log)}") unless ok
+  end
+  revert_noise_only_changes(clone)
+  after, _ = Open3.capture2("git", "-C", clone, "status", "--porcelain")
+  after = Util.to_utf8(after)
+  unless Codegen::Sync.classify_diff(after) == :in_sync
+    return reject.call("rerunning `api` on the pushed tree is not a no-op — the regeneration did not " \
+                       "survive the fix session, so merging this would leave the repo drifted:\n#{tail_chars(after)}")
+  end
+
+  note.call("re-verifying (#{verify_cmd}) on the pushed tree…")
+  build_ok, build_log = run_verify(clone, stack, verify_cmd)
+  return reject.call("the pushed tree does not build (#{verify_cmd}):\n#{tail_chars(build_log)}") unless build_ok
+
+  { status: :pr_opened, pr_url: pr_url }
 end
 
 # Thin integration glue: run a fresh Claude session in `clone` to make the
@@ -6973,11 +7114,18 @@ def spawn_claude(clone, prompt, model: CODEGEN_CLAUDE_MODEL, timeout_secs: CODEG
   # malformed byte in Claude's output.
   output = Util.to_utf8(output)
   unless status.success?
-    return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{output}" }
+    return { status: :needs_attention, error: "claude --print failed (clone left at #{clone}): #{tail_chars(output)}" }
   end
 
   pr_url = output[%r{https://github\.com/\S+/pull/\d+}]
-  return { status: :needs_attention, error: "claude finished but no PR URL found in output (clone left at #{clone})" } unless pr_url
+  # No PR is now a legitimate, instructed outcome as well as a failure: the fix
+  # prompt tells the session to stop rather than suppress an error it cannot fix
+  # in the consuming code. Either way its own last words are the explanation, so
+  # they have to reach the summary instead of being discarded.
+  unless pr_url
+    return { status: :needs_attention,
+             error: "claude finished without opening a PR (clone left at #{clone}): #{tail_chars(output)}" }
+  end
 
   { status: :pr_opened, pr_url: pr_url }
 end

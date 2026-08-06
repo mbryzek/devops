@@ -410,10 +410,41 @@ class TestFixPrompt < Minitest::Test
     assert_includes p, "rallyd"
     assert_includes p, "codegen-sync-x"
     assert_includes p, "npm run check"
-    assert_includes p.downcase, "never edit generated files"
+    assert_includes p.downcase, "never edit, revert, delete or rename a generated file"
     assert_includes p, "TS2322: type mismatch"
     assert_includes p, "gh pr create"
     assert_includes p.downcase, "do not merge to main"
+  end
+
+  # Every shortcut properties#45 took (ISS-630) has to be named in the prompt as
+  # well as caught afterwards — a session told only "make it build" reaches for
+  # the suppression first, and rejecting the PR afterwards costs a whole sweep.
+  def test_prompt_names_every_refused_shortcut
+    p = Codegen::Sync.fix_prompt(repo: "properties", branch: "b",
+                                 verify_cmd: "npm run check", regen_only: false)
+    %w[@ts-nocheck @ts-ignore @ts-expect-error eslint-disable scalastyle:off @nowarn
+       tsconfig*.json build.sbt package.json].each do |token|
+      assert_includes p, token
+    end
+    assert_includes p.downcase, "never add a new file beside"
+    assert_includes p.downcase, "rebase away the regen commit"
+  end
+
+  # The session is handed a committed regen, not a dirty tree — that commit is
+  # the base every post-session check diffs against.
+  def test_prompt_states_the_regen_is_already_committed
+    p = Codegen::Sync.fix_prompt(repo: "properties", branch: "b",
+                                 verify_cmd: "npm run check", regen_only: false)
+    assert_includes p.downcase, "already committed"
+  end
+
+  # Stopping with no PR is an instructed outcome, not only a crash: a repo the
+  # sweep cannot fix cleanly belongs at needs_attention, which the playbook
+  # handles, rather than in a PR that suppresses the error.
+  def test_prompt_tells_the_session_to_stop_rather_than_suppress
+    p = Codegen::Sync.fix_prompt(repo: "properties", branch: "b",
+                                 verify_cmd: "npm run check", regen_only: false)
+    assert_includes p.downcase, "do not open a pr"
   end
 
   # The clone is single-branch, so gh cannot resolve the pushed branch without
@@ -444,6 +475,155 @@ class TestFixPrompt < Minitest::Test
     refute_includes p, "npm run check"   # no build step
     refute_includes p.downcase, "code-reviewer agent"
     assert_includes p.downcase, "draft"  # regen-only opens a draft PR
+  end
+end
+
+# The bounded fix session's output is checked, never trusted. Every case below
+# is something properties#45 actually did (ISS-630): it reverted the regen,
+# prepended `// @ts-nocheck` to three generated files, added a hand-written
+# `.d.ts` shim beside them and set `noImplicitAny: false` — and came back as
+# `pr_opened`, indistinguishable in the summary from a clean sync.
+class TestFixSessionViolations < Minitest::Test
+  GENERATED = %w[
+    playwright/generated/com-bryzek-platform.ts
+    playwright/generated/com-bryzek-properties-api.ts
+    src/lib/generated/client.ts
+  ].freeze
+
+  def violations(name_status, diff = "")
+    Codegen::Sync.fix_session_violations(name_status: name_status, diff_text: diff, generated: GENERATED)
+  end
+
+  def diff_adding(path, line)
+    "--- a/#{path}\n+++ b/#{path}\n@@ -1,0 +1,1 @@\n+#{line}\n"
+  end
+
+  # A session that only fixes consuming code is the whole point — it must pass.
+  def test_a_clean_consumer_fix_is_allowed
+    diff = "--- a/src/routes/x.svelte\n+++ b/src/routes/x.svelte\n@@ -1 +1 @@\n-old(a)\n+renamed(a)\n"
+    assert_empty violations("M\tsrc/routes/x.svelte\n", diff)
+  end
+
+  def test_editing_a_generated_file_is_refused
+    v = violations("M\tplaywright/generated/com-bryzek-platform.ts\n")
+    assert_equal ["edited generated file playwright/generated/com-bryzek-platform.ts"], v
+  end
+
+  def test_deleting_a_generated_file_is_refused
+    assert_includes violations("D\tsrc/lib/generated/client.ts\n").first, "deleted generated file"
+  end
+
+  # Renaming one out of the way is deleting it with extra steps.
+  def test_renaming_a_generated_file_is_refused
+    v = violations("R100\tsrc/lib/generated/client.ts\tsrc/lib/generated/client.old.ts\n")
+    assert_includes v, "deleted generated file src/lib/generated/client.ts"
+    assert_includes v, "added src/lib/generated/client.old.ts inside generated directory src/lib/generated"
+  end
+
+  # The `.d.ts` re-export shim: a hand-written file the generator does not own,
+  # dropped in beside the files it does. The next regen leaves it orphaned.
+  def test_a_new_file_in_a_generated_directory_is_refused
+    v = violations("A\tplaywright/generated/com-bryzek-properties-api.d.ts\n")
+    assert_equal ["added playwright/generated/com-bryzek-properties-api.d.ts " \
+                  "inside generated directory playwright/generated"], v
+  end
+
+  # Generated directories legitimately hold hand-written files too (platform's
+  # api/conf keeps application.conf next to generated *.routes), so only ADDING
+  # a file there is refused — editing a hand-written neighbour is real work.
+  def test_editing_a_hand_written_neighbour_is_allowed
+    assert_empty violations("M\tplaywright/generated/README.md\n")
+  end
+
+  # Path-matched, not header-matched: stripping the marker off a generated file
+  # before editing it must not buy the session a pass.
+  def test_a_generated_file_is_matched_by_path_not_by_its_header
+    diff = "--- a/src/lib/generated/client.ts\n+++ b/src/lib/generated/client.ts\n" \
+           "@@ -1 +1 @@\n-// Generated by API Builder\n+// hand written, honest\n"
+    assert_includes violations("M\tsrc/lib/generated/client.ts\n", diff).first, "edited generated file"
+  end
+
+  def test_relaxing_tsconfig_is_refused
+    v = violations("M\ttsconfig.playwright.json\n",
+                   diff_adding("tsconfig.playwright.json", '    "noImplicitAny": false,'))
+    assert_equal ["edited build config tsconfig.playwright.json"], v
+  end
+
+  # Weakening the `check` script or ignoring the generated output makes the
+  # build go green the same way a compiler flag does.
+  def test_package_json_and_gitignore_are_build_config
+    assert_includes violations("M\tpackage.json\n").first, "build config package.json"
+    assert_includes violations("M\t.gitignore\n").first, "build config .gitignore"
+  end
+
+  def test_build_config_matches_every_stack
+    %w[tsconfig.json tsconfig.playwright.json .eslintrc .eslintrc.cjs eslint.config.js
+       svelte.config.js elm.json review/src/ReviewConfig.elm build.sbt .scalafmt.conf
+       scalastyle-config.xml].each do |p|
+      assert Codegen::Sync.build_config_path?(p), "expected #{p} to count as build config"
+    end
+  end
+
+  def test_ordinary_source_is_not_build_config
+    %w[src/lib/api.ts config/routes.ts my-package.json.md src/Main.elm].each do |p|
+      refute Codegen::Sync.build_config_path?(p), "expected #{p} NOT to count as build config"
+    end
+  end
+
+  def test_added_suppressions_are_refused
+    ["// @ts-nocheck", "// @ts-ignore", "// @ts-expect-error", "/* eslint-disable */",
+     "// scalastyle:off", "@nowarn"].each do |line|
+      v = violations("M\tsrc/lib/x.ts\n", diff_adding("src/lib/x.ts", line))
+      refute_empty v, "expected #{line.inspect} to be refused"
+      assert_includes v.first, "added suppression"
+    end
+  end
+
+  def test_suppression_finding_names_the_file
+    v = Codegen::Sync.suppression_findings(diff_adding("src/lib/x.ts", "// @ts-nocheck"))
+    assert_equal ["src/lib/x.ts: added suppression `// @ts-nocheck`"], v
+  end
+
+  # Only lines the session ADDED count. A suppression already in the repo is
+  # somebody else's reviewed decision, and it shows up as context, as a removed
+  # line, or in the `---`/`+++` headers — none of which is a finding.
+  def test_untouched_and_removed_suppressions_are_not_findings
+    diff = "--- a/src/@ts-nocheck-notes.ts\n+++ b/src/@ts-nocheck-notes.ts\n" \
+           "@@ -1,3 +1,3 @@\n // @ts-nocheck\n-eslint-disable-me()\n+renamed()\n"
+    assert_empty Codegen::Sync.suppression_findings(diff)
+  end
+
+  def test_empty_diff_and_empty_name_status_are_clean
+    assert_empty violations("", "")
+  end
+
+  # One session can take several shortcuts at once, and the summary has to name
+  # all of them — a human reading it should not have to re-derive the rest.
+  def test_every_shortcut_is_reported_together
+    name_status = "M\tplaywright/generated/com-bryzek-platform.ts\n" \
+                  "A\tplaywright/generated/com-bryzek-properties-api.d.ts\n" \
+                  "M\ttsconfig.playwright.json\n"
+    diff = diff_adding("playwright/generated/com-bryzek-platform.ts", "// @ts-nocheck")
+    v = violations(name_status, diff)
+    assert_equal 4, v.length, v.inspect
+    assert(v.any? { |f| f.include?("edited generated file") })
+    assert(v.any? { |f| f.include?("inside generated directory") })
+    assert(v.any? { |f| f.include?("build config tsconfig.playwright.json") })
+    assert(v.any? { |f| f.include?("added suppression") })
+  end
+end
+
+class TestGeneratedRelativePaths < Minitest::Test
+  # git speaks repo-relative paths; the wipe set is absolute. The comparison
+  # between them is what catches a hand-edited generated file, so the two forms
+  # have to line up exactly.
+  def test_paths_are_repo_relative
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "playwright/generated"))
+      File.write(File.join(dir, "playwright/generated/a.ts"), "// Generated by API Builder\n")
+      File.write(File.join(dir, "handwritten.ts"), "export const x = 1\n")
+      assert_equal ["playwright/generated/a.ts"], Codegen::Sync.generated_relative_paths(dir)
+    end
   end
 end
 
@@ -750,5 +930,187 @@ class TestDevCodegenEncoding < Minitest::Test
       assert status.success?, "File.read under empty locale crashed: #{out}"
       assert_includes out, "ENCODING_OK"
     end
+  end
+end
+
+# `verify_fix_session` end to end, against a real git repo with a real remote
+# and a stub generator on PATH. The unit tests above pin what counts as a
+# violation; this pins that the sweep actually looks — properties#45 (ISS-630)
+# was reported `pr_opened` because nothing between "claude printed a PR URL"
+# and the summary ever re-established a single property of the branch.
+class TestVerifyFixSession < Minitest::Test
+  GENERATED_HEADER = "// Generated by API Builder\n".freeze
+
+  def setup
+    @dir = Dir.mktmpdir("verify-fix-session")
+    @origin = File.join(@dir, "origin.git")
+    @clone = File.join(@dir, "repo")
+    @bin = File.join(@dir, "bin")
+    @branch = "codegen-sync-20260806-000000"
+    @pr_url = "https://github.com/mbryzek/properties/pull/45"
+    FileUtils.mkdir_p(@bin)
+    @saved_path = ENV["PATH"]
+    ENV["PATH"] = "#{@bin}:#{@saved_path}"
+
+    # `gh` must never be reached from a test — the only gh call on this path is
+    # the draft demotion, and a real one would hit GitHub.
+    @demoted = []
+    demoted = @demoted
+    @orig_demote = method(:demote_pr_to_draft)
+    Object.send(:define_method, :demote_pr_to_draft) { |_clone, url| demoted << url }
+
+    build_repo
+  end
+
+  def teardown
+    ENV["PATH"] = @saved_path
+    Object.send(:define_method, :demote_pr_to_draft, @orig_demote)
+    FileUtils.remove_entry(@dir)
+  end
+
+  # A stub `api`: rewrites the one generated file from `body`, exactly as the
+  # real generator would. Changing `body` after the regen commit is how a
+  # "the tree is not what the generator produces" case is set up.
+  def install_api(body)
+    File.write(File.join(@bin, "api"), <<~SH)
+      #!/bin/sh
+      mkdir -p generated
+      printf '%s' '#{GENERATED_HEADER}export const VERSION = "#{body}"
+      ' > generated/client.ts
+    SH
+    FileUtils.chmod(0o755, File.join(@bin, "api"))
+  end
+
+  def git(*args, dir: @clone)
+    out, status = Open3.capture2e("git", "-C", dir, *args)
+    raise "git #{args.join(' ')} failed: #{out}" unless status.success?
+    out
+  end
+
+  def build_repo
+    Open3.capture2e("git", "init", "--bare", "--initial-branch=main", @origin)
+    Open3.capture2e("git", "init", "--initial-branch=main", @clone)
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "test")
+    git("remote", "add", "origin", @origin)
+    FileUtils.mkdir_p(File.join(@clone, ".api"))
+    File.write(File.join(@clone, ".api", "config.pkl"), "// stub\n")
+    File.write(File.join(@clone, "app.ts"), "import { VERSION } from './generated/client'\n")
+    install_api("v1")
+    Open3.capture2e("api", chdir: @clone)
+    git("add", "-A")
+    git("commit", "-m", "base")
+    git("push", "-u", "origin", "main")
+
+    # The sweep's own regen, committed before the session is handed the clone.
+    git("checkout", "-b", @branch)
+    install_api("v2")
+    Open3.capture2e("api", chdir: @clone)
+    @generated = Codegen::Sync.generated_relative_paths(@clone)
+    @regen_sha, err = commit_regen(@clone)
+    raise err if err
+  end
+
+  # Everything a session does: edit files, commit, push. `push:` false leaves
+  # the remote behind the local tree.
+  def session(push: true)
+    yield
+    git("add", "-A")
+    git("commit", "--allow-empty", "-m", "fix consuming code")
+    git("push", "-u", "origin", @branch) if push
+  end
+
+  def verify(verify_cmd: "true")
+    verify_fix_session(@clone, @branch, :sveltekit, verify_cmd,
+                       regen_sha: @regen_sha, generated: @generated, pr_url: @pr_url)
+  end
+
+  def assert_rejected(result, reason)
+    assert_equal :needs_attention, result[:status], result.inspect
+    assert_equal @pr_url, result[:pr_url], "the summary must still carry the PR so a human can find it"
+    assert_includes result[:error], reason
+    assert_equal [@pr_url], @demoted, "a rejected PR must not be left looking ready to merge"
+  end
+
+  def test_a_clean_fix_session_is_accepted
+    session { File.write(File.join(@clone, "app.ts"), "// updated caller\n") }
+    result = verify
+    assert_equal({ status: :pr_opened, pr_url: @pr_url }, result)
+    assert_empty @demoted
+  end
+
+  # properties#45, exactly: main's pre-regen content with `// @ts-nocheck`
+  # prepended, committed over the regeneration.
+  def test_reverting_the_regen_with_a_suppression_is_rejected
+    session do
+      File.write(File.join(@clone, "generated/client.ts"),
+                 "// @ts-nocheck\n#{GENERATED_HEADER}export const VERSION = \"v1\"\n")
+    end
+    result = verify
+    assert_rejected(result, "edited generated file generated/client.ts")
+    assert_includes result[:error], "added suppression"
+  end
+
+  def test_a_shim_in_a_generated_directory_is_rejected
+    session { File.write(File.join(@clone, "generated/client.d.ts"), "export * from './client'\n") }
+    assert_rejected(verify, "inside generated directory generated")
+  end
+
+  def test_relaxing_a_build_config_is_rejected
+    session { File.write(File.join(@clone, "tsconfig.json"), "{\"noImplicitAny\": false}\n") }
+    assert_rejected(verify, "build config tsconfig.json")
+  end
+
+  # The only check that catches a tree the generator disagrees with WITHOUT any
+  # forbidden path or token in the diff — and the property the sweep exists to
+  # guarantee, so it is asserted rather than inferred from the other checks.
+  def test_a_tree_the_generator_would_rewrite_is_rejected
+    session { File.write(File.join(@clone, "app.ts"), "// updated caller\n") }
+    install_api("v3")  # the committed tree is no longer what `api` produces
+    assert_rejected(verify, "did not survive the fix session")
+  end
+
+  def test_a_tree_that_does_not_build_is_rejected
+    session { File.write(File.join(@clone, "app.ts"), "// updated caller\n") }
+    assert_rejected(verify(verify_cmd: "false"), "does not build")
+  end
+
+  def test_dropping_the_regen_commit_is_rejected
+    session { File.write(File.join(@clone, "app.ts"), "// updated caller\n") }
+    git("reset", "--hard", "origin/main")
+    git("push", "--force", "-u", "origin", @branch)
+    assert_rejected(verify, "no longer in the branch")
+  end
+
+  def test_uncommitted_changes_are_rejected
+    session { File.write(File.join(@clone, "app.ts"), "// updated caller\n") }
+    File.write(File.join(@clone, "app.ts"), "// and one more thing\n")
+    assert_rejected(verify, "left the tree dirty")
+  end
+
+  # A session that pushed, opened the PR and then kept committing leaves a PR
+  # nothing has checked. What GitHub shows is the remote, not this clone.
+  def test_a_remote_that_does_not_match_the_checked_tree_is_rejected
+    session { File.write(File.join(@clone, "app.ts"), "// updated caller\n") }
+    session(push: false) { File.write(File.join(@clone, "app.ts"), "// unpushed afterthought\n") }
+    assert_rejected(verify, "is not the tree these checks ran against")
+  end
+end
+
+# The diff parser's two ambiguities, pinned: a line of added CONTENT beginning
+# `+++ ` must not be read as a file header, and the header itself must not be
+# read as an added line.
+class TestSuppressionFindingsDiffParsing < Minitest::Test
+  def test_added_content_beginning_with_plusplusplus_is_content_not_a_header
+    diff = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n" \
+           "@@ -1,0 +1,2 @@\n+++ not a header\n+// @ts-nocheck\n"
+    assert_equal ["src/x.ts: added suppression `// @ts-nocheck`"],
+                 Codegen::Sync.suppression_findings(diff)
+  end
+
+  def test_a_filename_containing_a_directive_is_not_itself_a_finding
+    diff = "diff --git a/src/eslint-disable.md b/src/eslint-disable.md\n" \
+           "--- a/src/eslint-disable.md\n+++ b/src/eslint-disable.md\n@@ -1 +1 @@\n-a\n+b\n"
+    assert_empty Codegen::Sync.suppression_findings(diff)
   end
 end

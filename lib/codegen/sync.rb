@@ -85,6 +85,13 @@ module Codegen
       paths.to_a
     end
 
+    # The same set as repo-relative paths, which is the form git speaks — the
+    # post-session checks compare them against `git diff --name-status` output.
+    def generated_relative_paths(repo_dir)
+      root = File.expand_path(repo_dir) + File::SEPARATOR
+      generated_paths(repo_dir).map { |p| p.start_with?(root) ? p[root.length..] : p }
+    end
+
     # The marker only counts on a COMMENT line — generated headers are always
     # comments, while source code can carry the marker in a string literal
     # (platform's GeneratedHeader.scala EMITS the header and was wiped as if it
@@ -98,6 +105,129 @@ module Codegen
     def marker_comment_line?(line)
       stripped = line.lstrip
       stripped.downcase.include?(MARKER) && COMMENT_PREFIXES.any? { |p| stripped.start_with?(p) }
+    end
+
+    # ---- what the bounded fix session is not allowed to do -------------------
+    #
+    # The session's only job is to make CONSUMING code match the regenerated
+    # client. Every shortcut that dodges that job instead — suppressing the
+    # error, loosening the compiler, hand-editing (or reverting) the generated
+    # output — produces a PR that reads as a success and is worse than no PR at
+    # all, because the next regen wipes the edit and the drift comes straight
+    # back. properties#45 did all three and was reported as `pr_opened`
+    # (ISS-630). These are checked mechanically after the session, against the
+    # diff between the regen commit and what it pushed.
+
+    # Blanket "stop type-checking this" directives. Scoped to lines the session
+    # ADDED: one already in the repo is somebody else's decision, reviewed once.
+    SUPPRESSION_PATTERNS = [
+      /@ts-nocheck/,
+      /@ts-ignore/,
+      /@ts-expect-error/,
+      /eslint-disable/,
+      /scalastyle:\s*off/,
+      /@nowarn/,
+    ].freeze
+
+    # Files that decide how strictly the verify command judges the tree. A
+    # codegen sync never legitimately needs to touch one: if the generated code
+    # only type-checks with a weaker compiler, the spec or the .api config is
+    # wrong and a human has to see that. `package.json` and `.gitignore` are on
+    # the list for the same reason in a different disguise — weakening the
+    # `check` script, or ignoring the generated files, also makes the build go
+    # green without fixing anything.
+    BUILD_CONFIG_PATTERNS = [
+      /\Atsconfig.*\.json\z/,
+      /\A\.eslintrc(\..+)?\z/,
+      /\Aeslint\.config\.[cm]?[jt]s\z/,
+      /\Asvelte\.config\.[cm]?js\z/,
+      /\Aelm\.json\z/,
+      /\AReviewConfig\.elm\z/,
+      /\Abuild\.sbt\z/,
+      /\A\.scalafmt\.conf\z/,
+      /\Ascalastyle.*\.xml\z/,
+      /\Apackage\.json\z/,
+      /\A\.gitignore\z/,
+    ].freeze
+
+    def build_config_path?(path)
+      base = File.basename(path.to_s)
+      BUILD_CONFIG_PATTERNS.any? { |re| base.match?(re) }
+    end
+
+    # `git diff --name-status` → { path => status_letter }. A rename counts as
+    # both a delete of the old path and an add of the new one, so a generated
+    # file renamed out of the way is caught the same as one deleted.
+    def parse_name_status(text)
+      changes = {}
+      text.to_s.each_line do |line|
+        fields = line.chomp.split("\t")
+        next if fields.length < 2
+        letter = fields[0][0]
+        if letter == "R" || letter == "C"
+          changes[fields[1]] = "D"
+          changes[fields[2]] = "A"
+        else
+          changes[fields[1]] = letter
+        end
+      end
+      changes
+    end
+
+    CHANGE_VERBS = { "A" => "added", "M" => "edited", "D" => "deleted" }.freeze
+
+    # Added lines carrying a suppression directive, as one finding per file+line.
+    # Hunk-aware for the same reason `noise_only_diff?` is: the `+++ b/path`
+    # header also starts with `+`, and it is where the filename comes from. The
+    # `diff --git` line is what ends a hunk, so a line of added CONTENT that
+    # happens to begin `+++ ` is read as content, not as a new file header.
+    def suppression_findings(diff_text)
+      file = nil
+      in_hunk = false
+      findings = []
+      diff_text.to_s.each_line do |l|
+        if l.start_with?("diff --git ")
+          in_hunk = false
+          file = nil
+        elsif l.start_with?("+++ ") && !in_hunk
+          file = l[4..].to_s.strip.sub(%r{\A[ab]/}, "")
+        elsif l.start_with?("@@")
+          in_hunk = true
+        elsif in_hunk && l.start_with?("+")
+          content = l[1..].to_s.strip
+          next unless SUPPRESSION_PATTERNS.any? { |re| content.match?(re) }
+          findings << "#{file || '?'}: added suppression `#{content[0, 120]}`"
+        end
+      end
+      findings.uniq
+    end
+
+    # Everything the fix session did that the sweep refuses to ship, as
+    # human-readable findings. Empty means the session stayed inside its job.
+    #
+    #   name_status – `git diff --name-status <regen>..HEAD`
+    #   diff_text   – `git diff <regen>..HEAD`
+    #   generated   – repo-relative generated files as of the regen commit
+    #
+    # Generated files are matched by path rather than by re-reading the header,
+    # so a session that strips the marker off one before editing it is still
+    # caught. Only ADDED files are refused merely for sitting in a generated
+    # directory (that is the `.d.ts` re-export shim) — those directories can
+    # hold hand-written files too (platform's api/conf keeps application.conf
+    # next to generated *.routes), and editing one of those is legitimate.
+    def fix_session_violations(name_status:, diff_text:, generated:)
+      gen = generated.to_set
+      gen_dirs = generated.map { |p| File.dirname(p) }.to_set
+      findings = []
+      parse_name_status(name_status).sort.each do |path, letter|
+        if gen.include?(path)
+          findings << "#{CHANGE_VERBS.fetch(letter, 'changed')} generated file #{path}"
+        elsif letter == "A" && gen_dirs.include?(File.dirname(path))
+          findings << "added #{path} inside generated directory #{File.dirname(path)}"
+        end
+        findings << "#{CHANGE_VERBS.fetch(letter, 'changed')} build config #{path}" if build_config_path?(path)
+      end
+      findings + suppression_findings(diff_text)
     end
 
     def verify_cmd_for(stack, full_tests:)
@@ -122,14 +252,29 @@ module Codegen
         lines << "Commit the regenerated files as-is, push branch #{branch}, and open a DRAFT"
         lines << "PR with `gh pr create --draft --fill --head #{branch}`. Do not build, fix, or review."
       else
+        lines << "The regeneration is ALREADY COMMITTED as HEAD. Your commits go on top of it."
         lines << "Do exactly this and stop once the PR is open:"
         lines << "1. Make it build: run `#{verify_cmd}` and fix ONLY the consuming code needed"
-        lines << "   to match the regenerated client. NEVER edit generated files (they carry a"
-        lines << "   'Generated by API Builder' header) — fix the callers instead."
+        lines << "   to match the regenerated client."
         if build_error && !build_error.strip.empty?
           lines << "   The current build error is:"
           lines << "   #{build_error.strip}"
         end
+        lines << "   Hard rules. Every one of these is re-checked mechanically after you"
+        lines << "   finish — a PR that breaks one is rejected and reported for a human, so"
+        lines << "   taking the shortcut costs you the whole run:"
+        lines << "   - NEVER edit, revert, delete or rename a generated file (they carry a"
+        lines << "     'Generated by API Builder' header), and never add a new file beside"
+        lines << "     one. Fix the callers instead."
+        lines << "   - NEVER amend, reset, revert or rebase away the regen commit at HEAD."
+        lines << "   - NEVER add @ts-nocheck, @ts-ignore, @ts-expect-error, eslint-disable,"
+        lines << "     scalastyle:off or @nowarn anywhere."
+        lines << "   - NEVER relax a build config to make the build pass — tsconfig*.json,"
+        lines << "     eslint/svelte config, elm.json, build.sbt, package.json, .gitignore."
+        lines << "   If the ONLY way to a green build is one of those, the spec or the .api"
+        lines << "   config is wrong and this is not yours to fix: STOP. Do not commit, do"
+        lines << "   not push, do not open a PR. Print what failed and why the consuming"
+        lines << "   code cannot absorb it, and the sweep will report the repo for review."
         lines << "2. Commit the working, green tree and push branch #{branch}."
         lines << "3. Open the PR: `gh pr create --fill --head #{branch}` (the clone is"
         lines << "   single-branch, so without --head gh cannot see the pushed branch),"
