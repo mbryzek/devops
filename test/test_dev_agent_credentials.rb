@@ -50,9 +50,10 @@ class TestDevAgentCredentials < Minitest::Test
   # environment instead of an argument someone might tidy away.
   NO_PROCESS_ENV = {}.freeze
 
-  def credential(name: "PLAYBOOK_CLAUDE_KEY", app: "platform", environment: "development")
-    C::Credential.new(name: name, app: app, environment: environment,
-                      required_by: "#{name} things", how_to_provide: "set #{name} somewhere")
+  def credential(name: "PLAYBOOK_CLAUDE_KEY", source: C::AppEnv.new(app: "platform", environment: "development"))
+    C::Credential.new(name: name, source: source,
+                      required_by: "#{name} things", how_to_provide: "set #{name} somewhere",
+                      usage_example: "curl -H \"x-api-key: $#{name}\" ...")
   end
 
   # Stub the ONE read both public faces go through, so they cannot disagree.
@@ -136,9 +137,14 @@ class TestDevAgentCredentials < Minitest::Test
     assert_equal explanations.uniq.length, explanations.length
     assert_match(/not set/, explanations[0])
     assert_match(/LOCKED/, explanations[1])
-    assert_match(/no env repo/, explanations[2])
+    assert_match(/does not exist/, explanations[2])
   end
 
+  # `env: {}` is load-bearing and its absence is why this test failed on every
+  # runner and passed on every laptop: the process environment wins over the env
+  # repo, and a runner's own sessions are handed PLAYBOOK_CLAUDE_KEY (ISS-570) —
+  # so the credential resolved :present from the inherited environment and the
+  # locked branch under test was never reached.
   def test_a_locked_env_repo_reads_as_absent_rather_than_raising
     stub_lookup(:locked) do
       found = C.check(credentials: [credential], env: NO_PROCESS_ENV).first
@@ -236,6 +242,77 @@ class TestDevAgentCredentials < Minitest::Test
     refute_includes out, SECRET
   end
 
+  # ---- the two env-repo layouts (ISS-635) ----
+  #
+  # `apps/<app>/env/*.env` is what an APP boots with; `api_keys/<file>` is what a
+  # HUMAN or a tool authenticates with. The NewRelic key was filed under the
+  # first for years: no application anywhere read it, so nothing broke visibly
+  # when it went stale, and every session that followed the playbook's
+  # source-it-from-the-app-env instruction got a 401 and an empty NRQL result —
+  # which reads exactly like a healthy production graph.
+  def test_a_key_file_credential_reads_the_whole_file_as_its_value
+    with_env_repo("api_keys/newrelic" => "NRAK-fake\n") do
+      status, value, source = C.probe(credential(name: "NEWRELIC_USER_KEY", source: C::KeyFile.new(file: "newrelic")), env: {})
+      assert_equal [:present, "NRAK-fake", :env_repo], [status, value, source]
+    end
+  end
+
+  def test_a_key_file_that_is_absent_is_no_file_rather_than_missing
+    with_env_repo({}) do
+      status, = C.probe(credential(name: "NEWRELIC_USER_KEY", source: C::KeyFile.new(file: "newrelic")), env: {})
+      assert_equal :no_file, status
+    end
+  end
+
+  # An empty file is a different mistake from an absent one — somebody wrote the
+  # file and put nothing in it — and the doctor tells you to do different things.
+  def test_an_empty_key_file_is_missing_rather_than_present
+    with_env_repo("api_keys/newrelic" => "\n") do
+      status, value = C.probe(credential(name: "NEWRELIC_USER_KEY", source: C::KeyFile.new(file: "newrelic")), env: {})
+      assert_equal [:missing, nil], [status, value]
+    end
+  end
+
+  # The env repo encrypts everything by default, so api_keys/ is git-crypt'd too.
+  # A session may not unlock it, so a locked file must report as locked and never
+  # be mistaken for a key that was never issued.
+  def test_a_locked_key_file_reports_locked_and_never_unlocks
+    with_env_repo("api_keys/newrelic" => "\x00GITCRYPT\x00binary-goo") do
+      status, value = C.probe(credential(name: "NEWRELIC_USER_KEY", source: C::KeyFile.new(file: "newrelic")), env: {})
+      assert_equal [:locked, nil], [status, value]
+    end
+  end
+
+  # The registry itself, not a stand-in: the NewRelic key must be sourced from
+  # api_keys/, because pointing it back at an app env file is the ISS-635 bug.
+  def test_the_newrelic_credential_is_sourced_from_the_api_keys_directory
+    found = C::CREDENTIALS.find { |c| c.name == "NEWRELIC_USER_KEY" }
+    refute_nil found, "the NewRelic key must be handed to sessions, not sourced from a playbook instruction"
+    assert_equal "env/api_keys/newrelic", found.source_label
+  end
+
+  # One API's header is another API's 401, so the "pass it explicitly" line the
+  # assignment block prints has to come from the credential rather than from a
+  # single hardcoded Anthropic example.
+  def test_each_credential_states_how_to_pass_it_and_never_a_value
+    C::CREDENTIALS.each do |c|
+      refute_empty c.usage_example.to_s, "#{c.name} tells a session nothing about how to send it"
+      assert_includes c.usage_example, "$#{c.name}",
+                      "#{c.name}'s example must carry the variable, never a value"
+    end
+  end
+
+  def test_the_prompt_uses_each_credentials_own_usage_example
+    nr = credential(name: "NEWRELIC_USER_KEY", source: C::KeyFile.new(file: "newrelic"))
+    section = Agent::Prompt.credentials_section(
+      with_probe(:present, SECRET, :env_repo) { C.check(credentials: [nr]) },
+    )
+    assert_match(/NEWRELIC_USER_KEY.*available in your environment/, section)
+    assert_includes section, "x-api-key: $NEWRELIC_USER_KEY"
+    refute_includes section, "anthropic-version",
+                    "a NewRelic key must not be documented with Anthropic's headers"
+  end
+
   private
 
   def stub_lookup(status, value = nil)
@@ -244,6 +321,25 @@ class TestDevAgentCredentials < Minitest::Test
     yield
   ensure
     EnvironmentVariables.define_singleton_method(:lookup, original)
+  end
+
+  # A throwaway env repo, laid out exactly as the real one is relative to a
+  # devops checkout, so the path arithmetic is exercised rather than stubbed.
+  def with_env_repo(files)
+    Dir.mktmpdir do |root|
+      original = EnvRepo.method(:path)
+      EnvRepo.define_singleton_method(:path) { |relative| File.join(root, "env", relative) }
+      files.each do |relative, contents|
+        path = File.join(root, "env", relative)
+        FileUtils.mkdir_p(File.dirname(path))
+        File.binwrite(path, contents)
+      end
+      begin
+        yield
+      ensure
+        EnvRepo.define_singleton_method(:path, original)
+      end
+    end
   end
 
   def capture_stdout

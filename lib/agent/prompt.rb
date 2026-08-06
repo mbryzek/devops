@@ -114,10 +114,9 @@ module Agent
           lines << "- `#{f.name}` — **available in your environment** (#{f.explanation}). Needed for " \
                    "#{f.credential.required_by}."
           lines << "  Pass it explicitly to whatever you are verifying — e.g. " \
-                   "`curl -H \"x-api-key: $#{f.name}\" -H \"anthropic-version: 2023-06-01\" ...`."
+                   "`#{f.credential.usage_example}`."
           lines << "  **Never print, echo, commit, or paste it** into a PR, an issue comment, a plan or a " \
-                   "test fixture, and never copy it into `ANTHROPIC_API_KEY` — that variable reconfigures " \
-                   "the `claude` CLI you are running inside."
+                   "test fixture."
         else
           lines << "- `#{f.name}` — **NOT available on this runner** (#{f.explanation})."
           lines << "  Anything in your assignment that asks you to verify behaviour against the live API " \
@@ -127,6 +126,14 @@ module Agent
                    "then report it as verified."
         end
       end
+      # A footer rather than a per-credential line: this is a fact about the
+      # PROCESS the environment is handed to, not about any one key. `claude`
+      # resolves ANTHROPIC_API_KEY as its own credential, so copying anything
+      # into it moves the session off Mike's subscription onto per-token billing
+      # with nothing in the output to say so.
+      lines << ""
+      lines << "Never copy any of these into `ANTHROPIC_API_KEY` — that variable reconfigures the " \
+               "`claude` CLI you are running inside."
       lines.join("\n")
     end
 

@@ -1,8 +1,6 @@
 require 'json'
 
 class EnvironmentVariables
-    DIR = File.dirname(__FILE__)
-
     def initialize(vars)
         @vars = vars
     end
@@ -20,7 +18,7 @@ class EnvironmentVariables
     # The env file backing one (app, environment) pair. Every reader here goes
     # through this so the layout is stated once.
     def EnvironmentVariables.file_path(app_name, filename)
-        File.join(DIR, "../../env/apps/#{app_name}/env/#{filename}.env")
+        EnvRepo.path("apps/#{app_name}/env/#{filename}.env")
     end
 
     # True when the app has env files for this environment (load exits when
@@ -46,16 +44,16 @@ class EnvironmentVariables
     #
     # :no_file is separate from :missing on purpose. They call for opposite
     # responses — one is "add the variable", the other is "you are not looking at
-    # the env repo at all" (DIR resolves ../../env relative to THIS checkout, so
-    # a devops clone inside a feature dir has no sibling env/). Collapsing them
-    # reports a wrong diagnosis with total confidence.
+    # the env repo at all" (EnvRepo resolves ../../env relative to the devops
+    # checkout, so a devops clone inside a feature dir has no sibling env/).
+    # Collapsing them reports a wrong diagnosis with total confidence.
     def EnvironmentVariables.lookup(app_name, environment, key)
         seen = false
         [environment, 'common'].each do |filename|
             path = EnvironmentVariables.file_path(app_name, filename)
             next unless File.exist?(path)
             seen = true
-            return [:locked, nil] if File.binread(path, 10).to_s.start_with?("\x00GITCRYPT")
+            return [:locked, nil] if EnvRepo.locked?(path)
             File.readlines(path).each do |line|
                 k, v = line.strip.split("=", 2)
                 next unless k.to_s.strip == key
@@ -143,9 +141,8 @@ class EnvironmentVariables
         end
 
         # Check if file is encrypted (git-crypt locked files start with GITCRYPT header)
-        header = File.binread(env_path, 10)
-        if header&.start_with?("\x00GITCRYPT")
-            env_dir = File.join(DIR, "../../env")
+        if EnvRepo.locked?(env_path)
+            env_dir = EnvRepo.root
             STDERR.puts "Environment file is encrypted. Running git-crypt unlock..."
             Util.run("cd #{env_dir} && git-crypt unlock", :quiet => true)
         end
