@@ -63,6 +63,21 @@ module Agent
       prs.compact.max_by { |pr| [pr_rank(pr), pr["number"].to_i] }
     end
 
+    # ONE pull request, named by its url. Distinguished from everything else here
+    # by taking a url rather than a repo: what an issue records as a `fix` is a
+    # url, so this is the lookup that answers "has the fix on that issue actually
+    # merged" without first re-deriving the repo from the link.
+    #
+    # nil when `gh` is missing, unauthenticated, rate-limited, or the url names no
+    # PR — every caller reads that as UNKNOWN, never as "not merged".
+    def pr_by_url(url)
+      out = capture(["gh", "pr", "view", url.to_s, "--json", PR_FIELDS])
+      return nil if out.nil?
+      JSON.parse(out)
+    rescue JSON::ParserError
+      nil
+    end
+
     def list_prs(repo, *args)
       out = capture(["gh", "pr", "list", "--repo", repo, "--state", "all", "--json", PR_FIELDS, *args])
       return [] if out.nil?

@@ -768,22 +768,34 @@ class TestDevAgentTick < Minitest::Test
 
   # Drives one real claim with Jobs.spawn_session stubbed: everything up to and
   # including the prompt is exercised, and no `claude` is launched.
-  def claim_one(body:, number: 707, errors: [], playbooks: nil)
-    seen = { comments: [], statuses: [], released: [], prompt: nil, spawned: false }
+  # `links` / `blocker_issues` / `prs` drive the dependency gate below and are
+  # absent from every other caller, which is itself an assertion: `with_stubbed_api`
+  # flunks on an unstubbed request, so an issue with no blockers reaching for a
+  # blocker or for GitHub would fail every claim test in this file.
+  def claim_one(body:, number: 707, errors: [], playbooks: nil, links: nil, blocker_issues: {}, prs: {},
+                comments: [])
+    seen = { comments: [], statuses: [], released: [], snoozed: [], calls: [], prompt: nil, spawned: false }
     with_agent_home do
       register_identity
       Agent::Errors.write(errors) unless errors.empty?
       with_ai_token do
+        issue = { "number" => number, "title" => "Weekly code review: platform", "category" => "infrastructure",
+                  "body" => body }
+        issue["links"] = links if links
         stubs = {
           "POST /playbook/issue/leases" => { "lease" => { "id" => "lse-1", "issue_number" => number } },
-          "GET /playbook/issues/#{number}" =>
-            { "number" => number, "title" => "Weekly code review: platform", "category" => "infrastructure",
-              "body" => body },
-          "GET /playbook/issues/#{number}/comments?limit=101&offset=0" => [],
+          "GET /playbook/issues/#{number}" => issue,
+          "GET /playbook/issues/#{number}/comments?limit=101&offset=0" => comments,
           "POST /playbook/issues/#{number}/comments" => ->(b) { seen[:comments] << b[:body]; {} },
-          "PUT /playbook/issues/#{number}/status" => ->(b) { seen[:statuses] << b; {} },
-          "DELETE /playbook/issue/leases/lse-1" => ->(_b) { seen[:released] << "lse-1"; {} },
+          "PUT /playbook/issues/#{number}/status" => ->(b) { seen[:calls] << :status; seen[:statuses] << b; {} },
+          "DELETE /playbook/issue/leases/lse-1" => ->(_b) { seen[:calls] << :release; seen[:released] << "lse-1"; {} },
+          "PUT /playbook/issues/#{number}/snooze" => lambda { |b|
+            seen[:calls] << :snooze
+            seen[:snoozed] << b
+            { "number" => number, "snoozed_until" => b[:snoozed_until] }
+          },
         }
+        blocker_issues.each { |n, row| stubs["GET /playbook/issues/#{n}"] = row }
         # The playbook store, as this claim will see it. nil for a key means the
         # platform has never heard of it — a 404, which Agent::Api turns into nil.
         (playbooks || { PLAYBOOK_KEY => { "key" => PLAYBOOK_KEY, "body" => PLAYBOOK_BODY,
@@ -795,10 +807,16 @@ class TestDevAgentTick < Minitest::Test
           seen[:spawned] = true
           Process.pid
         end
-        stub_singleton(Agent::Jobs, :spawn_session, spawn) do
-          with_stubbed_api(stubs) do
-            seen[:out] = capture_stdout do
-              tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: 1))
+        # `gh pr view`, as this claim will see it: nil for a url means UNKNOWN
+        # (gh missing, rate limited, no such PR), which the gate must read as
+        # "dispatch" and never as "not merged".
+        pr_view = ->(url) { prs[url] }
+        stub_singleton(Agent::Github, :pr_by_url, pr_view) do
+          stub_singleton(Agent::Jobs, :spawn_session, spawn) do
+            with_stubbed_api(stubs) do
+              seen[:out] = capture_stdout do
+                tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: 1))
+              end
             end
           end
         end
@@ -852,6 +870,133 @@ class TestDevAgentTick < Minitest::Test
     assert_empty seen[:statuses], "nothing to resolve means nothing to fail on"
     refute_match(/^Playbook:/, seen[:comments].first)
     refute_match(/# Playbook/, seen[:prompt])
+  end
+
+  # ---- the dependency gate (ISS-649) ----
+  #
+  # The tracker unblocks a `blocked_by` edge as soon as the blocker reaches
+  # `fixed`, on the premise that `fixed` means the blocker's PR merged. In this
+  # fleet it does not: §1 of the standing instructions has every session record
+  # `fixed` the moment its PR is READY. So a dependent issue becomes claimable
+  # while the code it builds on is still on somebody's open branch, and the
+  # session that gets it can only re-implement that branch or stack on it —
+  # ISS-644 stacked, and its PR could not merge until a human merged the other
+  # one first.
+  #
+  # These prove the gate asks GitHub rather than the status, and that it puts the
+  # issue DOWN (deferred, at its own status) rather than escalating it on day one.
+
+  BLOCKER_PR = "https://github.com/mbryzek/devops/pull/359".freeze
+
+  def blocked_by(number: "633", status: "fixed")
+    [{ "type" => "blocked_by", "direction" => "outgoing",
+       "issue" => { "number" => number, "title" => "lint the playbook store", "status" => status } }]
+  end
+
+  def blocker_issue(number: "633", fixes: [{ "url" => BLOCKER_PR }])
+    { number => { "number" => number, "status" => "fixed", "fixes" => fixes } }
+  end
+
+  def pr(state, url: BLOCKER_PR)
+    { url => { "url" => url, "number" => 359, "title" => "ISS-633: lint the playbook store", "state" => state } }
+  end
+
+  def test_a_blocker_fixed_on_a_pr_that_has_not_merged_starts_no_session
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"))
+    refute seen[:spawned], "the dependency is not on origin/main; a session could only stack on it"
+    assert_equal ["lse-1"], seen[:released], "the lease must not be held by a session that never started"
+    assert_empty seen[:statuses], "an unmerged dependency is not a status change — it is not work YET"
+    refute_empty seen[:snoozed], "and it has to leave the queue, or the next tick re-claims it in 30 seconds"
+  end
+
+  # `snoozed_until` is cleared by any status transition, and releasing the lease
+  # transitions claimed -> open. Snoozing first would be wiped by the release and
+  # the issue would spin through this gate every 30 seconds.
+  def test_the_lease_is_released_before_the_issue_is_deferred
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"))
+    assert_equal [:release, :snooze], seen[:calls]
+  end
+
+  # What a human reads a week later has to name the PR, not just say "blocked".
+  def test_the_deferral_names_the_pull_request_it_is_waiting_on
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"))
+    comment = seen[:snoozed].first[:comment]
+    assert_includes comment, Agent::Tick::DEPENDENCY_DEFER_MARKER
+    assert_includes comment, BLOCKER_PR
+    assert_includes comment, "ISS-633"
+    assert_match(/attempt 1 of #{Agent::Tick::DEPENDENCY_DEFER_LIMIT}/, comment)
+  end
+
+  def test_a_blocker_whose_pr_has_merged_dispatches_normally
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("MERGED"))
+    assert seen[:spawned], "the code is on origin/main — this is ordinary work now"
+    assert_empty seen[:snoozed]
+  end
+
+  # A reopened issue accumulates fixes, and `dev issues fix` appends more after the
+  # fact. Reading only the newest would defer a dependent on a follow-up PR whose
+  # merge it never needed.
+  def test_any_merged_fix_clears_the_blocker_even_with_a_later_one_still_open
+    later = "https://github.com/mbryzek/devops/pull/400"
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue(fixes: [{ "url" => BLOCKER_PR }, { "url" => later }]),
+                     prs: pr("MERGED").merge(pr("OPEN", url: later)))
+    assert seen[:spawned]
+  end
+
+  # FAIL OPEN. `gh` missing, a rate limit, a url that names no PR — every unknown
+  # dispatches. A gate that stalls the queue whenever GitHub is unreachable is a
+  # worse failure than the one it prevents, and it would be a silent one.
+  def test_a_pr_that_cannot_be_read_dispatches_rather_than_stalling_the_queue
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: {})
+    assert seen[:spawned]
+    assert_empty seen[:snoozed]
+  end
+
+  # A document fix is not a merge anybody is waiting for.
+  def test_a_blocker_whose_fix_is_a_document_dispatches
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue(fixes: [{ "url" => "https://docs.google.com/document/d/1" }]),
+                     prs: {})
+    assert seen[:spawned]
+  end
+
+  # The server passes over an issue whose blocker is live work, so this is a race
+  # it should never see — agreeing with the server costs one branch and cannot
+  # false-positive. No blocker is read and GitHub is never called.
+  def test_a_blocker_that_is_still_live_work_defers_without_asking_github
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by(status: "claimed"))
+    refute seen[:spawned]
+    assert_includes seen[:snoozed].first[:comment], "ISS-633 is still `claimed`"
+  end
+
+  # A dismissed blocker is never going to ship. The tracker treats it as
+  # unblocking and so does this: the dependent is on its own.
+  def test_a_dismissed_blocker_does_not_hold_anything_back
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by(status: "dismissed"))
+    assert seen[:spawned]
+  end
+
+  # Deferring forever is the silent-aging outcome the whole close-out contract
+  # exists to prevent: a snoozed issue is out of the queue AND out of the daily
+  # nudge, so a PR nobody merges would stall its dependents with nothing anywhere
+  # saying so. After a week of daily checks it becomes a human's problem, loudly.
+  def test_a_week_of_deferrals_escalates_to_needs_input
+    prior = Array.new(Agent::Tick::DEPENDENCY_DEFER_LIMIT - 1) do
+      { "body" => "#{Agent::Tick::DEPENDENCY_DEFER_MARKER} — not dispatched, deferred 1 day." }
+    end
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"), comments: prior)
+    refute seen[:spawned]
+    assert_empty seen[:snoozed], "another day of silence is exactly what has already failed six times"
+    assert_equal ["needs_input"], seen[:statuses].map { |s| s[:status] }
+    assert_includes seen[:statuses].first[:comment], BLOCKER_PR
+    assert_equal ["lse-1"], seen[:released]
   end
 
   # ---- runner staleness is the PLATFORM's alert, not a runner's ----

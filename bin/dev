@@ -82,7 +82,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
   "issues block"        => 'issues block <number> --on NUMBER [--remove] [--localhost]',
@@ -544,6 +544,22 @@ USAGE = <<~USAGE
         work landed on a branch the executor could not find. An issue with no
         repos still works; its session just clones for itself. An unknown name is
         rejected here, with the full list.
+
+        Repeat --block-on for every dependency that has to LAND before this work
+        can start, and take the ordering out of the prose. It accepts an issue
+        number (644) or the pull request itself (devops#359, or its full URL),
+        because at filing time the dependency is usually a PR that just went up
+        and its issue number is not what you have in hand — a PR is traced back
+        to its issue through the mandatory `ISS-<n>: ` title prefix, and a PR
+        whose title does not carry one is rejected rather than guessed at. Each
+        one is recorded as the same `blocked_by` edge `issues block` writes, so
+        the queue stops offering the issue until the dependency ships, and the
+        dispatcher re-checks the PR against GitHub before it starts a session.
+        Requires --status open: an issue that cannot be worked yet is not one you
+        are working right now. Without this the dependency lives in a sentence
+        nobody reads before claiming at 3am, which is ISS-649 — ISS-644 said "de-
+        pends on devops#359 merging first", was dispatched twenty minutes later
+        anyway, and its session had to invent a merge order.
 
         --status says who the issue belongs to. `claimed` is yours to work now;
         `open` hands it to the queue and starts no session. From a terminal it
@@ -2861,7 +2877,12 @@ end
 # InternalIssueLinksDao.UnblockingStatuses applies server-side. Kept here only to
 # say WHICH blockers are still live when rendering; whether an issue is blocked at
 # all is always the server's `is_blocked`, never recomputed from this list.
-ISSUE_UNBLOCKING_STATUSES = %w[fixed deployed verified dismissed].freeze
+#
+# One definition, shared with the dispatcher's dependency gate: the same list
+# decides what this CLI calls a live blocker and what `Agent::Dependency` re-checks
+# against GitHub, and two copies of a mirrored server constant is two chances to
+# drift from it.
+ISSUE_UNBLOCKING_STATUSES = Agent::Dependency::SHIPPED_STATUSES
 
 def issue_snooze_note(issue)
   until_at = issue["snoozed_until"]
@@ -3326,6 +3347,78 @@ def issue_edit_in_editor
   end
 end
 
+# What a --block-on reference is allowed to look like: an issue, or the pull
+# request that will carry it. The PR form is the one that matters in practice —
+# at filing time the dependency is a branch that just went up, and the issue
+# number behind it is not what the filer has in hand (ISS-649).
+ISSUE_BLOCK_ON_ISSUE_REF = /\A(?:ISS-)?(\d+)\z/i
+ISSUE_BLOCK_ON_PR_REF = %r{\A(?:https://github\.com/[^/]+/([^/]+)/pull/(\d+)/?|([\w.-]+)\#(\d+))\z}
+
+def issue_block_on_problems(refs)
+  refs.filter_map do |ref|
+    next nil if ref.match?(ISSUE_BLOCK_ON_ISSUE_REF) || ref.match?(ISSUE_BLOCK_ON_PR_REF)
+    "--block-on #{ref}: name an issue (644, ISS-644) or a pull request " \
+      "(devops#359, https://github.com/#{ISSUE_PR_SEARCH_OWNER}/devops/pull/359)"
+  end
+end
+
+# The issue number one --block-on reference names, resolving a pull request
+# through its title.
+#
+# The `ISS-<n>: ` prefix is what makes that possible, and it is not a convention
+# this reaches for opportunistically: agent/instructions.md mandates it, the reap
+# classifies outcomes by it, and `issues reconcile` already adopts merged PRs
+# through it. A PR without one is REFUSED rather than guessed at — filing an
+# unblocked issue because a title was unparseable is the exact failure this flag
+# exists to prevent, and it would be silent.
+#
+# Exits rather than returning nil: this runs BEFORE the issue is filed, so a
+# reference that cannot be resolved costs nothing but the retype.
+def issue_block_on_resolve(ref)
+  m = ref.match(ISSUE_BLOCK_ON_ISSUE_REF)
+  return m[1] if m
+
+  pr_match = ref.match(ISSUE_BLOCK_ON_PR_REF)
+  repo = pr_match[1] || pr_match[3]
+  pr_number = pr_match[2] || pr_match[4]
+  url = "https://github.com/#{ISSUE_PR_SEARCH_OWNER}/#{repo}/pull/#{pr_number}"
+  pr = Agent::Github.pr_by_url(url)
+  Util.exit_with_error(
+    "--block-on #{ref}: could not read #{url}. Check `gh auth status` and the PR number, " \
+    "or pass the blocking issue's number instead."
+  ) if pr.nil?
+
+  numbers = issue_numbers_in_title(pr["title"])
+  Util.exit_with_error(
+    "--block-on #{ref}: \"#{pr['title']}\" does not start with an `ISS-<n>: ` prefix, so it names no " \
+    "issue to block on. Pass the blocking issue's number instead (and fix the PR title: " \
+    "`gh pr edit #{pr_number} --repo #{ISSUE_PR_SEARCH_OWNER}/#{repo} --title \"ISS-<n>: ...\"`)."
+  ) if numbers.empty?
+
+  puts "#{ref} is ISS-#{numbers.first} (#{pr['state'].to_s.downcase}: #{pr['title']})"
+  numbers.first
+end
+
+# Record every --block-on edge on the issue just filed, in the same command that
+# filed it.
+#
+# A failure here is LOUD and names the repair, because what it leaves behind is an
+# issue in the queue with no blocker on it — claimable immediately, which is the
+# state the flag exists to prevent. Left as a warning it would look like a
+# successful filing.
+def issue_record_blockers(endpoint, number, blockers)
+  blockers.each do |blocker|
+    ApiClient.request(endpoint, :post, issues_path("/#{URI.encode_www_form_component(number)}/blockers"),
+                      body: { issue_number: blocker })
+    puts "  blocked by ISS-#{blocker} — the queue will not offer it until that ships"
+  rescue StandardError => e
+    Util.exit_with_error(
+      "Filed ISS-#{number}, but recording its blocker ISS-#{blocker} failed: #{e.message}. " \
+      "It is in the queue UNBLOCKED — run `dev issues block #{number} --on #{blocker}` now."
+    )
+  end
+end
+
 # File a new issue and (unless --no-spawn) hand it straight to a Claude session.
 # Ordering is load-bearing: the brief and every upload happen BEFORE the issue
 # is created, and the session comment + plan are written BEFORE the spawn — so a
@@ -3340,6 +3433,7 @@ def cmd_issues_create(args)
   body = nil
   images = []
   repos = []
+  block_on = []
   is_epic = false
   parent = nil
   spawn_session = true
@@ -3378,6 +3472,12 @@ def cmd_issues_create(args)
       usage_exit("--repo requires a repository name", example: usage_for("issues create")) if repo.nil?
       repos << repo
       i += 2
+    when "--block-on"
+      dependency = rest[i + 1]
+      usage_exit("--block-on requires an issue number or a pull request (e.g. 644, devops#359)",
+                 example: usage_for("issues create")) if dependency.nil?
+      block_on << dependency
+      i += 2
     when "--epic"
       is_epic = true
       i += 1
@@ -3409,6 +3509,16 @@ def cmd_issues_create(args)
     problems << "--status must be one of: #{ISSUE_CREATE_STATUSES.join(', ')} " \
                 "(a new issue is either yours to work now or the queue's — move it anywhere else " \
                 "afterwards with `dev issues status`)"
+  end
+  problems.concat(issue_block_on_problems(block_on))
+  # Blocked work is by definition not work you are doing right now, and `claimed`
+  # says exactly that. Filing both would claim an issue the queue is being told
+  # nobody can start — the unpickupable state --status exists to prevent, reached
+  # from the other direction. An epic is already forced to `open`, so it needs no
+  # flag to say so.
+  if block_on.any? && !is_epic && status != "open"
+    problems << "--block-on requires --status open: an issue that cannot be worked until " \
+                "#{block_on.join(', ')} ships is not one you are working in this session"
   end
   images.each do |p|
     if !File.file?(p)
@@ -3444,6 +3554,10 @@ def cmd_issues_create(args)
   # are contradictory instructions. The status is the one the caller stated, so
   # the session is what gives way.
   spawn_session = false if status == "open"
+
+  # Resolved BEFORE anything is filed: a PR reference that names no issue has to
+  # cost a retype, not an issue in the queue with the blocker missing off it.
+  blockers = block_on.map { |ref| issue_block_on_resolve(ref) }.uniq
 
   brief = issue_resolve_brief(body)
   Util.exit_with_error("Aborting: empty issue. Nothing filed.") if brief.nil?
@@ -3481,7 +3595,8 @@ def cmd_issues_create(args)
 
     issue_file_and_start(
       endpoint: endpoint, form: form, category: category, status: status,
-      local_paths: images.map { |p| File.expand_path(p) }, spawn_session: spawn_session
+      local_paths: images.map { |p| File.expand_path(p) }, spawn_session: spawn_session,
+      blockers: blockers
     )
   end
 end
@@ -3522,11 +3637,17 @@ end
 # a plan on disk; the ordering there is load-bearing — the session comment and the
 # plan are both written BEFORE the spawn, so a failure leaves a fully recoverable
 # claimed issue rather than a half-filed one.
-def issue_file_and_start(endpoint:, form:, category:, status: "claimed", local_paths: [], spawn_session: true)
+def issue_file_and_start(endpoint:, form:, category:, status: "claimed", local_paths: [], spawn_session: true,
+                         blockers: [])
   claimed = status == "claimed"
   issue = ApiClient.request(endpoint, :post, issues_path, body: form.merge(claim_on_create: claimed))
   number = issue.fetch("number")
   puts "Filed #{issue_label(issue)} (#{category})"
+
+  # Immediately after the create and before anything else, because the window this
+  # closes is the one where the issue is open and unblocked: a lease runner ticking
+  # inside it claims work that is not workable yet.
+  issue_record_blockers(endpoint, number, blockers) unless blockers.empty?
 
   # The timeline as the server left it — which already carries the overlap note if
   # this issue names something a live issue names. Read once and used twice: shown

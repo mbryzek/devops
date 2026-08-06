@@ -4,6 +4,7 @@ require 'agent/api'
 require 'agent/checkout'
 require 'agent/claude_config'
 require 'agent/credentials'
+require 'agent/dependency'
 require 'agent/errors'
 require 'agent/gc'
 require 'agent/github'
@@ -74,6 +75,24 @@ module Agent
     # it was when ISS-511 introduced it) was the only thing keeping the machine's
     # other recurring failures — its housekeeping chores above all — silent.
     ERROR_ESCALATE_AT = 3
+
+    # An issue waiting on a dependency that has not merged is deferred a day at a
+    # time (ISS-649). A day rather than an hour because the thing being waited on
+    # is a human merging a PR, and rechecking that every tick would burn a lease
+    # and a `gh` call every 30 seconds to learn the same thing.
+    DEPENDENCY_DEFER_DAYS = 1
+
+    # ...but not forever. On the seventh consecutive deferral the issue goes to
+    # `needs_input` instead: a week of daily checks means the PR is not merely
+    # unmerged, it is stuck, and a snoozed issue is invisible to both the queue
+    # and the daily nudge while it waits.
+    DEPENDENCY_DEFER_LIMIT = 7
+
+    # How a prior deferral is recognised on the timeline, which is where the
+    # attempt count is kept. Deliberately a marker in the comment rather than a
+    # field: the tracker has nowhere to store a per-issue dispatch counter, and a
+    # comment is what a human reads anyway.
+    DEPENDENCY_DEFER_MARKER = "Blocked on a dependency that has not merged".freeze
 
     attr_reader :decisions
 
@@ -809,6 +828,14 @@ module Agent
       issue = Agent::Api.issue(number, use_localhost: @use_localhost)
       comments = Agent::Api.issue_comments(number, use_localhost: @use_localhost)
 
+      # The dependency gate (ISS-649). The server already passes over an issue
+      # whose blocker is live work; what it cannot see is a blocker sitting at
+      # `fixed` on a PR that is still OPEN, which in this fleet is what `fixed`
+      # means most of the day. Starting a session on one hands it a dependency
+      # that is not on main and forces it to invent a merge order.
+      unshipped = Agent::Dependency.unshipped(issue, use_localhost: @use_localhost)
+      return defer_for_dependency(lease, identity, number, unshipped, comments) unless unshipped.empty?
+
       # THE claim-time resolution (ISS-505). nil for every issue that carries its
       # brief inline — human-written ones, and everything filed before pointers
       # existed — so those are untouched. A pointer that IS present and does not
@@ -900,6 +927,74 @@ module Agent
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
       end
       decide("claim", "ISS-#{number}: #{message} — no session started, moved to needs_input")
+    end
+
+    # An issue whose dependency has not merged is not work yet, so it is put back
+    # DOWN rather than worked or escalated (ISS-649): the lease is released and
+    # the issue is deferred a day, at its unchanged status, with the open PR named
+    # on its timeline. Tomorrow's tick asks GitHub again, and the day the PR
+    # merges the issue dispatches with nothing to clear.
+    #
+    # Neither of the two obvious alternatives is right. Starting the session is
+    # what ISS-644 did: it shipped a stacked PR that could not merge until
+    # somebody merged the other one first, and nothing said so except its
+    # description. Sending it straight to `needs_input` burns a dispatch on day
+    # one to tell Mike something he can already see — a PR of his own, open and
+    # healthy, twenty minutes old.
+    #
+    # RELEASE BEFORE SNOOZE, and that ordering is load-bearing: `snoozed_until` is
+    # cleared by any status transition, and releasing the lease reverts the issue
+    # from `claimed` to `open`. Snoozing first would leave the issue awake and
+    # claimable, and the next tick 30 seconds later would do this all over again.
+    # The reverse window — released but not yet deferred — is at most one API call
+    # wide, and a tick that claims inside it simply re-runs this gate.
+    #
+    # A deferral that cannot be recorded escalates instead. Leaving the issue open
+    # and undeferred is the one outcome that spins.
+    def defer_for_dependency(lease, identity, number, unshipped, comments)
+      reasons = Agent::Dependency.describe(unshipped)
+      attempt = comments.count { |c| c["body"].to_s.include?(DEPENDENCY_DEFER_MARKER) } + 1
+      if attempt >= DEPENDENCY_DEFER_LIMIT
+        return escalate_stalled_dependency(lease, identity, number, reasons, attempt)
+      end
+
+      text = "#{DEPENDENCY_DEFER_MARKER} — not dispatched, deferred #{DEPENDENCY_DEFER_DAYS} day " \
+             "(attempt #{attempt} of #{DEPENDENCY_DEFER_LIMIT}).\n\n" \
+             "#{reasons.map { |r| "- #{r}" }.join("\n")}\n\n" \
+             "A session started now would be building on code that is not on `origin/main`, and its only " \
+             "options are to re-implement the dependency or to stack on it — both of which ISS-649 exists " \
+             "to stop. Nothing to do here: this returns to the queue on its own, and the check is rerun " \
+             "against GitHub each time."
+      unless @dry_run
+        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
+        deferred = Agent::Api.snooze(number, @now + (DEPENDENCY_DEFER_DAYS * 24 * 60 * 60),
+                                     comment: text, use_localhost: @use_localhost)
+        if deferred.nil? || deferred["snoozed_until"].to_s.empty?
+          return escalate_stalled_dependency(lease, identity, number, reasons, attempt,
+                                             undeferrable: true)
+        end
+      end
+      decide("claim", "ISS-#{number}: #{reasons.join('; ')} — no session started, deferred #{DEPENDENCY_DEFER_DAYS} day")
+    end
+
+    # A dependency that has not merged after a week of daily checks is no longer a
+    # scheduling problem, it is a PR nobody merged — and the ONLY thing that can
+    # clear it is a human. Deferring it forever would be the silent-aging outcome
+    # the whole close-out contract exists to prevent: a snoozed issue is out of the
+    # queue AND out of the daily nudge, so nothing would ever say it was stuck.
+    def escalate_stalled_dependency(lease, identity, number, reasons, attempt, undeferrable: false)
+      why = undeferrable ? "this runner could not record the deferral" : "#{attempt} daily checks have not cleared it"
+      text = "Waiting on a dependency that has not merged, and #{why}.\n\n" \
+             "#{reasons.map { |r| "- #{r}" }.join("\n")}\n\n" \
+             "Merge the PR (or drop the `blocked_by` edge with `dev issues block #{number} --on <n> --remove` " \
+             "if this issue no longer needs it) and move this back to `open`. No session has been started: " \
+             "the work is not blocked on a decision, only on the code landing on `origin/main`."
+      push("dependency_stalled", "dev-agent: ISS-#{number} is still waiting on an unmerged dependency (#{reasons.first})")
+      unless @dry_run
+        Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
+        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
+      end
+      decide("claim", "ISS-#{number}: #{reasons.join('; ')} — no session started, moved to needs_input")
     end
 
     # Enforcement, not advice (§4.6): core.hooksPath is injected through
