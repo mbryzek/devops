@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require_relative 'test_helper'
 require_relative '../lib/api_client'
+require_relative '../lib/apibuilder_client'
 
 # How `ApiClient` words a 401.
 #
@@ -86,5 +88,39 @@ class TestApiClientUnauthorized < Minitest::Test
   def test_the_ai_identity_is_reachable_without_loading_bin_dev
     assert_equal "ai", ApiClient::AI_USER_ID
     assert_equal "Otto AI", ApiClient::AI_USER_LABEL
+  end
+
+  # ApibuilderClient is the second HTTP client in this repo and NetworkGuard
+  # never covered it: it is a separate class that does not route through
+  # ApiClient, so `bin/api`'s calls to api.apibuilder.io went out unguarded, and
+  # the two test files that load bin/api did not even require this helper. What
+  # kept the suite off the network was the test authors' own discipline -- which
+  # is exactly the arrangement ISS-034 proved insufficient.
+  #
+  # Guarded at build_http rather than at the three public methods, so a fourth
+  # entry point cannot be added around it. `allocate` skips the constructor,
+  # which reads ~/.apibuilder/config: the guard is what is under test, not the
+  # credential loading, and a box with no config file should not change what
+  # this asserts.
+  def unconfigured_client
+    client = ApibuilderClient.allocate
+    client.instance_variable_set(:@base_uri, "https://api.apibuilder.io")
+    client.instance_variable_set(:@token, "tok")
+    client
+  end
+
+  def test_an_apibuilder_request_cannot_reach_the_network
+    err = assert_raises(DevTestSupport::NetworkBlocked) { unconfigured_client.request(:get, "/bryzek") }
+    assert_match(/apibuilder/, err.message)
+  end
+
+  def test_an_apibuilder_download_cannot_reach_the_network
+    assert_raises(DevTestSupport::NetworkBlocked) do
+      unconfigured_client.download("https://example.com/batch.zip")
+    end
+  end
+
+  def test_an_anonymous_apibuilder_init_cannot_reach_the_network
+    assert_raises(DevTestSupport::NetworkBlocked) { unconfigured_client.anonymous_init }
   end
 end
