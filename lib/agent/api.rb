@@ -104,6 +104,20 @@ module Agent
       nil
     end
 
+    # The CURRENT version of EVERY playbook, one row per key. Bounded by the
+    # number of producers, so no limit/offset -- the same reasoning as
+    # GET /agent/runners.
+    #
+    # Read-only on purpose, and the absence of a write here is deliberate. The
+    # store is append-only and a write is authoring INSTRUCTIONS every later
+    # session obeys, which is not a thing a runner should be able to do to itself
+    # in passing; playbooks are written at /admin/agents/playbooks by a human. What
+    # a runner needs is to READ the store — to resolve a pointer, and to check the
+    # store for defects it can otherwise only find by running into them (ISS-633).
+    def playbooks(token:, use_localhost:)
+      request(:get, "/agent/playbooks", token: token, use_localhost: use_localhost) || []
+    end
+
     # ---- producers ----
     #
     # READ ONLY, both of them. Producers are scheduled, checked and filed entirely

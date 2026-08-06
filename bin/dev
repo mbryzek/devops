@@ -118,6 +118,7 @@ INVOCATIONS = {
   "agent resume"        => 'agent resume [--localhost]',
   "agent runners"       => 'agent runners [--localhost]',
   "agent producers"     => 'agent producers [--localhost]',
+  "agent playbooks"     => 'agent playbooks [KEY] [--lint] [--localhost]',
   "agent runs"          => 'agent runs [KEY] [--issue N] [--limit N] [--localhost]',
   "agent refresh"       => 'agent refresh <issue> [--comment "TEXT"] [--localhost]',
   "agent release"       => 'agent release <issue> [--localhost]',
@@ -927,6 +928,17 @@ USAGE = <<~USAGE
         number here is READ from the server, the one thing that schedules
         producers; nothing is computed locally.
 
+    #{INVOCATIONS["agent playbooks"]}
+        The playbook store — the append-only rows a producer's issue points at,
+        managed at /admin/agents/playbooks. With no KEY it lists the current
+        version of every playbook; with a KEY it prints that body verbatim on
+        stdout, so `dev agent playbooks slow-query-review | grep -n ...` works.
+        --lint reports paths hardcoded under one user's home (`/Users/mbryzek/…`),
+        which are correct on the runner they were written on and silently wrong on
+        every other one, and exits 1 when it finds any. READ ONLY: a playbook is
+        instructions later sessions obey, so writing one is a human's job in
+        admin.
+
     #{INVOCATIONS["agent runs"]}
         Full history: every producer run, and every lease attempt for --issue N.
         "Did it actually fire, when, and what happened" in one command instead of
@@ -1018,7 +1030,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs pause resume runners producers runs refresh release gc maintenance doctor],
+  "agent"        => %w[tick status logs pause resume runners producers playbooks runs refresh release gc maintenance doctor],
 }.freeze
 
 def levenshtein(a, b)
@@ -10935,6 +10947,68 @@ def cmd_agent_producers(args)
   end
 end
 
+# Render one playbook, or the catalogue, and return the lint findings so the
+# caller decides the exit status. Split out from the command for the same reason
+# every other renderer here is: it is the part worth testing, and testing it
+# should not require a registered runner or a stubbed HTTP layer.
+def agent_playbooks_report(rows, key:, lint:)
+  findings = Agent::Playbook.home_paths_in_all(rows)
+  if lint
+    # The lint is the whole output in this mode, including when it is empty --
+    # "no findings" said out loud is what makes a clean store distinguishable from
+    # a detector that quietly ran against nothing, which is precisely how the
+    # meta-review's D4 stopped working when `agent/bodies/` was deleted.
+    puts findings.empty? ? "No hardcoded home paths in #{rows.length} playbook(s)." : findings.map(&:to_s)
+    puts "Use `~/…` — one playbook is read by every runner and they do not share a home." unless findings.empty?
+  elsif key
+    # Body only, byte for byte, so this composes with grep. Anything else on
+    # stdout would end up in whatever the caller is diffing or piping.
+    puts rows.first["body"]
+  else
+    puts "Playbook store: #{rows.length} playbook(s), managed at /admin/agents/playbooks"
+    by_key = findings.group_by(&:key)
+    rows.each do |row|
+      bytes = row["body"].to_s.bytesize
+      puts format("  %-32s %6s  v %s", row["key"], "#{(bytes / 1024.0).round(1)}k", row["created_at"])
+      hits = by_key[row["key"]] || []
+      puts "    #{hits.length} hardcoded home path(s): #{hits.map(&:path).uniq.join(', ')} — run --lint" unless hits.empty?
+    end
+  end
+  findings
+end
+
+def cmd_agent_playbooks(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  lint = false
+  leftover = []
+  rest.each { |a| a == "--lint" ? lint = true : leftover << a }
+  key = leftover.shift
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--app is not a valid option here" if app_filter
+  report_arg_problems("agent playbooks", problems, usage_for("agent playbooks"))
+  identity = agent_identity!(use_localhost)
+
+  findings = handle_errors do
+    rows =
+      if key
+        row = Agent::Api.playbook(key, token: identity.token, use_localhost: use_localhost)
+        # A key that does not exist is the ISS-360 failure seen from the outside,
+        # so it is an error rather than an empty list: asking for a playbook and
+        # being handed nothing is exactly the shape that let a producer run for a
+        # week without its procedure.
+        Util.exit_with_error("No playbook `#{key}`. `dev agent playbooks` lists every key.") if row.nil?
+        [row]
+      else
+        Agent::Api.playbooks(token: identity.token, use_localhost: use_localhost)
+      end
+    agent_playbooks_report(rows, key: key, lint: lint)
+  end
+  # Only --lint is a check, so only --lint fails the shell. The catalogue and a
+  # body dump are reads and must stay usable in a pipeline.
+  exit 1 if lint && !findings.empty?
+end
+
 def cmd_agent_runs(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   issue_number = nil
@@ -11414,6 +11488,7 @@ when "agent"
   when "resume"    then cmd_agent_resume(argv)
   when "runners"   then cmd_agent_runners(argv)
   when "producers" then cmd_agent_producers(argv)
+  when "playbooks" then cmd_agent_playbooks(argv)
   when "runs"      then cmd_agent_runs(argv)
   when "refresh"   then cmd_agent_refresh(argv)
   when "release"   then cmd_agent_release(argv)

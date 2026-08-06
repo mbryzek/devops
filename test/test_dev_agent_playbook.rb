@@ -180,4 +180,103 @@ class TestDevAgentPlaybook < Minitest::Test
     assert_equal VERSION, resolved.version
     assert_equal "slow-query-review @ #{VERSION}", resolved.label
   end
+
+  # ---- the hardcoded-home detector (ISS-633) ----
+  #
+  # One playbook, every runner, and the runners do not share a home: an absolute
+  # path under `/Users/mbryzek` is right on the MacBook and silently wrong on the
+  # Mac mini, where the session either errors or writes into a tree nothing reads.
+  # This is the detector that makes that findable without running into it.
+
+  # The real defect, verbatim from the row this issue was filed against.
+  def test_the_status_file_path_that_filed_this_issue_is_a_finding
+    body = "Write\n`/Users/mbryzek/code/openclaw/openclaw-workspace/data/slow-query-review-status.md`\nin this shape."
+    findings = Agent::Playbook.home_paths_in(body, key: "slow-query-review")
+
+    assert_equal 1, findings.length
+    assert_equal 2, findings.first.line
+    assert_equal "/Users/mbryzek", findings.first.path
+    assert_equal "slow-query-review:2: /Users/mbryzek", findings.first.to_s
+  end
+
+  # The home-relative form the fix uses, and the form the Ruby side always used
+  # (`Briefing::DATA_DIR`). If this ever became a finding the detector would be
+  # flagging the fix.
+  def test_a_home_relative_path_is_not_a_finding
+    body = "Write `~/code/openclaw/openclaw-workspace/data/slow-query-review-status.md`\n" \
+           "or `$HOME/code/openclaw/openclaw-workspace/data/`."
+    assert_empty Agent::Playbook.home_paths_in(body)
+  end
+
+  # A detector with a standing false positive is one nobody runs twice — and these
+  # are the exact strings the meta-review playbook carries, which describes this
+  # very defect and must stay clean.
+  def test_placeholders_and_commands_are_not_paths
+    [
+      "Do not hardcode `/Users/<someone>/code/openclaw/…`.",
+      "    grep -n '/Users/' -- the old detector",
+      "a path under /Users/ belonging to one person",
+    ].each { |line| assert_empty Agent::Playbook.home_paths_in(line), "must not flag: #{line}" }
+  end
+
+  # Whose home it is does not matter: hardcoding THIS runner's home breaks on the
+  # other one, which is the same bug pointed the other way.
+  def test_the_runners_own_home_is_a_finding_too
+    findings = Agent::Playbook.home_paths_in("write /Users/athena/code/ai/x and /home/ci/logs")
+    assert_equal ["/Users/athena", "/home/ci"], findings.map(&:path)
+  end
+
+  def test_the_whole_store_is_linted_key_by_key
+    rows = [
+      { "key" => "clean", "body" => "Write `~/code/x`." },
+      { "key" => "broken", "body" => "line one\nwrite /Users/mbryzek/code/x\n" },
+    ]
+    assert_equal ["broken:2: /Users/mbryzek"], Agent::Playbook.home_paths_in_all(rows).map(&:to_s)
+  end
+
+  # ---- what `dev agent playbooks` prints ----
+
+  ROWS = [
+    { "key" => "clean", "body" => "Write `~/code/x`.\n", "created_at" => VERSION },
+    { "key" => "broken", "body" => "one\nwrite /Users/mbryzek/code/x\n", "created_at" => VERSION },
+  ].freeze
+
+  def report(rows: ROWS, key: nil, lint: false)
+    findings = nil
+    out = capture_stdout { findings = agent_playbooks_report(rows, key: key, lint: lint) }
+    [out, findings]
+  end
+
+  # A body dump is a pipeline input (`| grep -n`), so anything else on stdout ends
+  # up in whatever the caller is grepping.
+  def test_one_key_prints_its_body_and_nothing_else
+    out, = report(rows: [ROWS.first], key: "clean")
+    assert_equal "Write `~/code/x`.\n", out
+  end
+
+  # "No findings" said out loud is what distinguishes a clean store from a
+  # detector that ran against nothing — which is exactly how the meta-review's D4
+  # stopped working when the directory it grepped was deleted.
+  def test_a_clean_lint_says_how_many_playbooks_it_read
+    out, findings = report(rows: [ROWS.first], lint: true)
+    assert_empty findings
+    assert_match(/No hardcoded home paths in 1 playbook\(s\)/, out)
+  end
+
+  def test_the_lint_names_the_key_the_line_and_the_path
+    out, findings = report(lint: true)
+    assert_equal 1, findings.length
+    assert_match(/broken:2: \/Users\/mbryzek/, out)
+    assert_match(/Use `~\/…`/, out)
+  end
+
+  # The catalogue is a read and stays exit-0, but a defect must be visible in it —
+  # a lint you have to know to ask for is one nobody asks for.
+  def test_the_catalogue_flags_an_offending_key_inline
+    out, = report
+    assert_match(/Playbook store: 2 playbook\(s\)/, out)
+    assert_match(/broken.*v #{Regexp.escape(VERSION)}/, out)
+    assert_match(/1 hardcoded home path\(s\): \/Users\/mbryzek/, out)
+    refute_match(/clean\n.*hardcoded/, out)
+  end
 end
