@@ -5267,17 +5267,28 @@ def issue_pr_label(pr)
   "#{pr['repo']}##{pr['number']}"
 end
 
-# The merged PR that most recently landed for a claimed issue, or nil when none
-# has. Only merges AFTER the claim count: a reopened issue accumulates PRs, and the
-# one that shipped the previous round says nothing about the round in flight now.
-# An issue with no claimed_at (filed before the field existed) takes any merge.
-def issue_adoptable_pr(issue, prs_by_number)
+# Every merged PR that could adopt a claimed issue, newest merge first. Only
+# merges AFTER the claim count: a reopened issue accumulates PRs, and the one that
+# shipped the previous round says nothing about the round in flight now. An issue
+# with no claimed_at (filed before the field existed) takes any merge.
+#
+# All of them, not one (ISS-657): a run that split into independent PRs — the
+# normal shape of a review run — has several, and adopting only the newest left
+# the rest recorded nowhere. They all carry the same `ISS-<n>: ` title, so they
+# are all already in hand here; the first becomes the fix and the rest are
+# appended through POST /:number/fixes.
+def issue_adoptable_prs(issue, prs_by_number)
   claimed_at = issue_parse_time(issue["claimed_at"])
-  (prs_by_number[issue["number"]] || []).find do |pr|
+  (prs_by_number[issue["number"]] || []).select do |pr|
     next true if claimed_at.nil?
     merged_at = issue_parse_time(pr["merged_at"])
     !merged_at.nil? && merged_at > claimed_at
   end
+end
+
+# The merged PR that most recently landed for a claimed issue, or nil when none has.
+def issue_adoptable_pr(issue, prs_by_number)
+  issue_adoptable_prs(issue, prs_by_number).first
 end
 
 def issue_parse_time(value)
@@ -5408,14 +5419,15 @@ def issues_adopt_merged_prs(endpoint:, registry:, version_cache:, apply:)
   return 0 if prs_by_number.empty?
 
   adoptable = claimed.filter_map do |issue|
-    pr = issue_adoptable_pr(issue, prs_by_number)
-    [issue, pr] if pr
+    prs = issue_adoptable_prs(issue, prs_by_number)
+    [issue, prs] unless prs.empty?
   end
   return 0 if adoptable.empty?
 
   puts ""
   puts "Claimed issues whose fix already merged (adopt as fixed):"
-  adoptable.each do |issue, pr|
+  adoptable.each do |issue, prs|
+    pr, *extras = prs
     body = issue_adoption_body(registry, version_cache, pr)
     merge_is_release = issue_repo_releases_nothing?(registry, pr["repo"])
     note = issue_adoption_note(body, pr, merge_is_release)
@@ -5428,17 +5440,44 @@ def issues_adopt_merged_prs(endpoint:, registry:, version_cache:, apply:)
       # no release to wait for.
       ApiClient.request(endpoint, :put, path,
                         body: body.merge(comment: "#{note}.", visibility: "internal"))
+      # The siblings, after the status write and never as one: POST /:number/fixes
+      # only accepts an issue that has shipped, and it is what keeps the FIRST fix
+      # the one the deploy reconciler watches (it takes the latest fix naming an
+      # app, and these deliberately name none).
+      issue_record_extra_fixes(endpoint: endpoint, issue: issue, prs: extras)
       if merge_is_release
         ApiClient.request(endpoint, :put, path,
                           body: { status: "deployed", visibility: "internal",
                                   comment: "No release to wait for; awaiting verification." })
       end
-      puts "  #{landing.ljust(8)} #{issue_link(issue)} <- #{note}"
+      puts "  #{landing.ljust(8)} #{issue_link(issue)} <- #{issue_adoption_line(note, extras)}"
     else
-      puts "  would #{merge_is_release ? 'deploy' : 'fix'} #{issue_link(issue)} <- #{note}"
+      puts "  would #{merge_is_release ? 'deploy' : 'fix'} #{issue_link(issue)} <- #{issue_adoption_line(note, extras)}"
     end
   end
   adoptable.length
+end
+
+# The per-issue line, naming the siblings that came with the adopted PR so a
+# multi-PR run reads as one on the release output instead of looking like five
+# merges nobody accounted for.
+def issue_adoption_line(note, extras)
+  return note if extras.empty?
+  "#{note}; also #{extras.map { |pr| issue_pr_label(pr) }.join(', ')}"
+end
+
+# Record the other merged PRs of one run as additional fixes. Idempotent
+# server-side on the url, so a sweep that runs twice adds no second row — and
+# fail-soft, because a 422 on one sibling must not abandon the rest or the
+# release output that follows.
+def issue_record_extra_fixes(endpoint:, issue:, prs:)
+  recorded = Array(issue["fixes"]).map { |fix| fix["url"] }
+  prs.reject { |pr| recorded.include?(pr["url"]) }.each do |pr|
+    ApiClient.request(endpoint, :post, issues_path("/#{URI.encode_www_form_component(issue['number'])}/fixes"),
+                      body: { url: pr["url"], comment: "Also shipped in #{issue_pr_label(pr)}." })
+  rescue StandardError => e
+    warn "issues reconcile: could not record #{issue_pr_label(pr)} on #{issue_link(issue)} (#{e.message})"
+  end
 end
 
 # Two passes over the issue tracker, both keyed on facts nobody has to remember:

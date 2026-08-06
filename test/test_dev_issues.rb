@@ -1438,6 +1438,65 @@ class TestDevIssues < Minitest::Test
     assert_nil issue_adoptable_pr(graph_issue, { "099" => [merged_pr] })
   end
 
+  # ISS-657: a run that shipped several independent PRs (a review run normally
+  # does) has all of them here — they carry the same `ISS-<n>: ` title — and
+  # adopting only the newest left the other five recorded nowhere. The newest is
+  # still the one that becomes the fix; the rest are appended.
+  def test_every_merge_after_the_claim_is_adoptable_not_just_the_newest
+    issue = graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")
+    prs = { "034" => [merged_pr(number: 9, merged_at: "2026-07-21T00:00:00Z"),
+                      merged_pr(number: 8, merged_at: "2026-07-20T00:00:00Z"),
+                      merged_pr(number: 7, merged_at: "2026-07-18T00:00:00Z")] }
+    adoptable = issue_adoptable_prs(issue, prs)
+    assert_equal [9, 8], adoptable.map { |pr| pr["number"] }, "the pre-claim merge belongs to an earlier round"
+    assert_equal 9, issue_adoptable_pr(issue, prs)["number"]
+  end
+
+  # The release output has to read as ONE run, or five sibling merges look like
+  # five merges nobody accounted for.
+  def test_the_adoption_line_names_the_siblings_that_came_with_the_adopted_pr
+    line = issue_adoption_line("acumen#173 merged", [merged_pr(number: 174), merged_pr(number: 175)])
+    assert_equal "acumen#173 merged; also acumen#174, acumen#175", line
+    assert_equal "acumen#173 merged", issue_adoption_line("acumen#173 merged", [])
+  end
+
+  # POST /:number/fixes, never a second status write: naming `fixed` again is
+  # what walked ten issues backward on 2026-08-05 (ISS-536).
+  def test_extra_fixes_are_appended_and_never_re_record_a_url_the_issue_has
+    posted = []
+    stub_singleton(ApiClient, :request, lambda { |_ep, method, path, **opts|
+      posted << [method, path, opts[:body]]
+      {}
+    }) do
+      issue_record_extra_fixes(endpoint: "ep",
+                               issue: graph_issue.merge("fixes" => [{ "url" => merged_pr(number: 174)["url"] }]),
+                               prs: [merged_pr(number: 174), merged_pr(number: 175)])
+    end
+    assert_equal 1, posted.length
+    method, path, body = posted.first
+    assert_equal :post, method
+    assert_match(%r{/034/fixes\z}, path)
+    assert_equal merged_pr(number: 175)["url"], body[:url]
+  end
+
+  # One sibling the server rejects must not abandon the others, nor the release
+  # output this runs in the middle of.
+  def test_a_failing_extra_fix_is_warned_about_and_the_rest_still_record
+    posted = []
+    stub_singleton(ApiClient, :request, lambda { |_ep, _method, _path, **opts|
+      posted << opts[:body][:url]
+      raise ApiError, "422" if posted.length == 1
+      {}
+    }) do
+      _out, err = capture_io do
+        issue_record_extra_fixes(endpoint: "ep", issue: graph_issue,
+                                 prs: [merged_pr(number: 174), merged_pr(number: 175)])
+      end
+      assert_match(/could not record acumen#174/, err)
+    end
+    assert_equal 2, posted.length
+  end
+
   # A repo that releases a tracked deployable gets the (app, baseline) pair, which
   # is what lets the deploy pass detect the release.
   def test_adoption_body_records_the_app_and_its_live_version_as_baseline

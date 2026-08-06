@@ -150,7 +150,9 @@ class TestDevAgentTick < Minitest::Test
                                  "lease_id" => "lse-1", "started_at" => (Time.now - 60).utc.iso8601,
                                  "timeout_at" => (Time.now + 3600).utc.iso8601)
       stubs = {
-        Agent::Github => { find_pr_in_workspace: ->(*) { nil }, search_pr: ->(*) { nil },
+        # Both lookups, or the empty-workspace case falls through to a live
+        # `gh search prs` (ISS-657 turned the reap's two calls into these).
+        Agent::Github => { prs_in_workspace: ->(*) { [] }, search_prs: ->(*) { [] },
                            plans_committed_since?: ->(*) { false } },
         Agent::Api => { issue_lease_history: ->(*) { [] } },
         subject => { cleanup: ->(*) { order << :cleanup }, apply_outcome: ->(*) { order << :apply_outcome } },

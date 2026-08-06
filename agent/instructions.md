@@ -65,6 +65,43 @@ forever.
 Nothing merges automatically. The worst case of any run here is a PR nobody
 merges, and that is the safety design working, not a failure.
 
+### More than one PR: the assigned branch is a NAMESPACE
+
+Most runs produce one PR and it goes on the assigned branch, verbatim. Some
+produce several — a review playbook that confirms six unrelated defects, a
+migration whose pieces merge on their own schedule. Those PRs must be
+INDEPENDENT: each branched off latest `origin/main`, each with a disjoint file
+set, none stacked on another (these repos squash-merge, and a squashed base
+orphans everything built on it). One branch cannot carry them.
+
+So the assigned branch is the name of the FIRST PR and the prefix of every other:
+
+- the **primary** PR — the most significant one — goes on `<assigned>` exactly;
+- every **additional** PR goes on `<assigned>_<suffix>`: the assigned branch, an
+  underscore, a short suffix naming the fix (`i651_irv` → `i651_irv_sig`,
+  `i651_irv_forms`). Keep the whole name ≤19 chars, for the sbt socket-path
+  reason in §4;
+- **every** PR title still starts with `ISS-<n>: `.
+
+A branch that does not start with the assigned name is invisible: the reap
+matches `<assigned>`, the `<assigned>_` family, and the title prefix, and nothing
+else. That is the whole allowance — a sibling is not a rename, and renaming is
+still the one thing you may not do.
+
+**Record every PR, or the ones you do not record did not happen.** The status
+write carries exactly one url, so:
+
+    dev issues status <n> --status fixed --url "<primary PR>"
+    dev issues fix <n> --url "<sibling PR>"      # once per additional PR
+
+`dev issues fix` appends to the same fix list `dev issues show` and the deploy
+reconciler read, and leaves the status where it is. A url mentioned only in a
+comment is invisible to both.
+
+**Do not split work to look thorough.** The test is whether each piece is
+reviewable and mergeable on its own. Related edits to one behaviour are ONE PR,
+and forcing them apart is worse than the problem this section solves.
+
 ### Before you close out: file what you WORKED AROUND
 
 Whichever of the four outcomes above you land on, answer one question before you
@@ -249,7 +286,10 @@ assigned by the executor; do not rename either.
 > or improve.
 >
 > The one thing you may not do is rename. Everything else about the branch —
-> what you commit to it, how you rebase it — is ordinary work.
+> what you commit to it, how you rebase it — is ordinary work, and that includes
+> opening `<assigned>_<suffix>` siblings when the work is genuinely several
+> independent PRs (§1). A sibling EXTENDS the assigned name; a rename replaces
+> it, and only the second one is invisible.
 
 - Clone every repo you need **into your workspace**:
   `gh repo clone mbryzek/<repo> <workspace>/<repo>`. When the issue named its
@@ -259,9 +299,12 @@ assigned by the executor; do not rename either.
   copy beside them.
 - Use **the assigned branch name, verbatim, in every repo** you touch, branched
   off the latest `origin/main` (`git fetch origin` first — never off another
-  feature branch, and never a stacked PR; these repos squash-merge).
+  feature branch, and never a stacked PR; these repos squash-merge). Work that
+  splits into several independent PRs keeps the first on that branch and names
+  the rest `<assigned>_<suffix>` — the rule, and how to record them, is in §1.
 - Feature dir and branch are already ≤19 chars because sbt's unix-socket paths
-  cap at 104 bytes. Do not lengthen them and do not shorten them.
+  cap at 104 bytes. Do not lengthen them and do not shorten them; a
+  `<assigned>_<suffix>` sibling branch stays under the same ceiling.
 - **Database:** every Scala test run needs an isolated session DB.
   `claude-db start --app platform --port "$(claude-db next-port)"` prints a final
   `CONF_DB_DEV_URL=jdbc:...` line. Export it **in the same shell call as sbt** —
