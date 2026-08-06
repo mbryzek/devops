@@ -119,5 +119,48 @@ module Agent
       raise MissingError, "playbook key `#{key}` is not a valid key" unless SAFE_KEY_RE.match?(key.to_s)
       key.to_s
     end
+
+    # ---- the hardcoded-home detector (ISS-633) ----
+    #
+    # ONE playbook is read by EVERY runner, and the runners do not share a home
+    # directory: Mike's MacBook is `/Users/mbryzek` and the Mac mini is
+    # `/Users/athena`. So an absolute path under somebody's home is a playbook
+    # that is correct on one machine and wrong on the other, and it fails in the
+    # worst available way — a session told to write `/Users/mbryzek/...` on the
+    # mini either errors, or helpfully creates the parents and writes into a tree
+    # nothing reads. Nothing anywhere says so, and the consumer just goes quiet.
+    #
+    # That is not hypothetical and it is not one path: three playbooks ended by
+    # writing a status file under `/Users/mbryzek/code/openclaw/...` while running
+    # nightly on a runner whose home is `/Users/athena` (ISS-503, ISS-612,
+    # ISS-633). The home-relative form is already what the Ruby side uses
+    # (`Briefing::DATA_DIR` is `File.expand_path("~/code/openclaw/...")`), so this
+    # is prose drifting from code that was always right.
+    #
+    # A username segment, not a bare `/Users/`: `/Users/<someone>/code` is a
+    # placeholder that a reader substitutes and `grep '/Users/'` is a command, and
+    # neither is a path anything will try to write. The distinction is exactly
+    # what keeps the clean state meaningful — a detector with a standing false
+    # positive is one nobody runs twice.
+    HOME_PATH_RE = %r{/(?:Users|home)/[A-Za-z0-9][A-Za-z0-9._-]*}.freeze
+
+    HomePath = Struct.new(:key, :line, :path, keyword_init: true) do
+      def to_s = "#{key}:#{line}: #{path}"
+    end
+
+    # Every hardcoded home path in one playbook body, in line order. Empty is the
+    # normal case and the one worth keeping true.
+    def home_paths_in(body, key: nil)
+      body.to_s.each_line.with_index(1).flat_map do |line, number|
+        line.scan(HOME_PATH_RE).uniq.map { |path| HomePath.new(key: key, line: number, path: path) }
+      end
+    end
+
+    # The same question asked of the whole store — what `dev agent playbooks
+    # --lint` runs, and what the meta-review's D4 detector calls now that
+    # `agent/bodies/*.md` (which it used to grep) is deleted.
+    def home_paths_in_all(rows)
+      rows.flat_map { |row| home_paths_in(row["body"], key: row["key"]) }
+    end
   end
 end
