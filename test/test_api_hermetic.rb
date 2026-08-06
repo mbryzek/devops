@@ -183,6 +183,119 @@ class TestApiHermetic < Minitest::Test
     end
   end
 
+  # ---- api validate: which (org, app) a spec file validates as (ISS-641) ----
+
+  # The org lives in .api/config.pkl, never in the spec — reading it off the spec
+  # and defaulting to "tmp" made EVERY `api validate` fail with "Organization with
+  # key 'tmp' not found", a message that reads like the spec is malformed.
+  def test_resolve_validate_target_reads_org_and_app_from_the_config
+    Dir.mktmpdir do |dir|
+      repo = make_spec_repo(dir, "repo", "some-api")
+      roots = Dir.chdir(repo) { resolve_config_roots(repo) }
+      spec = JSON.parse(IO.read(File.join(repo, "spec", "some-api.json")))
+
+      assert_equal ["bryzek", "some-api"],
+        resolve_validate_target(roots, File.join(repo, "spec", "some-api.json"), spec)
+    end
+  end
+
+  # A spec file reached by a relative path (how it is always typed: `api validate
+  # spec/x.json`) matches the config entry, which is relative to the repo root.
+  def test_resolve_validate_target_matches_a_relative_path
+    Dir.mktmpdir do |dir|
+      repo = make_spec_repo(dir, "repo", "some-api")
+      Dir.chdir(repo) do
+        roots = resolve_config_roots(repo)
+        spec = JSON.parse(IO.read("spec/some-api.json"))
+        assert_equal ["bryzek", "some-api"], resolve_validate_target(roots, "spec/some-api.json", spec)
+      end
+    end
+  end
+
+  # An `organization` key on the spec is not a thing apibuilder defines; if one is
+  # ever authored anyway it does not get to redirect the batch away from the org
+  # codegen uses.
+  def test_resolve_validate_target_ignores_an_organization_key_on_the_spec
+    Dir.mktmpdir do |dir|
+      repo = make_spec_repo(dir, "repo", "some-api")
+      roots = Dir.chdir(repo) { resolve_config_roots(repo) }
+      spec = { "name" => "some-api", "organization" => { "key" => "tmp" } }
+
+      assert_equal ["bryzek", "some-api"],
+        resolve_validate_target(roots, File.join(repo, "spec", "some-api.json"), spec)
+    end
+  end
+
+  # A spec listed only by a nested root still resolves — its config entry is
+  # relative to the nested directory, not the repo root.
+  def test_resolve_validate_target_finds_a_spec_owned_by_a_nested_root
+    Dir.mktmpdir do |dir|
+      repo = make_consumer_with_nested_root(dir, "consumer", nested_app: "nested-api")
+      nested_spec = File.join(repo, "playwright", "spec", "nested-api.json")
+      FileUtils.mkdir_p(File.dirname(nested_spec))
+      write_spec(File.dirname(nested_spec), "nested-api.json", { "name" => "nested-api" })
+      roots = Dir.chdir(repo) { resolve_config_roots(repo) }
+
+      assert_equal ["bryzek", "nested-api"],
+        resolve_validate_target(roots, nested_spec, { "name" => "nested-api" })
+    end
+  end
+
+  # Validating a spec BEFORE wiring it into the config is the other real use of
+  # this command: the org is the repo's, and the app key is the one the registry
+  # derives from the spec's name.
+  def test_resolve_validate_target_derives_the_key_for_an_unlisted_spec
+    Dir.mktmpdir do |dir|
+      repo = make_spec_repo(dir, "repo", "some-api")
+      roots = Dir.chdir(repo) { resolve_config_roots(repo) }
+      write_spec(File.join(repo, "spec"), "new.json", { "name" => "ApiBuilder Spec" })
+
+      assert_equal ["bryzek", "apibuilder-spec"],
+        resolve_validate_target(roots, File.join(repo, "spec", "new.json"), { "name" => "ApiBuilder Spec" })
+    end
+  end
+
+  def test_resolve_validate_target_rejects_an_unlisted_spec_with_no_name
+    Dir.mktmpdir do |dir|
+      repo = make_spec_repo(dir, "repo", "some-api")
+      roots = Dir.chdir(repo) { resolve_config_roots(repo) }
+      assert_raises(SystemExit) do
+        resolve_validate_target(roots, File.join(repo, "spec", "new.json"), {})
+      end
+    end
+  end
+
+  # Guessing an org for an unlisted spec is only safe when the repo configures
+  # exactly one. Two, and the answer has to come from the config.
+  def test_resolve_validate_target_refuses_to_guess_between_orgs
+    Dir.mktmpdir do |dir|
+      repo = make_two_org_repo(dir, "repo")
+      roots = Dir.chdir(repo) { resolve_config_roots(repo) }
+      assert_raises(SystemExit) do
+        resolve_validate_target(roots, File.join(repo, "spec", "new.json"), { "name" => "new" })
+      end
+    end
+  end
+
+  def test_apibuilder_key_slugs_a_spec_name
+    assert_equal "apibuilder-spec", apibuilder_key("ApiBuilder Spec")
+    assert_equal "acumen-sandbox", apibuilder_key("acumen-sandbox")
+    assert_equal "a-b", apibuilder_key("  A / B  ")
+    assert_equal "", apibuilder_key("///")
+  end
+
+  # Without a config there is no org, and the batch cannot be built at all — say
+  # so here rather than letting the server answer with an org-not-found error.
+  def test_run_validate_without_a_config_fails_before_the_network
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "spec"))
+      write_spec(File.join(dir, "spec"), "some-api.json", { "name" => "some-api" })
+      Dir.chdir(dir) do
+        assert_raises(SystemExit) { run_validate(nil, "spec/some-api.json") }
+      end
+    end
+  end
+
   def test_ensure_publishable_rejects_non_main_branch
     with_git_repo(branch: "feature-x") do |repo|
       Dir.chdir(repo) { assert_raises(SystemExit) { ensure_publishable!(repo) } }
@@ -256,6 +369,46 @@ class TestApiHermetic < Minitest::Test
       }
     PKL
     write_spec(File.join(repo, "spec"), "#{app_key}.json", { "name" => app_key })
+    repo
+  end
+
+  # A run that spans two organizations. One config declares exactly one `org`, so
+  # the only way to get two is a nested root pointed at a different one — rare, and
+  # exactly what makes guessing an org for an unlisted spec ambiguous.
+  def make_two_org_repo(parent, name)
+    repo = File.join(parent, name)
+    FileUtils.mkdir_p(File.join(repo, ".api"))
+    FileUtils.mkdir_p(File.join(repo, "spec"))
+    FileUtils.mkdir_p(File.join(repo, "nested", ".api"))
+    File.write(File.join(repo, ".api", "config.pkl"), <<~PKL)
+      amends "#{ApiConfig::BASE_MODULE_URI}"
+
+      org = "bryzek"
+
+      applications = new Listing<AppGroup> {
+        new {
+          names { "first-api" }
+          generators = module.modelOnly()
+        }
+      }
+
+      nestedConfigs {
+        "nested"
+      }
+    PKL
+    File.write(File.join(repo, "nested", ".api", "config.pkl"), <<~PKL)
+      amends "#{ApiConfig::BASE_MODULE_URI}"
+
+      org = "other-org"
+
+      applications = new Listing<AppGroup> {
+        new {
+          names { "second-api" }
+          generators = module.modelOnly()
+        }
+      }
+    PKL
+    write_spec(File.join(repo, "spec"), "first-api.json", { "name" => "first-api" })
     repo
   end
 
