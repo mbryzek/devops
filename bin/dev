@@ -40,6 +40,7 @@ require 'depsguard'
 # inlined here because the pieces that decide anything — schedule due-ness,
 # outcome classification, retention — are pure functions that get real tests.
 require 'agent/gc'
+require 'agent/github'
 require 'agent/maintenance'
 require 'agent/tick'
 require 'agent/claude_config'
@@ -787,10 +788,15 @@ USAGE = <<~USAGE
         pipeline. It lands `fixed` when the repo releases a tracked deployable, and
         straight to `deployed` when it does not (devops, acumen, the shared libs:
         there is no release to wait for, so the merge is the release). Then: flip
-        `fixed` issues to `deployed` once their target app has released past the fix.
-        Read-only against GitHub and the deploy registry (same live-version signal as
-        `dev deploy status`) — the release pipeline is untouched. Dry-run by default;
-        pass --apply to record the transitions (e.g. from a cron).
+        `fixed` issues to `deployed` once their target app has released past the fix
+        — or, for an issue whose every fix repo releases nothing, once one of its
+        recorded fix PRs has actually MERGED. `fixed` does not mean merged in this
+        fleet (a session records it at PR-ready), so that merge is checked rather
+        than assumed; an unmerged fix reports `waiting`, and a PR GitHub cannot be
+        read for stays put. Read-only against GitHub and the deploy registry (same
+        live-version signal as `dev deploy status`) — the release pipeline is
+        untouched. Dry-run by default; pass --apply to record the transitions (e.g.
+        from a cron).
 
     #{INVOCATIONS["autonomy decide"]}
         Ask the autonomy ledger for permission BEFORE acting, and act only if it
@@ -5157,16 +5163,31 @@ def issue_fix_deployment(issue)
   (issue["fixes"] || []).reverse.find { |f| f["deployment"] }&.fetch("deployment", nil)
 end
 
+# A fix url that names a pull request, capturing the repo and the PR number. A fix
+# can also be a document (a design doc, a plan), which matches nothing here and
+# contributes neither a repo to watch nor a merge to wait for.
+ISSUE_FIX_PR_URL = %r{\Ahttps://github\.com/[^/]+/([^/]+)/pull/(\d+)}
+
 # Every repo this issue's fixes shipped from, parsed out of their PR urls, oldest first
 # and deduped; a fix that is not a PR (a document link) contributes nothing. Repo-keyed
 # rather than app-keyed on purpose: the registry answers "does this repo release
 # anything?" by repo_name, and the same parse-the-url technique already keys the
 # changelog's ISS map.
 def issue_fix_repos(issue)
-  (issue["fixes"] || []).filter_map do |fix|
-    m = fix["url"].to_s.match(%r{\Ahttps://github\.com/[^/]+/([^/]+)/pull/\d+})
-    m && m[1]
-  end.uniq
+  issue_fix_pr_urls(issue).map { |url| url[ISSUE_FIX_PR_URL, 1] }.uniq
+end
+
+# Every pull request recorded as a fix on this issue, oldest first and deduped.
+# Derived from the same list the repos are, so "this issue names repos" and "this
+# issue names PRs to check for a merge" can never disagree.
+def issue_fix_pr_urls(issue)
+  (issue["fixes"] || []).filter_map { |fix| fix["url"] if fix["url"].to_s.match?(ISSUE_FIX_PR_URL) }.uniq
+end
+
+# `devops#358` for a fix url — how every other line in this command names a PR.
+def issue_fix_pr_label(url)
+  m = url.to_s.match(ISSUE_FIX_PR_URL)
+  m ? "#{m[1]}##{m[2]}" : url.to_s
 end
 
 # The repo the most recent fix shipped from — what a one-line explanation names.
@@ -5292,6 +5313,48 @@ def issue_repo_releases_nothing?(registry, repo)
   registry.deploy_tracked.none? { |a| a.repo_name == repo }
 end
 
+# One recorded fix PR, read from GitHub. A seam of its own so the deploy pass can
+# be driven in a test without reaching the network, exactly as
+# `issue_merged_prs_by_number` is for the adoption pass.
+def issue_fix_pr(url)
+  Agent::Github.pr_by_url(url)
+end
+
+# For a `fixed` issue whose repos all release nothing: has the merge that IS the
+# release actually happened?
+#
+# `fixed` does not mean merged in this fleet. agent/instructions.md §1 has every
+# session record `fixed` the moment its PR is READY, so a devops issue reaches
+# `fixed` with the PR still open and the very next reconcile would otherwise
+# promote it past the only gate the ladder has — and from `deployed` the 7-day
+# auto-verify closes it out, leaving an issue marked verified whose code was never
+# merged (ISS-652). The adoption pass one screen up has always been careful about
+# this; it only adopts PRs `gh search prs --merged` returned. This is the same
+# check, on the pass that inherited the phrasing without it.
+#
+# Returns [state, evidence]:
+#   :merged   — at least one fix merged and none is still open. ANY merge counts,
+#               because a superseded attempt that was closed unmerged must not
+#               strand an issue whose replacement landed; a still-OPEN fix does
+#               block, because that is work in flight.
+#   :unmerged — readable, and nothing has landed. Names the PR being waited on.
+#   :unknown  — GitHub could not be read. FAIL CLOSED: silence must not advance a
+#               fix. The cost is a printed skip line on a pass a human reads after
+#               every release, and the next run recovers on its own.
+def issue_merge_is_release_state(urls, pr_cache)
+  prs = urls.to_h { |url| [url, pr_cache.key?(url) ? pr_cache[url] : (pr_cache[url] = issue_fix_pr(url))] }
+  unreadable = prs.select { |_url, pr| pr.nil? }.keys
+  return [:unknown, issue_fix_pr_label(unreadable.first)] if unreadable.any?
+
+  open_url, = prs.find { |_url, pr| Agent::Github.open?(pr) }
+  return [:unmerged, "#{issue_fix_pr_label(open_url)} is still open"] if open_url
+
+  merged = prs.select { |_url, pr| Agent::Github.merged?(pr) }.keys
+  return [:merged, merged.map { |url| issue_fix_pr_label(url) }.join(", ")] if merged.any?
+
+  [:unmerged, "#{issue_fix_pr_label(prs.keys.first)} was closed without merging"]
+end
+
 # The fix payload for adopting `pr`: always the PR url, plus the (app,
 # baseline_version) pair when the repo maps to a deployable whose live version we
 # can actually read. The baseline is the version live RIGHT NOW, not at merge time —
@@ -5394,6 +5457,9 @@ def cmd_issues_reconcile(args)
 
   registry = Work::Registry.load
   version_cache = {}
+  # One `gh pr view` per fix url per run, no matter how many issues record it: an
+  # issue and the follow-up it spawned routinely name the same PR.
+  pr_cache = {}
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
@@ -5440,15 +5506,31 @@ def cmd_issues_reconcile(args)
         releasing = repos.reject { |r| issue_repo_releases_nothing?(registry, r) }
         phrase = "#{repos.join(' and ')} #{repos.length == 1 ? 'releases' : 'release'} nothing"
         if repos.any? && releasing.empty?
-          if apply
-            ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
-                              body: { status: "deployed", visibility: "internal",
-                                      comment: "#{phrase}, so the merge is the release; awaiting verification." })
-            puts "  deployed #{issue_link(c)}: #{phrase}"
+          # "The merge is the release" is only true once there IS a merge. Reading
+          # `fixed` as merged is what put five devops issues one reconcile away from
+          # a verified-but-never-merged fix on 2026-08-06 (ISS-652).
+          state, evidence = issue_merge_is_release_state(issue_fix_pr_urls(c), pr_cache)
+          case state
+          when :merged
+            note = "#{phrase} and #{evidence} merged"
+            if apply
+              ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
+                                body: { status: "deployed", visibility: "internal",
+                                        comment: "#{note}, so the merge is the release; awaiting verification." })
+              puts "  deployed #{issue_link(c)}: #{note}"
+            else
+              puts "  would deploy #{issue_link(c)}: #{note}"
+            end
+            deployed += 1
+          when :unmerged
+            # `waiting`, not `skip`, and counted as neither: this is the same state
+            # the app-keyed branch below reports when a release has not shipped yet.
+            # Nothing is wrong and nobody has to do anything.
+            puts "  waiting  #{issue_link(c)}: #{phrase}, but #{evidence}"
           else
-            puts "  would deploy #{issue_link(c)}: #{phrase}"
+            puts "  skip #{issue_link(c)}: could not read #{evidence} from GitHub — leaving it fixed"
+            skipped += 1
           end
-          deployed += 1
         else
           reason =
             if releasing.any?
