@@ -1,6 +1,23 @@
 require 'minitest/autorun'
 require 'stringio'
 
+# lib/ is the load root for the suite, exactly as lib/common.rb makes it the load
+# root for every bin/ script. Every module under lib/ pulls in its siblings by
+# name (`require 'agent/paths'`), so a test that requires ONE module directly —
+# rather than loading the whole `dev` CLI — resolves those sibling requires only
+# if lib/ is on $LOAD_PATH. Nothing else in a test process puts it there.
+#
+# The failure this removes is silent rather than red: the require blows up before
+# the file has defined a single test, so the run reports a LoadError instead of a
+# failing assertion, and a per-file suite run reads it as noise. That is exactly
+# how test_agent_workspace_slug.rb sat for as long as it existed, with all seven
+# of its assertions never once executed (ISS-634).
+#
+# Same guarded unshift as common.rb, and idempotent with it: both expand to the
+# identical absolute path, so loading bin/dev afterwards is a no-op here.
+lib = File.expand_path("../lib", __dir__)
+$LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
+
 # Shared across dev CLI tests: run a block that is expected to call `exit`,
 # capturing whatever it wrote to stderr. Returns [stderr_string, exit_status]
 # (status is nil if the block never exits). Include DevTestSupport in the test

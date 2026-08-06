@@ -44,6 +44,22 @@ class TestCommonLoadPaths < Minitest::Test
     assert_loads("bin/../lib/common.rb")
   end
 
+  # The test-side counterpart, and the reason this file is about load paths
+  # rather than about common.rb alone: test/test_helper.rb makes lib/ the load
+  # root for the SUITE, so a test can require the one module it exercises
+  # instead of loading the whole `dev` CLI to get a load path as a side effect.
+  #
+  # Pinned here because losing it fails silently. Without it, requiring a lib
+  # module directly dies on that module's own `require 'agent/paths'` — before
+  # the test file has defined a single test — so the run reports a LoadError
+  # rather than a red assertion, and every assertion in the file simply never
+  # executes. test_agent_workspace_slug.rb was in exactly that state, unnoticed,
+  # until ISS-634.
+  def test_test_helper_makes_lib_requirable
+    out, status = run_ruby("require './test/test_helper'; require 'agent/workspace'")
+    assert_equal 0, status, "test_helper did not make lib/ the load root:\n#{out}"
+  end
+
   # lib/ is the load root, so a subdirectory module resolves by name. bin/dev
   # and the tests that exercise it depend on this.
   def test_makes_lib_subdirectories_requirable
