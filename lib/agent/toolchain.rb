@@ -46,9 +46,20 @@ module Agent
     # `install` is a literal command, not a description. The single question this
     # file answers on a broken machine is "what do I type", and a prose hint is
     # how the plist comment failed.
-    Tool = Struct.new(:name, :required_by, :producers, :install, :required, keyword_init: true) do
+    # `paths` is for the one prerequisite shape a PATH scan cannot see: a macOS
+    # .app bundle (ISS-608). When it is set those absolute candidates are probed
+    # and PATH is not consulted at all — Google Chrome is a real prerequisite of
+    # `browse` and has never been on anybody's PATH, so a list that could only
+    # express "binary on PATH" would have had to leave it off and report a
+    # healthy machine that cannot render a page.
+    Tool = Struct.new(:name, :required_by, :producers, :install, :required, :paths, keyword_init: true) do
       def required? = required != false
       def optional? = !required?
+
+      # Probed at a fixed location rather than resolved on PATH. The doctor and
+      # the issue body both branch on this, because "not on the agent's PATH" is
+      # the wrong sentence to hand someone whose Chrome is simply not installed.
+      def absolute? = !Array(paths).empty?
     end
 
     # Everything the dispatcher, its producers and its claimed sessions shell out
@@ -101,6 +112,50 @@ module Agent
         producers: [],
         install: "ships in devops/bin — put it on the LOGIN PATH: " \
                  "echo 'export PATH=\"$HOME/code/devops/bin:$PATH\"' >> ~/.zprofile",
+      ),
+      # The visual-inspection path, and the second tool devops SHIPS rather than
+      # installs (ISS-608). Same reasoning as `api` directly above: the launcher
+      # sits in bin/ beside `dev`, so the only way to be missing it is to have a
+      # login PATH that never mentions that directory.
+      #
+      # What made this one silent is worth stating, because it is not the shape
+      # the rest of this list has. Nothing ERRORED. CLAUDE.md tells every session
+      # to `use the browse tool to visually inspect running web applications`;
+      # `browse` was `command not found`; and a session that cannot render a page
+      # does not fail, it ships a layout change it never looked at. Two nights
+      # running, ISS-600 and ISS-601 — both issues whose entire deliverable was
+      # how something looks — hand-rolled a screenshot harness instead, and this
+      # doctor reported "all required tools present" on that machine both times.
+      Tool.new(
+        name: "browse",
+        required_by: "the visual inspection CLAUDE.md prescribes for every UI change — " \
+                     "`browse <url>` (bin/browse, lib/browse.rb). Without it a session " \
+                     "verifies a layout change it never saw, and nothing reports an error",
+        producers: [],
+        install: "ships in devops/bin — put it on the LOGIN PATH: " \
+                 "echo 'export PATH=\"$HOME/code/devops/bin:$PATH\"' >> ~/.zprofile",
+      ),
+      # The browser `browse` actually drives, and the first entry here that is not
+      # on PATH — see `Tool#absolute?`. The path is the one Playwright resolves
+      # `channel: "chrome"` to on darwin, copied from playwright-core's registry
+      # rather than guessed, so this cannot pass while browse still fails.
+      #
+      # NOT Playwright's bundled Chromium, and that is a fleet fact rather than a
+      # preference: the egress gateway returns HTTP 400 for cdn.playwright.dev, so
+      # `npx playwright install chromium` cannot fetch a browser on these machines
+      # at all. It also does not admit that — a half-extracted browser leaves the
+      # version directory behind, the installer treats an existing directory as
+      # satisfied and exits 0, and the launch then dies with SIGABRT on a missing
+      # `Chromium Framework` dylib. ISS-608 proposed exactly that reinstall as its
+      # own fix; it could never have worked, and the cask below is why this needs
+      # no CDN.
+      Tool.new(
+        name: "google-chrome",
+        paths: ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+        required_by: "the browser `browse` drives (`channel: \"chrome\"`); Playwright's own " \
+                     "Chromium cannot be downloaded on this fleet, so this IS the browser",
+        producers: [],
+        install: "brew install --cask google-chrome",
       ),
       Tool.new(
         name: "gh",
@@ -187,6 +242,21 @@ module Agent
       nil
     end
 
+    # Where one tool is looked for. A `paths` tool is probed at its fixed
+    # locations and never on PATH: Chrome lives inside an .app bundle, so a PATH
+    # scan would report it missing on every machine that has it.
+    #
+    # The executable test is the same one either way, deliberately — a file that
+    # is present but not executable is not a usable tool no matter how it was
+    # found, and reporting it installed sends whoever is fixing the box looking
+    # in the wrong place.
+    def resolve(tool, path:)
+      return which(tool.name, path: path) unless tool.absolute?
+
+      Array(tool.paths).map { |c| File.expand_path(c) }
+                       .find { |c| File.file?(c) && File.executable?(c) }
+    end
+
     # Best-effort `--version`, purely for the operator's report. Never used to
     # decide present/absent: a tool that resolves but refuses `--version` is
     # installed, and treating it as missing would file an issue about a working
@@ -202,7 +272,7 @@ module Agent
     def check(tools: TOOLS, now: Time.now, path: nil, versions: true)
       resolved = path || agent_path
       found = tools.map do |tool|
-        binary = which(tool.name, path: resolved)
+        binary = resolve(tool, path: resolved)
         Found.new(tool: tool, path: binary, version: binary && versions ? version(binary) : nil)
       end
       Result.new(at: now, path: resolved, found: found)
@@ -261,6 +331,7 @@ module Agent
       lines = ["`#{hostname}` is missing #{result.missing_required.length} required tool(s).", ""]
       result.missing_required.each do |tool|
         lines << "- **#{tool.name}** — needed by #{tool.required_by}"
+        lines << "  - looked for at: `#{tool.paths.join('`, `')}` (not on PATH)" if tool.absolute?
         lines << "  - install: `#{tool.install}`"
         lines << "  - blocks producer(s): #{tool.producers.map { |k| "`#{k}`" }.join(', ')}" unless tool.producers.empty?
       end
