@@ -174,6 +174,20 @@ much louder problem:
 | Working tree dirty, or on a branch other than `main` | Nothing — a benign skip, deliberately left alone, because it means a human is working in that checkout |
 | Machine is dark | `agent_runner_heartbeat_stale` |
 
+**Which is why nothing autonomous merges a devops PR** (ISS-660). Everywhere
+else, merging and shipping are two acts with a human between them, and that gap
+is the entire safety argument for the `pr_auto_merge` loop: a merged PR sits on
+`main` until Mike deploys, so a revert PR opened in the meantime fully undoes it.
+Here the gap does not exist — the merge IS the deploy, it reaches every runner
+within one 30-second tick, and `gh pr revert` opens a revert PR rather than
+merging one. Worse, the change that would need reverting is the code that runs
+the fleet: break `dev agent tick` and you have also taken out the machines that
+would deliver the fix. So a devops PR is `irreversible` by the merge loop's own
+test ("does reverting this before it ships fully undo it"), whatever it touches,
+and `agent/instructions.md` §3 forbids merging one at all — a rule in the
+standing prompt rather than in a playbook, because it must hold for every
+session, not just for the one whose runbook currently remembers it.
+
 ## One copy of the plan, and it is the current one
 
 A producer's issue carries a **pointer** to its playbook, never a copy of it
