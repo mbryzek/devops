@@ -37,6 +37,19 @@ class TestDevAgentCredentials < Minitest::Test
 
   SECRET = "sk-ant-not-a-real-key-0123456789".freeze
 
+  # Opting out of CredentialsGuard (above) buys back the REAL `probe`, and with
+  # it the real `probe`'s dependence on the ambient process environment. Every
+  # assertion below that exercises the env repo must therefore say which process
+  # environment it is asking about, because a runner that exports
+  # PLAYBOOK_CLAUDE_KEY short-circuits `probe` before `stub_lookup` is consulted
+  # and the test quietly measures the machine instead. Every agent runner does
+  # export it — ISS-570 is what put it there — so this failed on the fleet and
+  # passed on the laptop it was written on (ISS-613).
+  #
+  # Named rather than `{}` so a call site reads as an assertion about an empty
+  # environment instead of an argument someone might tidy away.
+  NO_PROCESS_ENV = {}.freeze
+
   def credential(name: "PLAYBOOK_CLAUDE_KEY", app: "platform", environment: "development")
     C::Credential.new(name: name, app: app, environment: environment,
                       required_by: "#{name} things", how_to_provide: "set #{name} somewhere")
@@ -128,9 +141,30 @@ class TestDevAgentCredentials < Minitest::Test
 
   def test_a_locked_env_repo_reads_as_absent_rather_than_raising
     stub_lookup(:locked) do
-      found = C.check(credentials: [credential]).first
+      found = C.check(credentials: [credential], env: NO_PROCESS_ENV).first
       assert found.absent?
       refute found.present?
+    end
+  end
+
+  # `check` and `resolve` read the same two sources `probe` does, so the process
+  # environment has to be controllable through them too — otherwise the only way
+  # to test their env-repo behaviour is to hope the machine is not carrying the
+  # key. Pins the keyword rather than trusting the call sites above to keep
+  # passing it.
+  def test_check_reads_the_process_environment_it_is_given
+    stub_lookup(:locked) do
+      assert C.check(credentials: [credential], env: NO_PROCESS_ENV).first.absent?
+      assert C.check(credentials: [credential], env: { "PLAYBOOK_CLAUDE_KEY" => SECRET }).first.present?
+    end
+  end
+
+  def test_resolve_reads_the_process_environment_it_is_given
+    stub_lookup(:present, SECRET) do
+      # From the env repo: the child does not inherit it, so it must be handed over.
+      assert_equal({ "PLAYBOOK_CLAUDE_KEY" => SECRET }, C.resolve(credentials: [credential], env: NO_PROCESS_ENV))
+      # Already in the environment the child inherits: handing it over again is redundant.
+      assert_empty C.resolve(credentials: [credential], env: { "PLAYBOOK_CLAUDE_KEY" => SECRET })
     end
   end
 
