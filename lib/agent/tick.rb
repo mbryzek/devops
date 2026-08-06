@@ -101,7 +101,18 @@ module Agent
       # sha it lands on is what the registry report below claims.
       update_checkout
       identity = ensure_identity
-      heartbeat_runner(identity) if identity
+      # The runner heartbeat is REPORTING and the lease heartbeats are the thing
+      # that keeps live work alive, so a failure of the former must never cost
+      # the latter. Its own rescue is what makes that ordering safe: one 500 on
+      # the registry POST used to abort phase_a outright, and then every running
+      # job went a tick without a lease renewal — the "machine competes with
+      # itself" failure this module's header exists to prevent, arriving through
+      # the path built to prevent it.
+      begin
+        heartbeat_runner(identity) if identity
+      rescue SessionExpired, ApiError => e
+        log("vitals: runner heartbeat failed (#{e.message}) — lease heartbeats still follow")
+      end
       heartbeat_leases(identity)
     rescue SessionExpired, ApiError => e
       # Vitals must not abort the tick: the hard-timeout enforcement below is
@@ -331,7 +342,15 @@ module Agent
         begin
           Agent::Api.heartbeat_lease(record["lease_id"], token: identity.token, use_localhost: @use_localhost)
         rescue ApiError => e
-          raise unless e.code == 409
+          unless e.code == 409
+            # Anything that is not a 409 is the platform having a bad moment, not
+            # a verdict about this lease. Per-record, because the loop is what
+            # renews every OTHER job too: an error that escaped here took every
+            # job after this one in iteration order down with it, and kept doing
+            # so for as long as the first one's error lasted.
+            log("vitals: lease heartbeat failed for ISS-#{record['issue']} (#{e.message}) — continuing")
+            next
+          end
           # The lease expired or was reassigned. Another machine may already be
           # working this issue, so this process must die rather than race it.
           decide("lease_lost", "ISS-#{record['issue']} lease #{record['lease_id']} is gone (409) — killing pid #{pid}")

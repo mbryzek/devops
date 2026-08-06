@@ -435,12 +435,16 @@ class TestDevAgentTick < Minitest::Test
 
       # The platform is DOWN: the runner heartbeat blows up. The timeout must
       # still be enforced — an API outage cannot be allowed to produce an
-      # immortal job.
+      # immortal job. It is now enforced on the ORDINARY path rather than the
+      # degraded one: the runner heartbeat carries its own rescue, so phase_a
+      # runs on to heartbeat_leases, which checks every record's deadline before
+      # it renews anything. `enforce_timeouts` stays the backstop for an outage
+      # that takes out ensure_identity too.
       unreachable = {
         "POST /agent/runners/#{RUNNER_ID}/heartbeat" => ->(_body) { raise ApiError.new("HTTP 503", code: 503) },
       }
       out = with_stubbed_api(unreachable) { capture_stdout { tick(dry_run: false).phase_a } }
-      assert_match(/platform error/, out)
+      assert_match(/runner heartbeat failed/, out)
       assert_match(/exceeded its 4h hard timeout/, out)
       # Give the kill a moment to land.
       20.times { break unless Agent::Jobs.alive?(pid); sleep 0.1 }
@@ -496,6 +500,65 @@ class TestDevAgentTick < Minitest::Test
       assert_equal record["issue"], 121
     ensure
       Process.kill("KILL", pid) rescue nil
+    end
+  end
+
+  # The two heartbeats do different jobs and only one of them keeps live work
+  # alive. The runner heartbeat is REPORTING — a machine that misses one looks
+  # briefly quiet on the fleet page. The lease heartbeats are what stop
+  # `expire_issue_leases` pulling an issue back to `open` underneath a session
+  # that is still running it: the "machine competes with itself" failure this
+  # module's header is written around.
+  #
+  # They used to be one unrescued sequence, so a single 500 on the registry POST
+  # aborted phase_a and every running job went that tick without a renewal —
+  # the failure arriving through the code built to prevent it. These pin the
+  # ordering guarantee in both directions.
+  def test_a_failed_runner_heartbeat_does_not_cost_the_lease_heartbeats
+    with_agent_home do
+      register_identity
+      beat = []
+      stubs = fleet_responses.merge(
+        "POST /agent/runners/#{RUNNER_ID}/heartbeat" => ->(_body) { raise ApiError.new("HTTP 503", code: 503) },
+        "POST /playbook/issue/leases/lease-1/heartbeat" => ->(_body) { beat << "lease-1"; {} },
+      )
+      Agent::Jobs.write("issue" => 130, "pid" => Process.pid, "slug" => "i130_abc", "branch" => "i130_abc",
+                        "lease_id" => "lease-1", "started_at" => Time.now.utc.iso8601,
+                        "timeout_at" => (Time.now + 3600).utc.iso8601)
+      out = with_stubbed_api(stubs) { capture_stdout { tick(dry_run: false).phase_a } }
+      assert_match(/runner heartbeat failed/, out)
+      assert_equal ["lease-1"], beat, "a reporting failure must not stop the renewals that keep work alive"
+    end
+  end
+
+  # ...and one job's lease failing must not starve the others. The loop walks
+  # every record, so an ApiError that escaped it took every job after this one
+  # in iteration order down with it — silently, tick after tick, for as long as
+  # the first job's error persisted. Only a 409 is a verdict about the lease
+  # (it is gone, kill the session); anything else is the platform having a bad
+  # moment and is per-record.
+  def test_one_lease_heartbeat_failing_does_not_starve_the_others
+    with_agent_home do
+      register_identity
+      beat = []
+      stubs = fleet_responses.merge(
+        "POST /playbook/issue/leases/lease-a/heartbeat" => ->(_body) { raise ApiError.new("HTTP 500", code: 500) },
+        "POST /playbook/issue/leases/lease-b/heartbeat" => ->(_body) { beat << "lease-b"; {} },
+      )
+      Agent::Jobs.write("issue" => 131, "pid" => Process.pid, "slug" => "i131_abc", "branch" => "i131_abc",
+                        "lease_id" => "lease-a", "started_at" => Time.now.utc.iso8601,
+                        "timeout_at" => (Time.now + 3600).utc.iso8601)
+      Agent::Jobs.write("issue" => 132, "pid" => Process.pid, "slug" => "i132_abc", "branch" => "i132_abc",
+                        "lease_id" => "lease-b", "started_at" => Time.now.utc.iso8601,
+                        "timeout_at" => (Time.now + 3600).utc.iso8601)
+      out = with_stubbed_api(stubs) do
+        capture_stdout { tick(dry_run: false).heartbeat_leases(Agent::Host.cached_identity) }
+      end
+      assert_equal ["lease-b"], beat, "ISS-132's lease must still be renewed when ISS-131's call fails"
+      assert_match(/lease heartbeat failed/, out)
+      # A non-409 says nothing about whether the lease is still ours, so the
+      # session keeps running — only a 409 kills it.
+      assert_nil Agent::Jobs.find(131)["killed"]
     end
   end
 
