@@ -42,21 +42,31 @@ module Browse
   # cannot launch on.
   CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".freeze
 
-  # PLAYWRIGHT'S OWN CHROMIUM IS NOT AN OPTION ON THIS FLEET, and this constant
+  # `npx playwright install` IS NOT THE FIX FOR THIS MESSAGE, and this constant
   # exists so the next person to reach for it stops here instead of finding out
-  # the slow way. The egress gateway rejects the Playwright CDN: a fetch of
-  # cdn.playwright.dev redirects to playwright.download.prss.microsoft.com and
-  # comes back **HTTP 400**, so `npx playwright install chromium` cannot download
-  # a browser here at all.
+  # the slow way — but for a different reason than it used to give, and the
+  # correction is the point of ISS-780.
   #
-  # Worse, it does not say so. A half-extracted browser leaves the version
-  # directory in place, the installer treats an existing directory as satisfied
-  # and exits 0, and the launch then dies with SIGABRT and a `dlopen` error about
-  # a missing `Chromium Framework` dylib. That is what ISS-608 hit, and why its
-  # own suggested remedy ("rm -rf the cache and reinstall") could never have
-  # worked. browse.mjs already resolved this by driving the system Chrome; this
-  # note is here so the toolchain does not un-resolve it.
-  PLAYWRIGHT_CDN_BLOCKED = "the egress gateway returns HTTP 400 for cdn.playwright.dev".freeze
+  # It used to say the egress gateway 400s cdn.playwright.dev so no browser can
+  # be downloaded here at all. That is FALSE; a runner downloaded one on
+  # 2026-08-07 (see Agent::Toolchain's google-chrome entry for the measurements),
+  # and the claim had by then propagated into agent/instructions.md, where it
+  # talked a session out of running an e2e suite that would have worked.
+  #
+  # What is true is narrower and still closes the door: `playwright install` does
+  # not install *this* browser. It fetches Chromium/Chrome-for-Testing builds
+  # pinned to the caller's playwright-core version, into
+  # ~/Library/Caches/ms-playwright — none of which is the /Applications cask that
+  # `channel: "chrome"` resolves to. So it cannot satisfy `:no_chrome` no matter
+  # how well the network behaves, and a session that tries spends 20 minutes
+  # downloading the wrong thing.
+  #
+  # The trap that made ISS-608 expensive is real and unchanged: an interrupted
+  # install leaves the version directory in place, the next run treats it as
+  # satisfied and exits 0, and the launch dies with SIGABRT and a `dlopen` error
+  # about a missing `Chromium Framework` dylib.
+  WRONG_BROWSER = "`npx playwright install` fetches version-pinned Chromium builds into " \
+                  "~/Library/Caches/ms-playwright, never the /Applications cask".freeze
 
   # browse.mjs reads BROWSE_CHANNEL to drive a build other than stable Chrome.
   # Honoured here so the guard can never refuse a run that would have worked: a
@@ -128,7 +138,7 @@ module Browse
     when :no_chrome
       "browse: Google Chrome is not installed at #{chrome_path}\n" \
         "  browse drives the system Chrome, not Playwright's bundled Chromium:\n" \
-        "  #{PLAYWRIGHT_CDN_BLOCKED}, so `npx playwright install` cannot fetch one here.\n" \
+        "  #{WRONG_BROWSER}, so `npx playwright install` cannot fix this.\n" \
         "  fix: brew install --cask google-chrome"
     else
       "browse: cannot run (#{reason})"

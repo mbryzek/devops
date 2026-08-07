@@ -528,12 +528,38 @@ Enough to start without a survey. `~/code` holds independent repos; the
   something looks. It ships in `devops/bin`, so it is on your PATH already; the
   implementation and its full flag list are in `~/code/claude/tools/browse/`
   (`--device mobile`, `--full-page`, `--click`, `--steps` for a multi-step flow).
-  It drives the system Google Chrome. **Do not reach for `npx playwright install`
-  when a browser seems to be missing** — the egress gateway 400s the Playwright
-  CDN, so it cannot download one here, and it exits 0 without saying so when a
-  half-extracted browser is already on disk. If `browse` reports a missing
-  prerequisite it names the command that fixes it; `dev agent doctor` shows the
-  same thing for the whole toolchain (ISS-608).
+  It drives the system Google Chrome, which is installed from a cask and needs no
+  CDN — so if `browse` itself reports a missing prerequisite it names the command
+  that fixes it, and `dev agent doctor` shows the same for the whole toolchain
+  (ISS-608). Installing Playwright's own browsers is a separate thing; see below.
+- **Running a repo's Playwright e2e suite** — `npx playwright install <browsers>`
+  **works on these runners. Run it.** An earlier version of this file told you the
+  opposite, and it was wrong in a way that cost real coverage: ISS-779 shipped two
+  playbook-www PRs without the e2e suite because of it (ISS-780). What is actually
+  true, measured on a runner on 2026-08-07:
+    - macOS chromium comes from Chrome for Testing over the plain
+      `https://cdn.playwright.dev/builds/cft/<version>/mac-arm64/…` path. **206,
+      and a full 165 MiB download.** Firefox and WebKit come over the
+      `…/dbazure/download/playwright/builds/<browser>/…` mirror. **206.**
+    - The 400 does exist, but on two paths Playwright never requests on macOS:
+      that dbazure mirror does not carry `builds/cft/*` at all, and the legacy
+      `builds/chromium/<rev>/chromium-mac-arm64.zip` stops being published past
+      rev ~1205 because mac chromium moved to Chrome for Testing. Hitting either
+      by hand and generalising it to "the CDN is blocked" is the mistake that
+      produced the old note.
+  Two practical traps, both of which have already burned a session:
+    - **It takes far longer than one Bash call.** chromium + WebKit is ~500 MiB
+      and the unpack is thousands of small files; on a loaded runner that is
+      15–30 minutes, well past a 10-minute tool timeout. Start it detached
+      (`nohup … &`) and poll, or you will SIGTERM it mid-extract.
+    - **A killed install leaves a half-extracted version directory, and the next
+      run treats that directory as satisfied and exits 0** — then the launch dies
+      on a missing dylib. If a browser misbehaves after an interrupted install,
+      `rm -rf ~/Library/Caches/ms-playwright/<version-dir>` and reinstall.
+  Install from the repo's own Playwright (`./node_modules/.bin/playwright install`
+  after `npm ci`), never a global one: the browser build is pinned per
+  `playwright-core` version, and a mismatch is the original ISS-780 symptom
+  (`Executable doesn't exist at …/chromium_headless_shell-1217`).
 - **Playbooks** — the standing procedures producer-filed issues point at — are
   append-only rows in the platform, not files in any repo. Read one with `dev
   agent playbook <key>` and list them with `dev agent playbooks`. If your
