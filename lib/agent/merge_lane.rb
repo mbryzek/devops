@@ -21,8 +21,9 @@ require 'agent/shell'
 #           --squash` will replay onto main. A check attached to an earlier push
 #           is `:ci_stale`, not a pass.
 #   AHEAD   `head` contains the current tip of `main` (`compare/main...head` is
-#           `ahead` or `identical`). A PR that does not is `:needs_rebase`, and
-#           rebasing is what re-triggers CI at the new base.
+#           `ahead` or `identical`). A PR that does not is `:needs_update`, and
+#           `update_branch!` is what brings the base under it and re-triggers CI
+#           there (ISS-769).
 #
 # Together those say: the tree CI ran on is main-plus-this-PR, and nothing has
 # moved since. That is a merge queue, built out of two API reads instead of a
@@ -45,7 +46,29 @@ require 'agent/shell'
 #                  be red. Whether a red suite is this PR's fault or was already
 #                  red on main is a question only something that can read the
 #                  failure can answer.
-#   :needs_rebase  the rebase itself is a push, and a push can conflict.
+#
+# AND THE ONE PIECE OF WORK THAT IS NOT LEFT TO THE SESSION (ISS-769). A PR whose
+# base has moved needs the base brought under it, and under the AHEAD invariant
+# that is not an edge case — it is the state of every sibling PR the moment the
+# lane merges anything, so a lane that could not do it would merge at most one PR
+# per repo per run and then stall. That work is mechanical, so `update_branch!`
+# performs it, and HOW it is performed is the whole reason it is allowed:
+#
+#   it is GitHub's own `PUT /repos/.../pulls/N/update-branch`, which MERGES the
+#   base into the head server-side. There is no clone, no rebase and no push
+#   from here, so nothing is rewritten and `agent/instructions.md` §3's flat
+#   "never force-push" stands untouched;
+#   that endpoint has no rebase mode and refuses outright when the merge would
+#   conflict, so the sanctioned path CANNOT rewrite a branch and CANNOT author a
+#   resolution however it is called — the boundary is the endpoint's own
+#   capability rather than a promise this module makes about itself;
+#   the author's commits are preserved exactly and their next `git pull` is a
+#   fast-forward, not the hard reset a rewritten branch would force on them. The
+#   merge commit it adds is discarded by `--squash`, so `main` never sees it.
+#
+# `verdict` reaches `:needs_update` only AFTER the review deferral, which makes
+# the check order there load-bearing a second time: the lane never moves a branch
+# a human is mid-pass over (ISS-663).
 #
 # NOTHING HERE MERGES EXCEPT `merge!`, and `merge!` is unreachable without a
 # `:mergeable` verdict computed from a FRESH read plus a ledger approval — see
@@ -126,13 +149,16 @@ module Agent
     # rather than on prose, which is the point of returning them.
     #
     #   :merge   act now — this is the head of the line
-    #   :rebase  work: rebase onto main and push, which re-triggers CI
+    #   :update  run `dev agent update-branch`, which merges the base into the
+    #            head server-side and re-triggers CI there. NOT a local rebase
+    #            and NOT a push — see `update_branch!` for why that distinction
+    #            is the whole permission (ISS-769)
     #   :resolve work: a human-grade merge conflict
     #   :wait    CI is in flight; come back
     #   :park    a red suite, which needs a judgment about WHOSE fault it is
     #   :defer   a human is mid-review; leave it for them and NAME it
     #   :skip    not a candidate at all, and will not become one on its own
-    ACTIONS = %i[merge rebase resolve wait park defer skip].freeze
+    ACTIONS = %i[merge update resolve wait park defer skip].freeze
 
     # code    — a stable symbol, safe to branch on
     # action  — one of ACTIONS
@@ -186,6 +212,13 @@ module Agent
     # and a merge that times out CLIENT-side may still have happened — which is
     # the one outcome this whole module is built to be able to report honestly.
     MERGE_TIMEOUT_SECONDS = 180
+
+    # Same reasoning, one step smaller: the branch update is also a server-side
+    # merge GitHub performs on its own clock, and a client timeout leaves the
+    # same "may have happened" ambiguity. It is bounded by `expected_head_sha`
+    # rather than by this number — a retry after a timeout that DID land is
+    # refused with a 422 instead of merging the base in twice.
+    UPDATE_TIMEOUT_SECONDS = 120
 
     module_function
 
@@ -391,7 +424,8 @@ module Agent
         return v(NO_CI, :skip,
                  "no `#{CI_CHECK}` check on this PR. The lane merges only what an independent party " \
                  "verified, so a repo with no CI workflow merges nothing here — that is the enrolment " \
-                 "rule, not a bug")
+                 "rule, not a bug. (A commit seconds old has nothing attached to it yet either — re-read " \
+                 "before concluding the repo has no workflow)")
       end
 
       state = check_state(entry)
@@ -423,9 +457,10 @@ module Agent
       when "ahead", "identical"
         v(:mergeable, :merge, "`#{CI_CHECK}` green on #{short(pr['headRefOid'])}, which contains the current tip of #{base}")
       when "behind", "diverged"
-        v(:needs_rebase, :rebase,
+        v(:needs_update, :update,
           "head is #{base_status} #{base} — its green was measured against a base that has since moved, " \
-          "so it must be rebased and re-verified before it can land")
+          "so #{base} must be brought under it (`dev agent update-branch`) and CI re-run there before it " \
+          "can land")
       else
         v(:base_unknown, :wait,
           "could not compare the head against #{base}, so whether the tested tree contains the current " \
@@ -671,6 +706,43 @@ module Agent
                            "--squash", "--delete-branch",
                            "--match-head-commit", head_sha.to_s,
                            timeout: MERGE_TIMEOUT_SECONDS)
+    end
+
+    # The SECOND and last mutation in this file: the act `:needs_update` names
+    # (ISS-769). It moves a pull request's head branch, so it is shaped exactly
+    # like `merge!` — the repo guard again from an independent code path, and a
+    # head pin so the act is atomic against a push landing in the gap.
+    #
+    # THE REST ENDPOINT, NOT `gh pr update-branch`, for two reasons that are the
+    # same reason. The CLI cannot pin the head, and it carries a `--rebase` flag
+    # that rewrites the branch. This endpoint has neither: it merges the base in
+    # or it fails, so there is no argument anyone can pass here — today or in a
+    # future edit — that turns this call into a force-push. The rule in
+    # `agent/instructions.md` §3 is enforced by the choice of endpoint rather
+    # than by remembering to keep a flag off.
+    #
+    # `expected_head_sha` is `--match-head-commit` for this call, and it was
+    # verified against the live API rather than read off the documentation: a
+    # non-matching value comes back `422 expected head sha didn't match current
+    # head ref.` and nothing moves. Without it, a push landing between the
+    # verdict and here would have the base merged into a head nobody looked at.
+    #
+    # The repo guard is NOT about the revert window — updating a branch deploys
+    # nothing and lands nothing on `main`. It is here because a self-deploying
+    # repo is one the lane has no business acting on from any code path at all,
+    # and "the only reliable way never to do something is never to reach the
+    # call" applies to moving a branch exactly as it does to merging one.
+    def update_branch!(repo, number, head_sha:)
+      repo_name = repo.to_s.split("/").last
+      if SELF_DEPLOYING_REPOS.include?(repo_name)
+        raise ArgumentError, "#{repo} deploys itself and the lane never touches its branches"
+      end
+      raise ArgumentError, "a head sha is required to update #{repo}##{number}" if head_sha.to_s.empty?
+
+      Agent::Shell.capture("gh", "api", "--method", "PUT",
+                           "repos/#{repo}/pulls/#{number}/update-branch",
+                           "-f", "expected_head_sha=#{head_sha}",
+                           timeout: UPDATE_TIMEOUT_SECONDS)
     end
   end
 end
