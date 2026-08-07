@@ -122,6 +122,13 @@ class Report
     @run_completed.max
   end
 
+  # The sum of the per-subproject "Run completed in" summaries, which measures
+  # NOTHING and is reported here only so nobody has to compute it to find that
+  # out. See the note printed alongside it, and ISS-800.
+  def summed_runs_ms
+    @run_completed.sum
+  end
+
   def compile_ms
     return nil if @wall_ms.nil? || slowest_run_ms.nil?
 
@@ -219,6 +226,25 @@ if report.compile_ms
 end
 if report.slowest_run_ms
   puts format('  %-22s %s', 'longest test run:', "#{fmt(report.slowest_run_ms)}  (critical path across #{report.run_completed.length} subproject test runs)")
+end
+
+# ScalaTest's per-subproject "Run completed in" lines are the most misread numbers
+# in this log, and reading them the obvious way says the build is running its
+# subprojects ~15x concurrently when it is running them strictly one at a time.
+#
+# With forked tests, `done()` is called on the MASTER runner in the sbt JVM, whose
+# clock starts when that subproject's `executeTests` task begins. Only the forked
+# group INSIDE `executeTests` carries the concurrency tag, so all of them start
+# together and each one reports "start of the test phase -> end of my own turn".
+# They therefore overlap almost completely, and summing them multiplies the phase
+# by the number of subprojects.
+#
+# ISS-800 was filed off exactly that sum. Printing it here, next to the wall clock
+# that refutes it, is cheaper than the investigation it costs otherwise.
+if report.run_completed.length > 1
+  puts format('  %-22s %s', 'summed test runs:',
+              "#{fmt(report.summed_runs_ms)}  (MEANINGLESS - the #{report.run_completed.length} per-subproject " \
+              "'Run completed in' summaries share one start clock and are not additive; use 'longest test run')")
 end
 
 body = report.body_ms
