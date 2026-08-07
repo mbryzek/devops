@@ -455,6 +455,41 @@ class DbApp
     )
   end
 
+  # ── per-subproject test databases ─────────────────────────────────────────
+  #
+  # A build may clone its session database once per subproject so those
+  # subprojects' test suites can run CONCURRENTLY without writing each other's
+  # rows -- platform does, see platform/project/TestDatabases.scala and ISS-813.
+  # The clones are named `<session db>__<subproject>` and each is dropped and
+  # re-created at the head of every test run, so they hold nothing anyone wants
+  # to keep; they are session state, and they are reclaimed with the session.
+  #
+  # THE SEPARATOR IS TWO UNDERSCORES, and that is what makes ownership decidable
+  # rather than merely likely. `sanitize_session_id` collapses runs of
+  # underscores to one, so no session database name can contain `__` -- while a
+  # SINGLE underscore is ambiguous exactly where it costs the most: the agent
+  # executor gives an epic and its children workspaces `i682` and `i682_c03`, so
+  # `..._sess_i682_c03` is a real session's whole database AND reads as session
+  # `i682`'s `c03` clone. Reclaiming by single-underscore prefix would drop it.
+
+  LANE_SEPARATOR = '__'.freeze
+
+  # The session database a per-subproject clone belongs to, or nil when `db` is
+  # not a clone at all.
+  def lane_owner(db)
+    return nil unless owns_session_db?(db)
+    owner, sep, _lane = db.partition(LANE_SEPARATOR)
+    sep.empty? ? nil : owner
+  end
+
+  # Everything belonging to one session in this container: the session database
+  # itself, plus its per-subproject clones. Ordered so the session database
+  # comes first.
+  def session_dbs(port, db)
+    list_session_dbs(port).select { |d| d == db || lane_owner(d) == db }
+                          .sort_by { |d| d == db ? 0 : 1 }
+  end
+
   def active_session_dbs(port)
     DbImages.psql_query(
       port,
