@@ -48,6 +48,13 @@ require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/toolchain'
 
+# Cross-repo PR grouping (`dev prs group`). Split out for the same reason as
+# lib/agent/*: the part that DECIDES — which sibling merges first, and whether
+# its producer has shipped — is a pure function with tests, not a shape buried in
+# a printer.
+require 'prs/deploy'
+require 'prs/group'
+
 # Single source of truth for each command's invocation line, keyed by the command
 # path. The same string is interpolated into the USAGE block below and shown
 # inline (via usage_for) on an argument error, so help text and error hints can't
@@ -130,6 +137,7 @@ INVOCATIONS = {
   "agent doctor"        => 'agent doctor',
   "agent merge-lane"    => 'agent merge-lane [REPO]... [--json]',
   "agent merge"         => 'agent merge <repo> <pr> [--run-id ID] [--dry-run] [--localhost]',
+  "prs group"           => 'prs [group] [--branch NAME] [--repo NAME]... [--all] [--json]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -1062,6 +1070,13 @@ USAGE = <<~USAGE
         branch protection. A repo whose PRs carry no `ci` check merges nothing
         here: the presence of the check IS the enrolment, so there is no second
         list of CI-enabled repos to drift.
+        A PR whose cross-repo siblings have not landed yet reports
+        `waits_on_sibling` (ISS-758). That is the one condition none of the
+        per-PR invariants can see: FRESH and AHEAD say the tree is
+        main-plus-this-PR, and neither says anything about the producer in
+        another repo. See `dev prs group`, which computes it — a repo that
+        cannot be read at all holds the WHOLE lane, because an invisible
+        sibling and an absent one are the same empty list.
         Bare, it walks Agent::MergeLane::LANE_REPOS. --json emits the same view
         for a session to loop on instead of re-deriving it from prose.
 
@@ -1079,6 +1094,33 @@ USAGE = <<~USAGE
         only reliable way never to merge something is never to ask about it.
         Refuses a self-deploying repo (`devops`) from two independent code
         paths, whatever the ledger would say (ISS-660).
+    #{INVOCATIONS["prs group"]}
+        Group open pull requests across every tracked repo by head branch — the
+        join key a cross-repo change already has, since the executor assigns one
+        branch per unit of work and it is byte-identical in every repo. Prints
+        each member with its repo, role, state and a verdict, in the order the
+        group must merge. Read-only; it merges nothing and asks nothing.
+
+        Order comes from repo role — `*-postgresql` schema first, then `lib-*`,
+        then the spec owner (platform, acumen), then consumer regens — UNLESS a
+        PR body declares the real edge, which wins outright for that group:
+
+            depends-on: platform#2133            (must have DEPLOYED)
+            depends-on: platform#2133 merged     (merged is enough)
+
+        A member is `eligible` only when everything it waits on has merged AND
+        deployed. Deploy, not merge, is the default and is the whole point: a
+        consumer regen merged against a producer that has not shipped yet is
+        playbook-admin #760, a swallowed 404 that renders as "No data". Anything
+        this cannot establish — an unresolvable edge, an unknown deploy state —
+        HOLDS rather than passing.
+
+        A group containing a devops PR is a human decision outright: merging
+        there deploys the whole fleet within one 30-second tick.
+
+        Defaults to the cross-repo groups only (the ones with something to
+        order); --all adds single-repo branches, --branch NAME shows exactly one,
+        --repo NAME limits which repos are scanned, --json is the machine form.
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -1104,7 +1146,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent prs].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -1128,6 +1170,7 @@ SUBCOMMANDS = {
   "queries"      => %w[top],
   "claude-usage" => %w[top],
   "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge],
+  "prs"          => %w[group],
 }.freeze
 
 def levenshtein(a, b)
@@ -12221,7 +12264,12 @@ def cmd_agent_merge_lane(args)
   end
   work = (named.empty? ? Agent::MergeLane::LANE_REPOS : named).map { |r| Agent::MergeLane.qualify(r) }
 
-  lanes = work.map { |repo| [repo, Agent::MergeLane.candidates(repo)] }
+  # The cross-repo picture is built ONCE and answered from, rather than per PR:
+  # a lane over twelve repos would otherwise re-enumerate the whole account for
+  # every candidate. Scoped to `work` is not an option — a sibling in a repo the
+  # caller did not name is exactly the one that gets merged ahead of its producer.
+  hold = prs_group_sibling_hold
+  lanes = work.map { |repo| [repo, Agent::MergeLane.candidates(repo, sibling_hold: hold)] }
   return puts(JSON.pretty_generate(agent_merge_lane_json(lanes))) if json
 
   agent_merge_lane_report(lanes)
@@ -12301,7 +12349,11 @@ def cmd_agent_merge(args)
   report_arg_problems("agent merge", problems, usage_for("agent merge"))
 
   repo = Agent::MergeLane.qualify(repo_arg)
-  candidate = Agent::MergeLane.assess(repo, number)
+  # Recomputed here rather than carried from a `merge-lane` snapshot, for the
+  # same reason the whole verdict is: the session acting on that snapshot has
+  # since merged other PRs, and merging a producer is precisely what releases its
+  # consumers. A stale hold would be the one that let a consumer through early.
+  candidate = Agent::MergeLane.assess(repo, number, sibling_hold: prs_group_sibling_hold)
   if candidate.nil?
     warn "agent merge: could not read #{repo}##{number} from GitHub. Nothing merged."
     exit 1
@@ -12428,6 +12480,237 @@ def agent_doctor_credentials
   end
   puts "Sessions on this machine are TOLD this up front and will report such work as unverified " \
        "rather than guessing (ISS-570). Nothing else is blocked."
+end
+
+# ---------- prs (cross-repo pull-request groups) ----------
+
+# TWO reads per repo, not one `--state all`, because the two have different
+# failure costs and must not share a budget.
+#
+# An OPEN pull request missing from a group is the failure this whole command
+# exists to prevent — it is a sibling nobody knows they are about to merge ahead
+# of. So open PRs get their own uncontended page and can never be crowded out by
+# a busy week's merges: platform merges 60 PRs in well under a month, and a
+# single `--state all` window is spent on them first.
+#
+# The MERGED read is a smaller, separate budget. It exists only so the producer
+# half of a live group is visible (ISS-698 — the migration had already landed
+# while the other three sat open), and anything older is resolved on demand
+# through the `lookup` below rather than by widening the scan.
+PRS_GROUP_OPEN_LIMIT = 100
+PRS_GROUP_MERGED_LIMIT = 40
+
+PRS_GROUP_FIELDS = "number,title,url,state,isDraft,headRefName,body,mergeCommit".freeze
+
+# Every repo a cross-repo change can span: the same list `dev deploy status`
+# walks — deployable apps, their `-postgresql` schema repos, the scala libraries
+# and devops. Derived from the registry rather than kept as a second list, which
+# is the registry-drift failure `deploy_items` already avoids.
+def prs_group_repos(registry)
+  deploy_items(registry).map(&:first)
+end
+
+def prs_group_scala_repos(registry)
+  registry.deploy_tracked.select { |app| app.stack == :scala }.map(&:repo_name)
+end
+
+# nil — never [] — when the read FAILED. The distinction is the whole safety
+# property of the caller below: "this repo has no open PRs" and "I could not ask
+# this repo" are the same empty list, and treating the second as the first makes
+# an invisible sibling look like an absent one.
+def prs_group_list(repo, state, limit)
+  out = Agent::Github.capture(["gh", "pr", "list", "--repo", "mbryzek/#{repo}", "--state", state,
+                               "--limit", limit.to_s, "--json", PRS_GROUP_FIELDS])
+  return nil if out.nil?
+  JSON.parse(out).map { |pr| pr.merge("repository" => repo) }
+rescue JSON::ParserError
+  nil
+end
+
+# Concurrently — forty sequential round trips is the difference between a command
+# someone runs and one they stop running.
+#
+# Returns [prs, unreadable_repos].
+def prs_group_fetch(repos)
+  reads = repos.flat_map do |repo|
+    [["open", PRS_GROUP_OPEN_LIMIT], ["merged", PRS_GROUP_MERGED_LIMIT]].map do |state, limit|
+      Thread.new { [repo, prs_group_list(repo, state, limit)] }
+    end
+  end.map(&:value)
+
+  unreadable = reads.select { |_repo, prs| prs.nil? }.map(&:first).uniq
+  prs = reads.filter_map(&:last).flatten.uniq { |pr| Prs::Group.key(pr["repository"], pr["number"]) }
+  [prs, unreadable]
+end
+
+# What production is running for a repo, or nil when it has no prod probe (schema
+# repos, libraries, devops) — `Prs::Deploy` falls back to the newest release tag
+# for those. Memoised: a group of four consumers waiting on one producer must not
+# probe production four times.
+def prs_group_live_version(registry)
+  cache = {}
+  lambda do |repo|
+    cache.fetch(repo) do
+      app = registry.deploy_tracked.find { |a| a.repo_name == repo }
+      version = if app.nil?
+                  nil
+                else
+                  probe = fetch_app_version(registry, app)
+                  probe[:error] ? nil : probe["version"].to_s.strip
+                end
+      cache[repo] = (version.nil? || version.empty?) ? nil : version
+    end
+  end
+end
+
+def prs_group_print(group)
+  header = "#{group.branch}  (#{group.members.length} PR#{'s' if group.members.length != 1})"
+  header += "  HUMAN — devops is in this group" if group.human_only
+  puts header
+  width = group.members.map { |m| m.key.length }.max
+  role_w = group.members.map { |m| m.role.to_s.length }.max
+  group.members.each_with_index do |m, i|
+    puts "  #{i + 1}. #{m.key.ljust(width)}  #{m.role.to_s.ljust(role_w)}  " \
+         "#{m.state.downcase.ljust(6)}  #{Prs::Group.label(m)}"
+  end
+  group.suspected_drift.each do |other|
+    puts "  ! this branch is `#{other}` plus a suffix. If it is the same logical change the " \
+         "name has DRIFTED and the join is broken; if it is an independent PR (instructions §1) it is fine."
+  end
+  puts ""
+end
+
+def prs_group_json(group)
+  { "branch" => group.branch, "human_only" => group.human_only,
+    "suspected_drift" => group.suspected_drift,
+    "members" => group.members.map do |m|
+      { "repo" => m.repo, "number" => m.number, "key" => m.key, "url" => m.pr["url"],
+        "title" => m.pr["title"], "state" => m.state, "role" => m.role.to_s,
+        "verdict" => m.verdict.to_s, "reason" => m.reason }
+    end }
+end
+
+def parse_prs_group_args(args)
+  opts = { branch: nil, repos: [], all: false, json: false }
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--branch"
+      opts[:branch] = args[i + 1]
+      usage_exit("--branch requires a value", example: usage_for("prs group")) if opts[:branch].nil?
+      i += 2
+    when "--repo"
+      value = args[i + 1]
+      usage_exit("--repo requires a value", example: usage_for("prs group")) if value.nil?
+      opts[:repos] << value
+      i += 2
+    when "--all"  then opts[:all] = true; i += 1
+    when "--json" then opts[:json] = true; i += 1
+    when "-h", "--help" then usage_exit
+    else usage_exit("prs group: unknown argument: #{args[i]}", example: usage_for("prs group"))
+    end
+  end
+  opts
+end
+
+# The whole cross-repo picture: every group across `repos`, plus the repos that
+# could not be read at all. Returns [groups, unreadable_repos].
+def prs_group_build(repos)
+  registry = cached_registry
+  prs, unreadable = prs_group_fetch(repos)
+  by_key = prs.to_h { |pr| [Prs::Group.key(pr["repository"], pr["number"]), pr] }
+  groups = Prs::Group.build(
+    prs,
+    scala_repos: prs_group_scala_repos(registry),
+    # A declared `depends-on:` may name a PR outside the scanned window or
+    # outside the enumerated repos. Resolve it from what we already read first,
+    # then ask GitHub — never guess, because an unresolved edge HOLDS.
+    lookup: lambda do |repo, number|
+      by_key[Prs::Group.key(repo, number)] ||
+        begin
+          out = Agent::Github.capture(["gh", "pr", "view", number.to_s, "--repo",
+                                       "mbryzek/#{Prs::Group.bare_repo(repo)}", "--json", PRS_GROUP_FIELDS])
+          out.nil? ? nil : JSON.parse(out).merge("repository" => Prs::Group.bare_repo(repo))
+        rescue JSON::ParserError
+          nil
+        end
+    end,
+    deployed: Prs::Deploy.oracle(live_version: prs_group_live_version(registry)),
+  )
+  [groups, unreadable]
+end
+
+# Verdicts that mean "this member may not merge yet", as opposed to ones that
+# merely describe a state the merge lane already handles for itself (draft,
+# merged, closed) or the pass (eligible).
+PRS_GROUP_HOLD_VERDICTS = %i[waits_on_merge waits_on_deploy unknown_dependency
+                             unknown_deploy cycle human].freeze
+
+# `->(repo, number) { reason_or_nil }` for Agent::MergeLane (ISS-758). Built once
+# per invocation; the lane asks it per candidate.
+#
+# **An unreadable repo holds EVERYTHING**, which is the one decision in here worth
+# arguing about. A `gh` failure on one repo yields an empty PR list that is
+# indistinguishable from "that repo has no siblings", and reading it the second
+# way fails open on exactly the case this exists to catch — a consumer merged
+# ahead of a producer nobody could see. Holding the lane over a transient blip
+# costs one tick, and the next tick re-reads; merging early costs a production
+# incident and a revert PR a human still has to merge.
+def prs_group_sibling_hold
+  groups, unreadable = prs_group_build(prs_group_repos(cached_registry))
+  if unreadable.any?
+    reason = "could not enumerate #{unreadable.sort.join(', ')} — a cross-repo sibling there would be " \
+             "invisible, so nothing merges until that read succeeds (ISS-758)"
+    return ->(_repo, _number) { reason }
+  end
+
+  held = {}
+  groups.each do |group|
+    group.members.each do |member|
+      next unless PRS_GROUP_HOLD_VERDICTS.include?(member.verdict)
+      held[member.key] = "#{member.reason || member.verdict} (branch `#{group.branch}`, " \
+                         "#{group.members.length} PRs across #{group.members.map(&:repo).uniq.length} repos)"
+    end
+  end
+  ->(repo, number) { held[Prs::Group.key(repo, number)] }
+end
+
+def cmd_prs_group(args)
+  opts = parse_prs_group_args(args)
+  registry = cached_registry
+  repos = prs_group_repos(registry)
+  unless opts[:repos].empty?
+    unknown = opts[:repos] - repos
+    Util.exit_with_error("Unknown repo(s): #{unknown.join(', ')}. Valid: #{repos.join(', ')}") unless unknown.empty?
+    repos = opts[:repos]
+  end
+
+  groups, unreadable = prs_group_build(repos)
+  warn "prs group: could not read #{unreadable.sort.join(', ')} — any sibling there is MISSING below" if unreadable.any?
+  groups = groups.select { |g| g.members.any?(&:open?) }
+  groups = if opts[:branch]
+             groups.select { |g| g.branch == opts[:branch] }
+           elsif opts[:all]
+             groups
+           else
+             groups.select(&:cross_repo?)
+           end
+
+  if opts[:json]
+    puts JSON.pretty_generate(groups.map { |g| prs_group_json(g) })
+    return
+  end
+
+  if groups.empty?
+    scope = opts[:branch] ? "branch #{opts[:branch]}" : (opts[:all] ? "any branch" : "any cross-repo branch")
+    puts "No open pull requests on #{scope} across #{repos.length} repos."
+    return
+  end
+
+  groups.each { |g| prs_group_print(g) }
+  blocked = groups.sum { |g| g.blocked.length }
+  eligible = groups.sum { |g| g.open_members.count { |m| m.verdict == :eligible } }
+  puts "#{groups.length} group(s): #{eligible} member(s) eligible to merge now, #{blocked} held."
 end
 
 # ---------- dispatch ----------
@@ -12630,6 +12913,12 @@ when "agent"
   when "merge-lane"  then cmd_agent_merge_lane(argv)
   when "merge"       then cmd_agent_merge(argv)
   else                  unknown("agent subcommand", sub, SUBCOMMANDS["agent"])
+  end
+when "prs"
+  sub = resolve_subcommand(argv, default: "group")
+  case sub
+  when "group" then cmd_prs_group(argv)
+  else              unknown("prs subcommand", sub, SUBCOMMANDS["prs"])
   end
 when "changelog"
   sub = resolve_subcommand(argv, default: "all")
