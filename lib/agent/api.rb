@@ -316,6 +316,25 @@ module Agent
                                           use_localhost: use_localhost, body: form)
     end
 
+    # Every child of one epic, as issue numbers — the list `Agent::Workspace.
+    # child_index` turns into the `c<nn>` half of a branch name (ISS-767).
+    #
+    # NO status filter, deliberately. The index is a position in a stable
+    # ordering, so it has to be computed over every child the epic has ever had:
+    # filtering to the open ones would renumber a queued child the moment a
+    # sibling was dismissed, and the branch a retry computed would stop matching
+    # the PR the first attempt opened.
+    #
+    # One call, and only for an issue that HAS a parent — the claim already reads
+    # the issue itself, which carries the parent reference, so a standalone issue
+    # pays nothing for this.
+    def child_issue_numbers(parent_number, use_localhost:, limit: 200)
+      params = { "parent_number" => parent_number.to_s, "limit" => limit, "offset" => 0 }
+      rows = request(:get, "/#{TENANT}/issues?#{URI.encode_www_form(params)}",
+                     token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost) || []
+      rows.filter_map { |row| row["number"] }
+    end
+
     def issues(statuses:, use_localhost:, limit: 200)
       params = { "statuses" => Array(statuses), "limit" => limit, "offset" => 0 }
       request(:get, "/#{TENANT}/issues?#{URI.encode_www_form(params)}",

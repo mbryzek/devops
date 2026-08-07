@@ -9003,8 +9003,10 @@ end
 # (ISS-631). ~/code/ai holds two kinds of feature dir with two different
 # lifecycles: the ones a human makes, which this command owns, and the ones the
 # autonomous executor materializes for a job, which `Agent::Gc` owns. Agent
-# workspaces are named `i<issue>_<suffix>` (Agent::Workspace::SLUG) and NOTHING
-# else here is, so the two sets are distinguishable by name rather than by guess.
+# workspaces are named after their ISSUE — `i<issue>`, `i<epic>_c<nn>`, or the
+# `i<issue>_<rand>` form minted before ISS-767 (Agent::Workspace::SLUG) — and
+# NOTHING else here is, so the two sets are distinguishable by name rather than
+# by guess: a human names a feature dir after its FEATURE.
 # This command skips them outright — see `agent_workspace_dir?`.
 
 AI_ROOT = File.expand_path("~/code/ai")
