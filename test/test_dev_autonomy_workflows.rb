@@ -25,9 +25,25 @@ class TestDevAutonomyWorkflows < Minitest::Test
       "budget" => { "max_decisions_per_day" => nil, "max_auto_approved_per_day" => nil } }
   end
 
+  def stats(decisions_today: 0, auto_approved_today: 0, blocked_today: 0, pending: 0,
+            oldest_pending_at: nil, cost_today: 0, last_run_at: nil)
+    { "decisions_today" => decisions_today, "auto_approved_today" => auto_approved_today,
+      "blocked_today" => blocked_today, "pending" => pending,
+      "oldest_pending_at" => oldest_pending_at, "cost_today" => cost_today,
+      "last_run_at" => last_run_at }
+  end
+
   def show(env)
+    show_workflow(workflow(env))
+  end
+
+  def show_stats(st)
+    show_workflow(workflow.merge("stats" => st))
+  end
+
+  def show_workflow(w)
     capture_stdout do
-      with_stubbed_api("GET /autonomy/workflows/pr_auto_merge" => workflow(env)) do
+      with_stubbed_api("GET /autonomy/workflows/pr_auto_merge" => w) do
         cmd_autonomy_workflows(["pr_auto_merge"])
       end
     end
@@ -96,6 +112,68 @@ class TestDevAutonomyWorkflows < Minitest::Test
     end
     assert_match(/^  max rev:    does not gate$/, out)
     assert_match(/^  asserts:    none$/, out)
+  end
+
+  # What the workflow is allowed to do was here; what it has been doing was on the
+  # list view only, so reading one workflow told you nothing about its behaviour.
+  def test_prints_todays_counts_alongside_the_envelope
+    out = show_stats(stats(decisions_today: 12, auto_approved_today: 9, pending: 2,
+                           oldest_pending_at: "2026-08-02T11:00:00Z", cost_today: "0.42",
+                           last_run_at: "2026-08-06T06:45:00Z"))
+    assert_match(/^  today:      12 decision\(s\)$/, out)
+    assert_match(/^  approved:   9 today$/, out)
+    assert_match(/^  blocked:    0 today$/, out)
+    assert_match(/^  pending:    2 awaiting a human \(all time\)$/, out)
+    assert_match(/^  oldest:     2026-08-02T11:00:00Z$/, out)
+    assert_match(/^  cost:       \$0.42 today$/, out)
+    assert_match(/^  last run:   2026-08-06T06:45:00Z$/, out)
+  end
+
+  # ISS-756: with the daily budget gone, blocked is the remaining signal that a
+  # released loop and its envelope have stopped agreeing. A bare count is a number
+  # you have to already care about, so the view says what it means and how to read
+  # the decisions behind it.
+  def test_blocked_decisions_are_called_out_with_the_command_that_reads_them
+    out = show_stats(stats(decisions_today: 5, blocked_today: 3))
+    assert_match(/^  blocked:    3 today$/, out)
+    assert_match(/3 decision\(s\) BLOCKED today/, out)
+    assert_includes out,
+                    "dev autonomy decisions --workflow pr_auto_merge --disposition blocked"
+  end
+
+  # ...and says which blocked decisions are NOT news. Every one pr_auto_merge had
+  # on the day this shipped was a classification above its reversibility ceiling,
+  # which is the ceiling working; calling those an alarm makes the call-out noise
+  # on its first run.
+  def test_the_call_out_separates_the_designed_hold_from_the_anomaly
+    out = show_stats(stats(blocked_today: 8))
+    assert_match(/above max_reversibility lands here BY DESIGN/, out)
+    assert_match(/other reason means the envelope and the work no longer agree/, out)
+  end
+
+  # The quiet case is the common one, and a warning printed every day is a warning
+  # nobody reads.
+  def test_nothing_blocked_prints_no_warning
+    out = show_stats(stats(decisions_today: 5))
+    assert_match(/^  blocked:    0 today$/, out)
+    refute_match(/BLOCKED/, out)
+  end
+
+  # Same totality guard as the envelope: a stats field nobody taught this printer
+  # about still reaches the output, and an absent stats block does not crash the
+  # one command a loop reads its own state from.
+  def test_an_unknown_stats_field_is_still_printed
+    out = show_stats(stats.merge("reverted_today" => 4))
+    assert_match(/^  reverted_today: 4$/, out)
+  end
+
+  def test_a_missing_stats_block_renders_every_count_as_unset
+    out = show(envelope)
+    assert_match(/^  today:      -$/, out)
+    assert_match(/^  blocked:    -$/, out)
+    assert_match(/^  oldest:     nothing pending$/, out)
+    assert_match(/^  last run:   never$/, out)
+    refute_match(/BLOCKED/, out)
   end
 
   # The list view is a different shape and is not what a loop reads its gate from.

@@ -10954,21 +10954,71 @@ AUTONOMY_ENVELOPE_FIELDS = [
     show: ->(v) { "#{v} and below (#{AUTONOMY_REVERSIBILITIES.join(' < ')})" } }
 ].freeze
 
+# The same table, for the counts the ledger keeps about the workflow. These were
+# on the list view only, so the single-workflow view -- the one a loop and a
+# human both read -- said what the workflow was ALLOWED to do and nothing about
+# what it had been doing.
+#
+# `blocked` is the line that is not bookkeeping. pr_auto_merge was released with
+# no daily budget (ISS-756), so a blocked disposition is the remaining
+# early-warning signal that the envelope is too tight or the loop has gone wrong,
+# and reading it took knowing to filter the decision feed for it.
+AUTONOMY_STATS_FIELDS = [
+  { key: "decisions_today", label: "today", unset: "-", show: ->(v) { "#{v} decision(s)" } },
+  { key: "auto_approved_today", label: "approved", unset: "-", show: ->(v) { "#{v} today" } },
+  { key: "blocked_today", label: "blocked", unset: "-", show: ->(v) { "#{v} today" } },
+  # Not scoped to today on purpose: a decision pending for six days is the
+  # number worth seeing, and today's count would read as zero all morning.
+  { key: "pending", label: "pending", unset: "-", show: ->(v) { "#{v} awaiting a human (all time)" } },
+  { key: "oldest_pending_at", label: "oldest", unset: "nothing pending" },
+  { key: "cost_today", label: "cost", unset: "-", show: ->(v) { "$#{v} today" } },
+  { key: "last_run_at", label: "last run", unset: "never" }
+].freeze
+
 # One "  label:      value" line per envelope field, known fields first in the
 # order above, then anything else the API returned.
 def autonomy_envelope_lines(envelope)
-  env = envelope || {}
-  known = AUTONOMY_ENVELOPE_FIELDS.map { |f| [f[:label], autonomy_envelope_value(env[f[:key]], f)] }
-  unknown_keys = (env.keys - AUTONOMY_ENVELOPE_FIELDS.map { |f| f[:key] }).sort
-  extra = unknown_keys.map { |k| [k, autonomy_envelope_value(env[k], { unset: "not set" })] }
+  autonomy_field_lines(envelope, AUTONOMY_ENVELOPE_FIELDS)
+end
+
+def autonomy_stats_lines(stats)
+  autonomy_field_lines(stats, AUTONOMY_STATS_FIELDS)
+end
+
+def autonomy_field_lines(data, fields)
+  values = data || {}
+  known = fields.map { |f| [f[:label], autonomy_field_value(values[f[:key]], f)] }
+  unknown_keys = (values.keys - fields.map { |f| f[:key] }).sort
+  extra = unknown_keys.map { |k| [k, autonomy_field_value(values[k], { unset: "not set" })] }
   (known + extra).map { |label, value| format("  %-11s %s", "#{label}:", value) }
 end
 
-def autonomy_envelope_value(value, field)
+def autonomy_field_value(value, field)
   return field[:unset] if value.nil? || (value.respond_to?(:empty?) && value.empty?)
   return value.join(", ") if value.is_a?(Array)
 
   field[:show] ? field[:show].call(value) : value.to_s
+end
+
+# A count on a line is a number somebody has to know to care about, so say what
+# a blocked decision is and what would make this count worth acting on.
+#
+# Being precise about that matters more than it looks. `blocked` is BOTH the
+# designed hold path -- a decision above `max_reversibility` is refused, which is
+# the ceiling doing its job -- and the anomaly signal. All 8 of pr_auto_merge's
+# blocked decisions on the day this shipped were the former. A call-out that read
+# them all as an alarm would be noise from its first run, and a count nobody can
+# interpret is the thing this was added to fix.
+def autonomy_blocked_lines(workflow)
+  count = (workflow["stats"] || {})["blocked_today"].to_i
+  return [] unless count.positive?
+
+  ["",
+   "  #{count} decision(s) BLOCKED today: the ledger refused permission and is holding them.",
+   "  A classification above max_reversibility lands here BY DESIGN. A refusal for any",
+   "  other reason means the envelope and the work no longer agree -- read the reasons,",
+   "  and never re-submit a blocked decision under a softer classification:",
+   "    dev autonomy decisions --workflow #{workflow['key']} --disposition blocked"]
 end
 
 def autonomy_endpoint(use_localhost)
@@ -11181,6 +11231,8 @@ def cmd_autonomy_workflows(args)
       autonomy_envelope_lines(w["envelope"]).each { |line| puts line }
       budget = w["budget"]
       puts "  budget:     #{budget['max_decisions_per_day'] || '-'} decisions/day, #{budget['max_auto_approved_per_day'] || '-'} auto-approved/day"
+      autonomy_stats_lines(w["stats"]).each { |line| puts line }
+      autonomy_blocked_lines(w).each { |line| puts line }
     end
   end
 end
@@ -11217,6 +11269,11 @@ def cmd_autonomy_decisions(args)
       rows.each do |d|
         puts format("%-14s %-12s %-24s %s",
                     d["disposition"], d["status"], d["workflow"]["key"], d["subject"]["label"])
+        # Why it was held is the whole content of a non-approved row, and this
+        # feed is where `autonomy workflows` sends you to read it. Printed
+        # underneath rather than appended, because both are already long.
+        reason = d["disposition_reason"]
+        puts "  ↳ #{reason}" if reason && !reason.empty?
       end
     end
   end
