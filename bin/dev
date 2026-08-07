@@ -337,18 +337,24 @@ USAGE = <<~USAGE
              that does NOT depend on one of them (acumen does not wait on
              platform-postgresql, and neither does an app whose own DB is
              contracting, since that one waits on IT).
-          2. Apps that DO depend on a pending expanding DB (foo on
-             foo-postgresql) release in parallel (concurrency defaults to
-             10) via `release` with RELEASE_AUTO_TAG=1, once their DB is
-             done. With no expanding DB pending, all apps release here.
+          2. Apps that DO depend on a pending expanding DB release in
+             parallel (concurrency defaults to 10) via `release` with
+             RELEASE_AUTO_TAG=1, once their DB is done. The dependency is
+             the schema repo of the app's REPO, so every deployable built
+             from it waits — playbook-api on platform-postgresql, not on a
+             playbook-api-postgresql that does not exist. With no expanding
+             DB pending, all apps release here.
           3. CONTRACTING DB repos — those whose new migrations DROP or
              RENAME a table, column, view, sequence, type or function —
              release serially here, AFTER their apps. Dropping something
              the live code still selects is a 500 on every request that
              touches it for the whole length of a rollout, not a slow
-             migration (ISS-317). A contracting DB is skipped when its app
-             did not release, because the code that still uses the dropped
-             objects is then the code in production.
+             migration (ISS-317). A contracting DB is skipped when ANY
+             deployable it migrates did not release, because the code that
+             still uses the dropped objects is then the code in production.
+             A deployable this command does not release at all (an ignored
+             app sharing another's repo) cannot be held back on, so its
+             database is named in a warning here instead.
           4. Libraries (lib-*) release serially via `release`, which
              dispatches a lib- checkout to `release-lib`. That stays
              interactive — it confirms the tag and GPG asks for the
@@ -6591,8 +6597,14 @@ end
 
 # ---------- deploy (fleet release state) ----------
 
+# A schema repo is named for the REPO whose schema it holds, plus this suffix:
+# ~/code/platform's migrations live in ~/code/platform-postgresql. One definition
+# for every direction of that mapping (db_repo?, db_repo_for, app_for_db), so a
+# rename cannot leave one of them behind.
+DB_REPO_SUFFIX = "-postgresql".freeze
+
 def db_repo?(name)
-  name.end_with?("-postgresql")
+  name.end_with?(DB_REPO_SUFFIX)
 end
 
 def lib_repo?(name)
@@ -6709,7 +6721,7 @@ def deploy_items(registry = Work::Registry.load)
   # discovery from the registry keeps stray/abandoned *-postgresql checkouts
   # out of the list; scoping to deploy_tracked excludes ignored/archived apps.
   registry.deploy_tracked.select { |app| app.stack == :scala }.each do |app|
-    db = "#{app.repo_name}-postgresql"
+    db = db_repo_for(app)
     items << [db, File.expand_path("~/code/#{db}"), nil]
   end
   # Libraries publish to Maven Central, not to a cluster, so there is no prod
@@ -8052,22 +8064,97 @@ def cmd_deploy_all(args)
   run_deploys(pending, concurrency: concurrency, errors: errors)
 end
 
+# Every deployable the registry knows that runs against a schema repo — the one
+# set both directions of the app <-> schema dependency are computed from. A
+# deployable has a schema repo exactly when it has a database config, which is
+# what `stack == :scala` reads.
+def schema_deployables(registry = cached_registry)
+  registry.apps.select { |app| app.stack == :scala }
+end
+
+# The schema repo a deployable's migrations live in. Keyed on the REPO, never on
+# the deployable's name: several deployables can be built from one codebase —
+# platform and playbook-api are the same repo shipped to two DigitalOcean
+# accounts — and there is exactly one schema repo between them.
+def db_repo_for(app)
+  "#{app.repo_name}#{DB_REPO_SUFFIX}"
+end
+
 # The DB a pending app must wait for, or nil when nothing pending gates it.
-# The dependency is the naming convention: `foo` runs against `foo-postgresql`.
 # An app with no pending DB of its own (acumen while only platform-postgresql
 # is pending) is NOT gated — it releases alongside the DB phase.
+#
+# Resolved through the registry rather than off the app's own name, so a SECOND
+# deployable of a shared codebase is gated by the schema repo that actually
+# migrates it: playbook-api runs against platform-postgresql, and keying on the
+# name would look for a `playbook-api-postgresql` that does not exist and let it
+# roll out in parallel with the migration it depends on (ISS-738). An app the
+# registry does not know falls back to the naming convention.
 #
 # Only an EXPANDING database gates its app. A contracting one is the reverse
 # dependency — it waits for the app — so passing `db_pending` already narrowed
 # to the expanding ones is what makes both orderings fall out of the same rule.
-def blocking_db_for(app, db_pending)
-  db = "#{app}-postgresql"
+def blocking_db_for(app, db_pending, registry = cached_registry)
+  db = db_for_app(app, registry)
   db_pending.include?(db) ? db : nil
 end
 
-# The app a DB repo migrates, by the same naming convention.
+# The schema repo a deployable named `app` releases against.
+def db_for_app(app, registry = cached_registry)
+  found = schema_deployables(registry).find { |a| a.name == app }
+  found ? db_repo_for(found) : "#{app}#{DB_REPO_SUFFIX}"
+end
+
+# EVERY database a DB repo's migrations are applied to, as registry apps.
+#
+# This is release-db's own target rule, evaluated against the registry rather
+# than a second time: it selects every app with a database config built from the
+# schema repo ("so one release keeps every copy of the schema in sync"), and
+# `stack == :scala` is that same database config — both read the `scala` block of
+# the app's config.pkl. So one release changes the schema under all of these at
+# once, and any phase ordering has to reason about all of them.
+#
+# IGNORED apps are deliberately included. An ignored app is one `dev deploy` does
+# not release, not one release-db skips — the ignore flag lives in the registry,
+# and release-db never reads it. Excluding them here would hide exactly the
+# target this run cannot vouch for (see unchecked_db_targets).
+def db_targets_for(db, registry = cached_registry)
+  base = app_for_db(db)
+  schema_deployables(registry).select { |app| app.repo_name == base }
+end
+
+# The deployables a DB repo migrates, by name. The conventional name is a
+# fallback for a DB repo the registry has no app for, never the primary answer:
+# it is the single string that hid the second deployable from the Phase 3
+# hold-back (ISS-738).
+def apps_for_db(db, registry = cached_registry)
+  names = db_targets_for(db, registry).map(&:name)
+  names.empty? ? [app_for_db(db)] : names
+end
+
+# The databases a contracting release will migrate whose deployable this run
+# never releases and never probes — an app the registry ignores, which is how
+# `platform`/`playbook-api` is configured while the account split is mid-flight.
+# Returns [[db, [app names]], ...], empty for the ordinary case.
+#
+# Not a hold-back: an ignored app is one the fleet does not deploy at all, so
+# gating on it would stall every contracting release indefinitely rather than
+# order it. It is a warning because the alternative is silence — the deploy
+# reports a clean Phase 3 while a copy of the schema it just changed is served by
+# code no phase of this run looked at.
+def unchecked_db_targets(dbs, registry = cached_registry)
+  tracked = registry.deploy_tracked.map(&:name)
+  dbs.filter_map do |db|
+    unchecked = db_targets_for(db, registry).map(&:name).reject { |name| tracked.include?(name) }
+    [db, unchecked] unless unchecked.empty?
+  end
+end
+
+# The repo a DB repo holds the schema for, by the naming convention. This is a
+# REPO name, not necessarily a deployable name — use apps_for_db for the
+# deployables.
 def app_for_db(db)
-  db.sub(/-postgresql$/, "")
+  db.delete_suffix(DB_REPO_SUFFIX)
 end
 
 # Splits pending DB repos into [expanding, contracting].
@@ -8182,23 +8269,27 @@ def run_deploys(pending, concurrency:, errors: [])
     # when the app that stops using the object did not actually ship: the old
     # code is still serving, so the drop would break exactly what it broke then.
     #
-    # The hold-back is keyed on the conventional app name, the same convention
-    # blocking_db_for uses. A schema repo that feeds a second deployable (the
-    # playbook-api copy of platform-postgresql) is still covered by the PHASE
-    # ordering — every app in Phase 2 has rolled out by the time this runs — and
-    # only by the failure check for its primary app.
+    # The hold-back covers EVERY deployable the migration is applied to, not just
+    # the one named after the schema repo. platform-postgresql migrates both
+    # platform and playbook-api, and one drop lands in both databases; holding
+    # back only on platform meant a Phase 2 failure of playbook-api still let the
+    # drop through, against a deployable left serving the old code — the exact
+    # incident this whole ordering exists to prevent, for the second copy of the
+    # schema (ISS-738).
     contracting_to_run = contracting_dbs.reject do |db|
-      app = app_for_db(db)
-      if pending.include?(app) && !(results[app] && results[app][:ok])
-        skipped[db] = "contracting migration held back: #{app} did not release, so the code that still uses the dropped objects is live"
-        true
-      else
-        false
-      end
+      blocked = apps_for_db(db).select { |app| pending.include?(app) && !(results[app] && results[app][:ok]) }
+      next false if blocked.empty?
+      skipped[db] = "contracting migration held back: #{blocked.join(', ')} did not release, " \
+                    "so the code that still uses the dropped objects is live"
+      true
     end
 
     unless contracting_to_run.empty?
       progress.message("Phase 3: releasing #{contracting_to_run.length} contracting database(s) serially, after their apps: #{contracting_to_run.join(', ')}")
+      unchecked_db_targets(contracting_to_run).each do |db, apps|
+        progress.message("         WARNING: #{db} also migrates #{apps.join(', ')}, which this deploy does not release — " \
+                         "the code running against that copy of the schema was NOT checked")
+      end
       progress.message("")
       release_serial(contracting_to_run, results, results_mutex, progress)
       progress.message("")
