@@ -537,9 +537,12 @@ USAGE = <<~USAGE
         case too, for the same reason. No title is needed: the server files it
         under a placeholder ("New Bug", …) and a background task summarizes the
         body into a real one moments later — pass --title to set it yourself.
-        A URL on its own line is recorded as the page the issue is about
-        (source_url), and any pasted or dragged-in file path is uploaded as a real
-        attachment — both are lifted out of the body. Repeat --image PATH to
+        In the $EDITOR buffer — and ONLY there — a URL on its own line is
+        recorded as the page the issue is about (source_url) and any pasted or
+        dragged-in file path is uploaded as a real attachment, both lifted out of
+        the text. A --body or piped brief is content written by a caller rather
+        than a buffer typed into, so it is taken verbatim: an absolute path in it
+        is prose, not an attachment argument (ISS-745). Repeat --image PATH to
         attach files explicitly: each is uploaded to the issue AND handed to the
         session as a local path, so it can read the file directly.
 
@@ -3343,19 +3346,29 @@ def issue_resume_claude_argv(uuid)
   ["claude", "--resume", uuid]
 end
 
+# A resolved brief: the body text, plus whatever the $EDITOR buffer's own
+# affordances lifted OUT of it. `body` is nil when nothing meaningful was supplied,
+# which aborts `create` before any API call. A --body or piped brief fills nothing
+# but `body` — see issue_resolve_brief.
+IssueBrief = Struct.new(:body, :source_url, :attachments)
+
 # Where the brief comes from, in precedence order: --body, then piped stdin, then
 # $EDITOR. Only the last of those needs a terminal, so a headless caller (a Claude
 # session filing its own work, cron, `claude --print`) has two ways to file without
 # one — before this, every `create` shelled out to $EDITOR unconditionally and died
 # on the non-tty with a screenful of vim escape codes.
 #
-# Returns nil when nothing meaningful was supplied, which aborts before any API call.
-# `#` lines are stripped ONLY out of the editor buffer, where they are the
-# template's own instructions. A --body/piped brief is taken verbatim: it is written
-# by a caller, not a template, and markdown headings there are content.
+# The three sources are NOT interchangeable, and this is the one place that says so.
+# The editor buffer is a TEMPLATE with affordances, every one of them advertised in
+# the buffer the person is typing into: `#` lines are its own instructions and get
+# stripped, a URL alone on a line is lifted into source_url, a dragged-in file path
+# is lifted into an attachment. A --body/piped brief is CONTENT, written by a caller
+# who was never shown that template and who has flags for the same jobs (--image),
+# so it is taken verbatim — a markdown heading there is a heading and an absolute
+# path there is prose. See issue_editor_brief for what conflating the two cost.
 def issue_resolve_brief(body)
-  return issue_nonempty_brief(body) if body && !body.empty?
-  return issue_edit_in_editor if $stdin.tty?
+  return IssueBrief.new(issue_nonempty_brief(body), nil, []) if body && !body.empty?
+  return issue_editor_brief if $stdin.tty?
 
   # Non-interactive with no --body: stdin IS the brief. Empty stdin here is a
   # caller that meant to pass one and didn't, so say which flag to reach for
@@ -3367,7 +3380,31 @@ def issue_resolve_brief(body)
       "Pass --body \"TEXT\" or pipe the brief on stdin."
     )
   end
-  piped
+  IssueBrief.new(piped, nil, [])
+end
+
+# The $EDITOR buffer with the two lifts the template promises applied: a URL on its
+# own line becomes source_url, and a pasted or dragged-in file path becomes a real
+# attachment, instead of both sitting in the body as text nothing acts on.
+#
+# EDITOR-ONLY, deliberately, and that is the fix for ISS-745. Running these over a
+# --body treated the caller's prose as argv: a headless brief is usually an
+# autonomous session describing CODE, and code descriptions are full of absolute
+# paths — /bin/zsh, /opt/homebrew/bin/…, ~/code/… . Every one that existed on disk
+# was pulled out of the body and handed to the attachment path, so a file with no
+# supported extension failed the whole command ("Unsupported attachment type:
+# /bin/zsh") while one with a supported extension silently disappeared from the
+# brief and got uploaded instead. Both land on the single command that records a
+# finding, with nobody at the keyboard to work out that the body was the argument.
+def issue_editor_brief
+  text = issue_edit_in_editor
+  return IssueBrief.new(nil, nil, []) if text.nil?
+  remaining, source_url = issue_extract_source_url(text)
+  remaining, paths = issue_extract_attachment_paths(remaining)
+  # Deliberately not issue_nonempty_brief: a buffer holding nothing but a dragged-in
+  # file is a legitimate issue — the attachment IS the report — and lifting the path
+  # is what empties the text. `create` just omits an empty body from the form.
+  IssueBrief.new(remaining, source_url, paths)
 end
 
 # A brief supplied verbatim (--body, piped stdin): nil when it holds nothing but
@@ -3603,16 +3640,19 @@ def cmd_issues_create(args)
   blockers = block_on.map { |ref| issue_block_on_resolve(ref) }.uniq
 
   brief = issue_resolve_brief(body)
-  Util.exit_with_error("Aborting: empty issue. Nothing filed.") if brief.nil?
+  Util.exit_with_error("Aborting: empty issue. Nothing filed.") if brief.body.nil?
 
-  # Lift the pasted page URL and any pasted file paths out of the brief: the URL
-  # becomes source_url and the files become real attachments, instead of both
-  # sitting in the body as text that nothing acts on.
-  brief, source_url = issue_extract_source_url(brief)
-  brief, pasted = issue_extract_attachment_paths(brief)
-  bad = pasted.reject { |pth| issue_file_type(pth) }
-  Util.exit_with_error("Unsupported attachment type: #{bad.join(', ')} (allowed: #{ISSUE_FILE_TYPES.keys.sort.join(', ')})") unless bad.empty?
-  images = (images + pasted).uniq
+  # Paths lifted out of the editor buffer face the same allow-list as --image, and
+  # for the same reason: a bad one must fail before anything is filed. Naming where
+  # they came from matters — nothing on the command line asked for an attachment.
+  bad = brief.attachments.reject { |pth| issue_file_type(pth) }
+  unless bad.empty?
+    Util.exit_with_error(
+      "Unsupported attachment type: #{bad.join(', ')} — pasted into the issue buffer " \
+      "(allowed: #{ISSUE_FILE_TYPES.keys.sort.join(', ')})"
+    )
+  end
+  images = (images + brief.attachments).uniq
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
@@ -3630,8 +3670,8 @@ def cmd_issues_create(args)
     form[:type] = "epic" if is_epic
     form[:parent_number] = parent if parent
     form[:title] = title if title && !title.empty?
-    form[:body] = brief unless brief.empty?
-    form[:source_url] = source_url if source_url
+    form[:body] = brief.body unless brief.body.empty?
+    form[:source_url] = brief.source_url if brief.source_url
     form[:severity] = severity if severity
     form[:repositories] = issue_normalize_repos(repos) unless repos.empty?
     form[:attachments] = attachments unless attachments.empty?

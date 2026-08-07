@@ -3041,6 +3041,167 @@ class TestDevIssues < Minitest::Test
     assert_equal "Just a description", brief
   end
 
+  # ---- dev issues create: the lifts are the EDITOR's, not the caller's (ISS-745) ----
+
+  # The failure this pins: a --body is prose, and an autonomous session's prose is
+  # full of absolute paths, because what it is describing is CODE. A body naming
+  # /bin/zsh had that token pulled out of it and handed to the attachment path,
+  # which rejected it for having no supported extension and failed the whole
+  # command — on the single command that records a finding, exiting non-zero with
+  # nobody at the keyboard to work out that the body WAS the argument. A file with
+  # an unsupported extension stands in for /bin/zsh so the test does not depend on
+  # what this machine happens to have in /bin.
+  def test_create_keeps_an_absolute_path_in_a_body_instead_of_attaching_it
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    Tempfile.create(["login-shell", ".zsh"]) do |f|
+      brief = "The tick shells the login zsh via #{f.path} -lc, which rewrites PATH."
+      with_credentials do
+        with_stdin("", tty: false) do
+          cmd_issues_create(["--category", "bug", "--status", "open", "--body", brief, "--no-spawn"])
+        end
+      end
+      assert_equal brief, captured.fetch(:form).fetch(:body)
+      assert_empty captured.fetch(:local_paths)
+      refute captured.fetch(:form).key?(:attachments)
+    end
+  end
+
+  # The quieter half of the same bug, and the worse one: a path whose extension IS
+  # supported never raised anything. It was deleted from the brief and uploaded, so
+  # a body that said "the plan is at …/design.md" filed with the sentence truncated
+  # mid-clause and a surprise attachment, and nothing said so.
+  def test_create_does_not_attach_a_supported_file_type_named_in_a_body
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    Tempfile.create(["design", ".md"]) do |f|
+      brief = "The plan at #{f.path} still describes the old queue."
+      with_credentials do
+        with_stdin("", tty: false) do
+          cmd_issues_create(["--category", "bug", "--status", "open", "--body", brief, "--no-spawn"])
+        end
+      end
+      assert_equal brief, captured.fetch(:form).fetch(:body)
+      assert_empty captured.fetch(:local_paths)
+    end
+  end
+
+  # Piped stdin is the same kind of thing as --body — content a caller wrote — so it
+  # gets the same verbatim treatment. Worth its own test because it is a separate
+  # branch of issue_resolve_brief, and the headless filers reach for both.
+  def test_create_keeps_an_absolute_path_in_a_piped_brief
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    Tempfile.create(["login-shell", ".zsh"]) do |f|
+      brief = "Hardcodes #{f.path} instead of resolving the user's shell."
+      with_credentials do
+        with_stdin("#{brief}\n", tty: false) do
+          cmd_issues_create(["--category", "bug", "--status", "open", "--no-spawn"])
+        end
+      end
+      assert_equal brief, captured.fetch(:form).fetch(:body)
+      assert_empty captured.fetch(:local_paths)
+    end
+  end
+
+  # The url lift is the same affordance as the path lift and moves with it: a PR
+  # link on its own line in a body a session wrote is content it put there, not an
+  # instruction to relocate it into source_url and take it out of the brief.
+  def test_create_keeps_a_url_only_line_in_a_body
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    brief = "Blocked until this ships:\nhttps://github.com/mbryzek/devops/pull/376"
+    with_credentials do
+      with_stdin("", tty: false) do
+        cmd_issues_create(["--category", "bug", "--status", "open", "--body", brief, "--no-spawn"])
+      end
+    end
+    assert_equal brief, captured.fetch(:form).fetch(:body)
+    refute captured.fetch(:form).key?(:source_url)
+  end
+
+  # The other side of the rule: in the buffer the template tells you both lifts
+  # happen, so both still do. Making --body verbatim must not quietly cost the
+  # person who dragged a screenshot into $EDITOR the attachment they expected.
+  def test_create_from_the_editor_still_lifts_a_pasted_url_and_file_path
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    Tempfile.create(["shot", ".png"]) do |f|
+      f.binmode
+      f.write("png-bytes")
+      f.flush
+      define_singleton_method(:issue_edit_in_editor) do
+        "https://admin.clubaid.co/admin/issues/013\nThe chart is empty.\n#{f.path}\n"
+      end
+      with_stubbed_api("POST /#{ISSUE_TENANT_ID}/files/data_url" => { "id" => "fil-1" }) do
+        with_credentials do
+          with_stdin("", tty: true) do
+            capture_stdout { cmd_issues_create(["--category", "bug", "--no-spawn"]) }
+          end
+        end
+      end
+      assert_equal "The chart is empty.", captured.fetch(:form).fetch(:body)
+      assert_equal "https://admin.clubaid.co/admin/issues/013", captured.fetch(:form).fetch(:source_url)
+      assert_equal [f.path], captured.fetch(:local_paths)
+      assert_equal [{ file_id: "fil-1", description: File.basename(f.path) }], captured.fetch(:form).fetch(:attachments)
+    end
+  end
+
+  # A buffer holding nothing but a dragged-in file is a real issue — the attachment
+  # IS the report — and lifting the path is what empties the text. Pinned because
+  # the obvious way to write issue_editor_brief (reuse the nonempty check the other
+  # two sources use) turns this into "Aborting: empty issue. Nothing filed."
+  def test_create_from_the_editor_files_a_buffer_that_is_only_an_attachment
+    captured = nil
+    define_singleton_method(:issue_file_and_start) do |**kwargs|
+      captured = kwargs
+      { "number" => "099" }
+    end
+    Tempfile.create(["shot", ".png"]) do |f|
+      define_singleton_method(:issue_edit_in_editor) { "#{f.path}\n" }
+      with_stubbed_api("POST /#{ISSUE_TENANT_ID}/files/data_url" => { "id" => "fil-1" }) do
+        with_credentials do
+          with_stdin("", tty: true) do
+            capture_stdout { cmd_issues_create(["--category", "bug", "--no-spawn"]) }
+          end
+        end
+      end
+      refute_nil captured
+      refute captured.fetch(:form).key?(:body)
+      assert_equal [f.path], captured.fetch(:local_paths)
+    end
+  end
+
+  # The rejection still exists, and now it can only come from the buffer — so it
+  # says so, because nothing on the command line asked for an attachment.
+  def test_create_rejects_an_unsupported_type_pasted_into_the_editor_buffer
+    define_singleton_method(:issue_file_and_start) { |**| flunk("filed an issue with a bad attachment") }
+    Tempfile.create(["thing", ".xyz"]) do |f|
+      define_singleton_method(:issue_edit_in_editor) { "Broken\n#{f.path}\n" }
+      out, status = capture_stderr_and_exit do
+        with_credentials { with_stdin("", tty: true) { cmd_issues_create(["--category", "bug", "--no-spawn"]) } }
+      end
+      assert_equal 1, status
+      assert_includes out, "Unsupported attachment type"
+      assert_includes out, "pasted into the issue buffer"
+    end
+  end
+
   # ---- dev issues create/resume: the session id ----
 
   def test_session_comment_body_carries_the_uuid_and_the_resume_command
