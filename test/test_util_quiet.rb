@@ -64,6 +64,34 @@ class TestUtilQuiet < Minitest::Test
     end
   end
 
+  # Quiet mode has already sent the child's stdout and stderr to a log file, so a
+  # child that prompts is asking a question nobody can see. If it also inherits
+  # the terminal on stdin it then blocks on an answer that cannot arrive — a
+  # release that hangs forever rather than failing (`api publish` held
+  # `dev deploy` for 23 minutes on 2026-08-07). The child gets EOF instead.
+  #
+  # The parent's own stdin is deliberately a pipe WITH data here: without that,
+  # the assertion would pass on a runner whose stdin happened to be closed
+  # already, which is the confound that makes this kind of test read green
+  # everywhere except the machine that has the bug.
+  def test_run_gives_the_child_empty_stdin_in_quiet_mode
+    with_quiet do |log|
+      read, write = IO.pipe
+      write.write("would-be-answer\n")
+      write.close
+      saved = STDIN.dup
+      begin
+        STDIN.reopen(read)
+        assert Util.run("cat")
+      ensure
+        STDIN.reopen(saved)
+        saved.close
+        read.close
+      end
+      assert_equal "==> cat", File.read(log).strip, "the child read nothing from stdin"
+    end
+  end
+
   def test_run_passthrough_does_not_redirect_in_quiet_mode
     with_quiet do |log|
       Util.run("true", passthrough: true)

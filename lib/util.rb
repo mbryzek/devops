@@ -260,7 +260,15 @@ module Util
 
       if Util.quiet? && !passthrough
         Util.log("==> #{cmd}")
-        ok = system("(#{cmd}) >> '#{Util.log_file}' 2>&1")
+        # stdin is /dev/null, for the same reason run_with_timeout does it: this
+        # branch has already sent the child's stdout AND stderr to a log file, so
+        # a child that decides to prompt asks its question where nobody can see
+        # it and then blocks on a terminal read that will never be answered.
+        # That is not a slow release, it is a permanent one — `api publish` held
+        # `dev deploy` on "Publishing apibuilder specs..." for 23 minutes on
+        # 2026-08-07 and only ended in a Ctrl-C. EOF makes such a child fail
+        # instead, which is a failure someone can read.
+        ok = system("(#{cmd}) >> '#{Util.log_file}' 2>&1 < /dev/null")
         if !ok && !ignore_error
           $stderr.puts ""
           $stderr.puts "Command failed: #{cmd}"

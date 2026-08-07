@@ -1524,6 +1524,12 @@ if __FILE__ == $PROGRAM_NAME
   profile = global[:profile]
   remaining = global[:remaining]
 
+  # A batch that never finishes is reported here rather than at each of the three
+  # call sites, because the answer is the same for all of them: say what the
+  # server was last doing and stop. The alternative — the raw backtrace of a
+  # library exception — is what a release's log tail would have shown instead.
+  begin
+
   # `lint` and `publish` accept --app/--group, which may precede the command keyword
   # (e.g. `api --app db-playbook lint`), so route on their presence anywhere.
   if remaining.include?("lint")
@@ -1549,6 +1555,12 @@ if __FILE__ == $PROGRAM_NAME
       parsed = parse_batch_args(remaining)
       run_batch(profile, [], parsed[:apps], parsed[:group])
     end
+  end
+
+  rescue ApiBatchClient::Timeout => e
+    $stderr.puts ""
+    $stderr.puts e.message
+    exit 1
   end
 
   elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
