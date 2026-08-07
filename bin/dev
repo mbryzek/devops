@@ -87,6 +87,7 @@ INVOCATIONS = {
   "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
+  "issues split"        => 'issues split <number> --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues block"        => 'issues block <number> --on NUMBER [--remove] [--localhost]',
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
@@ -621,6 +622,24 @@ USAGE = <<~USAGE
         the awaiting-verification queue on its own — its epic becomes the one
         item verified once the whole effort has shipped.
 
+    #{INVOCATIONS["issues split"]}
+        Split ANOTHER unit of work out of the issue you are working, so it gets its
+        own number, its own PR and its own close-out. Use it when one run finds
+        several INDEPENDENT changes — a weekly review confirming four unrelated
+        defects, a perf run fixing two routes — and not when several PRs are one
+        change spread across repos (a spec change plus its regen plus its
+        migration is ONE unit: record those with `issues fix`).
+        On the first split NUMBER is promoted into an epic: a container carrying
+        its title is filed and NUMBER is adopted as its first child, so it keeps
+        the PR it already has. Later splits reuse that epic, as does an issue that
+        already had one. The new child is filed CLAIMED — you are about to work
+        it — with NUMBER's category, severity and repos unless you override them.
+        Close each child out yourself with `issues status`; the epic advances to
+        deployed on its own once they have all shipped, and IT is the one thing
+        verified. A finding you are NOT working is not a split: file it standalone
+        with `issues create --status open`, or it gets closed out silently with
+        the epic having had nobody look at it.
+
     #{INVOCATIONS["issues block"]}
         Record that NUMBER cannot be worked until --on NUMBER has shipped, and stop
         the queue handing it out until then: a blocked issue is never offered by
@@ -1122,7 +1141,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent block duplicate workaround handoff claim show status fix snooze reconcile resume],
+  "issues"       => %w[create list parent split block duplicate workaround handoff claim show status fix snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -4311,32 +4330,8 @@ def cmd_issues_parent(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
-    # The update endpoint replaces every editable field, so the issue is read
-    # first and its own values are sent back unchanged alongside the new parent.
-    # Sending a partial form here would silently clear severity, body and club.
-    #
-    # `issue_update_form` in the platform's spec/issues.json names the whole
-    # editable set -- "an omitted optional field (severity, body, club_id, apps,
-    # repositories) clears it" -- so every one of them has to be listed here.
-    # `repositories` became settable AFTER this round-trip was written and was
-    # never added, so re-parenting silently dropped an issue's repo attribution:
-    # the executor then had nothing to clone, and the session picked its own
-    # branch name and its PR stopped being findable (ISS-365, the exact failure
-    # --repo exists to prevent).
     issue = ApiClient.request(endpoint, :get, issues_path("/#{number}"))
-    form = {
-      category: issue.fetch("category"),
-      type: issue.fetch("type"),
-      title: issue.fetch("title"),
-    }
-    form[:body] = issue["body"] if issue["body"]
-    form[:severity] = issue["severity"] if issue["severity"]
-    form[:club_id] = issue.dig("club", "id") if issue["club"]
-    form[:apps] = issue["apps"] if issue["apps"]
-    form[:repositories] = issue["repositories"] if issue["repositories"]
-    form[:parent_number] = epic unless detach
-
-    updated = ApiClient.request(endpoint, :put, issues_path("/#{number}"), body: form)
+    updated = issue_reparent(endpoint, issue, detach ? nil : epic)
     if detach
       puts "Detached #{issue_label(updated)} from its epic."
     else
@@ -4344,6 +4339,237 @@ def cmd_issues_parent(args)
       puts "It will not appear in the awaiting-verification queue on its own — ISS-#{epic} is what gets verified."
     end
   end
+end
+
+# Move `issue` (as the API returned it) onto epic `epic_number`, or off its epic
+# when that is nil. Returns the updated issue.
+#
+# The update endpoint replaces every editable field, so the issue's own values
+# are sent back unchanged alongside the new parent. Sending a partial form here
+# would silently clear severity, body and club.
+#
+# `issue_update_form` in the platform's spec/issues.json names the whole editable
+# set -- "an omitted optional field (severity, body, club_id, apps, repositories)
+# clears it" -- so every one of them has to be listed here. `repositories` became
+# settable AFTER this round-trip was written and was never added, so re-parenting
+# silently dropped an issue's repo attribution: the executor then had nothing to
+# clone, and the session picked its own branch name and its PR stopped being
+# findable (ISS-365, the exact failure --repo exists to prevent).
+#
+# Not sent, and deliberately: `fingerprint`, `producer_key`, `occurrence_count`
+# and every status timestamp are server-owned and never rewritten by an update
+# (IssuesService.update), so adopting a producer-filed issue onto an epic cannot
+# cost it the dedup key its producer files against.
+def issue_reparent(endpoint, issue, epic_number)
+  form = {
+    category: issue.fetch("category"),
+    type: issue.fetch("type"),
+    title: issue.fetch("title"),
+  }
+  form[:body] = issue["body"] if issue["body"]
+  form[:severity] = issue["severity"] if issue["severity"]
+  form[:club_id] = issue.dig("club", "id") if issue["club"]
+  form[:apps] = issue["apps"] if issue["apps"]
+  form[:repositories] = issue["repositories"] if issue["repositories"]
+  form[:parent_number] = epic_number if epic_number
+
+  ApiClient.request(endpoint, :put, issues_path("/#{issue.fetch('number')}"), body: form)
+end
+
+# ---- issues split: one run, several independent units of work (ISS-759) ----
+#
+# A weekly review confirms four unrelated defects and correctly opens four
+# independent PRs. Before this they all carried the ONE issue number the run was
+# assigned, and that is where the tracking underneath them came apart: a status
+# write takes a single url, so the rest were appended as extra fixes on the same
+# issue and could not be closed out, deployed, verified or auto-merged apart from
+# each other. Measured 2026-08-06: ISS-735 -> devops #371-#375, ISS-723 ->
+# platform #2138-#2140.
+#
+# The shape that fits is the one CLAUDE.md already names — an epic is for work
+# that "decomposes into separately verifiable pieces" — with the timing inverted:
+# the findings are not known until the review has run, so the producer CANNOT
+# name the children when it files. The session names them, and this is the
+# command that lets it, promoting the issue it was handed into the epic on the
+# first call.
+#
+# Why one command rather than the three it replaces (`issues create --epic`,
+# `issues parent`, `issues create --parent`): the ordering between them is
+# load-bearing and the failure is not recoverable. An epic filed whose adopt then
+# fails is an empty container in the queue that nothing claims, nothing rolls up
+# and no command deletes — only `dismissed` — and the session that would notice
+# is unattended at 3am. Four playbooks need this, so the alternative is also the
+# same prose copy-pasted four times, which is ISS-360's failure exactly.
+def cmd_issues_split(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  title = nil
+  body = nil
+  category = nil
+  severity = nil
+  repos = []
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--title"
+      title = rest[i + 1]
+      usage_exit("--title requires a value", example: usage_for("issues split")) if title.nil?
+      i += 2
+    when "--body"
+      body = rest[i + 1]
+      usage_exit("--body requires a value", example: usage_for("issues split")) if body.nil?
+      i += 2
+    when "--category"
+      category = rest[i + 1]
+      usage_exit("--category requires a value", example: usage_for("issues split")) if category.nil?
+      i += 2
+    when "--severity"
+      severity = rest[i + 1]
+      usage_exit("--severity requires a value", example: usage_for("issues split")) if severity.nil?
+      i += 2
+    when "--repo"
+      repo = rest[i + 1]
+      usage_exit("--repo requires a repository name", example: usage_for("issues split")) if repo.nil?
+      repos << repo
+      i += 2
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  # AFTER the flag loop, like `issues parent` — shifting it off `rest` first made
+  # the position load-bearing there, and reported a usage error about a command
+  # line that had passed the flag it said was missing.
+  number = leftover.shift
+  problems = []
+  problems << "missing issue number (positional argument — the issue THIS session is working)" if number.nil? || number.empty?
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  problems << "--title is required (what this piece of work is, on its own)" if title.nil? || title.strip.empty?
+  if body.nil? || body.strip.empty?
+    problems << "--body is required (the finding, and enough of it to review the PR against)"
+  end
+  if category && !ISSUE_MANUAL_CATEGORIES.include?(category)
+    problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')} (omit it to inherit ISS-#{number}'s)"
+  end
+  problems << "--severity must be one of: #{ISSUE_SEVERITIES.join(', ')}" if severity && !ISSUE_SEVERITIES.include?(severity)
+  problems.concat(issue_repo_problems(repos))
+  report_arg_problems("issues split", problems, usage_for("issues split"))
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    source = ApiClient.request(endpoint, :get, issues_path("/#{number}"))
+    if source["type"] == "epic"
+      Util.exit_with_error(
+        "#{issue_label(source)} is already an EPIC — it holds no work of its own to split. " \
+        "File the piece directly:\n" \
+        "  dev issues create --category <cat> --status claimed --parent #{source.fetch('number')} " \
+        "--title \"...\" --body \"...\" --no-spawn"
+      )
+    end
+
+    epic = issue_split_epic(endpoint, source)
+    form = {
+      category: category || source.fetch("category"),
+      parent_number: epic.fetch("number"),
+      title: title,
+      body: issue_split_body(body, source),
+      # Claimed, always. A split names work THIS session is about to do — that is
+      # what makes it a split rather than a finding — and `claimed` is what says
+      # so. There is deliberately no --status: an `open` child would hold the epic
+      # open until somebody claimed it, and a side finding swept into an epic gets
+      # closed out silently when the epic is verified, with nobody having looked
+      # at it. Those are filed standalone with `issues create --status open`.
+      claim_on_create: true,
+    }
+    form[:severity] = severity || source["severity"] if severity || source["severity"]
+    inherited = repos.empty? ? Array(source["repositories"]) : issue_normalize_repos(repos)
+    form[:repositories] = inherited unless inherited.empty?
+
+    child = ApiClient.request(endpoint, :post, issues_path, body: form)
+    child_number = child.fetch("number")
+    puts "Filed #{issue_label(child)} (#{form[:category]}) — claimed, under EPIC ISS-#{epic.fetch('number')}."
+    note_on_source_issue(endpoint, number, child,
+                         "Split #{issue_label(child)} out of this run as its own unit of work: #{title}")
+    puts ""
+    puts "Its PR is ITS OWN, start to finish:"
+    puts "  branch: a sibling of this run's assigned branch (`<assigned>_<suffix>`)"
+    puts "  title:  ISS-#{child_number}: <title>"
+    puts "  close:  dev issues status #{child_number} --status fixed --url \"<PR URL>\""
+    puts ""
+    puts "Do NOT verify it. EPIC ISS-#{epic.fetch('number')} advances to deployed once every child has,"
+    puts "and it is the one thing verified."
+    child
+  end
+end
+
+# The epic this split belongs under: the one the issue already has, or a new one
+# filed to hold it.
+#
+# Promotion adopts the source issue as the FIRST child rather than leaving it
+# beside the epic, so the PR it has already opened stays attached to a unit of
+# work rather than to a container. The epic takes its title: the run is what the
+# epic is, and the children are what the run found.
+#
+# The epic carries NO fingerprint and NO producer_key, and the second omission is
+# the load-bearing one. `producer_key` would be inherited by every child (ISS-515),
+# which reads better on the producer page — but an epic sits `open` until its last
+# child ships, and ProducerIssueEmitter's `{datetime}` guard suppresses a producer
+# that has any issue of its own in `open` or `claimed`. Attributing the epic would
+# silently stop a sub-daily producer firing for as long as one review's PRs sat
+# unmerged. The source issue keeps its own key, and the epic is one hop from it.
+def issue_split_epic(endpoint, source)
+  existing = source["parent"]
+  if existing
+    puts "EPIC ISS-#{existing.fetch('number')} — #{existing.fetch('title')} (already this issue's epic)."
+    return existing
+  end
+
+  number = source.fetch("number")
+  epic = ApiClient.request(endpoint, :post, issues_path, body: {
+    category: source.fetch("category"),
+    type: "epic",
+    title: source.fetch("title"),
+    body: issue_split_epic_body(number),
+    severity: source["severity"],
+    repositories: Array(source["repositories"]).empty? ? nil : Array(source["repositories"]),
+    claim_on_create: false,
+  }.compact)
+  puts "Filed EPIC #{issue_label(epic)} to hold this run's independent changes."
+
+  # Immediately, and reported loudly if it fails: an epic with no children is a
+  # container nothing claims, nothing rolls up and no command deletes.
+  begin
+    issue_reparent(endpoint, source, epic.fetch("number"))
+  rescue SessionExpired, ApiError => e
+    Util.exit_with_error(
+      "EPIC #{issue_label(epic)} was filed but ISS-#{number} could not be adopted onto it (#{e.message}).\n" \
+      "Nothing was split. Adopt it and retry:\n" \
+      "  dev issues parent #{number} --epic #{epic.fetch('number')}"
+    )
+  end
+  puts "Adopted ISS-#{number} onto it as its first child — it keeps the PR it already has."
+  epic
+end
+
+def issue_split_epic_body(number)
+  "Filed by the session working ISS-#{number}, which produced several INDEPENDENT changes.\n\n" \
+    "Each is a child here with its own number, its own PR and its own close-out, because each " \
+    "is separately reviewable, separately mergeable and separately verifiable — the shape " \
+    "CLAUDE.md names for work that decomposes into separately verifiable pieces. ISS-#{number} " \
+    "is the run itself and the first of them.\n\n" \
+    "This epic advances to `deployed` on its own once every child has shipped, and it is the " \
+    "single thing verified — verifying it verifies every child with it."
+end
+
+# The child's half of the cross-reference, appended rather than asked for: which
+# run found this is the caller's bookkeeping, not the reporter's prose.
+def issue_split_body(body, source)
+  "#{body.strip}\n\n---\n\nSplit out of ISS-#{source.fetch('number')} — #{source.fetch('title')} — " \
+    "under devops/agent/instructions.md §1, because it is an independent change that has to be " \
+    "reviewed, merged and verified on its own."
 end
 
 # Read-only. Unlike `issues claim`, which lists open issues but also claims
@@ -12571,6 +12797,7 @@ when "issues"
   when "create"     then cmd_issues_create(argv)
   when "list"       then cmd_issues_list(argv)
   when "parent"     then cmd_issues_parent(argv)
+  when "split"      then cmd_issues_split(argv)
   when "block"      then cmd_issues_block(argv)
   when "duplicate"  then cmd_issues_duplicate(argv)
   when "workaround" then cmd_issues_workaround(argv)

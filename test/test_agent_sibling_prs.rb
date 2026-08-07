@@ -228,6 +228,86 @@ class TestAgentSiblingPrs < Minitest::Test
     assert_empty recorded
   end
 
+  # ---- 4. a sibling that is its OWN issue (ISS-759) ----
+  #
+  # Recording every sibling on the assigned issue is right when they are one
+  # change spread across repos, and wrong when they are several independent
+  # changes: those now get their own numbers with `dev issues split`, and each is
+  # closed out, deployed and verified where it belongs. Their PRs are still on
+  # branches in this run's family — that is what makes them findable at all — so
+  # the reap would otherwise record every one of them twice, which is the
+  # five-urls-behind-one-number bookkeeping ISS-759 exists to undo.
+
+  def test_a_sibling_titled_for_another_issue_belongs_to_that_issue
+    refute Agent::Github.belongs_to_issue?(pr(number: 37, head: "#{BRANCH}_sig", title: "ISS-770: split out"), BRANCH, "651")
+    assert Agent::Github.belongs_to_issue?(pr(number: 37, head: "#{BRANCH}_sig", title: "ISS-651: mine"), BRANCH, "651")
+    assert Agent::Github.belongs_to_issue?(pr(number: 37, head: "#{BRANCH}_sig", title: "no prefix at all"), BRANCH, "651")
+  end
+
+  # Zero-padding is display, not identity: `dev issues` prints ISS-035 and a
+  # session types ISS-35.
+  def test_the_number_comparison_ignores_zero_padding
+    assert Agent::Github.belongs_to_issue?(pr(number: 37, head: "other", title: "ISS-35: mine"), BRANCH, "035")
+  end
+
+  # The one asymmetry, and it is deliberate. The branch is assigned by the
+  # executor and recorded on the lease; the title is typed by the session. If they
+  # ever disagree, the handle that cannot be mistyped wins — the alternative is a
+  # delivered fix classified as `nothing_to_do` and, on a producer-filed issue,
+  # DISMISSED with its PR sitting ready on GitHub.
+  def test_a_pr_on_the_exact_assigned_branch_is_never_disowned_by_its_title
+    assert Agent::Github.belongs_to_issue?(pr(number: 36, head: BRANCH, title: "ISS-770: mistitled"), BRANCH, "651")
+  end
+
+  # With no number to compare against there is no question to answer, and
+  # answering it anyway would drop PRs the branch family legitimately found.
+  def test_an_unparseable_issue_number_disowns_nothing
+    assert Agent::Github.belongs_to_issue?(pr(number: 37, head: "other", title: "ISS-770: x"), BRANCH, nil)
+  end
+
+  def test_prs_in_workspace_drops_a_sibling_that_carries_its_own_number
+    primary = pr(number: 36, head: BRANCH)
+    split = pr(number: 37, head: "#{BRANCH}_sig", title: "ISS-770: split out")
+    Dir.mktmpdir do |ws|
+      stubs = { repos_in_workspace: ->(*) { ["mbryzek/lakeviewsummit-ui"] },
+                prs_on_branch: ->(*) { [primary] },
+                list_prs: ->(*) { [primary, split] } }
+      found = with_stubbed_github(stubs) { Agent::Github.prs_in_workspace(ws, BRANCH, "651") }
+      assert_equal [36], found.map { |p| p["number"] }
+    end
+  end
+
+  # The workspace-is-gone fallback: `head:i651_irv` matches siblings loosely, so
+  # the same PR arrives by the same route and needs the same answer. There is no
+  # exact-branch exemption to make here — search does not return headRefName —
+  # and nothing is lost by that: the title half only ever finds this issue's own.
+  def test_the_search_fallback_drops_a_sibling_that_carries_its_own_number
+    hits = [{ "number" => 36, "url" => url(36), "title" => "ISS-651: mine", "state" => "OPEN" },
+            { "number" => 37, "url" => url(37), "title" => "ISS-770: split out", "state" => "OPEN" }]
+    found = stub_singleton(Agent::Github, :search, ->(*, **) { hits }) do
+      Agent::Github.search_prs(BRANCH, "651")
+    end
+    assert_equal [36], found.map { |p| p["number"] }
+  end
+
+  # Filtered ONCE, at the lookup, and never again at the write: "which PRs are
+  # this issue's" has one answer, and the reap's two consumers — classification
+  # and the fix list — both read the list `prs_in_workspace`/`search_prs`
+  # produced. So there is deliberately no reap-level assertion here; the guard
+  # that the reap records everything it is handed is
+  # `test_the_reap_records_every_other_ready_pr_as_an_additional_fix` above, and
+  # a second copy of this rule in `record_extra_fixes` would be a second thing to
+  # keep in step for no handle the lookup does not already have.
+
+  # The contract half, beside the branch rule the sibling naming lives in: a
+  # session that reads §1 and stops has to have read which NUMBER each PR carries.
+  def test_the_instructions_say_when_a_sibling_needs_its_own_issue_number
+    section_one = instructions[/^## 1\. How this ends.*?^## 2\./m]
+    refute_nil section_one
+    assert_includes section_one, "dev issues split <n> --title"
+    assert_match(/Several INDEPENDENT changes\?/, Agent::Prompt.assignment(issue: issue, slug: BRANCH, workspace: "/ws"))
+  end
+
   def url(number) = "https://github.com/mbryzek/lakeviewsummit-ui/pull/#{number}"
 
   # Drive apply_outcome with the issue still `claimed` and collect the urls it

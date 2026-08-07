@@ -172,6 +172,40 @@ module Agent
       nil
     end
 
+    # The issue number a PR's title claims, or nil for a title that claims none.
+    # Zero-padding is not significant — `ISS-035` and `ISS-35` are one issue.
+    def titled_issue_number(pr)
+      digits = pr["title"].to_s[/\AISS-(\d+)\b/, 1]
+      digits && digits.to_i
+    end
+
+    # Does this PR belong to the issue being reaped, or to another one?
+    #
+    # ISS-759: a run that finds several INDEPENDENT changes now gives each its own
+    # issue number (`dev issues split`), and each of those PRs is on a branch in
+    # THIS run's family — that is the contract, and it is what makes them findable
+    # at all. Without this they would be recorded as extra fixes on the parent
+    # issue as well as on their own, which is the bookkeeping ISS-759 exists to
+    # undo: five urls behind one number, none of them separately closable.
+    #
+    # A title naming a DIFFERENT issue is the only thing that disqualifies a PR,
+    # and never the exact assigned branch. That asymmetry is deliberate: the
+    # branch is assigned by the executor and recorded on the lease, so a PR on it
+    # is this run's primary work by construction, while a title is typed by the
+    # session. If the two ever disagree, the lookup that cannot be mistyped wins —
+    # the alternative is a delivered fix classified as `nothing_to_do` and, for a
+    # producer-filed issue, dismissed with its PR sitting ready on GitHub.
+    # An issue number this cannot parse disqualifies nothing: with no number to
+    # compare against, "titled for somebody else" is not a question that has an
+    # answer, and answering it anyway would drop PRs the branch family found.
+    def belongs_to_issue?(pr, branch, number)
+      return true if !branch.to_s.empty? && pr["headRefName"].to_s == branch.to_s
+      mine = number.to_s[/\A0*(\d+)\z/, 1]
+      return true if mine.nil?
+      titled = titled_issue_number(pr)
+      titled.nil? || titled == mine.to_i
+    end
+
     # Every PR in one repo that belongs to this issue: on a branch in the
     # assigned branch's family, or carrying the issue's `ISS-<n>: ` title prefix.
     #
@@ -198,10 +232,14 @@ module Agent
     # All of them, not just the best one: classification only needs the strongest
     # PR, but the ISSUE needs all of them recorded, or five sixths of a run's work
     # is invisible to everything downstream (ISS-657).
+    #
+    # Minus the ones a session split onto their OWN issue numbers (ISS-759): those
+    # are on sibling branches by contract, so the family lookup finds them, and
+    # they are already tracked, closed out and verified where they belong.
     def prs_in_workspace(workspace, branch, number)
       repos_in_workspace(workspace).flat_map do |repo|
         prs_on_branch(repo, branch) + prs_for_issue(repo, branch, number)
-      end.uniq { |pr| pr["url"] }
+      end.uniq { |pr| pr["url"] }.select { |pr| belongs_to_issue?(pr, branch, number) }
     end
 
     # Fallback lookup when the workspace is gone (a resume, or a GC'd failure):
@@ -215,10 +253,15 @@ module Agent
     # the loose head match cannot stand in for it, so `primary_pr` falls back to
     # newest-wins here. That is the workspace-is-gone path, where the alternative
     # is no PR at all.
+    # A PR titled for another issue is filtered here too (ISS-759). The exact-branch
+    # exemption `belongs_to_issue?` makes cannot apply on this path — search does
+    # not return headRefName — but nothing is lost by it: a PR reaches this list
+    # either through the loose `head:` match, which is exactly how a split sibling
+    # arrives, or through the title search, which only ever finds this issue's own.
     def search_prs(branch, number = nil, owner: "mbryzek")
       hits = search("head:#{branch}", owner: owner)
       hits += search("ISS-#{Integer(number)}", owner: owner, match: "title") if number
-      hits.uniq { |pr| pr["url"] }
+      hits.uniq { |pr| pr["url"] }.select { |pr| belongs_to_issue?(pr, nil, number) }
     rescue ArgumentError, TypeError
       search("head:#{branch}", owner: owner)
     end
