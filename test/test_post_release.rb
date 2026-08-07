@@ -28,6 +28,7 @@ class TestPostRelease < Minitest::Test
   def teardown
     ENV.delete(Util::QUIET_ENV)
     ENV.delete(Util::LOG_FILE_ENV)
+    ENV.delete(Reconcilers::DEFER_ENV)
   end
 
   # Records every command instead of running it. Commands listed in @failing
@@ -127,12 +128,28 @@ class TestPostRelease < Minitest::Test
     refute(@commands.any? { |c| c[:cmd].include?("changelog") })
   end
 
-  def test_reconcilers_run_for_every_app_and_are_not_scoped_to_it
+  # A standalone `release` is the whole deploy, so it still reconciles — for
+  # every app, not just the ones the reconcilers happen to be about.
+  def test_a_standalone_release_reconciles_whatever_app_it_released
     run_quiet(post_release(app: "acumen"))
     %w[features issues].each do |command|
       assert(@commands.any? { |c| c[:cmd] == "#{BIN}/dev #{command} reconcile --apply --skip-generate-json" },
-             "#{command} reconcile must run after every release")
+             "#{command} reconcile must run after a standalone release")
     end
+  end
+
+  # Under `dev deploy` the reconcilers belong to the deploy, which runs them once
+  # after every app has released. A release that ran its own too would be back to
+  # N concurrent `--apply` passes over the same state (ISS-810).
+  def test_a_release_under_dev_deploy_defers_the_reconcilers
+    ENV[Reconcilers::DEFER_ENV] = "1"
+    out = run_quiet(post_release(app: "playbook-app"))
+    assert_equal [
+      ["Publishing apibuilder specs", "done"],
+      ["Recording changelog", "done"],
+    ], stages(out)
+    refute(@commands.any? { |c| c[:cmd].include?("reconcile") },
+           "no reconcile may run inside a release `dev deploy` spawned")
   end
 
   # A reconcile hiccup must never fail a release that has already deployed — but

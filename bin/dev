@@ -350,7 +350,8 @@ USAGE = <<~USAGE
         skipped when stdin is not a terminal (pipes, cron), so scripted
         callers just get the table.
     #{INVOCATIONS["deploy all"]}
-        Release every pending item without prompting. Five phases:
+        Release every pending item without prompting. Five phases, then
+        one reconcile pass:
           1. EXPANDING DB repos (*-postgresql) release serially via
              `release-db`, with RELEASE_AUTO_TAG=1 and
              RELEASE_DB_AUTO_CONFIRM=1 — alongside, in parallel, every app
@@ -384,6 +385,12 @@ USAGE = <<~USAGE
           5. devops, alone and last, as a plain `git pull` — its update
              rewrites the very scripts the phases above shell out to, so it
              must not run while anything else is mid-release.
+        Then, once and only if an app released, `features reconcile
+        --apply` and `issues reconcile --apply`. Neither is app-scoped —
+        both evaluate everything outstanding — so they belong to the
+        deploy, not to each app's release, which used to run them once
+        per app and all at the same time (ISS-810). A standalone
+        `release` still runs them itself.
         If an expanding DB release fails, the matching app (foo for
         foo-postgresql) is skipped to avoid deploying an app against an
         unmigrated schema. Skips repos not on `main` or with a dirty tree.
@@ -8431,7 +8438,11 @@ def release_one(name, progress)
     env = { "RELEASE_AUTO_TAG" => "1", "RELEASE_DB_AUTO_CONFIRM" => "1" }
   else
     release_bin = File.expand_path(File.join(__dir__, "release"))
-    env = { "RELEASE_AUTO_TAG" => "1" }
+    # Reconcilers.defer_env: this deploy runs the two global reconcilers itself,
+    # once, after every phase (run_post_deploy_reconcile). Without it a five-app
+    # deploy ran each of them five times, concurrently, all re-evaluating the
+    # same outstanding set (ISS-810).
+    env = { "RELEASE_AUTO_TAG" => "1" }.merge(Reconcilers.defer_env)
   end
   # release-db accepts either `foo` or `foo-postgresql` as --app; pass the full
   # name so the script doesn't have to guess.
@@ -8719,6 +8730,34 @@ def deploy_app_phase_message(phase, to_run, concurrency)
   end
 end
 
+# The two global reconcilers, ONCE for the whole deploy, after every phase has
+# finished. They are hoisted out of each app's post-release because neither is
+# app-scoped: both evaluate everything outstanding, so a five-app deploy ran
+# each of them five times over, concurrently, and only the first run of each had
+# anything left to apply. At ~7s apiece that redundancy was pure wall clock on
+# every multi-app deploy, and the concurrent `--apply` was five unsynchronised
+# writers against one feature-flag and issue state (ISS-810). The releases this
+# command spawns carry Reconcilers.defer_env so they skip their own run; a
+# standalone `release` still does it, because there the release IS the deploy.
+#
+# Gated on an APP having released, which is exactly the set that used to trigger
+# it: a database, a library or a devops pull runs no post-release at all, and a
+# deploy where every app failed has changed nothing for either reconciler to
+# find. Last, after Phase 5, so the answer to "what is production running" is
+# final before anything asks it.
+#
+# The reconciler object comes from a seam so tests can drive `run_deploys`
+# without an `--apply` against real feature-flag and issue state.
+def post_deploy_reconciler
+  Reconcilers.new(bin_dir: __dir__, skip_regenerate_flag: Config::SKIP_REGENERATE_FLAG)
+end
+
+def run_post_deploy_reconcile(app_pending, results)
+  return unless app_pending.any? { |n| results[n] && results[n][:ok] }
+  puts ""
+  post_deploy_reconciler.run
+end
+
 # Releases `names` and prints the summary. Shared by `deploy all` and the
 # `deploy status` prompt, so both get identical ordering, skip-on-DB-failure,
 # and exit-code behavior. `errors` are deploy-detection failures to report
@@ -8852,6 +8891,8 @@ def run_deploys(pending, concurrency:, errors: [])
     puts ""
     release_serial(devops_pending, results, results_mutex, DeployProgress::Disabled.new)
   end
+
+  run_post_deploy_reconcile(app_pending, results)
 
   pending.each do |n|
     next if skipped.key?(n)

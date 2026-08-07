@@ -168,6 +168,18 @@ module DeployReleaseStubs
   # Names in the order `release_one` saw them.
   attr_reader :released
 
+  # How many times the deploy ran the global reconcilers. ISS-810 is the whole
+  # reason this is counted rather than asserted present: the bug was N of them,
+  # not none.
+  attr_reader :reconcile_runs
+
+  # Stands in for Reconcilers so a test never runs `features reconcile --apply`
+  # or `issues reconcile --apply` for real — those write live feature-flag and
+  # issue state, and `run_deploys` reaches them on every successful app release.
+  FakeReconciler = Struct.new(:on_run) do
+    def run = on_run.call
+  end
+
   def stub_release_seams
     @released = []
     @released_mutex = Mutex.new
@@ -175,6 +187,7 @@ module DeployReleaseStubs
     @registry_apps = default_registry_apps
     @untracked = []
     @contracting = []
+    @reconcile_runs = 0
 
     # Each stub body lands on Object, so `self` inside it is NOT the test — but a
     # lambda defined here keeps this test as its own self, so the ivars above
@@ -191,10 +204,15 @@ module DeployReleaseStubs
     # do not have. Default every DB to expanding — what every test written before
     # ISS-317 assumes — and let a test name its contracting repos.
     partition = ->(db_pending) { db_pending.partition { |n| !@contracting.include?(n) } }
+    # The reconcile pass runs after every phase, so it is not concurrent with
+    # anything — but it is reached from the same run_deploys the release threads
+    # feed, so count it under the same mutex as the releases.
+    reconciler = FakeReconciler.new(-> { @released_mutex.synchronize { @reconcile_runs += 1 } })
 
     stub_global_for_test(:cached_registry) { registry.call }
     stub_global_for_test(:release_one) { |name, _progress| release.call(name) }
     stub_global_for_test(:partition_db_releases) { |db_pending| partition.call(db_pending) }
+    stub_global_for_test(:post_deploy_reconciler) { reconciler }
   end
 
   # Like capture_io, but tolerates SystemExit (cmd_deploy_all calls `exit 1` on
@@ -1614,5 +1632,113 @@ class TestDeployDevopsPhase < Minitest::Test
     out = capture_io { cmd_deploy_all([]) }
     assert_empty @released
     assert_match(/All apps up to date/, out)
+  end
+end
+
+# The global reconcilers belong to the DEPLOY, not to each app's release.
+#
+# `dev deploy` releases apps in parallel and each release used to run
+# `features reconcile --apply` and `issues reconcile --apply` itself, so a
+# five-app deploy ran each of them five times at once — five unsynchronised
+# writers over one feature-flag and issue state, of which only the first had
+# anything left to apply, at ~7s a run (ISS-810). What is pinned here is
+# therefore a COUNT, and the gate that decides whether the count is one or zero.
+class TestDeployPostDeployReconcile < Minitest::Test
+  include DeployReleaseStubs
+
+  def setup
+    @rows = []
+    stub_release_seams
+    rows_ref = -> { @rows }
+    stub_global_for_test(:resolve_deploy_items) { |_| rows_ref.call }
+  end
+
+  def capture_io
+    old = $stdout
+    $stdout = StringIO.new
+    yield
+    $stdout.string
+  ensure
+    $stdout = old
+  end
+
+  # The bug, stated as an assertion: four apps, ONE reconcile pass.
+  def test_a_multi_app_deploy_reconciles_exactly_once
+    @rows = [
+      ["acumen",   { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["rallyd",   { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["michaelb", { tag: "0.0.3", ahead: 1, last: "c" }],
+      ["hackathon", { tag: "0.0.4", ahead: 1, last: "d" }],
+    ]
+    capture_io { cmd_deploy_all(["--concurrency", "4"]) }
+    assert_equal 4, @released.length
+    assert_equal 1, @reconcile_runs
+  end
+
+  def test_a_single_app_deploy_still_reconciles_once
+    @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    capture_io { cmd_deploy_all([]) }
+    assert_equal 1, @reconcile_runs
+  end
+
+  # A deploy in which no app got as far as production has changed nothing either
+  # reconciler reads — and per-app post-release never ran for a failed release
+  # either, so this is the behaviour being preserved, not a new gate.
+  def test_no_reconcile_when_every_app_release_failed
+    @rows = [
+      ["acumen", { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["rallyd", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    @release_results = {
+      "acumen" => { ok: false, log: "boom" },
+      "rallyd" => { ok: false, log: "boom" },
+    }
+    capture_io_with_exit { cmd_deploy_all([]) }
+    assert_equal 0, @reconcile_runs
+  end
+
+  # One survivor is enough: what it shipped is exactly what the reconcilers exist
+  # to notice.
+  def test_reconciles_once_when_only_some_apps_released
+    @rows = [
+      ["acumen", { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["rallyd", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    @release_results = { "rallyd" => { ok: false, log: "boom" } }
+    capture_io_with_exit { cmd_deploy_all([]) }
+    assert_equal 1, @reconcile_runs
+  end
+
+  # A database, a library and a devops pull run no post-release at all, so none
+  # of them ever triggered a reconcile — and none of them changes what production
+  # is RUNNING, which is the only question either reconciler asks.
+  def test_no_reconcile_for_a_deploy_with_no_app_in_it
+    @rows = [
+      ["lib-util", { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["devops",   { tag: "abc1234", prod: "def5678", ahead: 1, ahead_noun: "to pull" }],
+    ]
+    with_tty(true) { capture_io { cmd_deploy_all([]) } }
+    assert_equal %w[lib-util devops], @released
+    assert_equal 0, @reconcile_runs
+  end
+
+  # Last, after every phase: a reconcile that ran before Phase 3's contracting
+  # migration or Phase 5's devops pull would be answering "what is production
+  # running" while the deploy was still changing the answer.
+  def test_reconcile_runs_after_every_release_phase
+    @rows = [
+      ["acumen",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+      ["lib-util",          { tag: "0.0.3", ahead: 1, last: "c" }],
+      ["devops",            { tag: "abc1234", prod: "def5678", ahead: 1, ahead_noun: "to pull" }],
+    ]
+    contracting!("acumen-postgresql")
+    # Records into the same list the releases append to, so the assertion is one
+    # sequence rather than two that have to be correlated by hand.
+    marker = -> { @released << "RECONCILE" }
+    stub_global_for_test(:post_deploy_reconciler) { DeployReleaseStubs::FakeReconciler.new(marker) }
+
+    with_tty(true) { capture_io { cmd_deploy_all([]) } }
+    assert_equal %w[acumen acumen-postgresql lib-util devops RECONCILE], @released
   end
 end
