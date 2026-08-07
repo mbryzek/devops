@@ -327,18 +327,15 @@ module Agent
     #
     # One call, and only for an issue that HAS a parent — the claim already reads
     # the issue itself, which carries the parent reference, so a standalone issue
-    # pays nothing for this.
+    # pays nothing for this. `limit` is the one place that call is bounded, and it
+    # is bounded by ONE EPIC's children rather than by the tracker — the unbounded
+    # read is `issues_list_all` in bin/dev (ISS-889), which is what anything
+    # scanning the whole tracker has to use.
     def child_issue_numbers(parent_number, use_localhost:, limit: 200)
       params = { "parent_number" => parent_number.to_s, "limit" => limit, "offset" => 0 }
       rows = request(:get, "/#{TENANT}/issues?#{URI.encode_www_form(params)}",
                      token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost) || []
       rows.filter_map { |row| row["number"] }
-    end
-
-    def issues(statuses:, use_localhost:, limit: 200)
-      params = { "statuses" => Array(statuses), "limit" => limit, "offset" => 0 }
-      request(:get, "/#{TENANT}/issues?#{URI.encode_www_form(params)}",
-              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost) || []
     end
   end
 end

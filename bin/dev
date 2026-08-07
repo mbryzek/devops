@@ -3025,6 +3025,15 @@ def issues_path(suffix = "")
   "/#{ISSUE_TENANT_ID}/issues#{suffix}"
 end
 
+# One page of the list endpoint, and the most pages `issues_list_all` will read
+# before it decides the server is repeating itself. 100 sits inside the spec's
+# declared `limit` maximum of 101 — the deployed server happens to serve more
+# than it declares, which is exactly the kind of thing to page rather than lean
+# on. 50 pages is 5,000 issues, comfortably past a tracker numbering in the
+# hundreds.
+ISSUES_PAGE_LIMIT = 100
+ISSUES_MAX_PAGES = 50
+
 # Path to the issues LIST endpoint filtered to one or more statuses. The spec
 # parameter is `statuses` (a repeatable list of issue_status) — NOT `status`. A
 # singular `status=open` is an unknown parameter the server silently ignores, so
@@ -3042,15 +3051,57 @@ end
 # alongside units of work. An epic is a container that `POST /claims` refuses
 # (`type != epic` in InternalIssuesDao.claimOpen), so anything offering work to
 # do must pass "issue".
-def issues_list_path(statuses:, category: nil, limit: 100, is_snoozed: nil, parent_number: nil, types: nil)
+#
+# ONE PAGE. The contract caps `limit` at 101 (platform spec/issues.json) and the
+# response is a bare array with no total, so a single call can neither return
+# every matching issue nor say that it didn't. Read through `issues_list_all`,
+# which pages; call this directly only to name a specific page.
+def issues_list_path(statuses:, category: nil, limit: ISSUES_PAGE_LIMIT, offset: 0,
+                     is_snoozed: nil, parent_number: nil, types: nil)
   params = { "statuses" => Array(statuses) }
   params["categories"] = category if category
   params["types"] = Array(types) if types
   params["parent_number"] = parent_number if parent_number
   params["is_snoozed"] = is_snoozed unless is_snoozed.nil?
   params["limit"] = limit
-  params["offset"] = 0
+  params["offset"] = offset
   issues_path("?#{URI.encode_www_form(params)}")
+end
+
+# Every issue matching a filter, by paging the list endpoint until a page comes
+# back short.
+#
+# The single 100-row request this replaces truncated in SILENCE, which is what
+# made it a bug rather than a limit (ISS-889): nothing in a full page says there
+# is another one, so `dev issues list` against a 900-issue tracker was
+# indistinguishable from a 100-issue tracker, and anything filtering that output
+# client-side was filtering a partial page without knowing it. For the rendering
+# callers the cost was missing lines; for `issues reconcile` and the post-deploy
+# changelog scan it was missing WORK — a fixed issue sitting past row 100 is never
+# advanced to deployed and strands with nobody looking at it.
+#
+# Deduped by number because offset paging over a newest-first ordering is not
+# stable: an issue filed between two requests shifts every later row down one, so
+# the row on the page boundary would otherwise come back twice.
+#
+# MAX_PAGES is a runaway guard, not a policy. Tripping it means the server is
+# returning full pages without end, which is a broken filter rather than a big
+# tracker — so it says so on stderr instead of looping forever or silently
+# truncating all over again.
+def issues_list_all(endpoint, **filters)
+  by_number = {}
+  offset = 0
+  ISSUES_MAX_PAGES.times do
+    page = ApiClient.request(
+      endpoint, :get, issues_list_path(limit: ISSUES_PAGE_LIMIT, offset: offset, **filters)
+    ) || []
+    page.each { |issue| by_number[issue["number"]] = issue }
+    return by_number.values if page.length < ISSUES_PAGE_LIMIT
+    offset += ISSUES_PAGE_LIMIT
+  end
+  warn "issues: stopped after #{ISSUES_MAX_PAGES} pages (#{by_number.length} issues) — " \
+       "the list filter is returning more than the tracker plausibly holds."
+  by_number.values
 end
 
 def issue_comments_path(number)
@@ -4943,10 +4994,9 @@ def cmd_issues_list(args)
 
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
-    issues = ApiClient.request(
-      endpoint, :get,
-      issues_list_path(statuses: statuses, category: category, parent_number: epic, is_snoozed: is_snoozed),
-    ) || []
+    issues = issues_list_all(
+      endpoint, statuses: statuses, category: category, parent_number: epic, is_snoozed: is_snoozed
+    )
     # Deferred work is read to decide what to pick back up, so the useful order is
     # by wake time rather than the endpoint's default. See issue_snooze_order_key
     # for why this is sorted here and not asked of the server.
@@ -4959,6 +5009,12 @@ def cmd_issues_list(args)
       puts issue_epic_children_lines(issues)
     else
       issues.each_with_index { |issue, idx| puts issue_summary_line(issue, idx + 1) }
+      # The total, stated. This listing used to be one 100-row page with nothing
+      # saying so, and a reader filtering the output had no way to tell a
+      # 100-issue tracker from the newest 100 of 900 (ISS-889). It is complete
+      # now, and the count is how the output says it is complete.
+      puts ""
+      puts "#{issues.length} #{issues.length == 1 ? 'issue' : 'issues'} — the complete list for this filter."
     end
     puts ""
   end
@@ -5086,9 +5142,7 @@ end
 def issue_family_section(endpoint, issue)
   number = issue.fetch("number")
   if issue["type"] == "epic"
-    children = ApiClient.request(
-      endpoint, :get, issues_list_path(statuses: [], parent_number: number, limit: 100)
-    ) || []
+    children = issues_list_all(endpoint, statuses: [], parent_number: number)
     return "\nEPIC with no children yet. Decompose it:\n#{issue_epic_decompose_command(number)}\n" if children.empty?
 
     done = children.count { |c| %w[deployed verified dismissed].include?(c["status"]) }
@@ -5254,11 +5308,9 @@ def cmd_issues_claim(args)
     # unfiltered preview listed epics, and claiming the "all" it offered came
     # back with nothing claimed and no explanation (an epic-only improvement
     # queue read as "every issue listed was taken or deferred").
-    all_open = ApiClient.request(
-      endpoint,
-      :get,
-      issues_list_path(statuses: "open", category: category, is_snoozed: false, types: "issue"),
-    ) || []
+    all_open = issues_list_all(
+      endpoint, statuses: "open", category: category, is_snoozed: false, types: "issue"
+    )
     # Blocked issues are held out of the offer for the same reason snoozed ones and
     # epics are: `POST /claims` refuses them server-side, so listing them puts work
     # on the menu that cannot be ordered. They are NOT hidden — they are printed
@@ -5508,9 +5560,7 @@ end
 # endpoint returns and what the nudge email shows — is precisely the one that
 # never reaches it.
 def issue_review_queue(endpoint, requested)
-  issues = ApiClient.request(
-    endpoint, :get, issues_list_path(statuses: ISSUE_REVIEW_STATUSES, is_snoozed: false),
-  ) || []
+  issues = issues_list_all(endpoint, statuses: ISSUE_REVIEW_STATUSES, is_snoozed: false)
   ordered = issues.sort_by { |issue| issue.dig("created", "at").to_s }
   return ordered if requested.nil? || requested.empty?
 
@@ -6587,7 +6637,7 @@ end
 # Silent on the zero state, like the deploy pass: this is release output, and
 # "nothing to adopt" is the normal case between misses.
 def issues_adopt_merged_prs(endpoint:, registry:, version_cache:, apply:)
-  claimed = ApiClient.request(endpoint, :get, issues_list_path(statuses: "claimed")) || []
+  claimed = issues_list_all(endpoint, statuses: "claimed")
   return 0 if claimed.empty?
 
   prs_by_number = issue_merged_prs_by_number
@@ -6810,7 +6860,7 @@ def cmd_issues_reconcile(args)
 
     # Read AFTER the adoption pass so anything just rescued is evaluated for deploy
     # in this same run.
-    fixed = ApiClient.request(endpoint, :get, issues_list_path(statuses: "fixed")) || []
+    fixed = issues_list_all(endpoint, statuses: "fixed")
     # Silent on the zero state. This runs after every release, where "nothing to
     # do" is the common case and a "nothing to do" line is pure noise. `dev issues
     # list --status fixed` is the human-facing view.
@@ -12083,8 +12133,7 @@ def changelog_issue_map(use_localhost)
   end
   map = {}
   begin
-    issues = ApiClient.request(issue_endpoint(use_localhost), :get,
-                               issues_list_path(statuses: %w[fixed deployed verified])) || []
+    issues = issues_list_all(issue_endpoint(use_localhost), statuses: %w[fixed deployed verified])
     issues.each do |issue|
       number = issue["number"]
       (issue["fixes"] || []).each do |fix|
