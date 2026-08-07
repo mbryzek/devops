@@ -10829,9 +10829,19 @@ def cmd_autonomy_decide(args)
   exit(decision["disposition"] == "auto_approved" ? 0 : 1)
 end
 
+# The write that closes a decision out, so every way of getting it wrong has to
+# be LOUD. This is the one command in the ledger that records what actually
+# happened after the fact, and an outcome the operator did not mean is
+# indistinguishable afterwards from one they did — there is no second signal to
+# reconcile it against. Hence: exactly one decision id, and exactly one of
+# --applied / --failed, both enforced here rather than inferred downstream
+# (ISS-744).
 def cmd_autonomy_outcome(args)
   rest, _app_filter, use_localhost = parse_common_flags(args)
-  applied = nil
+  # Which of the two outcome flags were SEEN, not what they resolved to: both
+  # assign the same variable, so `--applied --failed "boom"` is indistinguishable
+  # from a plain `--failed` by the time the loop ends.
+  outcome_flags = []
   error = nil
   undo_command = nil
   leftover = []
@@ -10840,10 +10850,10 @@ def cmd_autonomy_outcome(args)
     a = rest[i]
     case a
     when "--applied"
-      applied = true
+      outcome_flags << a
       i += 1
     when "--failed"
-      applied = false
+      outcome_flags << a
       error = rest[i + 1]
       usage_exit("--failed requires an error message", example: usage_for("autonomy outcome")) if error.nil?
       i += 2
@@ -10857,18 +10867,28 @@ def cmd_autonomy_outcome(args)
     end
   end
 
+  decision_id = leftover.shift
   problems = []
-  problems << "A decision id is required" if leftover.empty?
-  problems << "Pass exactly one of --applied or --failed" if applied.nil?
+  problems << "A decision id is required" if decision_id.nil? || decision_id.empty?
+  # An outcome closes out ONE decision. Silently keeping the first and dropping
+  # the rest leaves the operator believing they recorded every id they typed.
+  unless leftover.empty?
+    problems << "unexpected argument(s): #{leftover.join(', ')} " \
+                "(an outcome records one decision - run this once per decision id)"
+  end
+  problems << "Pass exactly one of --applied or --failed" if outcome_flags.empty?
+  if outcome_flags.uniq.length > 1
+    problems << "--applied and --failed are mutually exclusive: an outcome either applied or it failed"
+  end
   report_arg_problems("outcome", problems, usage_for("autonomy outcome"))
 
-  body = { applied: applied }
+  body = { applied: outcome_flags.first == "--applied" }
   body[:error] = error if error
   body[:undo] = { kind: "command", command: undo_command } if undo_command
 
   handle_errors do
     decision = ApiClient.request(autonomy_endpoint(use_localhost), :post,
-                                 "/autonomy/decisions/#{URI.encode_www_form_component(leftover.first)}/outcome",
+                                 "/autonomy/decisions/#{URI.encode_www_form_component(decision_id)}/outcome",
                                  body: body)
     puts "#{decision['status']}: #{decision['action']} #{decision['subject']['label']}"
     if decision["status"] == "contradicted"
@@ -10881,9 +10901,18 @@ end
 def cmd_autonomy_workflows(args)
   rest, _app_filter, use_localhost = parse_common_flags(args)
   endpoint = autonomy_endpoint(use_localhost)
+  # A read rather than a write, but the same drop: `workflows a b` showed a and
+  # said nothing about b, and a mistyped flag became a workflow key to GET
+  # (ISS-744).
+  key = rest.shift
+  unless rest.empty?
+    report_arg_problems("workflows",
+                        ["unexpected argument(s): #{rest.join(', ')} (this view shows one workflow at a time)"],
+                        usage_for("autonomy workflows"))
+  end
 
   handle_errors do
-    if rest.empty?
+    if key.nil? || key.empty?
       rows = ApiClient.request(endpoint, :get, "/autonomy/workflows?limit=100")
       if rows.empty?
         puts "No workflows registered yet."
@@ -10895,7 +10924,7 @@ def cmd_autonomy_workflows(args)
         end
       end
     else
-      w = ApiClient.request(endpoint, :get, "/autonomy/workflows/#{URI.encode_www_form_component(rest.first)}")
+      w = ApiClient.request(endpoint, :get, "/autonomy/workflows/#{URI.encode_www_form_component(key)}")
       puts "#{w['key']} (#{w['mode']})"
       puts "  #{w['description']}"
       autonomy_envelope_lines(w["envelope"]).each { |line| puts line }
@@ -11049,13 +11078,22 @@ def cmd_autonomy_reverted(args)
       i += 1
     end
   end
-  report_arg_problems("reverted", leftover.empty? ? ["A decision id is required"] : [], usage_for("autonomy reverted"))
+  decision_id = leftover.shift
+  problems = []
+  problems << "A decision id is required" if decision_id.nil? || decision_id.empty?
+  # Same reasoning as `autonomy outcome`: one revert completion per command, so a
+  # second id is a mistake to reject and not a row to drop (ISS-744).
+  unless leftover.empty?
+    problems << "unexpected argument(s): #{leftover.join(', ')} " \
+                "(a revert completion records one decision - run this once per decision id)"
+  end
+  report_arg_problems("reverted", problems, usage_for("autonomy reverted"))
 
   body = { succeeded: succeeded }
   body[:note] = note if note
   handle_errors do
     decision = ApiClient.request(autonomy_endpoint(use_localhost), :post,
-                                 "/autonomy/decisions/#{URI.encode_www_form_component(leftover.first)}/revert/completion",
+                                 "/autonomy/decisions/#{URI.encode_www_form_component(decision_id)}/revert/completion",
                                  body: body)
     puts "#{decision['id']}: #{decision['status']}"
   end
