@@ -516,16 +516,25 @@ USAGE = <<~USAGE
         on exit 0.
 
     #{INVOCATIONS["schema lint"]}
-        Replay a schema repo's migration scripts, in the order sem-apply runs
-        them, and report any object created twice — the failure that halts sem
-        and blocks EVERY migration behind it, not just the pair that collided.
-        Pure text, no database, about a second over 900 scripts. With no --app it
-        lints every schema repo checked out under ~/code; inside a feature dir it
-        lints that clone, not Mike's. Exit 0 clean, 1 collisions found.
-        This is the check that was missing when platform-postgresql #506 and #507
-        merged 23 seconds apart, each creating issues.issue_intake_senders from a
-        different draft of the same DAO spec (ISS-592). It also runs by itself as
-        a preflight in `claude-db sync`, `db-image build` and `release-db`.
+        Two checks over a schema repo. Pure text, no database, about a second
+        over 900 scripts. With no --app it lints every schema repo checked out
+        under ~/code; inside a feature dir it lints that clone, not Mike's.
+        Exit 0 clean, 1 anything found.
+        COLLISIONS: replay the scripts in the order sem-apply runs them and
+        report any object created twice — the failure that halts sem and blocks
+        EVERY migration behind it, not just the pair that collided. This is the
+        check that was missing when platform-postgresql #506 and #507 merged 23
+        seconds apart, each creating issues.issue_intake_senders from a different
+        draft of the same DAO spec (ISS-592). It also runs by itself as a
+        preflight in `claude-db sync`, `db-image build` and `release-db`.
+        INCOMPATIBLE MIGRATIONS: report any UNRELEASED script that renames or
+        retypes an object released code still names. No deploy ordering survives
+        one — applied before the app the old code breaks, applied after the new
+        code does — so it needs three releases (add, migrate the code, drop) and
+        this refuses it while that is still free to do. ISS-864: one
+        `rename column producer_key to producer_id` 500'd every read and write of
+        issues.issues for five minutes. Opt out per object, in the script:
+        `-- schema-compat: no-live-reader <object> -- <why nothing released reads it>`.
 
     #{INVOCATIONS["codegen sync"]}
         Regenerate every codegen-consuming repo against the latest generators and
@@ -7623,21 +7632,34 @@ def cmd_schema_lint(args)
          end
 
   # Every app is linted before the exit code is decided: one dirty schema repo
-  # must not hide the state of the next one.
-  colliding = apps.select do |app|
+  # must not hide the state of the next one. Both checks run on every app for
+  # the same reason — a collision must not hide a rename, and they are fixed by
+  # different edits to different scripts.
+  failing = apps.select do |app|
     app.require_repo!
-    found = SchemaCollisions.scan(app.repo_dir)
-    if found.empty?
+    collisions = SchemaCollisions.scan(app.repo_dir)
+    unreleased = SchemaCompat.unreleased_scripts(app.repo_dir)
+    incompatible = SchemaCompat.scan_scripts(app.repo_dir, unreleased)
+
+    if collisions.empty?
       count = SchemaCollisions.scripts(app.repo_dir).length
       puts "#{app.name}: #{count} script(s) in #{app.repo_dir} — no object created twice."
     else
       puts ""
-      puts SchemaCollisions.failure_message(app.repo_dir, found)
+      puts SchemaCollisions.failure_message(app.repo_dir, collisions)
     end
-    !found.empty?
+
+    if incompatible.empty?
+      puts "#{app.name}: #{unreleased.length} unreleased script(s) — none renames or retypes a live object."
+    else
+      puts ""
+      puts SchemaCompat.failure_message(app.repo_dir, incompatible)
+    end
+
+    !collisions.empty? || !incompatible.empty?
   end
 
-  exit 1 unless colliding.empty?
+  exit 1 unless failing.empty?
 end
 
 def cmd_docker_prune(args)

@@ -33,8 +33,14 @@ require 'set'
 # breaks the old code; applied late it breaks the new code. Ordering can only
 # choose which side pays, and choosing "late" at least shortens the window from
 # the app's whole build-and-rollout to the seconds between Phase 2 and Phase 3.
-# The actual cure for a rename is two releases - add the new name, deploy, then
-# drop the old one - and nothing here can substitute for that.
+# The actual cure for a rename is three releases - add the new name, migrate the
+# code, then drop the old one - and nothing here can substitute for that.
+#
+# That paragraph stood unenforced for four days and production paid for it a
+# third time (ISS-864, `issues.issues.producer_key` -> `producer_id`). It is
+# SchemaCompat's job now: this module still classifies a rename CONTRACTING, so
+# a release that already carries one is ordered as well as it can be, and
+# SchemaCompat is what refuses it before it merges.
 #
 # The classification errs toward EXPANDING on purpose. A false "contracting"
 # defers a migration the new code needs until after its rollout, which is the
@@ -173,16 +179,21 @@ module SchemaScripts
     end
   end
 
+  # Every tag in the repo, newest first. Version-sorted rather than date-sorted:
+  # sem tags are `x.y.z` and a re-tagged release would otherwise reorder them.
+  # Empty when the repo has no tags, or is not a git repo at all.
+  def SchemaScripts.tags(repo_dir)
+    out, _err, status = Open3.capture3("git", "tag", "--list", "--sort=-v:refname", chdir: repo_dir)
+    return [] unless status.success?
+    out.split("\n").map(&:strip).reject(&:empty?)
+  end
+
   # The tag released immediately before `tag`, or nil when `tag` is the first.
-  # Version-sorted rather than date-sorted: sem tags are `x.y.z` and a re-tagged
-  # release would otherwise reorder them.
   def SchemaScripts.previous_tag(repo_dir, tag)
-    out, status = Open3.capture2("git", "tag", "--list", "--sort=-v:refname", chdir: repo_dir)
-    return nil unless status.success?
-    tags = out.split("\n").map(&:strip).reject(&:empty?)
-    index = tags.index(tag)
+    all = tags(repo_dir)
+    index = all.index(tag)
     return nil if index.nil?
-    tags[index + 1]
+    all[index + 1]
   end
 
   # Operator-facing rendering of `contracting`: script by script, statement by
