@@ -77,25 +77,45 @@ module Agent
     # a shortened streak.
     def errors_lock    = File.join(state_dir, "agent-errors.lock")
 
-    # How this box's capacity is split between agent sessions and CI jobs
-    # (Agent::Ci, ISS-763). Written by `dev ci install`, read by `dev ci run` and
-    # by the tick's admission control.
+    # ---- the fleet verify job (Agent::Verify, ISS-848)
     #
-    # LOCAL rather than a field on the platform's runner row, and the distinction
-    # is the same one state_dir draws everywhere else: the registry derives
-    # max_concurrency from reported HARDWARE, which is a fact about the machine.
-    # How that capacity is divided is an operator's decision about this machine,
-    # taken when a runner is installed on it — and the tick has to be able to read
-    # it while the platform is unreachable, because the alternative is a box that
-    # oversubscribes itself for the length of an outage.
-    def ci_config_file = File.join(state_dir, "ci.json")
+    # There is no `ci.json` and no slot directory here any more, and their absence
+    # is the point of ISS-848 rather than an omission: they existed to split ONE
+    # machine between two schedulers, and there is only one scheduler now. A
+    # verify job claims through the same tick, against the same `max_concurrency`,
+    # so there is nothing to reserve and nothing to arbitrate.
 
-    # The CI slot semaphore: one lock file per reserved slot, held by `flock` for
-    # as long as the build process lives. Nothing is ever read out of them — the
-    # pid inside is for a human running `lsof` — so there is no state here to
-    # leak or expire, which is the property that keeps this off Agent::Tick's
-    # "there is no daemon" ledger.
-    def ci_slots_dir = File.join(state_dir, "ci-slots")
+    # One record per in-flight verify job, keyed by repo and sha. Same status as
+    # jobs_dir: a cache whose only question is "is this pid alive".
+    def verify_jobs_dir      = File.join(state_dir, "verify-jobs")
+    def verify_job_file(key) = File.join(verify_jobs_dir, "#{key}.json")
+
+    # "does ci/build.sh exist at <sha>" — an answer that can be cached FOREVER,
+    # because a sha is immutable. Bounded in Agent::Verify; without it every scan
+    # re-asks the same question about the same unenrolled pull requests.
+    def verify_enrolment_file = File.join(state_dir, "verify-enrolment.json")
+
+    # When this machine last walked the lane looking for work, and last looked at
+    # `main`. A throttle in exactly the sense maintenance_file is: the tick fires
+    # every 30 seconds and the walk is one API call per repo, so the cadence is
+    # decided here rather than by launchd.
+    def verify_scan_file = File.join(state_dir, "verify-scan.json")
+
+    # Where a repo is checked out to BUILD it — never a session's workspace, or
+    # the green measures a tree nobody is merging.
+    #
+    # THE ONE EXPENSIVE THING UNDER state_dir, and deliberately so: it holds the
+    # incremental state (`target/`, `node_modules/`) that is the entire argument
+    # for building on our own hardware. Deleting it still costs nothing but a cold
+    # build, so "delete ~/.platform and lose nothing that is a source of truth"
+    # stays true.
+    def ci_checkouts_dir  = File.join(state_dir, "ci-checkouts")
+    def ci_checkout(repo) = File.join(ci_checkouts_dir, repo.to_s.tr("/", "-"))
+
+    # A verify job's log tree, beside the issue logs and for the same reason: the
+    # artifact has to outlive the process that produced it, because a red `ci`
+    # status names this path and a human reads it hours later.
+    def verify_log_dir(key) = File.join(log_root, "ci", key)
 
     def tick_log(date)      = File.join(log_root, "tick", "#{date.strftime('%Y-%m-%d')}.log")
     def issues_dir          = File.join(log_root, "issues")

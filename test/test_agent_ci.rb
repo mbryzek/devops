@@ -2,25 +2,27 @@
 require 'minitest/autorun'
 require 'fileutils'
 require 'tmpdir'
-require 'yaml'
 require_relative 'test_helper'
 require 'agent/ci'
 require 'agent/errors'
 require 'agent/merge_lane'
 require 'agent/tick'
 
-# The runner-local half of CI (ISS-763).
+# The machine-side half of CI: is this runner fit to produce a verdict, and may
+# it trust what it has cached. The JOB that uses both is Agent::Verify — see
+# test_agent_verify.rb.
 #
 # What makes this worth testing rather than eyeballing is that every failure here
-# is SILENT in the direction that matters. An oversubscribed box does not raise,
-# it swaps. A stale cache does not go red, it goes GREEN and the merge lane lands
-# it. A preflight that reports an infrastructure fault as exit 1 does not lose
-# information anybody can see missing — it just makes a broken runner look like a
-# broken branch, and the PR gets read instead of the machine.
+# is SILENT in the direction that matters. A stale cache does not go red, it goes
+# GREEN and the merge lane lands it. A preflight that reports an infrastructure
+# fault as exit 1 does not lose information anybody can see missing — it just
+# makes a broken runner look like a broken branch, and the PR gets read instead
+# of the machine.
 #
-# So the assertions are about the three properties, one file each way they lie:
-# the reservation actually comes out of what the tick claims, the semaphore
-# actually excludes, and a fault is actually distinguishable from a test failure.
+# The slot and reservation assertions that used to live here are gone with the
+# thing they tested (ISS-848). They existed because GitHub Actions was a second
+# scheduler on this hardware; there is one scheduler now, and what replaced the
+# arithmetic is an ORDERING, asserted in test_agent_verify.rb.
 class TestAgentCi < Minitest::Test
   include DevTestSupport
 
@@ -33,166 +35,6 @@ class TestAgentCi < Minitest::Test
         yield root
       ensure
         ENV["DEV_AGENT_STATE_DIR"] = previous
-      end
-    end
-  end
-
-  def provision(slots)
-    Agent::Paths.write_json(Agent::Paths.ci_config_file, { "slots" => slots })
-  end
-
-  # ---- the reservation ------------------------------------------------------
-
-  def test_a_machine_with_no_ci_config_reserves_nothing
-    with_state_dir do
-      assert_equal 0, Agent::Ci.reserved
-      refute Agent::Ci.enabled?
-    end
-  end
-
-  def test_slots_are_read_from_the_config
-    with_state_dir do
-      provision(2)
-      assert_equal 2, Agent::Ci.reserved
-      assert Agent::Ci.enabled?
-    end
-  end
-
-  # A hand-edited config must degrade to "no CI here", never to a reservation
-  # nobody intended. Reserving garbage would subtract garbage from what the tick
-  # claims, and a machine that silently stops claiming looks exactly like a
-  # machine with an empty queue.
-  def test_a_malformed_slot_count_reserves_nothing
-    with_state_dir do
-      [nil, "two", -3, "", {}].each do |value|
-        Agent::Paths.write_json(Agent::Paths.ci_config_file, { "slots" => value })
-        assert_equal 0, Agent::Ci.reserved, "slots: #{value.inspect}"
-      end
-    end
-  end
-
-  # THE POINT OF THE WHOLE RESERVATION: it comes out of the tick's admission
-  # control, so the two schedulers on one box add up to the box.
-  def test_the_tick_claims_fewer_sessions_by_the_reservation
-    with_state_dir do
-      t = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: true,
-                          now: Time.now, verbose: false)
-      runner = { "max_concurrency" => 3 }
-
-      assert_equal 3, t.send(:session_capacity, runner)
-      provision(1)
-      assert_equal 2, t.send(:session_capacity, runner)
-      provision(3)
-      assert_equal 0, t.send(:session_capacity, runner), "a CI-only box claims nothing"
-    end
-  end
-
-  # Zero, not negative: a reservation larger than the machine is a provisioning
-  # mistake, and `(max - live).times` on a negative number is a loop that does
-  # not run — which is right — but a negative capacity printed in the log line is
-  # not something anybody should have to interpret at 3am.
-  def test_an_over_large_reservation_floors_at_zero_rather_than_going_negative
-    with_state_dir do
-      provision(9)
-      t = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: true,
-                          now: Time.now, verbose: false)
-      assert_equal 0, t.send(:session_capacity, { "max_concurrency" => 2 })
-    end
-  end
-
-  # The reservation has to be NAMED wherever capacity is reported, because the
-  # state it produces on a CI-only box — "at capacity (0/0)" — is otherwise
-  # indistinguishable from a broken registry read.
-  def test_the_capacity_note_names_the_reservation_when_there_is_one
-    with_state_dir do
-      t = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: true,
-                          now: Time.now, verbose: false)
-      assert_equal "", t.send(:ci_reservation_note)
-      provision(2)
-      assert_match(/2 reserved for CI/, t.send(:ci_reservation_note))
-    end
-  end
-
-  # ---- the slot semaphore ---------------------------------------------------
-
-  # A slot is held by a LIVE PROCESS, so the exclusion has to be proved across
-  # processes — a same-process flock re-lock succeeds and would prove nothing.
-  def test_a_held_slot_excludes_another_process
-    with_state_dir do
-      provision(1)
-      child = hold_slot_in_child(seconds: 5)
-      begin
-        wait_until { Agent::Ci.slots_held == 1 }
-        assert_equal 1, Agent::Ci.slots_held
-        assert_equal :timed_out, Agent::Ci.with_slot(wait_seconds: 1, poll_seconds: 0.1) { :ran },
-                     "the only slot was held, so nothing should have run"
-      ensure
-        reap(child)
-      end
-    end
-  end
-
-  # ...and releases it when the holder dies, with no reaper, no expiry and
-  # nothing to clean up: the fd closes and the kernel drops the lock. That is the
-  # property that keeps a slot manager off Agent::Tick's "there is no daemon"
-  # ledger.
-  def test_a_slot_is_free_again_once_its_holder_is_gone
-    with_state_dir do
-      provision(1)
-      child = hold_slot_in_child(seconds: 30)
-      wait_until { Agent::Ci.slots_held == 1 }
-      Process.kill("KILL", child)
-      Process.wait(child)
-
-      wait_until { Agent::Ci.slots_held.zero? }
-      assert_equal :ran, Agent::Ci.with_slot(wait_seconds: 5, poll_seconds: 0.1) { :ran }
-    end
-  end
-
-  def test_a_second_slot_is_available_while_the_first_is_held
-    with_state_dir do
-      provision(2)
-      child = hold_slot_in_child(seconds: 5)
-      begin
-        wait_until { Agent::Ci.slots_held == 1 }
-        assert_equal :ran, Agent::Ci.with_slot(wait_seconds: 1, poll_seconds: 0.1) { :ran }
-      ensure
-        reap(child)
-      end
-    end
-  end
-
-  def test_with_slot_returns_the_blocks_value_and_yields_the_index
-    with_state_dir do
-      provision(2)
-      assert_equal 0, Agent::Ci.with_slot(wait_seconds: 1) { |index| index }
-    end
-  end
-
-  # An unprovisioned box running a CI job is a provisioning mistake, and it must
-  # say so rather than silently running the build with no admission control at
-  # all — which is the oversubscription this whole mechanism exists to prevent.
-  def test_with_slot_refuses_on_a_machine_that_reserves_nothing
-    with_state_dir do
-      error = assert_raises(RuntimeError) { Agent::Ci.with_slot { :ran } }
-      assert_match(/not provisioned/, error.message)
-    end
-  end
-
-  # The deadline is what separates "this box is busy" from "this runner is
-  # wedged", so it has to be the deadline asked for rather than the next multiple
-  # of the poll interval.
-  def test_the_wait_honours_its_deadline_rather_than_the_poll_interval
-    with_state_dir do
-      provision(1)
-      child = hold_slot_in_child(seconds: 10)
-      begin
-        wait_until { Agent::Ci.slots_held == 1 }
-        started = Time.now
-        assert_equal :timed_out, Agent::Ci.with_slot(wait_seconds: 1, poll_seconds: 30) { :ran }
-        assert_operator Time.now - started, :<, 10, "the poll interval must not extend the deadline"
-      ensure
-        reap(child)
       end
     end
   end
@@ -333,8 +175,8 @@ class TestAgentCi < Minitest::Test
 
       assert_equal 1, filed.length
       assert_match(/cannot produce a verdict/, filed.first[:title])
-      assert_match(/dev ci install --slots 0/, filed.first[:body],
-                   "the issue must say how to take the box out of the pool")
+      assert_match(/dev agent pause/, filed.first[:body],
+                   "the issue must say how to take the box out of the pool, with a command that exists")
       assert_equal "bug", filed.first[:category]
     end
   end
@@ -366,74 +208,7 @@ class TestAgentCi < Minitest::Test
     end
   end
 
-  # ---- the check contract ---------------------------------------------------
-
-  # THE NAME `ci` IS THE ENROLMENT. Agent::MergeLane finds its one
-  # `statusCheckRollup` entry by that literal string, and a repo whose PRs carry
-  # no `ci` check merges nothing — deliberately, as the enrolment rule. So a
-  # template that renamed the gate job would not fail loudly anywhere: every repo
-  # copied from it would simply, silently, stop being mergeable.
-  def test_every_workflow_template_names_its_gate_job_ci
-    templates.each do |path, doc|
-      assert_includes doc.fetch("jobs").keys, Agent::MergeLane::CI_CHECK,
-                      "#{path} must define a job named #{Agent::MergeLane::CI_CHECK}"
-      gate = doc.fetch("jobs").fetch(Agent::MergeLane::CI_CHECK)
-      assert_equal Agent::MergeLane::CI_CHECK, gate["name"],
-                   "#{path}: the check name GitHub publishes is the job's `name:`"
-    end
-  end
-
-  # One check per repo, not one per shard. The gate has to depend on every other
-  # job in the file, or a shard added later reports separately and the lane —
-  # which reads exactly one entry — never sees it fail.
-  def test_the_gate_job_depends_on_every_other_job
-    templates.each do |path, doc|
-      jobs = doc.fetch("jobs")
-      others = jobs.keys - [Agent::MergeLane::CI_CHECK]
-      gate = jobs.fetch(Agent::MergeLane::CI_CHECK)
-      assert_equal others.sort, Array(gate["needs"]).sort, "#{path}: gate must aggregate every shard"
-      assert_equal "always()", gate["if"], "#{path}: a gate that skips on failure reports nothing"
-    end
-  end
-
-  # The slot semaphore is the ONLY admission control on a box running
-  # repository-level runners for several repos at once, and it is opt-in per
-  # step: a build shelled directly runs outside it. A template that did that
-  # would teach every repo copied from it to oversubscribe the machine.
-  def test_every_template_runs_its_build_through_the_slot
-    templates.each do |path, doc|
-      steps = doc.fetch("jobs").fetch("build").fetch("steps")
-      build = steps.find { |s| s["name"] == "build" }
-      refute_nil build, "#{path} has no build step"
-      assert_match(/dev ci run --/, build.fetch("run"), "#{path}: the build must hold a CI slot")
-    end
-  end
-
-  def templates
-    paths = Dir[File.expand_path("../templates/ci/*.yml", __dir__)]
-    refute_empty paths, "no workflow templates found"
-    paths.to_h { |path| [File.basename(path), YAML.safe_load_file(path, aliases: true)] }
-  end
-
   # ---- helpers --------------------------------------------------------------
-
-  # Fork a child that takes a slot and holds it. Forked rather than threaded
-  # because the exclusion under test is between PROCESSES: flock is per open file
-  # description, so a second thread in this process would take the same lock
-  # happily and the test would pass while proving nothing.
-  def hold_slot_in_child(seconds:)
-    fork do
-      Agent::Ci.with_slot(wait_seconds: 5, poll_seconds: 0.1) { sleep(seconds) }
-      exit!(0)
-    end
-  end
-
-  def reap(pid)
-    Process.kill("KILL", pid)
-    Process.wait(pid)
-  rescue Errno::ESRCH, Errno::ECHILD
-    nil
-  end
 
   def with_notifications_disabled
     previous = ENV["DEV_AGENT_NO_NOTIFY"]
@@ -441,12 +216,6 @@ class TestAgentCi < Minitest::Test
     yield
   ensure
     ENV["DEV_AGENT_NO_NOTIFY"] = previous
-  end
-
-  def wait_until(timeout: 10)
-    deadline = Time.now + timeout
-    sleep(0.05) until yield || Time.now > deadline
-    raise "condition never became true within #{timeout}s" unless yield
   end
 
   # Every probe shells out through Agent::Shell.capture, so one stub covers all

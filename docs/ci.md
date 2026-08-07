@@ -1,7 +1,7 @@
-# CI on self-hosted runners
+# CI: the fleet verify job
 
-How the runners the merge lane depends on are provisioned, and the four ways a
-correctly-written workflow still produces a wrong answer.
+How the `ci` check the merge lane depends on is produced, and the four ways a
+correctly-written build still produces a wrong answer.
 
 ISS-754 built the lane: it merges a PR only when the `ci` check passed on the
 exact commit about to be squashed, and that commit contains the current tip of
@@ -9,94 +9,163 @@ exact commit about to be squashed, and that commit contains the current tip of
 
 **Nothing here is enforced by GitHub.** There is no branch protection anywhere in
 this account and none is being adopted, so `gh pr merge` on a red PR succeeds.
-The lane is the only merger and `dev ci` is the only admission control. Both are
+The lane is the only merger and this is the only thing that verifies. Both are
 code in this repo, with tests, because there is no second layer to catch either.
 
 ---
 
-## Quick start
+## What produces the check
 
-On a machine that should run CI:
+A **verify job**: the second unit of work `Agent::Tick` schedules, and
+deliberately not a Claude session.
 
 ```
-dev ci install --slots 1              # reserve capacity FIRST
-bin/ci-runner-install mbryzek/<repo>  # then register a runner (a human step)
-dev ci status
+checkout <repo>@<sha> (detached)  ->  ci/build.sh  ->  POST /statuses/<sha> context=ci
 ```
 
-Then, in the repo, copy `templates/ci/ci.yml` (or `ci-scala.yml`) to
-`.github/workflows/ci.yml`, change the two marked places, and merge it.
+No model. A fixed command, an exit code, a deadline and a commit status. Scoping
+it as "a session that runs the tests" would put an LLM in the one loop that has
+to be deterministic, and would bill tokens per re-verification — of which there
+are many, for the reason in the next section.
 
-**Order matters.** Enrolment in the lane is the presence of the `ci` check, so
-landing the workflow before a runner is listening gives every PR in that repo a
-check that queues for 24 hours and then fails. Runner first, always.
+`Agent::MergeLane` needs no change to read it, and that is the property that made
+this swap cheap: `check_name` already reads `name` **or** `context`, and
+`check_state` already reads `state` **or** `status`+`conclusion`, because GitHub
+returns CheckRuns and StatusContexts through the same `statusCheckRollup` array.
+A commit status posted by the fleet lands in the arm that was already there. The
+suite asserts that arm exists, so a later refactor cannot quietly drop it.
+
+### Why there is no GitHub Actions half any more (ISS-848)
+
+ISS-763 produced this check from GitHub Actions on self-hosted runners, and
+carried a reservation file, a flock slot semaphore, a subtraction inside
+`Agent::Tick#session_capacity`, and a per-repo-per-box human install that mints a
+registration token on a personal account.
+
+Every one of those existed for one reason: **Actions is a second scheduler on
+hardware the tick already schedules.** Neither can see the other, so they need an
+agreed split. None of it is about verifying code. Delete the second scheduler and
+all of it goes — and two awkward things fall out in the other direction:
+
+- **Every machine runs CI for free.** No install anywhere: a box runs verify jobs
+  because it runs the tick. Under the reservation model this was the opposite of
+  free — the laptop's `max_concurrency` is 1, so reserving one CI slot on it drove
+  `session_capacity` to `max(1-1, 0) = 0` and it would have stopped claiming
+  sessions entirely.
+- **No human step.** `bin/ci-runner-install` was an account-level action no
+  autonomous session may take, which is why ISS-773 sat in `needs_input`. Nothing
+  here needs a credential the fleet does not already hold.
+
+The independence argument for a hosted runner is weak enough not to weigh against
+this, and it is worth writing down so nobody re-derives it as an objection.
+`Agent::MergeLane.check_name` already accepts a `StatusContext`, so any agent with
+`gh` can post `context=ci, state=success` on a sha today and the lane will merge
+on it. And `pull_request` runs the workflow file *from the PR branch*, so an
+Actions PR can weaken its own `ci.yml`. A runner buys a green that is hard to
+produce by accident, not one that is hard to forge — and a verify job in a
+separate process on a clean checkout has the same property.
 
 ---
 
-## Capacity
+## The actual requirement is RE-verification
 
-Both existing fleet machines were already fully committed to agent sessions:
+This is what an agent running the suite in-session does not satisfy, and what the
+design has to.
 
-| machine | hardware | agent concurrency |
-|---|---|---|
-| `Michaels-MacBook-Pro.local` | M4 Max, 16 cores, 64G | 1 |
-| `Mac` | M4, 10 cores, 24G | 3 |
+Under the lane's AHEAD invariant, **every merge invalidates every other open PR
+in that repo.** `update_branch!` merges the base under each one, which pushes a
+new head sha, which needs a *new* check on *that* sha — the FRESH invariant
+refuses a check attached to any earlier push. With a ~50-deep standing queue that
+is verification on the order of PRs x merges, each answering in minutes,
+triggered by a push nobody is watching.
 
-CI capacity has to come from somewhere, and taking it from the fleet is the
-correct trade: the fleet already produces more PRs than can be merged — a ~50-deep
-standing queue is the evidence — so converting session slots into verification
-slots moves capacity from the over-supplied side to the bottleneck.
+Actions gave that trigger for free. The fleet has to produce it, and `scan` is
+where it does.
 
-- **`Mac` (24G):** agent concurrency 3 → 2, CI gets 1–2 slots. Same total load,
-  better mix. (Dropping to 2 is what ISS-753 wants anyway, on memory grounds.)
-- **`Michaels-MacBook-Pro.local`:** leave it alone. It is Mike's laptop, and CI
-  jobs stealing cycles while he works is a bad trade for one extra slot.
+---
 
-### One pool, one number
+## The loop
 
-`max_concurrency` is derived server-side from the hardware a runner reports — a
-fact about the machine. **How that capacity is split is not**: it is an
-operator's decision about one box, so it lives in `~/.platform/ci.json`, written
-by `dev ci install` and read by both `dev ci run` and the tick.
+### Enqueue — the lane's own walk, read from the other side
 
-The tick subtracts the reservation from `max_concurrency` before it claims
-(`Agent::Tick#session_capacity`). Two schedulers each sizing themselves to the
-same machine is how a box ends up swapping at 100% CPU making progress on
-neither, and this is the one number that stops it.
+`Agent::Verify.scan` walks every open PR in `LANE_REPOS` (minus the
+self-deploying ones) and looks for the state the lane calls `:no_ci_verdict`: a
+head sha with no `ci` entry in its rollup. That is the enqueue signal.
 
-### Reserved, not borrowed
+Three properties, each of which is a measured failure if dropped:
 
-The reservation comes out of the tick's capacity **whether or not a CI job is
-running**. When no PR is open, those cores sit idle rather than running one more
-session. That is deliberate:
+- **Dedup by (repo, head sha), fleet-wide.** The runner posts `pending` carrying
+  a token only it knows, then reads the context back. GitHub keeps the latest
+  status per context, so exactly one racing box sees its own token and the losers
+  drop the job before spending a build. It lives on GitHub rather than in a file
+  on the runner precisely because the other box has to be able to see it.
+- **`pending` at ENQUEUE, not at start.** It is what makes the job visible to the
+  lane (`:ci_pending`) and to a human ("queued on Mac"), and what makes the next
+  scan's dedup readable off GitHub rather than out of local state.
+- **A cap per pass, and what it drops is LOGGED.** One merge in a 50-PR repo
+  makes 49 siblings need a new check at once; without a cap the first scan after
+  a merge fills the fleet with verify jobs. A silent cap reads as "everything is
+  covered" when it is not.
 
-- An agent session runs for **hours** and its work is deferrable — the queue
-  keeps.
-- A CI job runs for **minutes** and something is already waiting on it.
+Reading the rollup rather than the statuses endpoint is also what lets a repo that
+still produces `ci` from GitHub Actions coexist: an Actions CheckRun appears there
+too, so such a repo is never enqueued here. That is a transition affordance, not a
+supported end state — **one producer of `ci` per repo**, or the two race on one
+commit and the lane reads whichever landed last.
 
-If CI had to borrow a slot back from a running session, a PR would wait hours for
-a check — and the lane cannot distinguish a check queued behind a four-hour
-session from a check on a dead runner. It reads `:ci_pending` and waits, forever,
-on both. An idle core is a cheaper mistake than a merge queue that stops.
+### Enrolment — `ci/build.sh` at the head sha
 
-### Why the slot semaphore exists at all
+**A repo is enrolled when `ci/build.sh` exists at the pull request's head sha.**
 
-`mbryzek` is a personal account, not an organization. GitHub supports self-hosted
-runners at repository, organization and enterprise level — **so repository level
-is the only option here**. Eight repos means eight listener processes on a box,
-each of which will accept a job the instant one is queued, and nothing at the
-GitHub layer limits their sum.
+Same shape as the rule it replaces — enrolment was the presence of a `ci` check,
+deliberately, so there is no second registry to drift from the workflows that
+exist — with the file changed. Still self-describing, still enrolled by a merge
+and withdrawn by a deletion, and now the enrolling commit is one the lane can
+read at the sha it is verifying.
 
-`dev ci run` is that limit. It holds one of the reserved slots for the length of
-the build, using `flock` on N lock files — so liveness is the kernel's problem, a
-killed job releases its slot when the fd closes, and there is no lease, expiry or
-reaper to go wrong. **A workflow step that shells the build directly bypasses it
-and oversubscribes the machine.**
+The answer is cached permanently per sha, because a sha is immutable. Without
+that, ten repos with no CI would re-answer the same question every scan and burn
+the API budget the enrolled ones need.
 
-A job that waits out `--wait` without getting a slot exits 75 as an
-infrastructure fault, not as a test failure. That is also the signal that this
-box is short of capacity, which makes the buy-a-mini trigger below measurable
-rather than a feeling.
+Copy `templates/ci/build.sh` (or `build-scala.sh`), change the marked place,
+`chmod +x`, merge.
+
+### Result — a commit status
+
+```
+POST /repos/{owner}/{repo}/statuses/{sha}   context=ci   state=success|failure|pending
+```
+
+Always on **the sha that was actually built**, never re-pointed at the current
+head. If the branch moved underneath the build, the lane's FRESH check rejects the
+result, which is correct: re-pointing it would be a green measured on a tree
+nobody built.
+
+---
+
+## Capacity: one pool, one number
+
+Verify jobs claim through the same tick that claims agent sessions, against the
+same `max_concurrency`. That is the entire simplification — there is no second
+scheduler on the box, so there is nothing to reserve, nothing to subtract, and no
+way for the two to oversubscribe the machine.
+
+What the ISS-763 reservation was buying is **priority**, and that survives as
+ordering rather than as arithmetic: the tick claims verify jobs **before** it
+claims sessions.
+
+- An agent session runs for **hours** and its work is deferrable — the queue keeps.
+- A verify job runs for **minutes** and a pull request is already waiting on it,
+  and the lane cannot distinguish a check queued behind a four-hour session from
+  a check on a dead runner. It reads `:ci_pending` and waits on both.
+
+The honest cost, stated so nobody is surprised by it: **ordering only helps when a
+slot frees.** A box saturated with four-hour sessions verifies nothing until one
+ends. The reservation guaranteed a floor and this does not. That is the trade
+ISS-848 accepted, and the trigger for revisiting it is queue age — see below.
+
+`dev agent pause` covers both kinds of work, because both claim through the same
+tick. That is the one lever that takes a bad machine out of the pool.
 
 ### Dedicated hardware
 
@@ -110,23 +179,31 @@ concurrency 2 — marginal for a platform sbt run, whose recorded baseline neede
 12G and OOMs at sbt's default. **24G is the sensible minimum; 32G if it is going
 to run platform CI at any concurrency.**
 
-**Trigger:** CI queue time on `Mac` exceeding what a slot rebalance can fix —
-visible as repeated slot-wait faults. Likely once platform enters the lane.
+**Trigger:** verify-job queue age — pull requests sitting on `:no_ci_verdict` or
+`:ci_pending` for longer than a build takes, because every slot is held by a
+session. (It was slot-wait faults under the reservation model; there are no slots
+to wait for now, so the symptom moved to the queue.)
 
 ---
 
-## Warm state — the actual reason for self-hosting
+## Warm state — the actual reason for building on our own hardware
 
-Free minutes are why hosted CI is unaffordable. **Preserved incremental state is
-why self-hosted is fast, and it is the bigger effect.**
+Hosted minutes are why hosted CI is unaffordable at this volume. **Preserved
+incremental state is why this is fast, and it is the bigger effect.**
 
-- `~/.cache/coursier`, `~/.ivy2`, `~/.sbt`, `~/.npm` — created by `dev ci
-  install`, outside any workspace, so dependency resolution stops being a
-  download. They survive whatever `actions/checkout` does to the tree.
-- `target/` — zinc's incremental analysis. It lives *inside* the checkout, so it
-  survives only with `actions/checkout`'s `clean: false`. The recorded baseline
-  is ~8 minutes for a **cold** `Test/compile`; incrementally it is a fraction of
-  that.
+- `~/.cache/coursier`, `~/.ivy2`, `~/.sbt`, `~/.npm` — outside any checkout, so
+  dependency resolution stops being a download and nothing a build does to a tree
+  can take them away.
+- `target/`, `node_modules/` — zinc's incremental analysis and the node tree. They
+  live *inside* the checkout, so they survive only because
+  `Agent::Verify.checkout` cleans with `git clean -fd` — **without** `-x`, which
+  removes untracked files a previous build left and keeps the ignored ones. The
+  cold path adds `-x` and takes them too.
+
+The checkout itself is persistent, one per repo, under `~/.platform/ci-checkouts/`
+— never a session's workspace, or the green measures a tree nobody is merging.
+It is the one expensive thing under `~/.platform`, and losing it costs a cold
+build rather than correctness.
 
 ---
 
@@ -138,25 +215,29 @@ The cost of the section above, and **the only one of the four with no human
 downstream**: a red is read by whoever opened the PR, while a wrong green is
 merged by the lane without anyone looking.
 
-The rule, in `Agent::Ci.clean_build?` and asked for by every workflow through
-`dev ci clean-build`:
+The rule, in `Agent::Ci.clean_build?`, asked by `dev ci verify` rather than
+decided inline:
 
 | event | build |
 |---|---|
-| `pull_request` | **warm** — the fast path, and the point of self-hosting |
+| `pull_request` | **warm** — the fast path, and the point of the whole design |
 | `push` to `main` | **cold** — the tree every PR is measured against |
-| `schedule` (nightly) | **cold** — what notices the warm path has been lying |
 | anything else | **cold** |
 
 Warmth is an allowlist of exactly one entry, so a trigger somebody adds next year
-is cold until it is deliberately made warm. The nightly is not optional: without
-it, "the PR builds have been silently wrong since Tuesday" has nothing that would
-ever discover it.
+is cold until it is deliberately made warm.
+
+**The cold build on `main` is not optional**: without it, "the PR builds have been
+silently wrong since Tuesday" has nothing that would ever discover it. It was a
+`schedule:` trigger in the workflow this replaces; it is now the same rule the PR
+path uses, applied to the tip of `main` — no `ci` status on the tip, or one older
+than a day, means build it, cold. That covers the nightly *and* the push trigger
+in one rule, because a merge moves the tip and a new tip has no status.
 
 ### 2. A reused database → a red that is not the branch
 
-**A CI job must get a fresh database, every time.** This is a requirement on the
-runner, not a nicety.
+**A verify job must get a fresh database, every time.** This is a requirement on
+the runner, not a nicety.
 
 The suite is not idempotent against its own database. Eight consecutive platform
 runs on **one** session database, on unmodified `main` (`25b091124`), measured
@@ -170,32 +251,30 @@ under ISS-761:
 | 8 | 3h35m | 23 |
 
 Identical code every run. After eight runs the database held **131,632 rows in
-`tasks`**, and the specs that went red are the ones that scan or claim from a
-task lane — a spec asserting "at most `maxConcurrency` rows per pass" was
-asserting against a table holding six figures of other runs' rows.
+`tasks`**, and the specs that went red are the ones that scan or claim from a task
+lane — a spec asserting "at most `maxConcurrency` rows per pass" was asserting
+against a table holding six figures of other runs' rows.
 
 A lane fed by a runner that reuses its database therefore degrades run over run
 and **starts parking good PRs**, and what it produces looks like a flaky suite
 rather than a dirty fixture. Nothing in the suite noticed (ISS-801).
 
-Two mechanisms, and both are in `templates/ci/ci-scala.yml`:
+Two mechanisms:
 
-- **`CLAUDE_SESSION_ID` names the run, the attempt AND the shard.** `claude-db`
-  keys a database on it, so a name missing the attempt lets a re-run inherit the
-  rows of an attempt whose `claude-db end` never fired, and a name missing the
-  shard hands every matrix shard the same database to write over. It lives on the
-  **job**, not on the workflow — `matrix` is out of scope in a workflow-level
-  `env`, where it would expand to the empty string and silently re-share.
+- **`CLAUDE_SESSION_ID` names the run, the attempt AND the shard**, and the fleet
+  sets it (`Agent::Verify.session_id`). A name missing the attempt lets a retry
+  inherit the rows of an attempt whose `claude-db end` never fired; a name missing
+  the shard hands every shard the same database. The attempt component carries the
+  starting process as well as the second, because two machines may verify one sha
+  — harmless by design, and only harmless while their databases are distinct.
 - **`ci/build.sh` calls `claude-db reset --app <app>`** before sbt. Freshness by
-  construction is exactly the property that stops holding when somebody edits an
-  `env` block, and the reset is a no-op on a database just cloned from the
-  template.
+  construction is exactly the property that stops holding when somebody edits the
+  caller, and the reset is a no-op on a database just cloned from the template.
 
-Outside CI the same guarantee comes from `./run.sh test`, which resets the
-session database before every suite run (`bin/reset-session-db`) and reports what
-it did in the test summary. `--no-reset-db` opts out. Neither path can ever touch
-`:5432`: that is Mike's own Postgres.app, it is not a session database, and the
-port check in `SessionDb.shared_default_url?` is what guarantees it.
+Outside CI the same guarantee comes from `./run.sh test`, which resets the session
+database before every suite run (`bin/reset-session-db`). Neither path can ever
+touch `:5432`: that is Mike's own Postgres.app, and the port check in
+`SessionDb.shared_default_url?` is what guarantees it.
 
 ### 3. DigitalOcean auth expires
 
@@ -204,8 +283,8 @@ and the result is a wall of red that looks like a code failure.
 
 Note what actually expires. The fleet does **not** store a long-lived registry
 token — `doctl registry login` writes into Docker's credential store and hangs on
-a Desktop helper (ISS-578), so credentials are minted per process and live for
-the length of it. What expires is **doctl's own DigitalOcean auth**, and
+a Desktop helper (ISS-578), so credentials are minted per process and live for the
+length of it. What expires is **doctl's own DigitalOcean auth**, and
 `dev ci preflight --needs registry` asks it (`doctl account get`) *before* the
 build, rather than letting the failure surface minutes later as spec failures.
 
@@ -213,58 +292,112 @@ Fix: `doctl auth init` on the runner. The preflight prints it.
 
 ### 4. Everything else that is not the code
 
-A full disk has already faked spec failures on this fleet once. `dev ci
-preflight` covers disk headroom, the Docker daemon, doctl, and a free
-session-database port, and any of them can be added to.
+A full disk has already faked spec failures on this fleet once. `dev ci preflight`
+covers disk headroom, the Docker daemon, doctl, and a free session-database port,
+and any of them can be added to.
+
+A repo says what its build needs in the build script itself:
+
+```
+# ci-needs: docker, registry, database
+```
+
+Read at the sha being built, so a suite that stops needing Docker stops being held
+to a Docker daemon in the same commit. Unknown names are ignored rather than
+rejected — a script naming a probe a newer `dev` will have should run on today's
+runner, not fail closed on its own configuration.
 
 ### How an infrastructure fault is made distinguishable
 
-Every fault above exits **75** (`EX_TEMPFAIL`) rather than 1, prints a
-`::error title=CI INFRASTRUCTURE FAULT::` annotation, and writes a
-`$GITHUB_STEP_SUMMARY` block saying in as many words that this is the runner and
-not the branch. The `ci` gate job repeats the pointer when it goes red.
+Every fault above exits **75** (`EX_TEMPFAIL`) rather than 1, and `dev ci verify`
+turns that into a status whose description **leads with `INFRASTRUCTURE FAULT`**
+and names the job log. Under GitHub Actions this was an annotation and a
+`$GITHUB_STEP_SUMMARY` block; a fleet job has neither, so the commit status — the
+one surface GitHub gives — carries it, and a person reading a red PR still learns
+"fix the machine" rather than "read the diff".
 
 **The lane is deliberately not taught to read this.** It parks a red PR either
 way, and that is correct: a machine that has just proved it cannot be trusted is
-not a machine whose self-classification should be believed. What differs is what
-a *person* does — fix the machine, versus read the diff — so the distinguishing
-happens where a person is.
+not a machine whose self-classification should be believed. What differs is what a
+*person* does, so the distinguishing happens where a person is.
 
 Paging is separate and already existed. `dev ci preflight` records the fault in
-`Agent::Errors` under `ci_preflight`, and `Agent::Escalation` files an issue on
-the third consecutive failure — the same path a dead Docker daemon or a failing
-`git pull` already takes. A clean preflight clears the streak, so "in a row"
-means in a row.
+`Agent::Errors` under `ci_preflight`, and `Agent::Escalation` files an issue on the
+third consecutive failure — the same path a dead Docker daemon or a failing
+`git pull` already takes. A clean preflight clears the streak, so "in a row" means
+in a row.
+
+---
+
+## Silence is the one outcome nothing recovers from
+
+The lane reads `:ci_pending` for a job still running and for a job that died, and
+waits forever on both. So every exit path posts a terminal status, and there are
+three layers of that:
+
+1. **The worker's own watchdog.** `dev ci verify` bounds the build at
+   `BUILD_TIMEOUT_SECONDS`, kills the process group, and posts `failure` with the
+   infrastructure marker.
+2. **The tick's reap.** A worker that died without answering is noticed the next
+   time the tick runs. It writes two markers either side of its POST — `result`
+   before, `posted` after — so the reap re-posts the *true* answer when the worker
+   decided but could not post, and posts a `failure` only when the worker vanished
+   before it had one. Park is the safe direction; silence is not.
+3. **The abandoned-pending rule.** A `pending` status older than a job could
+   possibly still be running is re-enqueued by the next scan. That is what covers
+   the box that rebooted, whose job records went with it.
+
+Only `pending` is ever re-enqueued. A `failure` is an answer, and re-running a red
+PR on a timer would hide a real failure behind an eventually-green flake.
 
 ---
 
 ## The check contract
 
-**One check name per repo: `ci`.** Shard the work however is convenient, then
-have a single `ci` gate job that depends on all shards and reports the aggregate.
-The lane reads one `statusCheckRollup` entry and stays ignorant of the sharding
-scheme, so shards can be added and removed without ever touching the lane.
+**One check name per repo: `ci`.** Shard the work however is convenient, then have
+one aggregate result under that name. The lane reads one `statusCheckRollup` entry
+and stays ignorant of the sharding scheme.
 
-`code-review/reviewable` stays distinct from it. The lane already treats a
-pending Reviewable context as "a human is mid-review, defer", and that must never
-be conflated with "tests passed".
+`code-review/reviewable` stays distinct from it. The lane already treats a pending
+Reviewable context as "a human is mid-review, defer", and that must never be
+conflated with "tests passed".
+
+---
+
+## Rolling a repo in
+
+**A repo enrolled with a broken `ci/build.sh` parks every one of its pull
+requests**, because the lane refuses anything whose `ci` is not green. So the
+first build per repo is confirmed by hand:
+
+```
+dev ci scan                                     # what the fleet would enqueue
+dev ci verify --repo mbryzek/<repo> --sha <head sha> --pr <n> --no-post
+```
+
+`--no-post` runs the identical code path the fleet runs and posts nothing. Then
+land `ci/build.sh`, watch one PR go `no_ci -> pending -> success`, and confirm
+`dev agent merge-lane <repo>` has moved off `:no_ci_verdict` before letting it
+merge anything.
+
+Order: **`playbook-admin` first** (small suite, and its Reviewable review
+auto-completes, so the lane's verdict is the only thing gating). **`platform`
+last**, once ISS-761's measurement lands and ISS-762's affected-subproject
+targeting is exercised. **`devops` never** — merging here deploys fleet-wide in 30
+seconds, so a check buys a human signal and no automation, and spending fleet
+capacity on a signal no machine will act on is capacity the enrolled repos need.
 
 ---
 
 ## Deliberately out of scope
 
 - **No Playwright.** Every one of these repos needs a live backend for it, so
-  `npm test` means unit suites only. A browser test that cannot run is not a
-  merge gate.
+  `npm test` means unit suites only. A browser test that cannot run is not a merge
+  gate.
 - **No deploys and no library publishing.** Deploys stay manual; that is the
   entire safety argument the reversibility gate rests on.
-- **`pull_request`, never `pull_request_target`**, and no secret in the PR job
-  beyond what the runner environment already holds. Every PR here is authored by
-  our own fleet rather than an outside contributor, which is why self-hosted
-  runners are acceptable at all. Do not widen that.
 - **`devops` is not in the lane** and never will be: merging here deploys
-  fleet-wide within 30 seconds. A `ci` check on this repo would still be useful
-  to a human, but it buys no automation.
+  fleet-wide within 30 seconds.
 
 ---
 
@@ -272,12 +405,12 @@ be conflated with "tests passed".
 
 | command | what it does |
 |---|---|
-| `dev ci status` | this box's split: reserved, busy, what is left for sessions |
-| `dev ci install --slots N` | reserve N slots and create the warm cache dirs |
+| `dev ci scan [--main] [--limit N]` | what the tick would enqueue right now; posts nothing |
+| `dev ci verify --repo R --sha S [--pr N] [--no-post]` | build one commit and post the `ci` status |
 | `dev ci preflight [--needs ...]` | is this runner fit to produce a verdict |
-| `dev ci run -- <cmd>` | run a build holding one slot |
 | `dev ci clean-build --event E` | should this run discard incremental state |
-| `bin/ci-runner-install <owner/repo>` | register a runner (human step — needs a token) |
+| `dev agent pause` | take this machine out of the pool — sessions and verify jobs both |
 
-Code: `lib/agent/ci.rb`, `lib/agent/escalation.rb`, `bin/ci-runner-install`,
-`templates/ci/`. Tests: `test/test_agent_ci.rb`.
+Code: `lib/agent/verify.rb`, `lib/agent/ci.rb`, `lib/agent/tick.rb`
+(`capacity`, `verify`), `lib/agent/escalation.rb`, `templates/ci/`.
+Tests: `test/test_agent_ci.rb`, `test/test_agent_verify.rb`.

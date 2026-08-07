@@ -50,6 +50,7 @@ require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/toolchain'
+require 'agent/verify'
 
 # Cross-repo PR grouping (`dev prs group`). Split out for the same reason as
 # lib/agent/*: the part that DECIDES — which sibling merges first, and whether
@@ -151,10 +152,9 @@ INVOCATIONS = {
   "agent merge"         => 'agent merge <repo> <pr> [--run-id ID] [--dry-run] [--localhost]',
   "agent update-branch" => 'agent update-branch <repo> <pr> [--dry-run]',
   "prs group"           => 'prs [group] [--branch NAME] [--repo NAME]... [--all] [--json]',
-  "ci status"           => 'ci [status]',
-  "ci install"          => 'ci install --slots N [--dry-run]',
+  "ci scan"             => 'ci [scan] [--main] [--limit N]',
+  "ci verify"           => 'ci verify --repo OWNER/REPO --sha SHA [--pr N] [--event EVENT] [--no-post]',
   "ci preflight"        => 'ci preflight [--needs docker,registry,database]',
-  "ci run"              => 'ci run [--wait SECONDS] -- <command> [args]...',
   "ci clean-build"      => 'ci clean-build --event EVENT',
 }.freeze
 
@@ -1240,45 +1240,42 @@ USAGE = <<~USAGE
         Does NOT ask the autonomy ledger: this lands nothing on `main`, and the
         merge that follows re-reads and re-asks from scratch.
 
-  CI (self-hosted runners — ISS-763):
+  CI (the fleet verify job — ISS-848):
 
-    #{INVOCATIONS["ci status"]}
-        This machine's CI provisioning: slots reserved, slots busy, and what is
-        left for agent sessions. Prints nothing to configure on a box with no
-        runner — which is most of them.
+    #{INVOCATIONS["ci scan"]}
+        What the tick would enqueue right now: every open, non-draft PR in a lane
+        repo whose head sha carries `#{Agent::Verify::BUILD_SCRIPT}` and no `#{Agent::MergeLane::CI_CHECK}` check.
+        Read-only — it posts nothing and does not consume the fleet's next scan
+        window, so it is safe to run while the tick is running.
+        --main also considers the tip of `main`, which is the cold build that
+        notices the warm path has been lying.
 
-    #{INVOCATIONS["ci install"]}
-        Reserve N of this machine's concurrency slots for CI and create the warm
-        cache directories. The registry derives max_concurrency from the
-        hardware; this decides how it is SPLIT, so the tick claims that many
-        fewer sessions from the moment it lands.
-        Reserved rather than borrowed: an agent session's work is deferrable and
-        a CI job's is not, so CI never queues behind a four-hour session.
-        Installing the GitHub runner itself is `bin/ci-runner-install` — it needs
-        a registration token, so a human runs it.
+    #{INVOCATIONS["ci verify"]}
+        Build one commit and post the `#{Agent::MergeLane::CI_CHECK}` status the merge lane reads:
+        checkout at that exact sha, `#{Agent::Verify::BUILD_SCRIPT}`, exit code, status. No model,
+        no session — this is the deterministic half of the loop.
+        The tick spawns exactly this. Run it by hand with --no-post to confirm a
+        repo's FIRST build before the lane is left to depend on it: a repo
+        enrolled with a broken script parks every one of its PRs.
 
     #{INVOCATIONS["ci preflight"]}
         Is this runner fit to produce a verdict at all? Disk headroom, the Docker
         daemon, doctl's DigitalOcean auth (what actually expires, and what a
         registry pull needs), and a free session-database port.
-        Exits #{Agent::Ci::INFRA_EXIT_CODE} on a fault — NOT 1 — and says so as a
-        GitHub annotation, because "could not pull the DB image" must never read
-        as "your tests failed". Records the fault on this machine too, so three
-        in a row files an issue by the same path a dead Docker already does.
-
-    #{INVOCATIONS["ci run"]}
-        Run a build holding one of this machine's CI slots, waiting for one to
-        come free. Exits with the command's own status, so a test failure stays a
-        test failure — except when no slot came free inside --wait, which is a
-        capacity fault and exits #{Agent::Ci::INFRA_EXIT_CODE}.
+        Exits #{Agent::Ci::INFRA_EXIT_CODE} on a fault — NOT 1 — because "could not pull the DB
+        image" must never read as "your tests failed"; `ci verify` turns that
+        status into an INFRASTRUCTURE FAULT on the commit rather than a red suite.
+        Records the fault on this machine too, so three in a row files an issue
+        by the same path a dead Docker already does.
+        A repo declares what its build needs in `#{Agent::Verify::BUILD_SCRIPT}` itself:
+        `# ci-needs: docker, registry, database`.
 
     #{INVOCATIONS["ci clean-build"]}
         Prints `true` or `false`: should this run throw away the incremental
         state before building? Warm on a pull request and cold on everything
         else, so a false green from stale zinc analysis cannot outlive a day.
-        A workflow feeds it to `actions/checkout`'s `clean:` rather than writing
-        the comparison itself, so the rule lives in one tested place instead of
-        being copy-pasted into every repo.
+        `ci verify` asks it rather than deciding for itself, so the rule lives in
+        one tested place (Agent::Ci.clean_build?).
 
   Common options:
     --app APP       Limit to a single app (acumen, platform)
@@ -1329,7 +1326,7 @@ SUBCOMMANDS = {
   "claude-usage" => %w[top],
   "agent"        => %w[tick status logs run-op pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
-  "ci"           => %w[status install preflight run clean-build],
+  "ci"           => %w[scan verify preflight clean-build],
 }.freeze
 
 def levenshtein(a, b)
@@ -13928,76 +13925,87 @@ end
 
 # ---------- ci ----------
 #
-# The runner-local half of CI (ISS-763). Agent::Ci holds the reasoning; these
-# four commands are the surfaces a workflow step and an operator touch.
+# The fleet verify job (ISS-848). Agent::Verify holds the reasoning for the job
+# and Agent::Ci for the machine it runs on; these four commands are the surfaces
+# a build script, the tick, and an operator touch.
+#
+# `ci install`, `ci run` and `ci status` are gone with the GitHub Actions half of
+# ISS-763. They existed to split ONE machine between two schedulers — a
+# reservation, a slot semaphore, and a per-repo human runner install. There is
+# one scheduler now: a verify job claims through the same tick an agent session
+# does, against the same max_concurrency.
 
-def cmd_ci_status(args)
-  reject_unknown_args("ci status", args)
-
-  reserved = Agent::Ci.reserved
-  if reserved.zero?
-    puts "CI is not provisioned on this machine."
-    puts "  #{Agent::Paths.ci_config_file} reserves no slots, so nothing here changes:"
-    puts "  the tick claims against its full max_concurrency and no CI job can start."
-    puts
-    puts "  Reserve capacity with:  dev ci install --slots N"
-    puts "  Install a runner with:  bin/ci-runner-install <owner/repo>"
-    return
-  end
-
-  puts "CI slots reserved on this machine: #{reserved} (#{Agent::Ci.slots_held} busy)"
-  puts "  config: #{Agent::Paths.ci_config_file}"
-  puts "  slots:  #{Agent::Paths.ci_slots_dir}"
-  puts
-  puts "The tick subtracts all #{reserved} from this machine's max_concurrency before it claims,"
-  puts "whether or not a CI job is running — a reservation, so a PR never queues behind a"
-  puts "four-hour session (Agent::Ci.reserved)."
-end
-
-def cmd_ci_install(args)
-  slots = nil
-  dry_run = false
+def cmd_ci_scan(args)
+  limit = Agent::Verify::ENQUEUE_CAP
+  include_main = false
   rest = args.dup
   until rest.empty?
     arg = rest.shift
     case arg
-    when "--slots"
+    when "--main" then include_main = true
+    when "--limit"
       value = rest.shift
-      usage_exit("--slots requires a value", example: usage_for("ci install")) if value.nil?
-      usage_exit("--slots must be a non-negative integer", example: usage_for("ci install")) unless value.match?(/\A\d+\z/)
-      slots = value.to_i
-    when "--dry-run" then dry_run = true
-    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci install"))
+      usage_exit("--limit requires a value", example: usage_for("ci scan")) if value.nil?
+      usage_exit("--limit must be a positive integer", example: usage_for("ci scan")) unless value.match?(/\A[1-9]\d*\z/)
+      limit = value.to_i
+    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci scan"))
     end
   end
-  usage_exit("--slots is required", example: usage_for("ci install")) if slots.nil?
 
-  caches = Agent::Ci::WARM_CACHE_DIRS.map { |d| File.expand_path(d) }
-  if dry_run
-    puts "would write #{Agent::Paths.ci_config_file}: {\"slots\": #{slots}}"
-    puts "would create #{Agent::Paths.ci_slots_dir}"
-    caches.each { |dir| puts "would create #{dir}" }
+  # Deliberately does NOT mark the scan window. A human asking what the fleet
+  # would do must not delay the fleet doing it.
+  scan = Agent::Verify.scan(limit: limit, now: Time.now, include_main: include_main)
+  live = Agent::Verify.live
+  puts Util.underline("ci scan  [#{Agent::Verify.hostname}]")
+  if live.any?
+    puts "In flight on this machine:"
+    live.each { |r| puts "  #{r['repo']}#{r['pr'] ? "##{r['pr']}" : ''} #{Agent::Verify.short(r['sha'])}  pid #{r['pid']}  since #{r['started_at']}" }
+    puts
+  end
+  if scan.candidates.empty?
+    puts "Nothing to verify: every open PR in an enrolled repo already carries a `#{Agent::MergeLane::CI_CHECK}` check."
+    puts
+    puts "A repo is enrolled when `#{Agent::Verify::BUILD_SCRIPT}` exists at the PR's head sha. Nothing else"
+    puts "enrols it — there is no registry to keep in step with the repos that have one."
     return
   end
-
-  Agent::Paths.write_json(Agent::Paths.ci_config_file, { "slots" => slots })
-  Agent::Paths.mkdir_p(Agent::Paths.ci_slots_dir)
-  # Created rather than assumed, because the workflow does not create them: a
-  # cache directory that does not exist is not an error anywhere, it is just a
-  # cache that is cold every single run, which reads as "self-hosting bought us
-  # nothing" rather than as a missing directory.
-  caches.each { |dir| Agent::Paths.mkdir_p(dir) }
-
-  puts "Reserved #{slots} CI slot#{'s' unless slots == 1} on this machine."
-  puts "  #{Agent::Paths.ci_config_file}"
+  puts "Would enqueue #{scan.candidates.length} (cap #{limit}#{scan.dropped.positive? ? ", #{scan.dropped} deferred" : ''}):"
+  scan.candidates.each do |c|
+    puts "  #{c.label.ljust(24)} #{Agent::Verify.short(c.sha)}  #{c.event}  #{c.clean? ? 'cold' : 'warm'}"
+  end
   puts
-  puts "The tick subtracts this from max_concurrency on its next pass, so this machine now"
-  puts "claims #{slots} fewer session#{'s' unless slots == 1}. Check the split with `dev agent runners`"
-  puts "and `dev ci status`."
-  puts
-  puts "Next, install a GitHub runner per repo (needs a registration token, so this is a"
-  puts "human step):"
-  puts "  bin/ci-runner-install <owner/repo>"
+  puts "Confirm one by hand before leaving the lane to depend on it:"
+  first = scan.candidates.first
+  puts "  dev ci verify --repo #{Agent::MergeLane.qualify(first.repo)} --sha #{first.sha}#{first.pr ? " --pr #{first.pr}" : ''} --no-post"
+end
+
+def cmd_ci_verify(args)
+  repo = nil
+  sha = nil
+  pr = nil
+  event = "pull_request"
+  post = true
+  rest = args.dup
+  until rest.empty?
+    arg = rest.shift
+    case arg
+    when "--repo"  then repo = require_value(rest, "--repo", "ci verify")
+    when "--sha"   then sha = require_value(rest, "--sha", "ci verify")
+    when "--pr"    then pr = require_value(rest, "--pr", "ci verify")
+    when "--event" then event = require_value(rest, "--event", "ci verify")
+    when "--no-post" then post = false
+    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci verify"))
+    end
+  end
+  usage_exit("--repo is required", example: usage_for("ci verify")) if repo.nil?
+  usage_exit("--sha is required", example: usage_for("ci verify")) if sha.nil?
+  usage_exit("--pr must be a number", example: usage_for("ci verify")) if pr && !pr.match?(/\A\d+\z/)
+
+  outcome = Agent::Verify.perform(repo: repo, sha: sha, pr: pr&.to_i, event: event, post: post)
+  # The exit status is the BUILD's, so a wrapper can tell a red suite (1) from a
+  # runner that could not answer (75) — the same distinction Agent::Ci makes, kept
+  # alive here because the status description is the only other place it survives.
+  exit(outcome.exit_code.to_i)
 end
 
 def cmd_ci_preflight(args)
@@ -14041,51 +14049,10 @@ def cmd_ci_clean_build(args)
   puts Agent::Ci.clean_build?(event: event)
 end
 
-def cmd_ci_run(args)
-  wait = Agent::Ci::SLOT_WAIT_SECONDS
-  rest = args.dup
-  until rest.empty?
-    break if rest.first == "--"
-    arg = rest.shift
-    case arg
-    when "--wait"
-      value = rest.shift
-      usage_exit("--wait requires a value", example: usage_for("ci run")) if value.nil?
-      usage_exit("--wait must be a positive integer", example: usage_for("ci run")) unless value.match?(/\A\d+\z/)
-      wait = value.to_i
-    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci run"))
-    end
-  end
-  rest.shift if rest.first == "--"
-  usage_exit("ci run needs a command after `--`", example: usage_for("ci run")) if rest.empty?
-
-  outcome =
-    begin
-      Agent::Ci.with_slot(wait_seconds: wait) do |index|
-        warn "dev ci run: holding CI slot #{index} of #{Agent::Ci.reserved}"
-        # `system`, not Agent::Shell.capture: this is a BUILD, and its output has
-        # to stream to the job log as it happens rather than arrive in one lump
-        # at the end — a CI log nobody can watch is a CI log nobody uses. The
-        # deadline that would otherwise be missing is GitHub's own job timeout.
-        system(*rest)
-        $?&.exitstatus || 1
-      end
-    rescue RuntimeError => e
-      # An unprovisioned box running a CI job is a provisioning mistake, and it
-      # is emphatically not evidence about the branch.
-      ci_infra_fault("slot", [e.message])
-    end
-
-  # The ONE outcome here that is not the command's own answer, and the whole
-  # reason `dev ci run` exists rather than the workflow running the build
-  # directly: a box so oversubscribed that nothing came free is a capacity fault,
-  # and reporting it as a test failure would send somebody reading a diff that is
-  # fine.
-  if outcome == :timed_out
-    ci_infra_fault("slot", ["no CI slot came free within #{wait}s on this machine " \
-                            "(#{Agent::Ci.reserved} reserved, all busy)"])
-  end
-  exit(outcome)
+def require_value(rest, flag, command)
+  value = rest.shift
+  usage_exit("#{flag} requires a value", example: usage_for(command)) if value.nil?
+  value
 end
 
 # Report an infrastructure fault and exit INFRA_EXIT_CODE.
@@ -14094,30 +14061,22 @@ end
 # failed" must not look the same. The lane parks a red PR either way and that is
 # correct — a machine that just proved it cannot be trusted is not a machine
 # whose self-classification should be believed — so the distinguishing is done
-# where it changes what a person does: a GitHub annotation with a title that says
-# so, a step summary they see without opening the log, and an exit status
-# (75, EX_TEMPFAIL) a wrapper can branch on.
+# where it changes what a person does.
+#
+# WHERE THAT IS HAS MOVED (ISS-848). Under GitHub Actions it was a `::error
+# title=…::` annotation and a `$GITHUB_STEP_SUMMARY` block; a fleet verify job
+# has neither, so the fault travels out as the exit STATUS — which `dev ci
+# verify` turns into the commit status's own description, beside the path to the
+# job log. A person reading a red PR still learns "fix the machine" rather than
+# "read the diff", from the one surface GitHub gives a commit status.
 #
 # Paging is separate and already exists: Agent::Ci.preflight has recorded the
 # fault in Agent::Errors, so three in a row on one box files an issue by the same
 # path a dead Docker daemon already does.
 def ci_infra_fault(stage, lines)
   detail = lines.join("; ")
-  # GitHub's workflow-command syntax. Harmless noise anywhere else, which is why
-  # it is not conditional on being inside Actions — a human running `dev ci
-  # preflight` by hand wants the same words.
-  puts "::error title=CI INFRASTRUCTURE FAULT (#{stage})::#{detail}"
-  summary = ENV["GITHUB_STEP_SUMMARY"]
-  if summary && !summary.empty?
-    File.open(summary, "a") do |f|
-      f.puts "### CI infrastructure fault — this is the runner, not the branch"
-      f.puts
-      lines.each { |line| f.puts "- #{line}" }
-      f.puts
-      f.puts "Nothing here is evidence about the code under test. Do not re-read the diff."
-    end
-  end
-  warn "CI infrastructure fault (#{stage}): #{detail}"
+  warn "CI INFRASTRUCTURE FAULT (#{stage}): #{detail}"
+  warn "Nothing here is evidence about the code under test. Do not re-read the diff."
   exit(Agent::Ci::INFRA_EXIT_CODE)
 end
 
@@ -14302,14 +14261,13 @@ when "features"
   else                  unknown("features subcommand", sub, SUBCOMMANDS["features"])
   end
 when "ci"
-  sub = resolve_subcommand(argv, default: "status")
+  sub = resolve_subcommand(argv, default: "scan")
   case sub
-  when "status"    then cmd_ci_status(argv)
-  when "install"   then cmd_ci_install(argv)
+  when "scan"        then cmd_ci_scan(argv)
+  when "verify"      then cmd_ci_verify(argv)
   when "preflight"   then cmd_ci_preflight(argv)
-  when "run"         then cmd_ci_run(argv)
   when "clean-build" then cmd_ci_clean_build(argv)
-  else                  unknown("ci subcommand", sub, SUBCOMMANDS["ci"])
+  else                    unknown("ci subcommand", sub, SUBCOMMANDS["ci"])
   end
 when "agent"
   sub = resolve_subcommand(argv, default: "status")
