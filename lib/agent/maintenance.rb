@@ -1,6 +1,7 @@
 require 'time'
 require 'agent/gc'
 require 'agent/paths'
+require 'agent/processes'
 require 'agent/shell'
 
 # Runner-local housekeeping (ISS-520): collect this machine's agent logs, prune
@@ -145,6 +146,7 @@ module Agent
     DISK_TIMEOUT_SECONDS = 10
 
     GC_SOURCE = "agent_gc".freeze
+    PROCESSES_SOURCE = "process_reap".freeze
     AIDIRS_SOURCE = "aidirs_prune".freeze
     CLAUDE_DB_SOURCE = "claude_db_gc".freeze
     DOCKER_SOURCE = "docker_prune".freeze
@@ -237,7 +239,9 @@ module Agent
     # thing would execute.
     def plan(trigger, now: Time.now)
       entries = Agent::Gc.plan(now: now, workspace_days: workspace_days(trigger))
+      groups = Agent::Processes.leaked
       ["#{GC_SOURCE}: collect #{entries.length} path(s) (workspaces kept #{workspace_days(trigger)} day(s))",
+       "#{PROCESSES_SOURCE}: reap #{groups.flatten.length} process(es) in #{groups.length} abandoned session group(s)",
        *SHELL_SOURCES.map { |source| "#{source}: #{shell_command(source, trigger).join(' ')}" }]
     end
 
@@ -273,7 +277,8 @@ module Agent
     # machine sleeps) has still done the free work.
     def run(now: Time.now, trigger: :cadence)
       free_before, total = disk
-      outcomes = [run_gc(now, trigger), *SHELL_SOURCES.map { |source| run_shell(source, trigger) }]
+      outcomes = [run_gc(now, trigger), run_processes,
+                  *SHELL_SOURCES.map { |source| run_shell(source, trigger) }]
       free_after, total_after = disk
       result = Result.new(
         trigger: trigger, at: now, outcomes: outcomes,
@@ -291,6 +296,35 @@ module Agent
       Outcome.new(source: GC_SOURCE, label: "agent gc", ok: true, message: "collected #{removed} path(s)")
     rescue StandardError => e
       Outcome.new(source: GC_SOURCE, label: "agent gc", ok: false, message: "#{e.class}: #{e.message}")
+    end
+
+    # The one chore here that reclaims CPU rather than disk (ISS-782).
+    #
+    # It exists because the kill path cannot cover this on its own. `reap` only
+    # ever looks at a job whose leader is ALREADY dead, and it signals nothing —
+    # so a session that exits normally, which is the common case, leaves every
+    # process its Bash tool calls started running with no job record left on the
+    # machine that refers to them. Nothing else would ever notice: twenty spin
+    # loops burned 122 CPU-hours over thirteen hours here, and the only reason
+    # anyone found out was a later session wondering why the box felt slow.
+    #
+    # Nothing about this is disk, so it does not shorten under pressure and it
+    # does not move with the retention windows. It is here because this is the
+    # machine's hourly pass over its own leftovers, and a leaked process is one.
+    def run_processes
+      groups = Agent::Processes.leaked
+      return Outcome.new(source: PROCESSES_SOURCE, label: "process reap", ok: true,
+                         message: "no leaked session processes") if groups.empty?
+
+      pids = groups.flatten.map(&:pid)
+      cpu_hours = (groups.flatten.sum(&:cpu_seconds) / 3600.0).round(1)
+      Agent::Processes.terminate(pids)
+      Outcome.new(source: PROCESSES_SOURCE, label: "process reap", ok: true,
+                  message: "reaped #{pids.length} process(es) in #{groups.length} abandoned " \
+                           "session group(s), holding #{cpu_hours} CPU-hour(s)")
+    rescue StandardError => e
+      Outcome.new(source: PROCESSES_SOURCE, label: "process reap", ok: false,
+                  message: "#{e.class}: #{e.message}")
     end
 
     # `SystemCallError`, not `Errno::ENOENT` (ISS-740). ENOENT is only the most

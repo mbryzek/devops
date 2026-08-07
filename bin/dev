@@ -44,6 +44,7 @@ require 'agent/gc'
 require 'agent/github'
 require 'agent/maintenance'
 require 'agent/merge_lane'
+require 'agent/processes'
 require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
@@ -12505,6 +12506,7 @@ def cmd_agent_doctor(args)
 
   claude_config = agent_doctor_claude_config
   agent_doctor_credentials
+  agent_doctor_load
 
   unless missing.empty?
     puts
@@ -12813,6 +12815,44 @@ def agent_update_branch_apply(repo, candidate)
   puts "  on the NEW head. Until GitHub attaches that check the lane reads an empty rollup as"
   puts "  `#{Agent::MergeLane::NO_CI}` — a commit seconds old, not a repo without a workflow."
   puts "  Re-run `dev agent merge-lane` once CI has finished."
+end
+
+# The load half of the doctor (ISS-782).
+#
+# A session cannot tell "this machine is oversubscribed" from "my command is
+# wedged" — both look like a command that will not finish — and the cost of
+# guessing wrong is real: ISS-780 lost an hour to that ambiguity before proving
+# its hang was a genuine bug (ISS-781) rather than starvation, on a box that was
+# at load ~50 the entire time. So the doctor states it rather than leaving it to
+# be inferred from things being slow.
+#
+# Reported per-core, because the raw figure means nothing without the divisor: a
+# load of 20 is quiet on a 64-core machine and is five deep per core on the Mac
+# minis this actually runs on. Never fatal — an oversubscribed machine is still a
+# working machine, and this command's exit status answers "can this box run a
+# session at all", which is a different question.
+def agent_doctor_load
+  load = Agent::Processes.load_average
+  cpus = Agent::Processes.cpu_count
+  puts
+  if load.nil? || cpus.nil?
+    puts "Load: unknown (this machine would not report it)"
+    return
+  end
+
+  per_cpu = load.first / cpus
+  puts format("Load: %.2f %.2f %.2f over %d cores — %.2f per core", *load, cpus, per_cpu)
+  return if per_cpu < Agent::Processes::OVERSUBSCRIBED_PER_CPU
+
+  leaked = Agent::Processes.leaked
+  puts "  OVERSUBSCRIBED — commands here are competing for a core, not getting one."
+  if leaked.empty?
+    puts "  No abandoned session processes; the load is live work."
+  else
+    puts "  #{leaked.flatten.length} process(es) in #{leaked.length} abandoned session group(s) " \
+         "are holding #{(leaked.flatten.sum(&:cpu_seconds) / 3600.0).round(1)} CPU-hour(s)."
+    puts "  The next `dev agent maintenance` reaps them, or run it now."
+  end
 end
 
 # The `.claude` half of the doctor (ISS-615).

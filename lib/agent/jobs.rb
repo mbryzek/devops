@@ -3,6 +3,7 @@ require 'shellwords'
 require 'time'
 require 'agent/outcome'
 require 'agent/paths'
+require 'agent/processes'
 
 # The only local state the executor keeps: "is this pid alive", plus the two
 # things a later process cannot re-derive once the act of handling them has
@@ -108,15 +109,34 @@ module Agent
       false
     end
 
-    # SIGTERM, then SIGKILL. To the process GROUP, because the session spawns
-    # sbt, docker and gh children of its own and killing only the leader would
-    # leave a 12G sbt JVM behind holding the machine's memory.
+    # SIGTERM, then SIGKILL — to the session's own group AND to every descendant
+    # of it, which are two different sets of processes (ISS-782).
+    #
+    # This used to signal only the group, on the stated grounds that "the session
+    # spawns sbt, docker and gh children of its own and killing only the leader
+    # would leave a 12G sbt JVM behind holding the machine's memory". The
+    # intention was right and the mechanism never worked: `spawn_session` puts the
+    # wrapper in its own group, so the group contains the wrapper and the `claude`
+    # CLI and nothing else — because the CLI runs EVERY Bash tool call in a NEW
+    # process group of its own. So the sbt JVM this comment is about was never in
+    # the group being signalled, and neither was anything else the session
+    # started. Killing a timed-out session reached the CLI and left its work
+    # running; twenty orphaned spin loops held a runner at load ~50 for thirteen
+    # hours that way.
+    #
+    # The descendant TREE is the set that is actually right, and parentage proves
+    # membership rather than assuming it. Collected BEFORE the first signal, since
+    # killing the CLI reparents everything below it to init and destroys the very
+    # links this needs to read.
     def kill(pid, grace: 10)
       return false unless alive?(pid)
+      doomed = Agent::Processes.descendants(pid).map(&:pid)
       signal_group(pid, "TERM")
+      Agent::Processes.signal(doomed, "TERM")
       deadline = Time.now + grace
       sleep(0.2) while alive?(pid) && Time.now < deadline
       signal_group(pid, "KILL") if alive?(pid)
+      Agent::Processes.signal(doomed.select { |p| Agent::Processes.alive?(p) }, "KILL")
       true
     end
 
