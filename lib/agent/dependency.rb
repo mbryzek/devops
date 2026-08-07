@@ -74,12 +74,28 @@ module Agent
       end
     end
 
-    # The open PR that proves a `fixed` blocker has not landed, or nil.
+    # The PR that proves a `fixed` blocker has not landed, or nil.
     #
     # ANY merged fix clears it. A reopened issue accumulates fixes and `dev issues
     # fix` appends more after the fact, so "the newest fix is still open" is
     # routinely true of an issue whose code merged rounds ago — reading it as
     # unshipped would defer a dependent on a PR it never needed.
+    #
+    # Failing that, the fix is unshipped, and BOTH ways of being unshipped count
+    # (ISS-739). An OPEN fix is the common one. The other is a fix CLOSED WITHOUT
+    # MERGING — rejected, abandoned, or superseded by a PR opened under a url
+    # nobody recorded with `dev issues fix`. This used to answer nil there, which
+    # every caller reads as "shipped, dispatch is safe": the absence of unmerged
+    # evidence was standing in for positive evidence of a merge, and a closed
+    # PR is neither. The dependent then dispatched against code that never landed
+    # on main, which is exactly what ISS-649 exists to prevent. Note this is not
+    # the deliberate FAIL-OPEN policy — that covers UNKNOWNS (`gh` unreachable,
+    # a fix that is a document, a state this file does not recognise), and all of
+    # those still return nil below. Here the answer is known and verifiable.
+    #
+    # Among several closed fixes it is the LAST RECORDED one, not the highest PR
+    # number: fixes can span repos, where numbers are not comparable, and the
+    # recorded order is the only chronology available without a second API field.
     def unmerged_fix_pr(number, use_localhost:)
       blocker = begin
         Agent::Api.issue(number, use_localhost: use_localhost)
@@ -95,7 +111,7 @@ module Agent
       return nil if prs.any?(&:nil?)
       return nil if prs.any? { |pr| Agent::Github.merged?(pr) }
 
-      prs.find { |pr| Agent::Github.open?(pr) }
+      prs.find { |pr| Agent::Github.open?(pr) } || prs.reverse.find { |pr| Agent::Github.closed?(pr) }
     end
 
     # The PR urls recorded as fixes on an issue. A fix that is a document (a design
@@ -107,10 +123,21 @@ module Agent
     # One line per blocker for the timeline note, naming what is actually being
     # waited on — the PR when there is one, the status when the blocker has not
     # got that far.
+    #
+    # A CLOSED fix gets its own sentence, because the two cases want different
+    # things from whoever reads the note. An open PR resolves itself: it merges,
+    # and the next attempt of this gate passes. A closed-unmerged one never will
+    # — either the real fix went in under a url nobody recorded (`dev issues
+    # fix`) or the blocker was never actually fixed — so the deferral loop can
+    # only end with a human, and saying "has not merged" would hide that behind
+    # wording that reads as "not yet".
     def describe(unshipped)
       unshipped.map do |b|
         pr = b["pr"]
-        if pr
+        if pr && Agent::Github.closed?(pr)
+          "ISS-#{b['number']} is `#{b['status']}`, but its fix #{pr['url']} was CLOSED WITHOUT MERGING — " \
+            "nothing shipped, and no open PR will ship it"
+        elsif pr
           "ISS-#{b['number']} is `#{b['status']}`, but its fix #{pr['url']} has not merged"
         else
           "ISS-#{b['number']} is still `#{b['status']}`"
