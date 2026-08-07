@@ -80,11 +80,23 @@ module Agent
     # a name this module could not itself have minted is refused, not sanitized.
     NAME_PATTERN = /\A[a-z0-9][a-z0-9._-]{0,47}\z/
 
+    # An environment variable name, for `--env KEY=VALUE`. The same shape the
+    # shell itself accepts, and refused rather than sanitized for the reason
+    # NAME_PATTERN is: a session that meant `--env` and typed something else
+    # should be told so before anything runs, not have its intent guessed at.
+    ENV_NAME_PATTERN = /\A[A-Za-z_][A-Za-z0-9_]*\z/
+
     # `status` is the OPERATION's exit status; nil exactly when it timed out, for
     # the same reason Agent::Shell::Result.status is (a deadline is not an answer
     # the command gave).
+    #
+    # `env_keys` is the NAMES of the variables `--env` set, never their values.
+    # The record is a post-mortem artifact and "this ran with HOMEBREW_NO_AUTOREMOVE
+    # set" is the part of it a human needs; the values are session-supplied and may
+    # be credentials, which have no business landing in a file on disk that nobody
+    # thinks of as holding them.
     Record = Struct.new(:operation, :argv, :status, :timed_out, :summary, :effects,
-                        :started_at, :finished_at, :output_tail, keyword_init: true)
+                        :started_at, :finished_at, :output_tail, :env_keys, keyword_init: true)
 
     module_function
 
@@ -132,24 +144,54 @@ module Agent
     # place allowed to call Open3 (test_dev_agent_shell.rb asserts it), and the
     # deadline and group-kill it brings are not incidental here — an ops run is
     # unattended by definition.
+    #
+    # `env` is what `--env KEY=VALUE` collected. It exists because this command
+    # takes ARGV and the things it is asked to run are written as SHELL lines —
+    # `HOMEBREW_NO_AUTOREMOVE=1 brew uninstall ...` is a toolchain install hint
+    # verbatim — and leading assignments are shell syntax with no argv spelling.
+    # The obvious translation, prepending `env`, is what ISS-896 is: `env`
+    # resolved to `~/code/devops/bin/env`, because `~/code/devops/bin` precedes
+    # /usr/bin on this fleet's PATH, and that script died parsing the following
+    # words as its own flags. ISS-893 moved that particular file out of the way,
+    # but the collision was the symptom: an argv API that cannot express "with
+    # this variable set" is incomplete however PATH happens to be arranged, and
+    # a session should not have to know what is in devops/bin to run a chore.
+    #
+    # LISTENER_ENV is merged LAST and so cannot be overridden by `--env`: it is
+    # the marker protocol this whole file is built on, not a caller-tunable, and
+    # a session that unset it would silently lose every operation's summary.
     def run(number:, operation:, argv:, timeout: DEFAULT_TIMEOUT_SECONDS, now: Time.now, env: {})
       raise ArgumentError, "operation name #{operation.inspect} is not #{NAME_PATTERN.inspect}" unless valid_name?(operation)
 
       started = now.utc
-      result = Agent::Shell.capture(*argv, timeout: timeout, env: { LISTENER_ENV => "1" }.merge(env))
+      result = Agent::Shell.capture(*argv, timeout: timeout, env: env.merge(LISTENER_ENV => "1"))
       report, visible = extract(result.output)
       record = Record.new(
         operation: operation, argv: argv,
         status: result.exitstatus, timed_out: result.timed_out?,
         summary: report && report["summary"], effects: (report && report["effects"]) || {},
         started_at: started.iso8601, finished_at: Time.now.utc.iso8601,
-        output_tail: tail(visible),
+        output_tail: tail(visible), env_keys: env.keys.sort,
       )
       write(number, record)
       [record, visible]
     end
 
     def valid_name?(operation) = operation.to_s.match?(NAME_PATTERN)
+
+    # Splits one `--env KEY=VALUE` into [key, value], or nil when it is not one.
+    #
+    # `split("=", 2)` rather than a full split, so a value may itself contain
+    # `=` — connection strings and JDBC urls routinely do, and a helper that
+    # truncated them at the first one would corrupt exactly the values most
+    # worth setting. An empty value is legal (`--env FOO=` sets FOO to ""),
+    # which is what the shell does; a missing `=` is not, because `--env FOO`
+    # is far more likely a session that meant `FOO=1` than one that meant "".
+    def env_assignment(pair)
+      key, value = pair.to_s.split("=", 2)
+      return nil if value.nil? || !key.to_s.match?(ENV_NAME_PATTERN)
+      [key, value]
+    end
 
     # Scrubbed on BOTH paths, not only the truncated one. An operation is free to
     # print bytes that are not valid UTF-8 — a stack trace out of a subprocess, a

@@ -54,8 +54,29 @@ you. Every operation succeeding plus a clean exit closes the issue as `deployed`
 with what each one DID on the timeline. Any operation failing returns the issue
 to the queue to be run again.
 
-Three things follow from that, and each has already cost a run somewhere:
+These follow from that, and each has already cost a run somewhere:
 
+- **`run-op` takes ARGV, not a shell line, and the difference is where runs get
+  lost.** Everything after `--` is `execve`'d directly: there is no shell, so
+  `&&`, `;`, `|`, `>`, globs and quoting mean nothing, and a leading `VAR=1`
+  assignment is not syntax at all.
+  - one variable to set → **`--env KEY=VALUE`** before the `--`, repeatable:
+    `dev agent run-op node-pin --env HOMEBREW_NO_AUTOREMOVE=1 -- brew uninstall --ignore-dependencies node`.
+    Only the variable NAMES are echoed and recorded, never the values.
+  - genuinely a shell line (an `install:` hint from `dev agent doctor` usually
+    is) → hand it to a shell **explicitly**:
+    `dev agent run-op <name> -- /bin/zsh -lc '<the whole line>'`.
+  - **Do not prepend `env` to translate an assignment.** `~/code/devops/bin`
+    precedes `/usr/bin` on this fleet's PATH, so `env` resolved to devops' own
+    script, which parsed the following words as its own flags and died. That is
+    ISS-896, and the expensive half is the second one: the operation never ran,
+    and the failed record returned an issue whose work was completed correctly
+    back to the queue. ISS-893 moved that one file out of the way; `--env` is
+    the answer regardless of what happens to be on PATH.
+  - More generally: **a bare command name in a `run-op` argv resolves against
+    `~/code/devops/bin` FIRST.** That is usually what you want (`api`, `browse`,
+    `claude-db`, `dev` all live there). Spell the absolute path when you mean a
+    system binary and it matters.
 - **Run every operation through it, including ones you expect to be a no-op.**
   A reconcile that moved nothing still has to be recorded as having run: without
   a record you look identical to a session that did nothing, which on a
