@@ -142,6 +142,65 @@ class TestChangelogAppRepo < Minitest::Test
   end
 end
 
+# ISS enrichment is what puts the ISS-NNN link on a note, and it is skipped when there is no
+# playbook credential. It used to ask for a SESSION specifically -- which a Claude session never
+# has, because it authenticates with the AI's API token -- so every agent-driven release wrote its
+# notes with the links silently dropped, behind one warning in the middle of a release (ISS-736).
+class TestChangelogIssueMap < Minitest::Test
+  include DevTestSupport
+
+  AI_TOKEN_HEADER = ["Authorization", "Basic dG9rOg=="].freeze
+  ONE_FIXED_ISSUE = [{ "number" => "034",
+                       "fixes" => [{ "url" => "https://github.com/mbryzek/platform/pull/412" }] }].freeze
+
+  # `responds_with` is data, not a method call: stub_singleton rebinds self to ApiClient, so a
+  # helper method referenced from inside the block is simply not there -- and changelog_issue_map
+  # swallows the resulting NameError as "enrichment unavailable", which looks exactly like the
+  # behaviour under test.
+  def issue_map(auth_header: nil, session_id: nil, responds_with: :never_called)
+    responder = lambda do |*_args, **_kwargs|
+      raise "enrichment must not call the API with no credential" if responds_with == :never_called
+      responds_with.is_a?(StandardError) ? raise(responds_with) : responds_with
+    end
+    stub_singleton(ApiClient, :auth_header_for, ->(_app, use_localhost:) { auth_header }) do
+      stub_singleton(ApiClient, :session_id_for, ->(_app, use_localhost:) { session_id }) do
+        stub_singleton(ApiClient, :request, responder) { changelog_issue_map(false) }
+      end
+    end
+  end
+
+  def test_no_credential_skips_enrichment_and_says_so
+    map = nil
+    _, err = capture_io { map = issue_map }
+    assert_empty map
+    assert_includes err, "no playbook credential"
+  end
+
+  def test_an_ai_token_alone_is_enough_to_enrich
+    map = nil
+    _, err = capture_io { map = issue_map(auth_header: AI_TOKEN_HEADER, responds_with: ONE_FIXED_ISSUE) }
+    assert_equal({ "platform#412" => "034" }, map)
+    refute_includes err, "skipping ISS enrichment"
+  end
+
+  def test_a_human_session_alone_is_still_enough_to_enrich
+    map = nil
+    capture_io { map = issue_map(session_id: "sess-playbook", responds_with: ONE_FIXED_ISSUE) }
+    assert_equal({ "platform#412" => "034" }, map)
+  end
+
+  # The enrichment is a nice-to-have on top of notes that get written either way, so a failure
+  # here degrades rather than aborting the build.
+  def test_a_failed_lookup_degrades_instead_of_raising
+    map = nil
+    _, err = capture_io do
+      map = issue_map(auth_header: AI_TOKEN_HEADER, responds_with: ApiError.new("boom", code: 500))
+    end
+    assert_empty map
+    assert_includes err, "issue enrichment unavailable"
+  end
+end
+
 # The capture summary is the only place that reports which checkouts were read, so a
 # missing checkout or a renamed repo has to be visible in it.
 class TestChangelogCaptureScanLine < Minitest::Test

@@ -2798,8 +2798,7 @@ end
 # "run 'dev auth login'" that handle_errors emits on a 401. A Claude session carrying the AI token has
 # its own credential and needs no login at all.
 def require_playbook_session!(use_localhost)
-  return unless ApiClient.auth_header_for("playbook", use_localhost: use_localhost).nil?
-  return unless ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
+  return if ApiClient.credential_for?("playbook", use_localhost: use_localhost)
   Util.exit_with_error("No playbook session#{use_localhost ? ' (localhost)' : ''}. Run `dev auth login --app playbook#{use_localhost ? ' --localhost' : ''}` first.")
 end
 
@@ -10460,8 +10459,12 @@ def changelog_pending(endpoint, apps, workdir)
 end
 
 def changelog_issue_map(use_localhost)
-  if ApiClient.session_id_for("playbook", use_localhost: use_localhost).nil?
-    warn "changelog: no playbook session; skipping ISS enrichment (run `dev auth login --app playbook` to enable)"
+  # credential_for?, not session_id_for: a Claude session authenticates with the AI token and has no
+  # session file at all, so asking for the session alone skipped enrichment for exactly the identity
+  # that runs agent-driven releases -- and the notes still got written, just without their ISS links
+  # (ISS-736).
+  unless ApiClient.credential_for?("playbook", use_localhost: use_localhost)
+    warn "changelog: no playbook credential; skipping ISS enrichment (run `dev auth login --app playbook` to enable)"
     return {}
   end
   map = {}
