@@ -167,14 +167,28 @@ class TestAgentMergeLane < Minitest::Test
 
   # ---- the base, which is the other half of "in the state it lands in" ------
 
-  def test_a_pr_behind_main_must_be_rebased
+  def test_a_pr_behind_main_needs_its_base_brought_under_it
     v = verdict(green_pr, base_status: "behind")
-    assert_equal :needs_rebase, v.code
-    assert_equal :rebase, v.action
+    assert_equal :needs_update, v.code
+    assert_equal :update, v.action
   end
 
-  def test_a_diverged_pr_must_be_rebased
-    assert_equal :needs_rebase, verdict(green_pr, base_status: "diverged").code
+  def test_a_diverged_pr_needs_its_base_brought_under_it
+    assert_equal :needs_update, verdict(green_pr, base_status: "diverged").code
+  end
+
+  # ISS-769. The action a session reads is the act it will attempt, so it must
+  # name the one that is actually sanctioned: `dev agent update-branch` merges
+  # the base in server-side, and nothing here rebases or pushes. `:rebase` named
+  # work that `agent/instructions.md` §3 forbids to every session.
+  def test_no_action_names_a_rebase
+    refute_includes ML::ACTIONS, :rebase,
+                    "a rebase of a PR branch is a force-push, which no session may perform"
+    assert_includes ML::ACTIONS, :update
+  end
+
+  def test_the_update_verdict_points_at_the_command_that_may_perform_it
+    assert_includes verdict(green_pr, base_status: "behind").message, "dev agent update-branch"
   end
 
   def test_an_identical_head_is_mergeable
@@ -511,5 +525,79 @@ class TestAgentMergeLane < Minitest::Test
       assert_raises(ArgumentError) { ML.merge!("mbryzek/platform", 41, head_sha: "") }
     end
     refute called
+  end
+
+  # ---- bringing the base under a PR (ISS-769) -------------------------------
+
+  def update_command
+    seen = nil
+    stub_shell(->(cmd, _opts) { seen = cmd; shell_result }) do
+      ML.update_branch!("mbryzek/platform", 41, head_sha: "a" * 40)
+    end
+    seen
+  end
+
+  # THE reason this act is allowed at all. GitHub's update-branch REST endpoint
+  # merges the base into the head server-side; it has no rebase mode, so nothing
+  # in this call can rewrite the branch. A `git push --force` or a `gh pr
+  # update-branch --rebase` here would be the exact act `agent/instructions.md`
+  # §3 forbids, and the boundary must be the endpoint rather than a comment.
+  def test_the_update_is_a_server_side_merge_and_never_a_push
+    cmd = update_command.join(" ")
+    assert_includes cmd, "--method PUT"
+    assert_includes cmd, "repos/mbryzek/platform/pulls/41/update-branch"
+    refute_includes cmd, "--rebase"
+    refute_includes cmd, "push"
+    refute_includes cmd, "--force"
+  end
+
+  # `--match-head-commit` for this call. Without it a push landing between the
+  # verdict and here would have the base merged into a head nobody looked at.
+  # Verified against the live API: a non-matching value comes back 422.
+  def test_the_update_pins_the_head_commit_the_verdict_was_computed_from
+    assert_includes update_command.join(" "), "expected_head_sha=#{'a' * 40}"
+  end
+
+  # The same second, independent refusal `merge!` carries. Updating a branch
+  # deploys nothing, so this is not about the revert window — a self-deploying
+  # repo is one the lane may not act on from ANY code path.
+  def test_the_update_refuses_a_self_deploying_repo_even_when_asked_directly
+    called = false
+    stub_shell(->(_cmd, _opts) { called = true; shell_result }) do
+      assert_raises(ArgumentError) { ML.update_branch!("mbryzek/devops", 7, head_sha: "a" * 40) }
+    end
+    refute called, "the devops guard must fire before any subprocess is spawned"
+  end
+
+  def test_the_update_refuses_without_a_head_sha
+    called = false
+    stub_shell(->(_cmd, _opts) { called = true; shell_result }) do
+      assert_raises(ArgumentError) { ML.update_branch!("mbryzek/platform", 41, head_sha: "") }
+    end
+    refute called
+  end
+
+  # The ordering in `verdict` is load-bearing a second time (ISS-663 + ISS-769):
+  # a PR a human is mid-pass over defers BEFORE the base is ever compared, so the
+  # lane never moves a branch out from under a review in flight.
+  def test_a_pr_under_review_is_never_verdicted_for_an_update
+    pr = green_pr("statusCheckRollup" => [
+      check_run("ci", "SUCCESS"),
+      status_context(ML::REVIEW_CONTEXT, "PENDING"),
+    ])
+    assert_equal :review_in_flight, verdict(pr, base_status: "behind").code
+  end
+
+  # Nor is a red one: CI is checked before the base, so a PR whose suite is
+  # failing parks rather than spending a CI run on a branch that is already red.
+  def test_a_red_pr_is_never_verdicted_for_an_update
+    pr = green_pr("statusCheckRollup" => [check_run("ci", "FAILURE")])
+    assert_equal :ci_failed, verdict(pr, base_status: "behind").code
+  end
+
+  # And a conflicting one is left for its author (ISS-765). The endpoint would
+  # refuse it anyway, but the lane must not ask.
+  def test_a_conflicting_pr_is_never_verdicted_for_an_update
+    assert_equal :conflicts, verdict(green_pr("mergeStateStatus" => "DIRTY"), base_status: "behind").code
   end
 end

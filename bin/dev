@@ -138,6 +138,7 @@ INVOCATIONS = {
   "agent doctor"        => 'agent doctor',
   "agent merge-lane"    => 'agent merge-lane [REPO]... [--json]',
   "agent merge"         => 'agent merge <repo> <pr> [--run-id ID] [--dry-run] [--localhost]',
+  "agent update-branch" => 'agent update-branch <repo> <pr> [--dry-run]',
   "prs group"           => 'prs [group] [--branch NAME] [--repo NAME]... [--all] [--json]',
 }.freeze
 
@@ -1081,7 +1082,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["agent merge-lane"]}
         The per-repo merge lane (ISS-754), READ-ONLY. For each repo, every open
         PR oldest-first with the lane's verdict on it and what to do about it:
-        merge, rebase, resolve, wait, park, defer or skip. The head of the line
+        merge, update, resolve, wait, park, defer or skip. The head of the line
         is the oldest PR that may merge RIGHT NOW.
         A PR merges only when the `ci` check passed on the exact commit that
         will land AND that commit contains the current tip of `main` — the two
@@ -1141,6 +1142,25 @@ USAGE = <<~USAGE
         order); --all adds single-repo branches, --branch NAME shows exactly one,
         --repo NAME limits which repos are scanned, --json is the machine form.
 
+    #{INVOCATIONS["agent update-branch"]}
+        Bring `main` under ONE pull request whose lane verdict is
+        `needs_update` — the other thing the lane can do, and the only
+        sanctioned way for a session to move a PR branch at all (ISS-769).
+        It calls GitHub's `PUT /repos/.../pulls/N/update-branch`, which MERGES
+        the base into the head server-side. That is not a force-push and not a
+        local rebase: the author's commits are preserved exactly, their next
+        `git pull` is a fast-forward, and the merge commit is discarded by the
+        squash when the PR eventually lands. The endpoint has no rebase mode
+        and refuses outright on a conflict, so this cannot rewrite a branch and
+        cannot author a resolution however it is called.
+        Pins `expected_head_sha`, so a push landing between the verdict and the
+        call is refused by GitHub rather than silently merged over.
+        Refuses anything the lane does not verdict `needs_update` — a PR under
+        review verdicts `defer` first and is never touched, and a red or
+        conflicting one is not updated either.
+        Does NOT ask the autonomy ledger: this lands nothing on `main`, and the
+        merge that follows re-reads and re-asks from scratch.
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -1188,7 +1208,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge],
+  "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
 }.freeze
 
@@ -12661,6 +12681,88 @@ def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id
   exit 1
 end
 
+# The other thing the lane can DO, and the one that is not a merge (ISS-769).
+#
+# It is a COMMAND rather than a permission for the same reason `merge` is. The
+# AHEAD invariant makes `needs_update` the most frequently returned non-terminal
+# verdict there is — every sibling PR in a repo becomes behind the moment the
+# lane merges anything — so a session that had no sanctioned way to act on it
+# would either stall the lane on almost every PR or improvise a local rebase and
+# a force-push past `agent/instructions.md` §3. Naming the act and putting the
+# guarantees inside it is what makes the flat rule survivable.
+#
+# NOT GATED BY THE AUTONOMY LEDGER, deliberately. The ledger's question is "does
+# reverting this before it ships fully undo it", and this ships nothing: it moves
+# a PR branch, never `main`, and the merge commit it adds is discarded by the
+# squash. It cannot cause a merge either — `dev agent merge` re-reads the PR and
+# re-asks the ledger from scratch, and CI has to go green on the new head first.
+# A decision recorded here would be bookkeeping in a feed whose every other row
+# is a merge, and one more thing that can come back `blocked` and stall the lane
+# for no safety gained.
+def cmd_agent_update_branch(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent update-branch", [app_filter].compact) if app_filter
+  dry_run = false
+  positional = []
+  rest.each { |a| a == "--dry-run" ? dry_run = true : positional << a }
+
+  repo_arg, number = positional
+  problems = []
+  problems << "missing repo (e.g. playbook-admin)" if repo_arg.nil? || repo_arg.empty?
+  problems << "missing PR number" if number.nil? || number.to_s.empty?
+  problems << "PR must be a number, got '#{number}'" if number && !number.to_s.match?(/\A\d+\z/)
+  problems << "unexpected argument(s): #{positional[2..].join(', ')}" if positional.length > 2
+  if repo_arg && !repo_arg.empty? && !Agent::MergeLane.in_lane?(repo_arg)
+    problems << "#{repo_arg} is not in the lane. Allowed: #{Agent::MergeLane::LANE_REPOS.join(', ')}"
+  end
+  report_arg_problems("agent update-branch", problems, usage_for("agent update-branch"))
+
+  repo = Agent::MergeLane.qualify(repo_arg)
+  # A fresh read, never a `merge-lane` snapshot — same reason as `merge`. The
+  # head sha this pins is the one the verdict was computed from, so a branch
+  # that moved while the session was doing something else is refused here rather
+  # than merged into blind.
+  candidate = Agent::MergeLane.assess(repo, number)
+  if candidate.nil?
+    warn "agent update-branch: could not read #{repo}##{number} from GitHub. Nothing updated."
+    exit 1
+  end
+
+  puts "#{candidate.label} #{candidate.title}"
+  puts "  #{candidate.verdict.code}: #{candidate.verdict.message}"
+  unless candidate.verdict.code == :needs_update
+    warn "agent update-branch: refusing — the lane's verdict is `#{candidate.verdict.code}` " \
+         "(do: #{candidate.verdict.action}), not `needs_update`. Nothing updated."
+    exit 1
+  end
+
+  if dry_run
+    puts "  --dry-run: would merge #{repo}'s base into #{candidate.head_sha} server-side. Nothing updated."
+    return
+  end
+
+  agent_update_branch_apply(repo, candidate)
+end
+
+def agent_update_branch_apply(repo, candidate)
+  result = Agent::MergeLane.update_branch!(repo, candidate.number, head_sha: candidate.head_sha)
+  unless result.ok?
+    # The 422 path is the SUCCESS case of `expected_head_sha`: something pushed
+    # between the verdict and this call, and GitHub refused to merge the base
+    # into a head nothing verified. It is also what a conflict comes back as —
+    # which is the endpoint refusing to author a resolution, exactly as intended.
+    warn "agent update-branch: #{candidate.label} was not updated (#{result.summary}): " \
+         "#{result.output.to_s.strip}"
+    exit 1
+  end
+
+  puts "Updated #{candidate.label}: main is merged into its head branch and `ci` re-runs there."
+  puts "  The head has moved, so this PR is not mergeable again until `#{Agent::MergeLane::CI_CHECK}` is green"
+  puts "  on the NEW head. Until GitHub attaches that check the lane reads an empty rollup as"
+  puts "  `#{Agent::MergeLane::NO_CI}` — a commit seconds old, not a repo without a workflow."
+  puts "  Re-run `dev agent merge-lane` once CI has finished."
+end
+
 # The `.claude` half of the doctor (ISS-615).
 #
 # UNLIKE the credentials section below, this DOES affect the exit code. An
@@ -13146,6 +13248,7 @@ when "agent"
   when "doctor"      then cmd_agent_doctor(argv)
   when "merge-lane"  then cmd_agent_merge_lane(argv)
   when "merge"       then cmd_agent_merge(argv)
+  when "update-branch" then cmd_agent_update_branch(argv)
   else                  unknown("agent subcommand", sub, SUBCOMMANDS["agent"])
   end
 when "prs"
