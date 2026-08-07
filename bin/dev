@@ -44,6 +44,7 @@ require 'agent/gc'
 require 'agent/github'
 require 'agent/maintenance'
 require 'agent/merge_lane'
+require 'agent/ops'
 require 'agent/processes'
 require 'agent/tick'
 require 'agent/claude_config'
@@ -126,6 +127,7 @@ INVOCATIONS = {
   "agent tick"          => 'agent tick [--dry-run] [--localhost]',
   "agent status"        => 'agent [status] [--localhost]',
   "agent logs"          => 'agent logs <issue> [--follow]',
+  "agent run-op"        => 'agent run-op <operation> [--timeout SECONDS] -- <command> [args...]',
   "agent pause"         => 'agent pause [--localhost]',
   "agent resume"        => 'agent resume [--localhost]',
   "agent runners"       => 'agent runners [--localhost]',
@@ -999,6 +1001,21 @@ USAGE = <<~USAGE
         The session log for one issue (~/Library/Logs/dev-agent/issues/ISS-<n>/).
         --follow tails it.
 
+    #{INVOCATIONS["agent run-op"]}
+        How an autonomous session RUNS an operation — `dev features reconcile
+        --apply`, `api publish` — so that having run it is a fact the executor can
+        read (ISS-815). It executes the command, streams nothing back until it
+        finishes, prints its output, and files a record under the issue's log tree
+        with the command's OWN exit status and the effects the command itself
+        reported. `dev agent tick` reads those records when it classifies the
+        session: all-succeeded plus a clean exit closes the issue as `deployed`
+        with what each operation did on the timeline; any failure returns it to
+        the queue. Without a record a clean ops run is indistinguishable from a
+        session that did nothing, which on a producer-filed issue means DISMISSED.
+        Refuses to run outside an agent session (it reads DEV_AGENT_ISSUE from the
+        environment the executor set, and takes no flag to override it). Exits
+        with the operation's own status, so `&&` chains behave.
+
     #{INVOCATIONS["agent pause"]}
     #{INVOCATIONS["agent resume"]}
         Kill switch. A paused runner finishes what it is working and claims
@@ -1262,7 +1279,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
+  "agent"        => %w[tick status logs run-op pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[status install preflight run clean-build],
 }.freeze
@@ -6147,6 +6164,7 @@ def cmd_issues_reconcile(args)
     # do" is the common case and a "nothing to do" line is pure noise. `dev issues
     # list --status fixed` is the human-facing view.
     if fixed.empty?
+      issues_reconcile_emit(adopted: adopted, deployed: 0, skipped: 0, total: 0, apply: apply)
       puts "Re-run with --apply to record the transitions." if !apply && adopted > 0
       return
     end
@@ -6178,6 +6196,8 @@ def cmd_issues_reconcile(args)
       end
     end
 
+    issues_reconcile_emit(adopted: adopted, deployed: deployed, skipped: skipped,
+                          total: fixed.length, apply: apply)
     summary = issues_reconcile_summary(deployed: deployed, skipped: skipped, total: fixed.length, apply: apply)
     if summary
       puts ""
@@ -6185,6 +6205,21 @@ def cmd_issues_reconcile(args)
     end
     puts "Re-run with --apply to record the transitions." if !apply && (deployed + adopted) > 0
   end
+end
+
+# What this reconcile DID, for the executor rather than for the release log
+# (ISS-815). On BOTH paths out of the command, including the zero state the
+# human-facing lines above deliberately stay silent on — an ops session's whole
+# deliverable is this number, and "0 deployed" is a result while no line at all
+# is indistinguishable from a run that never happened.
+def issues_reconcile_emit(adopted:, deployed:, skipped:, total:, apply:)
+  said = [issues_adopt_summary(adopted: adopted, apply: apply),
+          issues_reconcile_summary(deployed: deployed, skipped: skipped, total: total, apply: apply)].compact
+  Agent::Ops.emit(
+    summary: said.empty? ? "nothing to adopt or deploy; #{total} fixed total." : said.join(" "),
+    effects: { "adopted" => adopted, "deployed" => deployed, "skipped" => skipped,
+               "fixed_total" => total, "applied" => apply },
+  )
 end
 
 # True when the target app has released since the fix was recorded. Primary signal:
@@ -6503,6 +6538,20 @@ def cmd_features_reconcile(args)
       end
       purged_count += 1
     end
+
+    # BEFORE the zero-state return, and unconditional where the human-facing
+    # summary below is deliberately not (ISS-815). The two silences mean opposite
+    # things: a release log with no line under this heading is a release with
+    # nothing to say, while an ops session that emitted nothing is a session that
+    # cannot prove it ran at all — and "0 processed" is exactly the answer the
+    # executor needs to distinguish from "never ran".
+    Agent::Ops.emit(
+      summary: features_reconcile_summary(processed: processed_count, purged: purged_count,
+                                          outstanding: outstanding.length, apply: apply) ||
+               "nothing to process or purge; #{outstanding.length} outstanding.",
+      effects: { "processed" => processed_count, "purged" => purged_count,
+                 "outstanding" => outstanding.length, "applied" => apply },
+    )
 
     return if lines.empty?
 
@@ -11985,6 +12034,83 @@ def cmd_agent_logs(args)
   exec(*(follow ? ["tail", "-f", log] : ["tail", "-n", "200", log]))
 end
 
+# `dev agent run-op <name> -- <command>` — the ops close-out contract (ISS-815).
+#
+# The command exists so that "the session ran the thing it was sent to run" is a
+# fact the executor can READ, in a system whose outcome classification is
+# deliberately blind to what a session says about itself. See lib/agent/ops.rb
+# for why the record is written from the operation's own output rather than from
+# the session's account of it.
+#
+# Everything after `--` is handed to the operation untouched — never through
+# parse_common_flags, which would eat the `--app` and `--localhost` that belong
+# to the operation and not to this wrapper.
+def cmd_agent_run_op(args)
+  separator = args.index("--")
+  mine = separator ? args[0...separator] : args
+  argv = separator ? args[(separator + 1)..] : []
+
+  rest, app_filter, _use_localhost = parse_common_flags(mine)
+  timeout = Agent::Ops::DEFAULT_TIMEOUT_SECONDS
+  positional = []
+  i = 0
+  while i < rest.length
+    if rest[i] == "--timeout"
+      timeout = rest[i + 1]
+      i += 2
+    else
+      positional << rest[i]
+      i += 1
+    end
+  end
+
+  operation = positional.first
+  problems = []
+  problems << "missing operation name (e.g. features-reconcile)" if operation.nil? || operation.empty?
+  if operation && !operation.empty? && !Agent::Ops.valid_name?(operation)
+    problems << "operation name '#{operation}' must be lowercase letters, digits, dot, dash or underscore (max 48)"
+  end
+  problems << "unexpected argument(s) before `--`: #{positional[1..].join(', ')}" if positional.length > 1
+  problems << "unexpected --app" if app_filter
+  problems << "missing `-- <command>`: name the command to run after a bare `--`" if argv.empty?
+  problems << "--timeout must be a positive number of seconds, got '#{timeout}'" unless timeout.to_s.match?(/\A\d+\z/) && timeout.to_i.positive?
+  report_arg_problems("agent run-op", problems, usage_for("agent run-op"))
+
+  cmd_agent_run_op_apply(agent_run_op_issue!, operation, argv, timeout.to_i)
+end
+
+# The issue this record is filed under, from the environment the EXECUTOR set —
+# never a flag, and never derived from CLAUDE_SESSION_ID (a child's slug names
+# its EPIC, not itself). A session cannot file a record against work it is not
+# doing, and running this by hand on a laptop writes into nobody's log tree.
+def agent_run_op_issue!
+  number = ENV["DEV_AGENT_ISSUE"].to_s
+  return number.to_i if number.match?(/\A\d+\z/)
+
+  Util.exit_with_error(
+    "agent run-op: DEV_AGENT_ISSUE is not set, so there is no issue to file this operation's result under.\n" \
+    "  This command is for an autonomous session, which the executor spawns with that variable set.\n" \
+    "  Outside one, just run the command directly.",
+  )
+end
+
+def cmd_agent_run_op_apply(number, operation, argv, timeout)
+  puts "Running #{operation} for ISS-#{number}: #{argv.join(' ')}"
+  record, visible = Agent::Ops.run(number: number, operation: operation, argv: argv, timeout: timeout)
+  print(visible)
+
+  puts ""
+  puts "Recorded #{operation} for ISS-#{number}: #{Agent::Ops.outcome_phrase(record)}"
+  if record.summary.to_s.strip.empty? && Agent::Ops.succeeded?(record)
+    # Not a failure — an uninstrumented operation is still worth having run and
+    # still closes the issue out. But "what it DID" is the payload of this whole
+    # contract, so an operation that reported nothing says so where somebody
+    # adding one will see it.
+    puts "  It reported no effects. To record what it did, have it print `Agent::Ops.emit`'s marker line."
+  end
+  exit(record.timed_out ? 124 : record.status.to_i)
+end
+
 def cmd_agent_pause(args) = agent_set_paused(args, "agent pause", true)
 def cmd_agent_resume(args) = agent_set_paused(args, "agent resume", false)
 
@@ -13595,6 +13721,7 @@ when "agent"
   when "tick"      then cmd_agent_tick(argv)
   when "status"    then cmd_agent_status(argv)
   when "logs"      then cmd_agent_logs(argv)
+  when "run-op"    then cmd_agent_run_op(argv)
   when "pause"     then cmd_agent_pause(argv)
   when "resume"    then cmd_agent_resume(argv)
   when "runners"   then cmd_agent_runners(argv)

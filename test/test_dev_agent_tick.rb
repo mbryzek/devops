@@ -92,7 +92,7 @@ class TestDevAgentTick < Minitest::Test
   # The value is CredentialsGuard's stand-in, not a real secret.
   def test_a_spawned_session_is_given_the_external_api_credentials
     with_agent_home do
-      env = tick.send(:child_env, "i707_abc")
+      env = tick.send(:child_env, "i707_abc", 707)
       assert_equal "stub-PLAYBOOK_CLAUDE_KEY", env["PLAYBOOK_CLAUDE_KEY"]
       refute_includes env.keys, "ANTHROPIC_API_KEY",
                       "that variable reconfigures the `claude` CLI the session runs as"
@@ -108,7 +108,7 @@ class TestDevAgentTick < Minitest::Test
   # with no age cutoff, and no way to reach another session's data.
   def test_a_spawned_session_is_named_after_its_workspace
     with_agent_home do
-      assert_equal "i707_abc", tick.send(:child_env, "i707_abc")["CLAUDE_SESSION_ID"]
+      assert_equal "i707_abc", tick.send(:child_env, "i707_abc", 707)["CLAUDE_SESSION_ID"]
     end
   end
 
@@ -231,6 +231,124 @@ class TestDevAgentTick < Minitest::Test
                               lease_row("lse-now", nil, at: "2026-08-04T00:00:00Z")])
     assert_equal "needs_input", seen[:statuses].first[:status]
     assert_match(/Failure 3 of 3 in a row/, seen[:statuses].first[:comment])
+  end
+
+  # ---- the ops close-out contract, at the reap (ISS-815) ----
+  #
+  # Agent::Outcome's own arms are pinned in test_dev_agent_outcome.rb. What is
+  # only testable HERE is the wiring: that the reap actually reads the records
+  # this attempt wrote, from the log tree that survives the workspace it deletes,
+  # and that it reads THIS attempt's and not a predecessor's.
+
+  # A reap of a session that ran operations and exited cleanly. `ops` are written
+  # before the reap, exactly as `dev agent run-op` would have written them.
+  def reap_with_operations(ops, started_at: Time.now - 60)
+    seen = { statuses: [], released: [] }
+    with_agent_home do
+      register_identity
+      with_ai_token do
+        subject = tick(dry_run: false)
+        record = Agent::Jobs.write("issue" => 707, "pid" => 999_999, "slug" => "i707_abc", "branch" => "i707_abc",
+                                   "lease_id" => "lse-now", "producer_filed" => true,
+                                   "started_at" => started_at.utc.iso8601,
+                                   "timeout_at" => (Time.now + 3600).utc.iso8601)
+        ops.each { |op| Agent::Ops.write(707, op) }
+        Agent::Paths.write_atomic(Agent::Jobs.exit_code_file(707), "0\n")
+        api = {
+          "GET /playbook/issue/leases?is_active=true&issue_number=707&limit=100&offset=0" => [],
+          "GET /playbook/issue/leases?is_active=false&issue_number=707&limit=100&offset=0" => [],
+          "GET /playbook/issues/707" => { "number" => 707, "status" => "claimed" },
+          "PUT /playbook/issues/707/status" => ->(b) { seen[:statuses] << b; {} },
+          "DELETE /playbook/issue/leases/lse-now?outcome=completed" => ->(_b) { seen[:released] << "completed"; {} },
+        }
+        stubs = {
+          Agent::Github => { prs_in_workspace: ->(*) { [] }, search_prs: ->(*) { [] },
+                             plans_committed_since?: ->(*) { false } },
+          subject => { cleanup: ->(*) {} },
+        }
+        with_stubbed_methods(stubs) do
+          with_stubbed_api(api) { capture_stdout { subject.send(:reap_one, record, Agent::Host.cached_identity) } }
+        end
+      end
+    end
+    seen
+  end
+
+  def op_record(operation:, summary:, status: 0, started_at: Time.now)
+    Agent::Ops::Record.new(operation: operation, argv: ["dev", operation], status: status, timed_out: false,
+                           summary: summary, effects: {}, started_at: started_at.utc.iso8601,
+                           finished_at: started_at.utc.iso8601, output_tail: "")
+  end
+
+  # Before this arm the very same run — producer-filed, no PR, no plan, exit 0 —
+  # landed on `nothing_to_do` and DISMISSED itself, with the twelve transitions it
+  # had just applied recorded nowhere.
+  def test_a_session_that_ran_its_operations_closes_the_issue_as_deployed
+    seen = reap_with_operations([op_record(operation: "issues-reconcile", summary: "12 deployed, 0 skipped.")])
+
+    assert_equal ["completed"], seen[:released]
+    assert_equal "deployed", seen[:statuses].first[:status]
+    # WHAT IT DID, not merely that it exited 0 — the timeline is where that fact
+    # has to land, or the contract has recorded nothing worth having run.
+    assert_match(/issues-reconcile — 12 deployed, 0 skipped\./, seen[:statuses].first[:comment])
+    refute_match(/nothing to do/, seen[:statuses].first[:comment])
+  end
+
+  # The reap reads the log tree, which OUTLIVES an attempt — so attempt 1 running
+  # the operation and then crashing leaves a successful record behind for an
+  # attempt 2 that did nothing at all. `started_at` is what separates them.
+  def test_a_previous_attempts_operation_does_not_close_out_this_attempt
+    seen = reap_with_operations([op_record(operation: "issues-reconcile", summary: "12 deployed.",
+                                           started_at: Time.now - 7200)],
+                                started_at: Time.now - 60)
+    assert_equal "dismissed", seen[:statuses].first[:status], "this attempt delivered nothing of its own"
+    assert_match(/nothing to do/, seen[:statuses].first[:comment])
+  end
+
+  # ---- who wins: the session's own status, or the reap's classification ----
+  #
+  # ISS-815 asked the question, so it gets an answer that cannot quietly change:
+  # THE SESSION'S OWN STATUS WINS. An issue no longer `claimed` was moved by the
+  # session, and the reap comments instead of writing.
+  #
+  # Not a contradiction of "classification never trusts Claude's prose". A
+  # session may declare a status by taking a recorded ACTION — `dev issues status
+  # --status needs_review`, `dev issues handoff` — each a platform write with an
+  # author and a timeline entry. What it may not do is narrate. The stub flunks
+  # on any request it was not told about, so the ABSENCE of a status PUT here is
+  # the assertion.
+  def test_a_status_the_session_set_itself_is_not_overwritten_by_the_reap
+    comments = []
+    with_agent_home do
+      register_identity
+      with_ai_token do
+        subject = tick(dry_run: false)
+        record = Agent::Jobs.write("issue" => 707, "pid" => 999_999, "slug" => "i707_abc", "branch" => "i707_abc",
+                                   "lease_id" => "lse-now", "producer_filed" => true,
+                                   "started_at" => (Time.now - 60).utc.iso8601,
+                                   "timeout_at" => (Time.now + 3600).utc.iso8601)
+        Agent::Paths.write_atomic(Agent::Jobs.exit_code_file(707), "0\n")
+        api = {
+          "GET /playbook/issue/leases?is_active=true&issue_number=707&limit=100&offset=0" => [],
+          "GET /playbook/issue/leases?is_active=false&issue_number=707&limit=100&offset=0" => [],
+          # The session closed itself out, the way a suggestion session does.
+          "GET /playbook/issues/707" => { "number" => 707, "status" => "needs_review" },
+          "POST /playbook/issues/707/comments" => ->(b) { comments << b; {} },
+          "DELETE /playbook/issue/leases/lse-now?outcome=completed" => ->(_b) { {} },
+        }
+        stubs = {
+          Agent::Github => { prs_in_workspace: ->(*) { [] }, search_prs: ->(*) { [] },
+                             plans_committed_since?: ->(*) { false } },
+          subject => { cleanup: ->(*) {} },
+        }
+        with_stubbed_methods(stubs) do
+          with_stubbed_api(api) { capture_stdout { subject.send(:reap_one, record, Agent::Host.cached_identity) } }
+        end
+      end
+    end
+    assert_equal 1, comments.length
+    assert_match(/already at `needs_review`/, comments.first[:body],
+                 "the reap must record its own reading without applying it")
   end
 
   # stub_singleton, applied to a whole table at once — six nested blocks say

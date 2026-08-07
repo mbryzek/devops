@@ -13,6 +13,7 @@ require 'agent/host'
 require 'agent/jobs'
 require 'agent/maintenance'
 require 'agent/notify'
+require 'agent/ops'
 require 'agent/outcome'
 require 'agent/paths'
 require 'agent/playbook'
@@ -751,6 +752,10 @@ module Agent
       result = Agent::Outcome.classify(
         pr: Agent::Github.primary_pr(prs, branch),
         plans_committed: Agent::Github.plans_committed_since?(started),
+        # THIS attempt's operations only (ISS-815). The issue directory outlives
+        # an attempt, so `started` is what stops a previous attempt's successful
+        # run from closing out an attempt that did nothing.
+        operations: Agent::Ops.records(number, since: started),
         exit_code: Agent::Jobs.exit_code(number),
         producer_filed: record["producer_filed"],
         attempt: failed_attempts(number, record, identity),
@@ -780,10 +785,27 @@ module Agent
       1
     end
 
-    # Never override a status the SESSION already set. `needs_input` is the one
-    # outcome a session declares for itself (§4.4), and a session that closed its
-    # own issue out with `dev issues status --status fixed` has already reported
-    # a truer answer than a re-classification would.
+    # THE SESSION'S OWN STATUS WINS. Settled here rather than left implicit,
+    # because ISS-815 asked the question and the answer is load-bearing for every
+    # close-out path: if the issue is no longer `claimed`, the session moved it,
+    # and this comments instead of writing.
+    #
+    # Which is not a contradiction of "classification never trusts Claude's
+    # prose". The two rules divide cleanly: a session may declare a status by
+    # taking a recorded ACTION — `dev issues status --status fixed --url`,
+    # `--status needs_review`, `dev issues handoff` — and every one of those is a
+    # platform write with a timeline entry and an author. What it may not do is
+    # narrate. So the reap defers to a decision the session put on the record and
+    # ignores anything it merely said.
+    #
+    # ONE HOLE, deliberately left open: an unreadable issue (`Agent::Api.issue`
+    # raising) falls through to the write, because there is then no way to tell
+    # "the session moved it" from "still claimed". Guessing wrong in the other
+    # direction is worse — an issue left in `claimed` by a reap that declined to
+    # write is invisible to the sweep and to `dev issues claim`, which is the
+    # silent-aging failure this whole system is built against. `fixed` and
+    # `deployed` are protected anyway: the platform refuses a move back down the
+    # ship ladder (ISS-536).
     def apply_outcome(number, record, result, identity, prs = [])
       comment = "#{result.name} by #{hostname} — #{result.reason}"
 
@@ -1132,7 +1154,7 @@ module Agent
                                    prepared_repos: prepared.repos, continued_repos: prepared.continued,
                                    playbook: playbook)
       pid = Agent::Jobs.spawn_session(argv: @claude_argv, prompt: prompt, workspace: workspace,
-                                      number: number, env: child_env(slug))
+                                      number: number, env: child_env(slug, number))
       Agent::Jobs.write(
         "issue" => number,
         "pid" => pid,
@@ -1348,8 +1370,14 @@ module Agent
     # touching anyone else's. Left unset it currently resolves to the same string
     # via the workspace fallback — but only for as long as every session's cwd
     # stays inside its workspace, which is not something this code controls.
-    def child_env(slug)
+    # `DEV_AGENT_ISSUE` is what makes `dev agent run-op` a contract rather than a
+    # convention (ISS-815): the EXECUTOR names the issue an operation's record is
+    # filed under, so a session cannot file one against work it is not doing, and
+    # `run-op` refuses outright when the variable is absent — which is what keeps
+    # the command from being run by hand on a laptop into some issue's log tree.
+    def child_env(slug, number)
       {
+        "DEV_AGENT_ISSUE" => number.to_s,
         "CLAUDE_SESSION_ID" => slug,
         "GIT_CONFIG_COUNT" => "1",
         "GIT_CONFIG_KEY_0" => "core.hooksPath",

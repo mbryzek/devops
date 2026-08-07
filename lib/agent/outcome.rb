@@ -1,11 +1,12 @@
 # Outcome classification (design §4.4).
 #
-# MECHANICAL, NEVER INFERRED FROM CLAUDE'S PROSE. Four signals, in order:
+# MECHANICAL, NEVER INFERRED FROM CLAUDE'S PROSE. Five signals, in order:
 #
 #   1. a PR the session left behind, and its state: merged, open-ready, or draft
 #   2. new commits under ~/code/claude/plans/
 #   3. whether the tick itself killed this session, and why
-#   4. the process exit code
+#   4. the operations `dev agent run-op` executed, and what each one reported
+#   5. the process exit code
 #
 # The session's own words are not one of them. A session that says "I opened a
 # PR" and did not, or that summarizes a failure as a success, must not be able
@@ -19,10 +20,18 @@
 # having completed with nothing to do (ISS-364). The killer records what it did
 # on the job record and classification reads it back.
 #
+# Signal 4 is the newest and the reason ISS-815 exists. Signals 1 and 2 are both
+# CODE CHANGES, so a session whose job is to RUN something — `dev features
+# reconcile --apply`, `api publish` — delivered its whole result and still fell
+# through to `nothing_to_do`. It stays mechanical the same way the others do:
+# the record is written by the OPERATION's exit status and the OPERATION's own
+# output, not by the session's account of them (see Agent::Ops).
+#
 # Pure: every input is passed in and nothing here shells out. `Agent::Github`
-# is required only for its PR-state predicates, which are plain functions over
-# the hash it produced; the tick gathers the signals.
+# and `Agent::Ops` are required only for their predicates, which are plain
+# functions over records those modules produced; the tick gathers the signals.
 require 'agent/github'
+require 'agent/ops'
 
 module Agent
   module Outcome
@@ -80,11 +89,13 @@ module Agent
     # pr:              nil, or { "url" => ..., "isDraft" => ..., "state" => "MERGED"|"OPEN"|"CLOSED" }
     # plans_committed: did the session land new commits under ~/code/claude/plans/?
     # killed:          nil, or the tick's own record of killing it ({ "reason" => ... })
+    # operations:      Agent::Ops::Records THIS attempt wrote, oldest first
     # exit_code:       the reaped process's exit status (nil if it never wrote one)
     # timed_out:       did Phase A kill it on the 4-hour hard timeout?
     # producer_filed:  was this issue filed by a producer rather than a human?
     # attempt:         which consecutive failure this one would be — `attempt_number`
-    def classify(pr:, plans_committed:, exit_code:, producer_filed:, attempt: 1, timed_out: false, killed: nil)
+    def classify(pr:, plans_committed:, exit_code:, producer_filed:, attempt: 1, timed_out: false, killed: nil,
+                 operations: [])
       # A MERGED PR outranks every other signal, including a kill and a non-zero
       # exit. It is the strongest possible evidence the work landed, and until
       # ISS-364 it was the one case that read as failure: classification looked
@@ -118,6 +129,27 @@ module Agent
         return failure(killed_reason(killed), attempt, url: pr && pr["url"], lease_outcome: "cancelled")
       end
 
+      # AN OPERATION THAT RAN AND FAILED, above every remaining arm including a
+      # clean exit code.
+      #
+      # This ordering is the load-bearing half of ISS-815, not the success arm
+      # below it. A session sent to run `dev issues reconcile --apply` that
+      # watched it exit 1 and then exited 0 itself is the most likely shape of
+      # this failure — the wrapper's `echo $?` reports on CLAUDE, and Claude
+      # finishing tidily says nothing about whether the thing it was sent to run
+      # worked. Without this arm that run classified as `nothing_to_do` and, on a
+      # producer-filed issue, DISMISSED itself.
+      #
+      # A failure, so the issue returns to the queue and the operation is run
+      # again — safe because every operation reached this way is idempotent by
+      # construction (both reconcilers evaluate everything outstanding on every
+      # pass; `api publish` uploads the specs that are there).
+      broken = Agent::Ops.failed(operations)
+      if broken.any?
+        return failure("Operation#{'s' if broken.length > 1} failed: #{Agent::Ops.describe(broken)}",
+                       attempt, url: pr && pr["url"])
+      end
+
       # A draft PR is unfinished work, not a result: the session opened it and
       # never marked it ready. Retryable, and the retry resumes THIS branch and
       # updates the same PR in place (§4.4.1) rather than opening a second one.
@@ -133,6 +165,31 @@ module Agent
       # exactly how that used to read as "completed with nothing to do".
       return failure("Session left no exit code — it was killed or the machine went down before it finished", attempt) if exit_code.nil?
       return failure("Session exited #{exit_code} with no PR and no plan", attempt) unless exit_code.zero?
+
+      # THE OPS ARM: every operation this attempt ran reported success, and the
+      # session then exited cleanly.
+      #
+      # `deployed`, not `fixed`. The two are not interchangeable here: `fixed`
+      # means "resolved in a merged PR, awaiting release" and starts a deploy
+      # watch that needs a fix url to derive an app from — an ops run has no PR
+      # to give it, and a `fixed` with nothing to watch is how 49 issues came to
+      # sit in `fixed` forever (ISS-737). `deployed` is the platform's own word
+      # for "the fix is live, or needed no release", which is precisely an
+      # operation whose effect already happened in production. It stamps
+      # deployed_at, so the ordinary 7-day auto-verify applies unchanged, and it
+      # is a RolledUpStatus, so a child filed this way stops holding its epic
+      # open exactly like any other.
+      #
+      # Requires a CLEAN EXIT and no kill, and that is deliberate. Nothing here
+      # knows how many operations the issue meant to run, so a session that ran
+      # the first of three and then crashed must not read as done — the exit code
+      # is what supplies "and there was nothing left to do". A retry re-runs the
+      # operations that already succeeded, which is free: they are idempotent.
+      if operations.any?
+        return Result.new(name: "operation_completed", status: "deployed", lease_outcome: "completed",
+                          reason: "Ran #{operations.length} operation#{'s' if operations.length > 1}: " \
+                                  "#{Agent::Ops.describe(operations)}")
+      end
 
       # Clean exit, nothing produced. Who filed the issue decides where it lands,
       # and this is the asymmetry that matters: an agent finding "nothing wrong"
@@ -202,7 +259,7 @@ module Agent
     # Workspaces are deleted on success and kept for the post-mortem window
     # otherwise (design §4.3.1).
     def success?(result)
-      %w[merged_pr ready_pr design_document nothing_to_do].include?(result.name)
+      %w[merged_pr ready_pr design_document operation_completed nothing_to_do].include?(result.name)
     end
   end
 end

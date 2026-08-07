@@ -1705,6 +1705,64 @@ class TestDevIssues < Minitest::Test
     assert_equal "", out
   end
 
+  # ---- the ops close-out contract (ISS-815) ----
+
+  # The counterpart to the test just above, and the pair is the point: a release
+  # log stays silent when nothing moved, while an ops session — whose whole
+  # deliverable is having run this — reports "0 deployed" as the answer. Without
+  # it a reconcile that moved twelve issues and a reconcile that never ran are
+  # the same observation, and a producer-filed issue gets DISMISSED either way.
+  #
+  # On BOTH paths out of the command, including the early return this exercises.
+  def test_under_an_ops_run_reconcile_reports_its_counts_even_when_nothing_moved
+    out, = capture_io do
+      with_ops_run do
+        with_merged_prs({}) do
+          with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [graph_issue],
+                           "GET #{issues_list_path(statuses: 'fixed')}" => []) do
+            cmd_issues_reconcile([])
+          end
+        end
+      end
+    end
+    report, visible = Agent::Ops.extract(out)
+    assert_equal "nothing to adopt or deploy; 0 fixed total.", report["summary"]
+    assert_equal 0, report["effects"]["deployed"]
+    assert_equal "", visible, "the release log is unchanged; the marker is addressed to `run-op`"
+  end
+
+  # `2 deployed` versus `0 deployed` is the whole value of having run this, so it
+  # is the number that has to reach the record — not merely "the process exited 0".
+  def test_under_an_ops_run_reconcile_reports_the_transitions_it_applied
+    url = "https://github.com/mbryzek/devops/pull/248"
+    out, = capture_io do
+      with_ops_run do
+        with_merged_prs({}) do
+          with_merged_fix_pr(url) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)],
+                             "PUT #{issues_path('/034/status')}" => graph_issue.merge("status" => "deployed")) do
+              cmd_issues_reconcile(["--apply"])
+            end
+          end
+        end
+      end
+    end
+    report, = Agent::Ops.extract(out)
+    assert_equal 1, report["effects"]["deployed"]
+    assert_equal 1, report["effects"]["fixed_total"]
+    assert_equal true, report["effects"]["applied"]
+    assert_match(/1 deployed/, report["summary"])
+  end
+
+  def with_ops_run
+    original = ENV[Agent::Ops::LISTENER_ENV]
+    ENV[Agent::Ops::LISTENER_ENV] = "1"
+    yield
+  ensure
+    ENV[Agent::Ops::LISTENER_ENV] = original
+  end
+
   # ---- deploy pass: fixes that arrive with no app recorded ----
   #
   # ISS-136 taught the deploy pass to split that branch two ways, but only

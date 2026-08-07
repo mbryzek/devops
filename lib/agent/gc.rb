@@ -42,7 +42,7 @@ module Agent
 
     # Outcomes that end an issue's work. Anything else (a failure, a give-up)
     # keeps the longer post-mortem window.
-    TERMINAL_OUTCOMES = %w[ready_pr design_document nothing_to_do].freeze
+    TERMINAL_OUTCOMES = %w[ready_pr design_document operation_completed nothing_to_do].freeze
 
     # Only directories the executor itself created, ever. `~/code/ai` is also
     # where Mike's own feature dirs live and this runs unattended with rm -rf.
