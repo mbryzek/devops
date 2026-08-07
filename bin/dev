@@ -42,6 +42,7 @@ require 'depsguard'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/maintenance'
+require 'agent/merge_lane'
 require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
@@ -127,6 +128,8 @@ INVOCATIONS = {
   "agent gc"            => 'agent gc [--dry-run]',
   "agent maintenance"   => 'agent maintenance [--dry-run] [--force]',
   "agent doctor"        => 'agent doctor',
+  "agent merge-lane"    => 'agent merge-lane [REPO]... [--json]',
+  "agent merge"         => 'agent merge <repo> <pr> [--run-id ID] [--dry-run] [--localhost]',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -1048,6 +1051,35 @@ USAGE = <<~USAGE
         costs them all of it silently (ISS-615). The tick creates it; this only
         reads.
 
+    #{INVOCATIONS["agent merge-lane"]}
+        The per-repo merge lane (ISS-754), READ-ONLY. For each repo, every open
+        PR oldest-first with the lane's verdict on it and what to do about it:
+        merge, rebase, resolve, wait, park, defer or skip. The head of the line
+        is the oldest PR that may merge RIGHT NOW.
+        A PR merges only when the `ci` check passed on the exact commit that
+        will land AND that commit contains the current tip of `main` — the two
+        invariants that make "verified in the state it lands in" true without
+        branch protection. A repo whose PRs carry no `ci` check merges nothing
+        here: the presence of the check IS the enrolment, so there is no second
+        list of CI-enabled repos to drift.
+        Bare, it walks Agent::MergeLane::LANE_REPOS. --json emits the same view
+        for a session to loop on instead of re-deriving it from prose.
+
+    #{INVOCATIONS["agent merge"]}
+        Merge ONE pull request through the lane — the only supported way for an
+        automated loop to merge anything, and the only place the guarantees are
+        actually enforced. It re-reads the PR from GitHub (never trusting a
+        `merge-lane` snapshot, which the session's own rebases and merges have
+        since invalidated), recomputes the verdict, computes the ledger's facts
+        from the diff rather than from the PR's description, asks
+        `dev autonomy decide`, and merges only on `auto_approved` — with
+        `--match-head-commit`, so a push landing in the gap is rejected by
+        GitHub rather than squashed unverified.
+        --dry-run stops before the ledger is asked, which is deliberate: the
+        only reliable way never to merge something is never to ask about it.
+        Refuses a self-deploying repo (`devops`) from two independent code
+        paths, whatever the ledger would say (ISS-660).
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -1095,7 +1127,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor],
+  "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge],
 }.freeze
 
 def levenshtein(a, b)
@@ -11057,6 +11089,60 @@ def autonomy_print_decision(decision)
   puts "  id: #{decision['id']}"
 end
 
+# The one thing that counts as permission. Everything else — pending, blocked,
+# suppressed, a validation failure, a ledger that never answered — is a no, and
+# collapsing them into one predicate is what stops a caller inventing its own
+# reading of "well, it wasn't blocked".
+def autonomy_approved?(decision) = !decision.nil? && decision["disposition"] == "auto_approved"
+
+# POST one decision and return it, or nil.
+#
+# Extracted from cmd_autonomy_decide so that `dev agent merge` asks the ledger
+# through the SAME code path a human does rather than a second copy of it — the
+# lane computes its own facts (Agent::MergeLane.assertions) precisely so that
+# nothing about how they are submitted has to be re-implemented.
+#
+# nil on ANY failure, and that is the fail-closed half of the contract: an
+# unreachable or erroring ledger must never read as permission. The caller
+# decides what to do with a no; this only decides that a non-answer is one.
+def autonomy_submit_decision(workflow:, action:, subject:, rationale:, reversibility:,
+                             assertions: {}, run_id: nil, idempotency_key: nil,
+                             workflow_defaults: nil, use_localhost: false)
+  body = {
+    workflow_key: workflow,
+    idempotency_key: idempotency_key ||
+      autonomy_default_idempotency_key(workflow, action, subject[:type], subject[:id]),
+    action: action,
+    subject: subject.compact,
+    rationale: rationale,
+    reversibility: reversibility,
+    assertions: assertions,
+  }
+  body[:run_id] = run_id if run_id
+  body[:workflow_defaults] = workflow_defaults if workflow_defaults
+  ApiClient.request(autonomy_endpoint(use_localhost), :post, "/autonomy/decisions", body: body)
+rescue StandardError => e
+  warn "autonomy: #{e.message}"
+  warn "autonomy: treating an unanswered request as 'do nothing'"
+  nil
+end
+
+# Close a decision out. Best-effort by construction and loud when it fails: the
+# merge has already happened by the time this runs, so a failed outcome write is
+# a bookkeeping gap to shout about, never a reason to pretend the merge did not
+# occur.
+def autonomy_submit_outcome(decision_id, applied:, error: nil, undo_command: nil, use_localhost: false)
+  body = { applied: applied }
+  body[:error] = error if error
+  body[:undo] = { kind: "command", command: undo_command } if undo_command
+  ApiClient.request(autonomy_endpoint(use_localhost), :post,
+                    "/autonomy/decisions/#{URI.encode_www_form_component(decision_id)}/outcome",
+                    body: body)
+rescue StandardError => e
+  warn "autonomy: could not record the outcome of #{decision_id} (#{e.message})"
+  nil
+end
+
 def cmd_autonomy_decide(args)
   rest, _app_filter, use_localhost = parse_common_flags(args)
   opts = {}
@@ -11093,41 +11179,26 @@ def cmd_autonomy_decide(args)
   end
   report_arg_problems("decide", problems, usage_for("autonomy decide"))
 
-  body = {
-    workflow_key: opts[:workflow],
-    idempotency_key: opts[:idempotency_key] ||
-      autonomy_default_idempotency_key(opts[:workflow], opts[:action], opts[:subject_type], opts[:subject_id]),
-    action: opts[:action],
-    subject: {
-      type: opts[:subject_type],
-      id: opts[:subject_id],
-      label: opts[:subject_label],
-    },
-    rationale: opts[:rationale],
-    reversibility: opts[:reversibility],
-    assertions: assertions,
-  }
-  body[:run_id] = opts[:run_id] if opts[:run_id]
-  body[:subject][:url] = opts[:subject_url] if opts[:subject_url]
-  if opts[:register_name]
-    body[:workflow_defaults] = {
-      name: opts[:register_name],
-      description: opts[:register_description] || "",
-    }
-  end
-
-  decision =
-    begin
-      ApiClient.request(autonomy_endpoint(use_localhost), :post, "/autonomy/decisions", body: body)
-    rescue StandardError => e
-      # Fail CLOSED. An unreachable or erroring ledger must never read as permission.
-      warn "autonomy: #{e.message}"
-      warn "autonomy: treating an unanswered request as 'do nothing'"
-      exit 1
+  defaults =
+    if opts[:register_name]
+      { name: opts[:register_name], description: opts[:register_description] || "" }
     end
 
+  decision = autonomy_submit_decision(
+    workflow: opts[:workflow], action: opts[:action],
+    subject: { type: opts[:subject_type], id: opts[:subject_id],
+               label: opts[:subject_label], url: opts[:subject_url] },
+    rationale: opts[:rationale], reversibility: opts[:reversibility],
+    assertions: assertions, run_id: opts[:run_id],
+    idempotency_key: opts[:idempotency_key], workflow_defaults: defaults,
+    use_localhost: use_localhost,
+  )
+  # Fail CLOSED: `autonomy_submit_decision` answers nil for an unreachable or
+  # erroring ledger, and a non-answer is a no.
+  exit 1 if decision.nil?
+
   autonomy_print_decision(decision)
-  exit(decision["disposition"] == "auto_approved" ? 0 : 1)
+  exit(autonomy_approved?(decision) ? 0 : 1)
 end
 
 # The write that closes a decision out, so every way of getting it wrong has to
@@ -11183,19 +11254,15 @@ def cmd_autonomy_outcome(args)
   end
   report_arg_problems("outcome", problems, usage_for("autonomy outcome"))
 
-  body = { applied: outcome_flags.first == "--applied" }
-  body[:error] = error if error
-  body[:undo] = { kind: "command", command: undo_command } if undo_command
+  decision = autonomy_submit_outcome(decision_id, applied: outcome_flags.first == "--applied",
+                                                  error: error, undo_command: undo_command,
+                                                  use_localhost: use_localhost)
+  exit 1 if decision.nil?
 
-  handle_errors do
-    decision = ApiClient.request(autonomy_endpoint(use_localhost), :post,
-                                 "/autonomy/decisions/#{URI.encode_www_form_component(decision_id)}/outcome",
-                                 body: body)
-    puts "#{decision['status']}: #{decision['action']} #{decision['subject']['label']}"
-    if decision["status"] == "contradicted"
-      warn "autonomy: the ledger never approved this decision. Acting on it was a contract violation."
-      exit 1
-    end
+  puts "#{decision['status']}: #{decision['action']} #{decision['subject']['label']}"
+  if decision["status"] == "contradicted"
+    warn "autonomy: the ledger never approved this decision. Acting on it was a contract violation."
+    exit 1
   end
 end
 
@@ -12120,6 +12187,195 @@ def cmd_agent_doctor(args)
   exit 1
 end
 
+# ---- the merge lane (ISS-754) ----------------------------------------------
+#
+# `merge-lane` ANSWERS and `merge` ACTS, and they are two commands rather than
+# one with a flag on purpose: everything a session does between them — rebasing
+# a branch, waiting on CI, merging something else — invalidates the answer, so
+# `merge` re-reads from scratch and never takes a verdict it was handed.
+
+# The workflow key the lane's decisions are recorded under. The same one the
+# `pr-auto-merge` playbook uses, deliberately: the lane REPLACES that loop's
+# enumeration and merge, so its decisions belong in the same feed and under the
+# same human-controlled envelope rather than in a second one nobody is watching.
+AGENT_MERGE_WORKFLOW = "pr_auto_merge".freeze
+
+def cmd_agent_merge_lane(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent merge-lane", [app_filter].compact) if app_filter
+  json = false
+  repos = []
+  rest.each { |a| a == "--json" ? json = true : repos << a }
+
+  named = repos.reject { |r| r.start_with?("-") }
+  reject_unknown_args("agent merge-lane", repos - named)
+  unknown = named.reject { |r| Agent::MergeLane.in_lane?(r) }
+  unless unknown.empty?
+    # NOT a soft warning. A repo outside LANE_REPOS is outside the permission
+    # boundary, and a view that quietly walked it would be the loop choosing its
+    # own boundary — which is how a devops PR ended up in front of one (ISS-660).
+    report_arg_problems("agent merge-lane",
+                        ["#{unknown.join(', ')} is not in the lane. " \
+                         "Allowed: #{Agent::MergeLane::LANE_REPOS.join(', ')}"],
+                        usage_for("agent merge-lane"))
+  end
+  work = (named.empty? ? Agent::MergeLane::LANE_REPOS : named).map { |r| Agent::MergeLane.qualify(r) }
+
+  lanes = work.map { |repo| [repo, Agent::MergeLane.candidates(repo)] }
+  return puts(JSON.pretty_generate(agent_merge_lane_json(lanes))) if json
+
+  agent_merge_lane_report(lanes)
+end
+
+def agent_merge_lane_json(lanes)
+  lanes.map do |repo, candidates|
+    head = Agent::MergeLane.head_of_line(candidates)
+    {
+      "repo" => repo,
+      "head_of_line" => head&.number,
+      "candidates" => candidates.map(&:to_h),
+    }
+  end
+end
+
+# Written for a human reading a run summary, which is why the deferred-for-review
+# PRs get their own section rather than a count. Each of those is a PR the lane
+# would have merged and deliberately left for Mike, and he cannot act on a
+# number (ISS-663).
+def agent_merge_lane_report(lanes)
+  lanes.each do |repo, candidates|
+    head = Agent::MergeLane.head_of_line(candidates)
+    puts "#{repo} — #{candidates.length} open, head of line: #{head ? "##{head.number}" : 'none'}"
+    candidates.each do |c|
+      marker = c.mergeable? ? "->" : "  "
+      puts "  #{marker} ##{c.number} [#{c.verdict.action}] #{c.title}"
+      puts "       #{c.verdict.message}"
+    end
+    # Only the PRs whose ONLY blocker is the review. A red PR that also happens
+    # to be under review would not have merged, and listing it here would tell
+    # Mike the lane was holding something back for him when it was not.
+    deferred = candidates.select { |c| c.verdict.code == :review_in_flight }
+    unless deferred.empty?
+      puts "  Held for a review in flight (Mike decides when his own pass is done):"
+      deferred.each { |c| puts "    #{c.url}" }
+    end
+    puts
+  end
+end
+
+# The gated merge. Every guarantee this system has is enforced between here and
+# `Agent::MergeLane.merge!`, in this order, and the order is the point: the
+# cheapest refusal first, the ledger LAST, and the merge only after it said yes.
+def cmd_agent_merge(args)
+  rest, app_filter, use_localhost = parse_common_flags(args)
+  reject_unknown_args("agent merge", [app_filter].compact) if app_filter
+  run_id = nil
+  dry_run = false
+  positional = []
+  i = 0
+  while i < rest.length
+    a = rest[i]
+    case a
+    when "--run-id"
+      run_id = rest[i + 1]
+      usage_exit("--run-id requires a value", example: usage_for("agent merge")) if run_id.nil?
+      i += 2
+    when "--dry-run"
+      dry_run = true
+      i += 1
+    else
+      positional << a
+      i += 1
+    end
+  end
+
+  repo_arg, number = positional
+  problems = []
+  problems << "missing repo (e.g. playbook-admin)" if repo_arg.nil? || repo_arg.empty?
+  problems << "missing PR number" if number.nil? || number.to_s.empty?
+  problems << "PR must be a number, got '#{number}'" if number && !number.to_s.match?(/\A\d+\z/)
+  problems << "unexpected argument(s): #{positional[2..].join(', ')}" if positional.length > 2
+  if repo_arg && !repo_arg.empty? && !Agent::MergeLane.in_lane?(repo_arg)
+    problems << "#{repo_arg} is not in the lane. Allowed: #{Agent::MergeLane::LANE_REPOS.join(', ')}"
+  end
+  report_arg_problems("agent merge", problems, usage_for("agent merge"))
+
+  repo = Agent::MergeLane.qualify(repo_arg)
+  candidate = Agent::MergeLane.assess(repo, number)
+  if candidate.nil?
+    warn "agent merge: could not read #{repo}##{number} from GitHub. Nothing merged."
+    exit 1
+  end
+
+  puts "#{candidate.label} #{candidate.title}"
+  puts "  #{candidate.verdict.code}: #{candidate.verdict.message}"
+  unless candidate.mergeable?
+    warn "agent merge: refusing — the lane's verdict is `#{candidate.verdict.code}` " \
+         "(do: #{candidate.verdict.action}). Nothing merged."
+    exit 1
+  end
+
+  base = Agent::MergeLane.base_sha(repo, "main")
+  asserts = Agent::MergeLane.assertions(candidate, base_sha: base)
+  reversibility = Agent::MergeLane.reversibility(candidate.changed_paths, repo: repo)
+  puts "  reversibility: #{reversibility}"
+  asserts.each { |k, v| puts "  assert #{k}=#{v}" }
+
+  if dry_run
+    # Deliberately stops BEFORE the ledger. A dry run that recorded a decision
+    # would leave an `auto_approved` sitting in the feed for a merge nobody
+    # performed, and the only reliable way never to merge something is never to
+    # ask about it.
+    puts "  --dry-run: the ledger was not asked and nothing was merged."
+    return
+  end
+
+  agent_merge_decide_and_merge(repo, candidate, asserts, reversibility,
+                              run_id: run_id, use_localhost: use_localhost)
+end
+
+def agent_merge_rationale(candidate, reversibility, asserts)
+  "Lane merge: classified #{reversibility} from #{Array(candidate.changed_paths).length} changed path(s), " \
+    "#{asserts['diff_lines']} changed line(s). `#{Agent::MergeLane::CI_CHECK}` passed on " \
+    "#{Agent::MergeLane.short(candidate.head_sha)}, which is the exact commit that will be squashed, and " \
+    "that commit contains the current tip of main (#{Agent::MergeLane.short(asserts['base_sha'])}). " \
+    "Verified by GitHub Actions rather than asserted by this session."
+end
+
+def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id:, use_localhost:)
+  decision = autonomy_submit_decision(
+    workflow: AGENT_MERGE_WORKFLOW, action: "merge_pull_request",
+    subject: { type: "pull_request", id: candidate.label,
+               label: candidate.title, url: candidate.url },
+    rationale: agent_merge_rationale(candidate, reversibility, asserts),
+    reversibility: reversibility, assertions: asserts, run_id: run_id,
+    use_localhost: use_localhost,
+  )
+  exit 1 if decision.nil?
+
+  autonomy_print_decision(decision)
+  unless autonomy_approved?(decision)
+    warn "agent merge: the ledger did not approve this. Nothing merged."
+    exit 1
+  end
+
+  result = Agent::MergeLane.merge!(repo, candidate.number, head_sha: candidate.head_sha)
+  if result.ok?
+    puts "Merged #{candidate.label}."
+    autonomy_submit_outcome(decision["id"], applied: true, use_localhost: use_localhost,
+                                            undo_command: "gh pr revert #{candidate.number} --repo #{repo}")
+    return
+  end
+
+  # `--match-head-commit` rejecting the merge lands here, and it is the SUCCESS
+  # case of that flag: something pushed between the verdict and the merge, and
+  # GitHub refused to squash a commit nothing verified.
+  warn "agent merge: #{candidate.label} did not merge (#{result.summary}): #{result.output.to_s.strip}"
+  autonomy_submit_outcome(decision["id"], applied: false, use_localhost: use_localhost,
+                                          error: "#{result.summary}: #{result.output.to_s.strip[0, 500]}")
+  exit 1
+end
+
 # The `.claude` half of the doctor (ISS-615).
 #
 # UNLIKE the credentials section below, this DOES affect the exit code. An
@@ -12371,6 +12627,8 @@ when "agent"
   when "gc"          then cmd_agent_gc(argv)
   when "maintenance" then cmd_agent_maintenance(argv)
   when "doctor"      then cmd_agent_doctor(argv)
+  when "merge-lane"  then cmd_agent_merge_lane(argv)
+  when "merge"       then cmd_agent_merge(argv)
   else                  unknown("agent subcommand", sub, SUBCOMMANDS["agent"])
   end
 when "changelog"

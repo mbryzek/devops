@@ -261,6 +261,16 @@ action never happens, and no artifact substitutes for not doing it.
   autonomy ledger returns `auto_approved` for, and nothing else. The permission
   belongs to the ledger, so "the ledger was down so I checked it myself" is not
   the exception, it is the failure the exception is shaped to prevent.
+
+  When that session does merge, it merges with **`dev agent merge`** and never
+  with a bare `gh pr merge` (ISS-754). That command is the merge lane: it
+  re-reads the PR, refuses anything the `ci` check did not pass on the exact
+  commit about to land, refuses anything whose head does not contain the current
+  tip of `main`, computes the ledger's facts from the diff rather than from what
+  the PR says about itself, and merges with `--match-head-commit` so a push
+  landing in the gap is rejected rather than squashed unverified. A bare
+  `gh pr merge` has none of that, and there is no branch protection anywhere in
+  this account to supply it.
 - **Never merge a `devops` pull request, under any playbook or workflow.**
   Merging here IS deploying. Every runner fast-forwards its `~/code/devops`
   checkout at the top of every tick, 30 seconds apart, so a merged commit is
