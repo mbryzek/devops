@@ -61,6 +61,13 @@ module Agent
     # per-reap API call.
     TITLE_SCAN_LIMIT = 100
 
+    # How many DISTINCT repos the fallback search may go on to scan exactly. A
+    # search hit is a CANDIDATE repo, not an answer (see `search_repos`), and the
+    # reap runs inside the work lock — an unbounded fan-out of `gh pr list` there
+    # is the ISS-740 stall with a different cause. Five is well above the one repo
+    # an issue names in practice, and the confirmed repos are scanned first.
+    MAX_SEARCH_REPOS = 5
+
     # What separates the assigned branch from a sibling's suffix: `i651_irv` is
     # the assigned branch, `i651_irv_sig` is one of its siblings (ISS-657).
     #
@@ -165,11 +172,21 @@ module Agent
       head == branch.to_s || head.start_with?("#{branch}#{SIBLING_SEPARATOR}")
     end
 
-    # `ISS-<n>` at the start of a title, or nil when the number is not one.
-    def title_prefix(number)
-      /\AISS-#{Integer(number)}\b/
+    # `ISS-<n>` — the PR-title prefix devops/agent/instructions.md §1 mandates —
+    # or nil when the number is not one. Both title lookups start here: the local
+    # match below, and the exact half of the fallback search.
+    def issue_tag(number)
+      "ISS-#{Integer(number)}"
     rescue ArgumentError, TypeError
       nil
+    end
+
+    # `ISS-<n>` at the start of a title, or nil when the number is not one. The
+    # trailing `\b` is load-bearing: without it `ISS-77` matches `ISS-772: …`, the
+    # same digit-swallowing that makes the search side of ISS-772 wrong.
+    def title_prefix(number)
+      tag = issue_tag(number)
+      tag && /\A#{Regexp.escape(tag)}\b/
     end
 
     # The issue number a PR's title claims, or nil for a title that claims none.
@@ -225,46 +242,65 @@ module Agent
       end
     end
 
-    # EVERY PR a session left behind across its workspace's clones, deduped by
-    # url — the branch family and the title prefix overlap by design, and the
-    # exact-branch call repeats what the broad scan already saw.
+    # EVERY PR this issue has across these repos, deduped by url — the branch
+    # family and the title prefix overlap by design, and the exact-branch call
+    # repeats what the broad scan already saw.
     #
     # All of them, not just the best one: classification only needs the strongest
     # PR, but the ISSUE needs all of them recorded, or five sixths of a run's work
     # is invisible to everything downstream (ISS-657).
     #
-    # Minus the ones a session split onto their OWN issue numbers (ISS-759): those
-    # are on sibling branches by contract, so the family lookup finds them, and
-    # they are already tracked, closed out and verified where they belong.
-    def prs_in_workspace(workspace, branch, number)
-      repos_in_workspace(workspace).flat_map do |repo|
+    # THE decision about what belongs to an issue, and the only one. Both lookups
+    # below answer by naming repos and deferring to it, so the workspace path and
+    # the fallback cannot drift into two different notions of "this issue's PR" —
+    # which is how the fallback came to accept somebody else's (ISS-772).
+    def prs_in_repos(repos, branch, number)
+      repos.flat_map do |repo|
         prs_on_branch(repo, branch) + prs_for_issue(repo, branch, number)
       end.uniq { |pr| pr["url"] }.select { |pr| belongs_to_issue?(pr, branch, number) }
     end
 
-    # Fallback lookup when the workspace is gone (a resume, or a GC'd failure):
-    # GitHub search across the account. Index lag is acceptable here because the
-    # branch is minutes-to-days old by the time this path runs.
-    #
-    # Siblings ARE found here — `head:i651_irv` matches `i651_irv_sig` too, since
-    # search matches the qualifier loosely — and the title half finds them again
-    # by contract. What this path CANNOT do is tell which of them is on the
-    # assigned branch: search does not return headRefName (see SEARCH_FIELDS) and
-    # the loose head match cannot stand in for it, so `primary_pr` falls back to
-    # newest-wins here. That is the workspace-is-gone path, where the alternative
-    # is no PR at all.
-    # A PR titled for another issue is filtered here too (ISS-759). The exact-branch
-    # exemption `belongs_to_issue?` makes cannot apply on this path — search does
-    # not return headRefName — but nothing is lost by it: a PR reaches this list
-    # either through the loose `head:` match, which is exactly how a split sibling
-    # arrives, or through the title search, which only ever finds this issue's own.
-    def search_prs(branch, number = nil, owner: "mbryzek")
-      hits = search("head:#{branch}", owner: owner)
-      hits += search("ISS-#{Integer(number)}", owner: owner, match: "title") if number
-      hits.uniq { |pr| pr["url"] }.select { |pr| belongs_to_issue?(pr, nil, number) }
-    rescue ArgumentError, TypeError
-      search("head:#{branch}", owner: owner)
+    # …in the clones the session actually worked in. The primary path: no search
+    # index between the PR and this answer, so a PR opened seconds ago is found.
+    def prs_in_workspace(workspace, branch, number)
+      prs_in_repos(repos_in_workspace(workspace), branch, number)
     end
+
+    # Fallback lookup when the workspace is gone (a resume, or a GC'd failure).
+    # The same answer `prs_in_workspace` gives, over repos GitHub search finds
+    # instead of clones on disk. Index lag is acceptable here because the branch
+    # is minutes-to-days old by the time this path runs.
+    #
+    # Search DISCOVERS repos; it does not decide anything. That indirection is the
+    # fix for ISS-772. `head:<branch>` is a PREFIX match on the whole branch name
+    # — `head:i76` hits `i767`, and `head:i735_te` returns four `i735_tej*` PRs on
+    # this account — while `gh search prs` cannot return headRefName (see
+    # SEARCH_FIELDS), so its hits could never be narrowed back to the branch they
+    # were supposed to identify. `primary_pr` then fell through to newest-wins,
+    # and the reap could record ANOTHER issue's PR as this issue's fix, which
+    # `dev issues reconcile` would go on to reason about deployment from. Deferring
+    # to the exact per-repo lookup also restores the full PR_FIELDS the search
+    # never carried: headRefName for the assigned-branch tie-break, mergedAt for
+    # the reconciler.
+    def search_prs(branch, number = nil, owner: "mbryzek")
+      prs_in_repos(search_repos(branch, number, owner: owner), branch, number)
+    end
+
+    # Candidate repos for the fallback, best first and capped at
+    # MAX_SEARCH_REPOS. A hit whose TITLE carries the `ISS-<n>: ` prefix is
+    # certainly this issue's — that match is made here, locally, against a field
+    # the search does return — so those repos are scanned first; everything the
+    # loose head qualifier surfaced is a maybe and follows.
+    def search_repos(branch, number = nil, owner: "mbryzek")
+      tag = issue_tag(number)
+      prefix = title_prefix(number)
+      hits = search("head:#{branch}", owner: owner)
+      hits += search(tag, owner: owner, match: "title") if tag
+      confirmed, candidates = hits.partition { |pr| prefix && pr["title"].to_s.match?(prefix) }
+      (repos_of(confirmed) + repos_of(candidates)).uniq.first(MAX_SEARCH_REPOS)
+    end
+
+    def repos_of(prs) = prs.filter_map { |pr| pr["repository"] }.reject { |repo| repo.to_s.empty? }
 
     def search(query, owner:, match: nil)
       cmd = ["gh", "search", "prs", query, "--owner", owner, "--json", "#{SEARCH_FIELDS},repository", "--limit", "10"]
@@ -279,8 +315,16 @@ module Agent
     # The resume path (§4.4.1) wants only a branch whose PR is still OPEN: a
     # merged or closed PR is finished, and pushing more commits to it is worse
     # than starting over on a fresh branch.
+    #
+    # Search names the repos, `--head` decides — the same ISS-772 correction, and
+    # here it decides more than bookkeeping: the caller CLONES the repo this
+    # answers with and checks the branch out in it. A loose `head:` hit on another
+    # issue's branch resumes the wrong repo, and in a repo that happens to carry a
+    # branch of this name it resumes the wrong work. No title half: resuming needs
+    # this exact branch to exist, which a same-titled PR elsewhere does not give.
     def search_open_pr(branch, owner: "mbryzek")
-      search("head:#{branch} state:open", owner: owner).find { |pr| open?(pr) }
+      repos = repos_of(search("head:#{branch} state:open", owner: owner)).uniq.first(MAX_SEARCH_REPOS)
+      repos.filter_map { |repo| prs_on_branch(repo, branch).find { |pr| open?(pr) } }.first
     end
 
     # Did the session land commits under ~/code/claude/plans/ during its run?

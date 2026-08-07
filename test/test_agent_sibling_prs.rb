@@ -281,11 +281,26 @@ class TestAgentSiblingPrs < Minitest::Test
   # the same PR arrives by the same route and needs the same answer. There is no
   # exact-branch exemption to make here — search does not return headRefName —
   # and nothing is lost by that: the title half only ever finds this issue's own.
+  #
+  # ISS-772: search only DISCOVERS the repo now; `prs_in_repos` decides, over the
+  # same per-repo `gh pr list` the workspace path uses. So the fallback here
+  # stubs `search` (repo discovery, headRefName-less hits) and `list_prs`
+  # (per-repo, honouring `--head` for real) rather than trusting a raw hit list.
   def test_the_search_fallback_drops_a_sibling_that_carries_its_own_number
-    hits = [{ "number" => 36, "url" => url(36), "title" => "ISS-651: mine", "state" => "OPEN" },
-            { "number" => 37, "url" => url(37), "title" => "ISS-770: split out", "state" => "OPEN" }]
+    repo = "mbryzek/lakeviewsummit-ui"
+    primary = pr(number: 36, head: BRANCH)
+    split = pr(number: 37, head: "#{BRANCH}_sig", title: "ISS-770: split out")
+    hits = [primary, split].map { |p| p.reject { |k, _| k == "headRefName" }.merge("repository" => repo) }
+    list_impl = lambda do |_repo, *args|
+      prs = [primary, split]
+      head = args[args.index("--head") + 1] if args.include?("--head")
+      prs = prs.select { |p| p["headRefName"] == head } if head
+      prs.map { |p| p.merge("repository" => repo) }
+    end
     found = stub_singleton(Agent::Github, :search, ->(*, **) { hits }) do
-      Agent::Github.search_prs(BRANCH, "651")
+      stub_singleton(Agent::Github, :list_prs, list_impl) do
+        Agent::Github.search_prs(BRANCH, "651")
+      end
     end
     assert_equal [36], found.map { |p| p["number"] }
   end
