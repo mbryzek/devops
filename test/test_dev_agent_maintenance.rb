@@ -311,6 +311,34 @@ class TestDevAgentMaintenance < Minitest::Test
     end
   end
 
+  # An exec that fails before the child exists raises rather than returning a
+  # status, and rescuing only Errno::ENOENT let every other one out of the whole
+  # work phase (ISS-743). EACCES is the reachable one: a binary that is present
+  # but not executable — a half-finished homebrew upgrade, or permissions a
+  # macOS update reset — which is not distinguishable from "docker is missing"
+  # by anything this code can see beforehand.
+  def test_a_binary_that_is_present_but_not_executable_is_a_failed_chore_not_a_crash
+    Dir.mktmpdir do |dir|
+      binary = File.join(dir, "docker")
+      File.write(binary, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o644, binary)
+      command = ->(_source, _trigger) { [binary, "system", "prune", "--force"] }
+      # The one test in this file that needs the REAL run_shell — DevTestSupport's
+      # MaintenanceGuard replaces it fleet-wide with a success, which is right
+      # for every other test here and is exactly the thing under test in this one.
+      DevTestSupport::MaintenanceGuard.uninstall
+      begin
+        stub_singleton(Agent::Maintenance, :shell_command, command) do
+          outcome = Agent::Maintenance.run_shell(Agent::Maintenance::DOCKER_SOURCE, :cadence)
+          refute outcome.ok, "an unrunnable chore is a failed chore"
+          assert_match(/could not run #{Regexp.escape(binary)}/, outcome.message)
+        end
+      ensure
+        DevTestSupport::MaintenanceGuard.install
+      end
+    end
+  end
+
   # ---- what the platform is told ---------------------------------------------
 
   # The half an error channel structurally cannot cover. Errors report runs that
