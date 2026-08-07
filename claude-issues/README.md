@@ -12,6 +12,17 @@ decoding guide, and working rules a fix session needs:
 | `suggestion-body.md` | category `suggestion`           | investigating a member's request, not building it       |
 | `default-body.md`    | every other category            | triaging the issue, then the shared working rules       |
 | `manual-body.md`     | `dev issues create` (prepended) | what is specific to a hand-filed issue                  |
+| `review-summary.md`  | `dev issues review`             | summarising ONE blocked issue for the human answering it |
+
+`review-summary.md` is the odd one out and it is worth saying why. Every other file here
+orients a session that is about to DO the work. That one orients a session that must not:
+it reads an issue sitting at `needs_input`/`needs_review` and writes the compact "here is
+what you are actually being asked" that `dev issues review` prints to Mike a second before
+he types his answer. It runs with Edit, Write, NotebookEdit and Bash denied at the CLI, so
+it can read every repo under `~/code` and change none of them — see `lib/issue_review.rb`.
+Its one instruction that carries the whole feature is *read the code the issue references*:
+the question was recorded by a session that had that context and the person answering does
+not, which is the friction the command exists to remove.
 
 **`dev issues claim`** claims a category's open issues and writes **one plan per issue** under
 `~/code/claude/plans/<date>-issue-<number>-<slug>.md`, appending `<category>-body.md` to each.

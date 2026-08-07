@@ -58,6 +58,12 @@ require 'agent/toolchain'
 require 'prs/deploy'
 require 'prs/group'
 
+# `dev issues review`. Split out for the same reason as lib/agent/*: the pieces
+# that DECIDE — which summary sessions are in flight, what a typed line at the
+# prompt means — are pure functions with tests, not a shape buried in a walk that
+# needs a terminal and five child processes to exercise.
+require 'issue_review'
+
 # Single source of truth for each command's invocation line, keyed by the command
 # path. The same string is interpolated into the USAGE block below and shown
 # inline (via usage_for) on an argument error, so help text and error hints can't
@@ -102,6 +108,7 @@ INVOCATIONS = {
   "issues show"         => 'issues show <number> [--localhost]',
   "issues resume"       => 'issues resume <number> [--localhost]',
   "issues claim"        => 'issues claim [--category CATEGORY] [--number 078,080] [--localhost] [--yes] [--no-spawn]',
+  "issues review"       => 'issues review [--number 574,645] [--all] [--localhost]',
   "issues status"       => 'issues status <number> --status STATUS [--comment "TEXT"] [--url URL] [--duplicate-of NUMBER] [--app APP --baseline-version VERSION] [--localhost]',
   "issues fix"          => 'issues fix <number> --url URL [--comment "TEXT"] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
@@ -729,6 +736,44 @@ USAGE = <<~USAGE
         `dev auth login --app playbook` once first (the issues API requires a playbook
         admin, not the platform `dev auth login`).
 
+    #{INVOCATIONS["issues review"]}
+        The other side of `issues claim`: walk the issues that are blocked on YOU
+        — `needs_input` and `needs_review`, the two statuses that mean "waiting on
+        a human" — oldest first, one at a time, and answer them. It prints the
+        whole queue up front with how long each has been waiting, then for each
+        issue prints a Claude session's compact summary of what is actually being
+        asked (the question, the options, a recommendation) and takes your answer
+        as free text. The answer is recorded as a timeline comment and the issue
+        moves to `open`, which is what puts it back in front of `dev issues claim`
+        and the autonomous fleet.
+
+        Those summaries are why this is not just `issues show` in a loop. The
+        question was recorded by a session that had the CODE in context and you do
+        not, so each summary session READS the code the issue references before it
+        says anything. #{IssueReview::WINDOW} of them run at a time, a lookahead window ahead of
+        where you are in the walk, so you are not waiting on a session after the
+        first issue and a walk you abandon early has not paid for summaries nobody
+        read. If one is still running or fails when you reach its issue, the walk
+        prints what the tracker alone records — the note left when it was blocked,
+        any handoff commands waiting on a human, its blockers — and `r` runs the
+        session again. The summary is an enhancement over that floor, never a
+        dependency on it.
+
+        At each prompt: type the answer, or press enter (or `e`) to write a longer
+        one in $EDITOR. `s` skips the issue and leaves it blocked, `z` snoozes it
+        for N days, `d` dismisses it with a reason, `r` re-runs the summary, `q`
+        ends the walk. Only a line that is EXACTLY one of those letters is a
+        command — "skip the second option" is an answer. Ctrl-C anywhere leaves
+        every un-answered issue exactly as it was and kills the summary sessions
+        still in flight; a partial walk is a normal outcome.
+
+        --number 574,645 scopes the walk to specific issues. --all prints every
+        summary first and then collects the answers, for when you want the whole
+        picture before deciding anything. Snoozed issues stay out until they wake.
+        Interactive only — it is a question, so it refuses to run without a
+        terminal. Authenticates with your persisted playbook session, same as the
+        rest of `issues`.
+
     #{INVOCATIONS["issues status"]}
         Close a claimed issue. NUMBER is the per-tenant issue number shown as
         ISS-<number> (034, or unpadded 34). STATUS is one of open, claimed,
@@ -1277,7 +1322,7 @@ SUBCOMMANDS = {
   "scripts"      => %w[list run],
   "codegen"      => %w[sync],
   "dependencies" => %w[check upgrade],
-  "issues"       => %w[create list parent split block duplicate workaround handoff claim show status fix snooze reconcile resume],
+  "issues"       => %w[create list parent split block duplicate workaround handoff claim review show status fix snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top],
@@ -2977,6 +3022,42 @@ def issue_comments_path(number)
   issues_path("/#{number}/comments?limit=101&offset=0")
 end
 
+def issue_status_path(number)
+  issues_path("/#{URI.encode_www_form_component(number)}/status")
+end
+
+def issue_snooze_path(number)
+  issues_path("/#{URI.encode_www_form_component(number)}/snooze")
+end
+
+# The ONE door for writing an issue's status: `issues status`, the `handoff`
+# park, and every transition `issues review` records all go through it.
+#
+# It is the one place the INTERNAL VISIBILITY rule is stated, which is why it is
+# worth a function rather than three near-identical request calls. Everything
+# this CLI writes to a timeline is a note to the team — a terminal is not where
+# the club that filed an issue gets replied to; that happens from playbook-admin,
+# written by a person. Sent explicitly rather than left to the server's default
+# so the rule survives that default changing.
+#
+# Blank fields are dropped rather than sent as null: `--url ""` and no --url at
+# all mean the same thing to every caller here, and the server reads an explicit
+# null differently from an absent key.
+def issue_put_status(endpoint, number, **fields)
+  body = fields.reject { |_, value| value.nil? || (value.respond_to?(:empty?) && value.empty?) }
+  body[:visibility] = "internal" if body.key?(:comment)
+  ApiClient.request(endpoint, :put, issue_status_path(number), body: body)
+end
+
+# Defer an issue for `days`, keeping its status. Shared by `issues snooze` and
+# the `z` key in `issues review`, so "snoozed" means one thing and is computed
+# once.
+def issue_snooze!(endpoint, number, days, comment: nil)
+  body = { snoozed_until: (Time.now + (days * 24 * 60 * 60)).utc.iso8601 }
+  body[:comment] = comment if comment && !comment.empty?
+  ApiClient.request(endpoint, :put, issue_snooze_path(number), body: body)
+end
+
 # The ONE way anything in this CLI reads an issue's timeline: `dev issues show`,
 # the claim-time plan render, and `dev issues resume`'s session lookup all go
 # through it, so the limit and the ordering are decided in one place.
@@ -3135,12 +3216,10 @@ def issue_snooze_note(issue)
 end
 
 def issue_summary_line(issue, index)
-  title = issue["title"].to_s.gsub(/\s+/, " ").strip
-  title = "#{title[0, 57]}..." if title.length > 60
   # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
   # No category here: the only caller prints these under a per-category heading.
-  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_blocked_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{title}"
+  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_blocked_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{issue_short_title(issue)}"
 end
 
 # A timeline comment that moved the issue BACK to `open` from anything else is a
@@ -4411,9 +4490,7 @@ end
 def handoff_park(endpoint, issue, url)
   return issue unless issue["status"] == "open"
 
-  ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(issue['number'])}/status"),
-                    body: { status: "needs_input", visibility: "internal",
-                            comment: handoff_park_comment(issue, url) })
+  issue_put_status(endpoint, issue["number"], status: "needs_input", comment: handoff_park_comment(issue, url))
 rescue SessionExpired, ApiError => e
   # The commands are already filed and visible; what is lost is the guarantee that
   # no agent claims them. That is the entire point of the command, so it is loud.
@@ -5253,6 +5330,492 @@ def cmd_issues_claim(args)
   end
 end
 
+# ---------- `dev issues review`: the walk through what is blocked on a human ----------
+#
+# The two statuses that literally mean "waiting on a human". `deployed` is
+# deliberately not among them: awaiting-verification is a different interaction —
+# verify or reject, not answer a question — and it has its own flow. A snoozed
+# issue is out until it wakes, whatever its status.
+ISSUE_REVIEW_STATUSES = %w[needs_input needs_review].freeze
+
+# Where a summary session runs. `~/code` rather than a scratch directory because
+# the session's job is to read the repositories, and because CLAUDE.md and
+# `.claude/` resolve from there — a session one directory away loads neither and
+# has to rediscover the repo layout by hand. It can read everything under it and
+# write none of it: Edit/Write/NotebookEdit/Bash are denied at the CLI
+# (IssueReview::Session::DENIED_TOOLS), which is a guarantee rather than an
+# instruction to a model.
+def issue_review_session_dir
+  dir = File.expand_path("~/code")
+  Dir.exist?(dir) ? dir : Dir.pwd
+end
+
+# Walk the issues blocked on a human, oldest first, one at a time.
+#
+# This is the counterpart to `issues claim`. Claim answers "what should I work
+# on"; nothing answered "what is waiting on ME", and the cost of that was not the
+# answering — the answers are a sentence or two — it was the re-derivation: read
+# the nudge, run `issues show`, reconstruct from a long body and timeline what
+# was actually being asked, then hand-compose a status call. That friction is per
+# issue, so the queue only ever grew. ISS-574 was waiting long before ISS-832 was
+# filed.
+def cmd_issues_review(args)
+  rest, _app, use_localhost = parse_common_flags(args)
+  requested = nil
+  all = false
+  leftover = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--number"
+      requested = rest[i + 1]
+      usage_exit("--number requires a value (e.g. --number 574,645)", example: usage_for("issues review")) if requested.nil?
+      i += 2
+    when "--all"
+      all = true
+      i += 1
+    else
+      leftover << rest[i]
+      i += 1
+    end
+  end
+
+  problems = []
+  problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
+  report_arg_problems("issues review", problems, usage_for("issues review"))
+
+  # The command's entire output is a question, so there is nothing for it to do
+  # without somebody to answer. Refuse on a pipe rather than blocking on a read
+  # that never returns — and name what a script actually wanted instead.
+  unless $stdin.tty?
+    Util.exit_with_error(
+      "`dev issues review` is interactive and stdin is not a terminal. " \
+      "To see what is waiting without answering it: " \
+      "`dev issues list #{ISSUE_REVIEW_STATUSES.map { |s| "--status #{s}" }.join(' ')}`."
+    )
+  end
+
+  require_playbook_session!(use_localhost)
+
+  handle_errors do
+    endpoint = issue_endpoint(use_localhost)
+    issues = issue_review_queue(endpoint, requested)
+    if issues.empty?
+      puts ""
+      puts "Nothing is blocked on you. Every issue is either being worked or already closed out."
+      puts "(`dev issues list` shows the whole tracker; snoozed issues stay out of this walk until they wake.)"
+      puts ""
+      return
+    end
+
+    issue_review_walk(endpoint, issues, issue_comments_by_number(endpoint, issues), all: all)
+  end
+end
+
+# The issues this walk covers, oldest first.
+#
+# OLDEST FIRST is the whole ordering decision. The queue's problem is the issue
+# that has been waiting longest, and a newest-first walk — which is what the list
+# endpoint returns and what the nudge email shows — is precisely the one that
+# never reaches it.
+def issue_review_queue(endpoint, requested)
+  issues = ApiClient.request(
+    endpoint, :get, issues_list_path(statuses: ISSUE_REVIEW_STATUSES, is_snoozed: false),
+  ) || []
+  ordered = issues.sort_by { |issue| issue.dig("created", "at").to_s }
+  return ordered if requested.nil? || requested.empty?
+
+  resolved, unknown = issue_resolve_requested(requested, ordered)
+  unless unknown.empty?
+    Util.exit_with_error(
+      "Not waiting on an answer: #{unknown.join(', ')}. " \
+      "This walk covers #{ISSUE_REVIEW_STATUSES.join(' and ')} only, and skips snoozed issues. " \
+      "Waiting now: #{ordered.empty? ? 'nothing' : ordered.map { |c| c['number'] }.join(', ')}. " \
+      "Wake a snoozed one with `dev issues snooze <n> --wake`."
+    )
+  end
+  resolved
+end
+
+def issue_review_walk(endpoint, issues, comments, all:)
+  numbers = issues.map { |issue| issue["number"] }
+  by_number = issues.to_h { |issue| [issue["number"], issue] }
+
+  puts ""
+  puts Util.underline("Blocked on you (#{issues.length})")
+  issues.each_with_index { |issue, idx| puts issue_review_queue_line(issue, idx + 1, comments[issue["number"]] || []) }
+  puts ""
+  puts issue_review_key_help
+  puts ""
+
+  window = IssueReview::Window.new(numbers, size: IssueReview::WINDOW) do |number|
+    IssueReview::Session.new(
+      number: number,
+      prompt: issue_review_prompt(by_number.fetch(number), comments[number] || []),
+      model: INTERACTIVE_CLAUDE_MODEL,
+      chdir: issue_review_session_dir,
+      timeout: IssueReview::TIMEOUT_SECONDS,
+    )
+  end
+
+  outcomes = {}
+  begin
+    # --all reads every summary BEFORE any of them is answered, for when the
+    # decisions interact and the whole picture has to come first. The window is
+    # unchanged by it: the summaries are consumed in walk order either way, so K
+    # still bounds how many sessions run at once, it just no longer bounds waste
+    # (every summary in an --all walk is read by definition).
+    if all
+      issues.each_with_index do |issue, idx|
+        puts issue_review_heading(issue, idx + 1, issues.length, comments[issue["number"]] || [])
+        issue_review_show_summary(window, issue, comments[issue["number"]] || [])
+      end
+      puts Util.underline("Now the answers")
+      puts ""
+    end
+
+    issues.each_with_index do |issue, idx|
+      puts issue_review_heading(issue, idx + 1, issues.length, comments[issue["number"]] || [])
+      issue_review_show_summary(window, issue, comments[issue["number"]] || []) unless all
+      outcome = issue_review_ask(endpoint, window, issue, comments[issue["number"]] || [])
+      break if outcome == :quit
+      outcomes[issue["number"]] = outcome
+    end
+  rescue Interrupt
+    # Ctrl-C is a normal way to end a walk, not a failure: nothing has been
+    # written for the issue that was on screen, and everything after it is
+    # untouched. The `ensure` below is what makes that true of the SESSIONS too —
+    # they are in their own process groups, so the terminal's Ctrl-C never
+    # reached them and they would otherwise keep running with nobody to read
+    # them.
+    puts ""
+    puts "Interrupted — nothing recorded for the issue on screen."
+  ensure
+    window.shutdown
+  end
+
+  puts ""
+  puts issue_review_report(issues, outcomes)
+  puts ""
+end
+
+# One line per issue in the up-front list. HOW LONG IT HAS BEEN WAITING is the
+# column that is not on any other listing of these issues and is the reason to
+# print the list at all: the nudge email shows titles, and a title does not say
+# that this one has been sitting for eleven weeks.
+def issue_review_queue_line(issue, index, comments)
+  "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_review_waiting_label(issue, comments)} · #{issue_short_title(issue)}"
+end
+
+def issue_review_heading(issue, index, total, comments)
+  [
+    "",
+    Util.underline("#{index}/#{total}  #{issue_label(issue)} — #{issue['title']}"),
+    "  #{issue['status']}#{issue_review_waiting_label(issue, comments)} · #{issue['category']} · #{issue_url(issue)}",
+    "",
+  ].join("\n")
+end
+
+# When this issue became blocked: the most recent transition INTO one of the
+# review statuses. Falls back to when it was filed, because there is not always a
+# transition to find — `dev issues handoff` files an issue and parks it at
+# needs_input in the same breath.
+def issue_review_blocked_at(issue, comments)
+  transition = Array(comments).select { |c| ISSUE_REVIEW_STATUSES.include?(c.dig("transition", "to").to_s) }.last
+  at = transition&.dig("created", "at") || issue.dig("created", "at")
+  Time.parse(at.to_s)
+rescue ArgumentError, TypeError
+  nil
+end
+
+def issue_review_waiting_label(issue, comments)
+  at = issue_review_blocked_at(issue, comments)
+  return "" if at.nil?
+
+  days = ((Time.now - at) / (24 * 60 * 60)).floor
+  return " · waiting since today" if days <= 0
+  " · waiting #{days} day#{'s' if days != 1}"
+end
+
+# The truncation `issues claim` and `issues review` both list with. Extracted so
+# the two listings cannot drift into different ideas of a long title.
+def issue_short_title(issue)
+  title = issue["title"].to_s.gsub(/\s+/, " ").strip
+  title.length > 60 ? "#{title[0, 57]}..." : title
+end
+
+def issue_review_key_help
+  [
+    "  Type the answer and press enter. It is recorded on the timeline and the issue",
+    "  moves back to `open`, where `dev issues claim` and the fleet can pick it up.",
+    "",
+    "  enter/e  write a longer answer in $EDITOR      r  re-run the summary session",
+    "  s  skip, leave it blocked                      z  snooze it for N days",
+    "  d  dismiss it, with a reason                   q  end the walk",
+    "",
+    "  Only a line that is exactly one of those letters is a command — anything else",
+    "  is your answer. Ctrl-C leaves every un-answered issue exactly as it is.",
+  ].join("\n")
+end
+
+# The prompt handed to one summary session: the durable instructions from
+# claude-issues/, then the issue itself.
+#
+# The issue is RENDERED IN, not looked up by the session. Everything it needs is
+# already in hand here — the record, its timeline, its edges — so handing it over
+# costs nothing, while a session told to go and fetch ISS-574 would need the
+# playbook credential and a Bash tool, and the second of those is exactly what is
+# denied to keep it read-only.
+def issue_review_prompt(issue, comments)
+  [
+    File.read(claude_issues_path("review-summary.md")).strip,
+    "",
+    "---",
+    "",
+    issue_render_item(issue, comments: comments).strip,
+    issue_links_section(issue).strip,
+  ].join("\n")
+end
+
+def issue_review_show_summary(window, issue, comments)
+  number = issue["number"]
+  puts "  Reading the issue and the code it names..." unless window.ready?(number)
+  issue_review_print_summary(window.take(number), issue, comments)
+end
+
+def issue_review_print_summary(summary, issue, comments)
+  if summary.ok?
+    puts issue_review_indent(summary.text)
+  else
+    puts "  No Claude summary — #{summary.error}. `r` runs it again."
+    puts "  What the tracker records:"
+    puts ""
+    puts issue_review_fallback(issue, comments)
+  end
+  puts ""
+end
+
+def issue_review_indent(text)
+  text.to_s.lines.map { |line| line.strip.empty? ? "" : "  #{line.rstrip}" }.join("\n")
+end
+
+# The floor under every summary: what the tracker alone can say, for when the
+# session was still running, failed, or could not be started at all.
+#
+# Deliberately these four things and not the whole record. They are what the
+# BLOCKING session left behind — the note it wrote when it blocked, the commands
+# a handoff is waiting on a human to run, and what this issue is waiting on — and
+# they are the four that answer "what is being asked". Everything else about the
+# issue is one `dev issues show` away, which the last line says.
+def issue_review_fallback(issue, comments)
+  lines = []
+  blocking = issue_review_blocking_comment(comments)
+  if blocking
+    lines << "  Last note (#{blocking.dig('created', 'at')} · #{issue_author_label(blocking)}):"
+    lines << issue_review_quote(blocking["body"])
+  else
+    lines << "  No note was left when this was blocked."
+  end
+
+  commands = issue_review_handoff_commands(issue)
+  unless commands.empty?
+    lines << ""
+    lines << "  Waiting on a human to run:"
+    commands.each { |command| lines << "    #{command}" }
+  end
+
+  blockers = issue_blockers(issue)
+  unless blockers.empty?
+    lines << ""
+    lines << "  Blocked by: #{blockers.map { |b| "#{issue_ref_label(b)} #{b['title']}" }.join('; ')}"
+  end
+
+  lines << ""
+  lines << "  Everything else: `dev issues show #{issue['number']}`"
+  lines.join("\n")
+end
+
+# The note whose question this walk is here to answer: the most recent comment
+# that MOVED the issue into needs_input/needs_review and said something. Falls
+# back to the most recent note of any kind, because an issue can be parked by one
+# comment and clarified by a later one — and the later one is the live version of
+# the question.
+def issue_review_blocking_comment(comments)
+  history = issue_history_comments(comments).reverse
+  with_body = history.reject { |c| c["body"].to_s.strip.empty? }
+  with_body.find { |c| ISSUE_REVIEW_STATUSES.include?(c.dig("transition", "to").to_s) } || with_body.first
+end
+
+def issue_review_quote(body)
+  body.to_s.strip.lines.map { |line| "    #{line.rstrip}" }.join("\n")
+end
+
+# The indented block under "## Run these" in a `dev issues handoff` body, up to
+# the `---` that closes it. That body is written by handoff_body in this same
+# file, so this parses a shape the CLI itself produced rather than guessing at
+# prose. An issue blocked for any other reason has no such section and
+# contributes nothing.
+#
+# These matter more than anything else in the fallback: a handoff is an issue
+# whose whole content is a command only a human can run, and prose describing the
+# step instead of naming it is the exact failure `dev issues handoff` exists to
+# prevent (ISS-396 — two `openclaw cron rm` calls described in a comment, both
+# crons still firing a day later).
+ISSUE_HANDOFF_COMMANDS_SECTION = /^## Run these\s*\n(.*?)(?=^---\s*$|\z)/m
+
+def issue_review_handoff_commands(issue)
+  match = issue["body"].to_s.match(ISSUE_HANDOFF_COMMANDS_SECTION)
+  return [] if match.nil?
+
+  match[1].lines.map(&:strip).reject(&:empty?)
+end
+
+# One issue's prompt loop. Returns what happened to it, which is what the
+# end-of-walk report counts; `:quit` ends the walk with everything from here on
+# untouched.
+#
+# A REJECTED WRITE COSTS THIS ISSUE AND NOTHING ELSE. Every write here is
+# per-issue, and the walk around it is holding a person's attention plus K
+# running sessions — so a 422 on one transition re-prompts rather than unwinding
+# through handle_errors and taking the remaining issues, and the summaries
+# already paid for, down with it.
+def issue_review_ask(endpoint, window, issue, comments)
+  loop do
+    action = IssueReview.parse_answer(issue_review_read_line)
+    case action.kind
+    when :quit
+      return :quit
+    when :skip
+      puts "  Skipped — #{issue_label(issue)} stays #{issue['status']}."
+      return :skipped
+    when :retry
+      puts "  Running the summary session again..."
+      issue_review_print_summary(window.restart(issue["number"]), issue, comments)
+    when :editor
+      text = issue_review_edit_answer(issue)
+      if text.nil?
+        puts "  Nothing written — no answer recorded. Type one, or `s` to skip this issue."
+      else
+        outcome = issue_review_write(issue) { issue_review_record_answer(endpoint, issue, text) }
+        return outcome if outcome
+      end
+    when :answer
+      outcome = issue_review_write(issue) { issue_review_record_answer(endpoint, issue, action.text) }
+      return outcome if outcome
+    when :snooze
+      days = Ask.for_positive_integer("  Snooze #{issue_label(issue)} for how many days?")
+      outcome = issue_review_write(issue) { issue_review_snooze(endpoint, issue, days) }
+      return outcome if outcome
+    when :dismiss
+      reason = Ask.for_string("  Why is #{issue_label(issue)} being dismissed? (recorded on the timeline)")
+      outcome = issue_review_write(issue) { issue_review_dismiss(endpoint, issue, reason) }
+      return outcome if outcome
+    end
+  end
+end
+
+# One write, with its failure contained to this issue: nil back to the prompt
+# loop, which re-asks. Deliberately NOT rescuing SessionExpired — a dead
+# credential fails every remaining write too, and quietly re-prompting through
+# fourteen issues would be worse than stopping and saying so.
+def issue_review_write(issue)
+  yield
+rescue ApiError => e
+  puts "  #{issue_label(issue)} was NOT updated: #{e.message}"
+  puts "  Nothing was recorded. Try again, or `s` to leave it blocked and move on."
+  nil
+end
+
+def issue_review_read_line
+  print "  answer > "
+  $stdout.flush
+  $stdin.gets
+end
+
+# $EDITOR on an empty buffer for a longer answer, matching how `issues create`
+# takes a brief. Its own template rather than issue_editor_template's: that one
+# advertises affordances this buffer does not have (a URL on its own line becomes
+# source_url, a dragged-in path becomes an attachment), and promising them here
+# would silently eat part of an answer.
+def issue_review_answer_template(issue)
+  <<~TEMPLATE
+
+    # Your answer to #{issue_label(issue)} — #{issue['title']}
+    #
+    # It is recorded verbatim as a timeline comment, and the issue moves back to
+    # `open` so `dev issues claim` and the autonomous fleet pick it up again. The
+    # session that takes it will have this text and nothing else, so answer the
+    # question rather than acknowledging it.
+    #
+    # Lines starting with '#' are ignored. An empty message records nothing.
+  TEMPLATE
+end
+
+def issue_review_edit_answer(issue)
+  editor = ENV["VISUAL"] || ENV["EDITOR"] || "vi"
+  Tempfile.create(["ISSUE_ANSWER", ".md"]) do |f|
+    f.write(issue_review_answer_template(issue))
+    f.flush
+    unless system(editor, f.path)
+      # Not fatal, unlike `issues create`: there is a walk in progress and other
+      # issues after this one, so a broken $EDITOR costs this answer rather than
+      # everything still queued behind it.
+      puts "  Editor `#{editor}` exited non-zero — nothing recorded."
+      return nil
+    end
+    parse_issue_editor_brief(File.read(f.path))
+  end
+end
+
+# The answer, verbatim, plus the move to `open` that puts the issue back in front
+# of the fleet.
+#
+# `open` and not "whatever it was before it blocked", which is the tempting
+# version and is wrong: most of these were `claimed` when they blocked, and a
+# `claimed` issue nobody is working is invisible to `dev issues claim` — it only
+# ever offers OPEN ones. Restoring the old status would answer the question and
+# leave the work unpickupable, which is the exact failure `--status` on `create`
+# exists to prevent.
+#
+# The comment is recorded with no decoration. The transition beside it on the
+# timeline already says what it is — needs_input → open is unambiguous — and a
+# prefix would put words next to Mike's that he did not write.
+def issue_review_record_answer(endpoint, issue, text)
+  updated = issue_put_status(endpoint, issue["number"], status: "open", comment: text)
+  puts "  #{issue_label(updated)}: answered — now #{updated['status']}, back in the queue for `dev issues claim`."
+  :answered
+end
+
+def issue_review_snooze(endpoint, issue, days)
+  updated = issue_snooze!(endpoint, issue["number"], days)
+  puts "  #{issue_label(updated)}: snoozed until #{updated['snoozed_until']} (still #{updated['status']}); it stays out of this walk until then."
+  :snoozed
+end
+
+def issue_review_dismiss(endpoint, issue, reason)
+  updated = issue_put_status(endpoint, issue["number"], status: "dismissed", comment: reason)
+  puts "  #{issue_label(updated)}: dismissed."
+  :dismissed
+end
+
+# What the walk did, and — the part that matters — what it did NOT do. A walk
+# ended early is the normal outcome, so the untouched count is printed as a
+# standing fact with the command to come back to, not as a warning.
+def issue_review_report(issues, outcomes)
+  counts = outcomes.values.tally
+  done = %i[answered skipped snoozed dismissed].filter_map do |kind|
+    n = counts[kind].to_i
+    n.zero? ? nil : "#{n} #{kind}"
+  end
+  untouched = issues.length - outcomes.length
+  lines = ["#{done.empty? ? 'Nothing recorded' : done.join(', ')} of #{issues.length} issue(s) blocked on you."]
+  if untouched.positive?
+    lines << "#{untouched} left exactly as #{untouched == 1 ? 'it was' : 'they were'} — `dev issues review` picks up where this stopped."
+  end
+  lines << "Answered issues are `open` again: `dev issues claim` will offer them." if counts[:answered].to_i.positive?
+  lines.join("\n")
+end
+
 def cmd_issues_status(args)
   rest, target_app, use_localhost = parse_common_flags(args)
   status = nil
@@ -5313,27 +5876,22 @@ def cmd_issues_status(args)
   problems << "--duplicate-of only applies to --status dismissed (a duplicate is recorded by dismissing it)" if duplicate_of && !duplicate_of.empty? && status != "dismissed"
   report_arg_problems("issues status", problems, usage_for("issues status"))
 
-  # Always internal, never settable from here. This command is how a Claude fix session talks to
-  # the tracker, and everything an automated actor writes is a note to the team — the club that
-  # filed the issue is replied to by a person, from playbook-admin. Sent explicitly rather than
-  # leaning on the server default so this stays true if that default ever changes.
-  body = { status: status }
-  body[:comment] = comment if comment && !comment.empty?
-  body[:visibility] = "internal" if body.key?(:comment)
-  body[:url] = url if url && !url.empty?
-  body[:duplicate_of_number] = duplicate_of if duplicate_of && !duplicate_of.empty?
-
-  if has_app
-    body[:app] = issue_app!(target_app)
-    body[:baseline_version] = baseline_version
-  end
+  # Blank fields drop out in issue_put_status, which is also where the always-internal
+  # visibility rule lives — see there for why it is never settable from a terminal.
+  # --app is resolved only when it was given: issue_app! exits on an unknown one.
+  fields = {
+    status: status,
+    comment: comment,
+    url: url,
+    duplicate_of_number: duplicate_of,
+    app: has_app ? issue_app!(target_app) : nil,
+    baseline_version: has_app ? baseline_version : nil,
+  }
 
   require_playbook_session!(use_localhost)
 
   handle_errors do
-    res = ApiClient.request(issue_endpoint(use_localhost), :put,
-                            issues_path("/#{URI.encode_www_form_component(number)}/status"),
-                            body: body)
+    res = issue_put_status(issue_endpoint(use_localhost), number, **fields)
     puts "#{issue_label(res)}: status set to #{res['status']}"
     puts "  target app: #{target_app} (baseline #{baseline_version})" if has_app
     print_duplicate_link(res)
@@ -5564,19 +6122,11 @@ def cmd_issues_duplicate(args)
 
   require_playbook_session!(use_localhost)
 
-  body = {
-    status: "dismissed",
-    duplicate_of_number: canonical,
-    # Internal for the same reason every other write from this CLI is: an automated actor
-    # writes notes to the team, never words put in front of the club that filed the issue.
-    comment: comment && !comment.empty? ? comment : "Duplicate of ISS-#{canonical}.",
-    visibility: "internal",
-  }
+  note = comment && !comment.empty? ? comment : "Duplicate of ISS-#{canonical}."
 
   handle_errors do
-    res = ApiClient.request(issue_endpoint(use_localhost), :put,
-                            issues_path("/#{URI.encode_www_form_component(number)}/status"),
-                            body: body)
+    res = issue_put_status(issue_endpoint(use_localhost), number,
+                           status: "dismissed", duplicate_of_number: canonical, comment: note)
     puts "#{issue_label(res)}: dismissed as a duplicate."
     print_duplicate_link(res)
     puts ""
@@ -5626,17 +6176,13 @@ def cmd_issues_snooze(args)
   report_arg_problems("issues snooze", problems, usage_for("issues snooze"))
 
   require_playbook_session!(use_localhost)
-  path = issues_path("/#{URI.encode_www_form_component(number)}/snooze")
 
   handle_errors do
     if wake
-      res = ApiClient.request(issue_endpoint(use_localhost), :delete, path)
+      res = ApiClient.request(issue_endpoint(use_localhost), :delete, issue_snooze_path(number))
       puts "#{issue_label(res)}: snooze cleared; back in the queue"
     else
-      until_iso = (Time.now + (days_i * 24 * 60 * 60)).utc.iso8601
-      body = { snoozed_until: until_iso }
-      body[:comment] = comment if comment && !comment.empty?
-      res = ApiClient.request(issue_endpoint(use_localhost), :put, path, body: body)
+      res = issue_snooze!(issue_endpoint(use_localhost), number, days_i, comment: comment)
       puts "#{issue_label(res)}: snoozed until #{res['snoozed_until']} (status #{res['status']} unchanged)"
     end
   end
@@ -5973,22 +6519,19 @@ def issues_adopt_merged_prs(endpoint:, registry:, version_cache:, apply:)
     note = issue_adoption_note(body, pr, merge_is_release)
     landing = merge_is_release ? "deployed" : "fixed"
     if apply
-      path = issues_path("/#{URI.encode_www_form_component(issue['number'])}/status")
       # `fixed` first even when the destination is `deployed`: the url (and with it
       # the recorded fix) is only meaningful on the fixed transition, and the
       # timeline should read as the two facts it is — this PR fixed it, and there is
       # no release to wait for.
-      ApiClient.request(endpoint, :put, path,
-                        body: body.merge(comment: "#{note}.", visibility: "internal"))
+      issue_put_status(endpoint, issue["number"], **body.merge(comment: "#{note}."))
       # The siblings, after the status write and never as one: POST /:number/fixes
       # only accepts an issue that has shipped, and it is what keeps the FIRST fix
       # the one the deploy reconciler watches (it takes the latest fix naming an
       # app, and these deliberately name none).
       issue_record_extra_fixes(endpoint: endpoint, issue: issue, prs: extras)
       if merge_is_release
-        ApiClient.request(endpoint, :put, path,
-                          body: { status: "deployed", visibility: "internal",
-                                  comment: "No release to wait for; awaiting verification." })
+        issue_put_status(endpoint, issue["number"], status: "deployed",
+                                                    comment: "No release to wait for; awaiting verification.")
       end
       puts "  #{landing.ljust(8)} #{issue_link(issue)} <- #{issue_adoption_line(note, extras)}"
     else
@@ -6198,8 +6741,7 @@ def cmd_issues_reconcile(args)
       case outcome.action
       when :deploy
         if apply
-          ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
-                            body: { status: "deployed", visibility: "internal", comment: outcome.comment })
+          issue_put_status(endpoint, c["number"], status: "deployed", comment: outcome.comment)
           puts "  deployed #{issue_link(c)}#{outcome.detail}"
         else
           puts "  would deploy #{issue_link(c)}#{outcome.detail}"
@@ -13728,6 +14270,7 @@ when "issues"
   when "show"       then cmd_issues_show(argv)
   when "resume"     then cmd_issues_resume(argv)
   when "claim"      then cmd_issues_claim(argv)
+  when "review"     then cmd_issues_review(argv)
   when "status"     then cmd_issues_status(argv)
   when "fix"        then cmd_issues_fix(argv)
   when "snooze"     then cmd_issues_snooze(argv)
