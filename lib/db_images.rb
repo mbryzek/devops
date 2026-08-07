@@ -362,4 +362,25 @@ module DbImages
   def DbImages.database_exists?(port, db)
     psql_query(port, "SELECT 1 FROM pg_database WHERE datname = '#{db}'") == ["1"]
   end
+
+  # How many backends are currently attached to `db`.
+  #
+  # The caller's own psql connects to `postgres`, not to `db`, so this counts
+  # nobody but other clients — which is exactly what `reset` needs before it
+  # drops the database. `end` force-terminates instead, and that asymmetry is
+  # deliberate: ending a session is the session saying it is finished with its
+  # own database, while resetting happens at the head of a test run and the
+  # thing most likely to be holding a connection is ANOTHER test run in flight
+  # (bin/run's log-tidying comment records that overlapping `./run.sh test`
+  # invocations are routine). Terminating that one would kill a live run and
+  # leave it reporting failures against a database that vanished under it.
+  #
+  # A negative answer is impossible and an unreadable one must not read as
+  # "nobody is here", so a query that returns nothing is reported as unknown
+  # (nil) rather than as zero.
+  def DbImages.connection_count(port, db)
+    rows = psql_query(port, "SELECT count(*) FROM pg_stat_activity WHERE datname = '#{db}'")
+    return nil unless rows.length == 1 && rows.first =~ /\A\d+\z/
+    rows.first.to_i
+  end
 end

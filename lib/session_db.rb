@@ -57,6 +57,39 @@ module SessionDb
     end
   end
 
+  # Whether `args` runs TESTS, as opposed to merely opening a database.
+  #
+  # Narrower than opens_database? on both sides, and both narrowings matter:
+  #
+  #   `run` / `runMain` open a database and are NOT tests. They start the
+  #   application, against state the developer put there deliberately, and a
+  #   reset on that path would wipe it on every restart.
+  #
+  #   `test:compile` / `Test/compile` start with "test" and are NOT tests. They
+  #   compile; opens_database? already lets them through unblocked and there is
+  #   nothing for a reset to do. Recognised by the `compile` token sitting in
+  #   the same argument, which is the only way the two forms are ever spelled.
+  #
+  # Everything else that names a test task counts, in every shape sbt accepts it:
+  # `test`, `core/test`, `"core/testOnly core.FooSpec"`, `testQuick`.
+  def self.test_task?(args)
+    args.any? do |arg|
+      tokens = arg.to_s.split(%r{[\s/:]+}).map(&:downcase)
+      next false if tokens.include?("compile")
+      tokens.any? { |token| token.start_with?("test") }
+    end
+  end
+
+  # The `[port, database]` a session JDBC URL names, or `[nil, nil]` when it is
+  # not one this tooling produced. Only ever used to CHECK a URL against a
+  # database claude-db located for itself — never to go find one — so an
+  # unparseable URL is a mismatch rather than something to recover from.
+  def self.parse_url(url)
+    match = url.to_s.match(%r{\Ajdbc:postgresql://[^/:]*:(\d+)/([^?\s]+)})
+    return [nil, nil] if match.nil?
+    [match[1].to_i, match[2]]
+  end
+
   # Whether a JDBC URL names the shared dev database rather than a session one.
   #
   # A session database is a container on its own allocated port (5500-9999), so
