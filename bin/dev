@@ -11289,12 +11289,23 @@ end
 
 def agent_job_line(job)
   number = job["issue"]
-  alive = Agent::Jobs.alive?(job["pid"])
   elapsed = ((Time.now - Time.parse(job["started_at"])) / 60).round
   log = Agent::Paths.claude_log(number)
   last = File.file?(log) ? File.readlines(log).last&.strip : nil
-  "  ISS-#{number}  #{alive ? 'running' : 'FINISHED (unreaped)'}  #{elapsed}m  branch #{job['branch']}\n" \
+  "  ISS-#{number}  #{agent_job_state(job)}  #{elapsed}m  branch #{job['branch']}\n" \
     "      #{last ? last[0, 140] : '(no output yet)'}"
+end
+
+# A dead job whose VERDICT is already on the record is not simply unreaped: the
+# reap classified it, the platform write has not gone through yet, and the next
+# tick retries that write rather than re-classifying (ISS-741). The two states
+# look identical otherwise, and they mean opposite things — "nothing has looked
+# at this yet" versus "this is mid-retry and the answer is already known".
+def agent_job_state(job)
+  return "running" if Agent::Jobs.alive?(job["pid"])
+  verdict = Agent::Outcome.from_h(job.dig("reap", "result"))
+  return "FINISHED (unreaped)" unless verdict
+  "FINISHED (#{verdict.name} recorded; outcome write pending)"
 end
 
 def cmd_agent_logs(args)

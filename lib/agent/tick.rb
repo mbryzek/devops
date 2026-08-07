@@ -639,12 +639,68 @@ module Agent
     def reap(identity)
       Agent::Jobs.all.each do |record|
         next if Agent::Jobs.alive?(record["pid"])
-        reap_one(record, identity)
+        begin
+          reap_one(record, identity)
+        rescue SessionExpired, ApiError => e
+          # Per-record, for the reason `heartbeat_leases` is per-record: this
+          # loop is what closes out every OTHER dead job, and `claim` runs after
+          # it, so one issue whose outcome write hit a 500 used to take the
+          # reap of every job behind it — and this runner's next claim — down
+          # with it. The verdict is already written to the job record by the
+          # time anything in here can raise (see `reap_decision`), so the next
+          # tick retries the WRITE and never re-derives the verdict.
+          log("reap: ISS-#{record['issue']} could not be closed out (#{e.message}) — " \
+              "the recorded outcome is retried next tick")
+        end
       end
     end
 
     def reap_one(record, identity)
       number = record.fetch("issue")
+      record, result, prs = reap_decision(record, identity)
+      return if @dry_run
+
+      # RECLAIM FIRST, then release the lease. Everything `cleanup` reclaims is
+      # keyed by the slug, and the slug is reused verbatim when this issue is
+      # resumed — so releasing the lease first opens a window in which the next
+      # claim (this runner's own next tick, or another runner's) starts a session
+      # on that slug while this one is still deleting its database and its
+      # working tree out from under it. The window was always there for the
+      # workspace delete; it is not worth widening it to a database drop.
+      #
+      # Safe to reclaim this early only because the verdict is already ON DISK:
+      # `cleanup` deletes the very workspace classification reads, so before
+      # ISS-741 a raising `apply_outcome` left a job record whose evidence was
+      # gone, and the retry re-derived `nothing_to_do` from it.
+      cleanup(record, result)
+      apply_outcome(number, record, result, identity, prs)
+      Agent::Jobs.finish(record, { "name" => result.name, "status" => result.status, "reason" => result.reason, "url" => result.url })
+    end
+
+    # The verdict, classified ONCE and written down before anything acts on it.
+    # Returns the job record as it now stands, the outcome, and every PR the run
+    # delivered.
+    #
+    # A recorded verdict WINS over re-classification, and that is the whole fix
+    # for ISS-741. Everything below this line in `reap_one` can raise — one
+    # platform 500 on the status write is enough — and the job record survives to
+    # be reaped again 30 seconds later. By then `cleanup` has deleted the
+    # workspace, so `prs_in_workspace` finds nothing and the fallback search is
+    # inside its own documented index lag: the retry saw no PR, no plans and exit
+    # 0, and called a delivered fix `nothing_to_do` — dismissing a producer-filed
+    # issue with its PR sitting ready on GitHub. Same lesson as ISS-364, arriving
+    # through the retry path instead of the kill path: when the act of handling an
+    # outcome destroys the evidence for it, the evidence has to be written down
+    # first.
+    def reap_decision(record, identity)
+      number = record.fetch("issue")
+      recorded = Agent::Outcome.from_h(record.dig("reap", "result"))
+      if recorded
+        decide("reap", "ISS-#{number} → #{recorded.name} (issue #{recorded.status}): recorded by an earlier " \
+                       "reap of this job and applied unchanged — #{recorded.reason}")
+        return [record, recorded, Array(record.dig("reap", "prs"))]
+      end
+
       branch = record.fetch("branch")
       workspace = Agent::Workspace.path(record.fetch("slug"))
       started = Time.parse(record.fetch("started_at"))
@@ -661,33 +717,21 @@ module Agent
       # below rather than dropped on the floor.
       prs = Agent::Github.prs_in_workspace(workspace, branch, number)
       prs = Agent::Github.search_prs(branch, number) if prs.empty?
-      pr = Agent::Github.primary_pr(prs, branch)
-      plans = Agent::Github.plans_committed_since?(started)
-      attempt = failed_attempts(number, record, identity)
 
       result = Agent::Outcome.classify(
-        pr: pr,
-        plans_committed: plans,
+        pr: Agent::Github.primary_pr(prs, branch),
+        plans_committed: Agent::Github.plans_committed_since?(started),
         exit_code: Agent::Jobs.exit_code(number),
         producer_filed: record["producer_filed"],
-        attempt: attempt,
+        attempt: failed_attempts(number, record, identity),
         timed_out: Agent::Jobs.timed_out?(record, now: @now),
         killed: record["killed"],
       )
       siblings = prs.length > 1 ? " (#{prs.length} PRs found)" : ""
       decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status})#{siblings}: #{result.reason}")
-      return if @dry_run
+      return [record, result, prs] if @dry_run
 
-      # RECLAIM FIRST, then release the lease. Everything `cleanup` reclaims is
-      # keyed by the slug, and the slug is reused verbatim when this issue is
-      # resumed — so releasing the lease first opens a window in which the next
-      # claim (this runner's own next tick, or another runner's) starts a session
-      # on that slug while this one is still deleting its database and its
-      # working tree out from under it. The window was always there for the
-      # workspace delete; it is not worth widening it to a database drop.
-      cleanup(record, result)
-      apply_outcome(number, record, result, identity, prs)
-      Agent::Jobs.finish(record, { "name" => result.name, "status" => result.status, "reason" => result.reason, "url" => result.url })
+      [Agent::Jobs.mark_reaped(record, result: result, prs: prs, now: @now), result, prs]
     end
 
     # Which consecutive failure this attempt would be — the trailing run of

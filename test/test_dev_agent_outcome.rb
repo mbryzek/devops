@@ -237,6 +237,40 @@ class TestDevAgentOutcome < Minitest::Test
     assert_equal "gave_up", gave_up.name
   end
 
+  # ---- writing a verdict down and reading it back (ISS-741) ----
+  #
+  # The reap records its Result on the job record before it deletes the
+  # workspace that Result was derived from, and applies the recorded one if the
+  # outcome write fails and the job has to be reaped again. That round trip goes
+  # through JSON, so it is only as good as these two functions.
+
+  def test_a_recorded_result_round_trips_through_json
+    # One of each shape, including the two that leave `url` nil.
+    [classify(pr: READY_PR), classify(plans_committed: true), classify(exit_code: 1),
+     classify(producer_filed: true)].each do |result|
+      restored = Agent::Outcome.from_h(JSON.parse(JSON.generate(Agent::Outcome.to_h(result))))
+      assert_equal result, restored, "#{result.name} did not survive the job record"
+    end
+  end
+
+  # A job record written before ISS-741 has no verdict on it, and a truncated or
+  # hand-edited one has half of one. Both must read back as "nothing recorded",
+  # which sends the reap back to classifying — the old behaviour, and never worse
+  # than it. What must not happen is the reap raising on a file it did not write.
+  def test_an_unrecognizable_verdict_reads_back_as_nothing_recorded
+    [nil, "not a hash", {}, { "url" => URL }, { "name" => "ready_pr" }, { "status" => "fixed" }].each do |junk|
+      assert_nil Agent::Outcome.from_h(junk), "#{junk.inspect} was accepted as a recorded verdict"
+    end
+  end
+
+  # A verdict written by a NEWER executor, carrying a field this one has never
+  # heard of. Dropped, not raised on: the two sides of a fleet mid-`git pull` are
+  # 30 seconds apart, and a reap that dies on an unknown key strands the lease.
+  def test_an_unknown_field_on_a_recorded_verdict_is_dropped
+    forward = Agent::Outcome.to_h(classify(pr: READY_PR)).merge("invented_later" => true)
+    assert_equal classify(pr: READY_PR), Agent::Outcome.from_h(forward)
+  end
+
   # ---- PR state predicates and ranking (ISS-364 / ISS-365) ----
 
   def test_pr_state_predicates_are_case_insensitive

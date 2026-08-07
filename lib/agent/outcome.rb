@@ -150,6 +150,27 @@ module Agent
       end
     end
 
+    # ---- writing a verdict down, and reading it back ----
+    #
+    # The reap records its Result on the job record BEFORE it starts reclaiming
+    # what that Result was derived from, and applies the recorded one if it has
+    # to run again (ISS-741, `Agent::Jobs.mark_reaped`). These two are that
+    # round trip, through JSON, so string keys both ways.
+
+    def to_h(result) = result.to_h.transform_keys(&:to_s)
+
+    # nil for anything that is not a Result this module wrote — a job record
+    # from an executor that predates ISS-741, a truncated write, a hand-edited
+    # file. The caller re-classifies then, which is exactly the old behaviour and
+    # so never worse than it. Unknown keys are dropped rather than raised on, for
+    # the same reason: a record written by a NEWER executor must not be able to
+    # crash the reap that finds it mid-upgrade.
+    def from_h(hash)
+      return nil unless hash.is_a?(Hash)
+      return nil if hash["name"].to_s.empty? || hash["status"].to_s.empty?
+      Result.new(**Result.members.to_h { |field| [field, hash[field.to_s]] })
+    end
+
     # A retryable failure returns the issue to `open` (the sweeper applies the
     # snoozed_until backoff server-side); the give-up threshold converts it to a
     # question for a human rather than an issue that ages silently.
