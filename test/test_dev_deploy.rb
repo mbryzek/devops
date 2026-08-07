@@ -96,10 +96,11 @@ class TestDevPending < Minitest::Test
   end
 end
 
-# deploy_items derives DB repos from the apps registry (scala apps ship a
-# "<repo>-postgresql" repo), NOT from a filesystem glob — so abandoned
-# *-postgresql checkouts next to the apps are never picked up.
-class TestPendingItems < Minitest::Test
+# A stand-in apps registry. Shared by every deploy test rather than nested in
+# one class: the app <-> schema-repo mapping is now read by the release
+# orchestration too (ISS-738), and a second copy of the fake would be a second
+# definition of what a deployable looks like.
+module DeployRegistryFake
   FakeApp = Struct.new(:name, :stack, :repo, keyword_init: true) do
     # Mirrors Work::Registry::App: the repo (and so the checkout dir) defaults to
     # the app name but can differ once an app is rebranded ahead of its repo.
@@ -113,16 +114,41 @@ class TestPendingItems < Minitest::Test
     end
     attr_reader :apps
     def deploy_tracked = @deploy_tracked
+    def find(name) = @apps.find { |a| a.name == name }
+  end
+
+  # platform and playbook-api are ONE codebase deployed to two DigitalOcean
+  # accounts, so both are built from ~/code/platform and both are migrated by
+  # platform-postgresql. That pair is the whole subject of ISS-738, so it is the
+  # default fleet here.
+  def default_registry_apps
+    [
+      FakeApp.new(name: "platform",     stack: :scala, repo: "mbryzek/platform"),
+      FakeApp.new(name: "playbook-api", stack: :scala, repo: "mbryzek/platform"),
+      FakeApp.new(name: "acumen",       stack: :scala),
+    ]
+  end
+
+  def fake_registry(apps, deploy_tracked = nil)
+    FakeRegistry.new(apps, deploy_tracked || apps)
   end
 
   def with_registry(apps, deploy_tracked = nil)
-    deploy_tracked ||= apps
+    registry = fake_registry(apps, deploy_tracked)
     orig = Work::Registry.method(:load)
-    Work::Registry.define_singleton_method(:load) { FakeRegistry.new(apps, deploy_tracked) }
+    Work::Registry.define_singleton_method(:load) { registry }
     yield
   ensure
     Work::Registry.define_singleton_method(:load, orig)
   end
+end
+
+# deploy_items derives DB repos from the apps registry (scala apps ship a
+# "<repo>-postgresql" repo), NOT from a filesystem glob — so abandoned
+# *-postgresql checkouts next to the apps are never picked up.
+class TestPendingItems < Minitest::Test
+  include DeployRegistryFake
+  FakeApp = DeployRegistryFake::FakeApp
 
   def names = deploy_items.map(&:first)
 
@@ -240,6 +266,8 @@ end
 # cmd_deploy_all orchestrates DB-first + parallel-app workers.
 # Stub resolve_deploy_items + release_one so tests do no real I/O.
 class TestPendingReleaseOrchestration < Minitest::Test
+  include DeployRegistryFake
+
   def setup
     @rows = []
     @release_results = {}
@@ -248,6 +276,18 @@ class TestPendingReleaseOrchestration < Minitest::Test
 
     @orig_resolve = Object.instance_method(:resolve_deploy_items)
     @orig_release = Object.instance_method(:release_one)
+
+    # Phase gating resolves app <-> schema repo through the registry, so it has
+    # to be stubbed here too — otherwise these tests shell out to `pkl eval` and
+    # the fleet they assert on becomes whatever this machine happens to have
+    # checked out. `registry!` lets a test name a different fleet; `untracked!`
+    # names an app the registry knows and `dev deploy` does not release (an
+    # ignored deployable sharing another app's repo).
+    @registry_apps = default_registry_apps
+    @untracked = []
+    @orig_cached_registry = Object.instance_method(:cached_registry)
+    registry_ref = -> { fake_registry(@registry_apps, @registry_apps.reject { |a| @untracked.include?(a.name) }) }
+    Object.send(:define_method, :cached_registry) { registry_ref.call }
 
     rows_ref = -> { @rows }
     results_ref = -> { @release_results }
@@ -276,10 +316,19 @@ class TestPendingReleaseOrchestration < Minitest::Test
     @contracting = names
   end
 
+  def registry!(*apps)
+    @registry_apps = apps
+  end
+
+  def untracked!(*names)
+    @untracked = names
+  end
+
   def teardown
     Object.send(:define_method, :resolve_deploy_items, @orig_resolve)
     Object.send(:define_method, :release_one, @orig_release)
     Object.send(:define_method, :partition_db_releases, @orig_partition)
+    Object.send(:define_method, :cached_registry, @orig_cached_registry)
   end
 
   def capture_io
@@ -673,6 +722,197 @@ class TestPendingReleaseOrchestration < Minitest::Test
     assert_equal ["platform-postgresql"], @released
     refute_match(/Phase 1:/, out)
     assert_match(/Phase 3:/, out)
+  end
+
+  # --- ISS-738: a schema repo migrates EVERY deployable built from its repo ---
+  #
+  # platform-postgresql is applied to both platform and playbook-api (the same
+  # codebase, two DigitalOcean accounts), so both directions of the gating have
+  # to see both deployables — not just the one the schema repo is named after.
+
+  # The failure the issue describes: the primary app ships, the second deployable
+  # does not, and the drop would land against a copy of the schema whose code is
+  # still selecting the dropped object.
+  def test_contracting_db_is_held_back_when_a_second_deployable_fails
+    contracting!("platform-postgresql")
+    @release_results = { "playbook-api" => { ok: false, log: "image pull failed" } }
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["playbook-api",        { tag: "0.0.1", ahead: 1, last: "b" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "c" }],
+    ]
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
+    refute_includes @released, "platform-postgresql"
+    refute_nil exc
+    assert_match(/skipped:\s+platform-postgresql \(contracting migration held back: playbook-api did not release/, out)
+  end
+
+  # Both deployables shipped, so nothing is left running the old code and the
+  # drop is safe — the hold-back must not fire just because a second name exists.
+  def test_contracting_db_releases_when_every_deployable_succeeds
+    contracting!("platform-postgresql")
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["playbook-api",        { tag: "0.0.1", ahead: 1, last: "b" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "c" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal "platform-postgresql", @released.last
+    assert_match(/Phase 3: releasing 1 contracting database\(s\)/, out)
+  end
+
+  # Every failed deployable is named, so the summary says which release to retry.
+  def test_hold_back_names_every_deployable_that_failed
+    contracting!("platform-postgresql")
+    @release_results = {
+      "platform"     => { ok: false, log: "boom" },
+      "playbook-api" => { ok: false, log: "boom" },
+    }
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["playbook-api",        { tag: "0.0.1", ahead: 1, last: "b" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "c" }],
+    ]
+    out, = capture_io_with_exit { cmd_deploy_all([]) }
+    assert_match(/held back: platform, playbook-api did not release/, out)
+  end
+
+  # The mirror of the same bug, in the expanding direction: keying on the app's
+  # own name looked for a playbook-api-postgresql that does not exist, found no
+  # gate, and rolled the second deployable out in Phase 1 — in parallel with the
+  # migration its new code needs.
+  def test_second_deployable_waits_for_the_expanding_db_of_its_repo
+    @rows = [
+      ["playbook-api",        { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal ["platform-postgresql", "playbook-api"], @released
+    refute_match(/in parallel with/, out)
+  end
+
+  def test_second_deployable_is_skipped_when_the_db_of_its_repo_fails
+    @release_results = { "platform-postgresql" => { ok: false, log: "boom" } }
+    @rows = [
+      ["playbook-api",        { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out, exc = capture_io_with_exit { cmd_deploy_all([]) }
+    assert_equal ["platform-postgresql"], @released
+    refute_nil exc
+    assert_match(/skipped:\s+playbook-api \(db release failed \(platform-postgresql\)\)/, out)
+  end
+
+  # An app the registry does not know still falls back to the naming convention,
+  # so nothing about the pre-registry behaviour changes for it.
+  def test_unknown_app_still_gated_by_its_conventional_db
+    registry!
+    @rows = [
+      ["acumen",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["acumen-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    capture_io { cmd_deploy_all([]) }
+    assert_equal ["acumen-postgresql", "acumen"], @released
+  end
+
+  # The state the fleet is actually in mid-account-split: playbook-api has a
+  # database config (so release-db migrates it) but is ignored (so nothing here
+  # releases or probes it). There is no release to wait for, so the drop still
+  # goes — but it says out loud whose schema it just changed unchecked, rather
+  # than reporting a clean Phase 3.
+  def test_untracked_target_is_warned_about_not_held_back
+    untracked!("playbook-api")
+    contracting!("platform-postgresql")
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_equal ["platform", "platform-postgresql"], @released
+    assert_match(/WARNING: platform-postgresql also migrates playbook-api, which this deploy does not release/, out)
+  end
+
+  # The ordinary fleet must stay quiet: a schema repo whose every deployable is
+  # released has nothing unchecked, and a warning on every contracting release
+  # would train everyone to ignore this one.
+  def test_no_warning_when_every_target_is_released
+    contracting!("platform-postgresql")
+    @rows = [
+      ["platform",            { tag: "0.0.1", ahead: 1, last: "a" }],
+      ["playbook-api",        { tag: "0.0.1", ahead: 1, last: "b" }],
+      ["platform-postgresql", { tag: "0.0.2", ahead: 1, last: "c" }],
+    ]
+    out = capture_io { cmd_deploy_all([]) }
+    refute_match(/WARNING/, out)
+  end
+end
+
+# The app <-> schema-repo mapping both deploy phases gate on. One schema repo can
+# migrate several deployables (ISS-738), so neither direction may be derived from
+# a single conventional name.
+class TestDeployDbAppMapping < Minitest::Test
+  include DeployRegistryFake
+
+  def registry
+    fake_registry(default_registry_apps)
+  end
+
+  def test_app_for_db_strips_the_suffix
+    assert_equal "platform", app_for_db("platform-postgresql")
+    assert_equal "acumen", app_for_db("acumen-postgresql")
+  end
+
+  def test_apps_for_db_returns_every_deployable_built_from_the_repo
+    assert_equal %w[platform playbook-api], apps_for_db("platform-postgresql", registry)
+  end
+
+  def test_apps_for_db_returns_the_single_deployable_of_an_unshared_repo
+    assert_equal ["acumen"], apps_for_db("acumen-postgresql", registry)
+  end
+
+  # A DB repo with no registry app behind it keeps the conventional answer rather
+  # than an empty list, which would silently disable the hold-back.
+  def test_apps_for_db_falls_back_to_the_conventional_name
+    assert_equal ["mystery"], apps_for_db("mystery-postgresql", registry)
+  end
+
+  def test_db_for_app_follows_the_repo_not_the_app_name
+    assert_equal "platform-postgresql", db_for_app("playbook-api", registry)
+    assert_equal "platform-postgresql", db_for_app("platform", registry)
+    assert_equal "acumen-postgresql", db_for_app("acumen", registry)
+  end
+
+  def test_db_for_app_falls_back_to_the_conventional_name
+    assert_equal "mystery-postgresql", db_for_app("mystery", registry)
+  end
+
+  def test_blocking_db_only_gates_on_a_pending_db
+    assert_equal "platform-postgresql", blocking_db_for("playbook-api", ["platform-postgresql"], registry)
+    assert_nil blocking_db_for("playbook-api", ["acumen-postgresql"], registry)
+    assert_nil blocking_db_for("playbook-api", [], registry)
+  end
+
+  # A deployable with no database config is not a migration target: release-db
+  # selects on the scala block, and so does this.
+  def test_db_targets_exclude_a_deployable_with_no_database
+    apps = default_registry_apps.reject { |a| a.name == "playbook-api" } +
+           [FakeApp.new(name: "playbook-api", stack: :unknown, repo: "mbryzek/platform")]
+    assert_equal ["platform"], apps_for_db("platform-postgresql", fake_registry(apps))
+  end
+
+  # An IGNORED target still counts. release-db never reads the ignore flag, so
+  # the migration lands in that database either way — it is exactly the one this
+  # run cannot vouch for.
+  def test_unchecked_targets_name_an_ignored_deployable
+    tracked = default_registry_apps.reject { |a| a.name == "playbook-api" }
+    reg = fake_registry(default_registry_apps, tracked)
+    assert_equal %w[platform playbook-api], apps_for_db("platform-postgresql", reg)
+    assert_equal [["platform-postgresql", ["playbook-api"]]],
+                 unchecked_db_targets(["platform-postgresql"], reg)
+  end
+
+  def test_unchecked_targets_are_empty_when_every_target_is_released
+    assert_empty unchecked_db_targets(%w[platform-postgresql acumen-postgresql], registry)
   end
 end
 
