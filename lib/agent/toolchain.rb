@@ -52,7 +52,17 @@ module Agent
     # `browse` and has never been on anybody's PATH, so a list that could only
     # express "binary on PATH" would have had to leave it off and report a
     # healthy machine that cannot render a page.
-    Tool = Struct.new(:name, :required_by, :producers, :install, :required, :paths, keyword_init: true) do
+    #
+    # `unsupported` is the third state, and it is here because PRESENT AND WRONG
+    # is a thing this list could not say (ISS-781). Everything above answers "is
+    # it installed"; node 26 is installed, runs, answers `--version`, and
+    # deadlocks Playwright's browser installer forever. A doctor that can only
+    # report presence reports `node ok` on a machine where no frontend session can
+    # obtain a browser — the same shape of silence as the rest of this file, one
+    # level in. It takes the probed version string and returns the reason it
+    # cannot be used, or nil.
+    Tool = Struct.new(:name, :required_by, :producers, :install, :required, :paths, :unsupported,
+                      keyword_init: true) do
       def required? = required != false
       def optional? = !required?
 
@@ -60,6 +70,63 @@ module Agent
       # the issue body both branch on this, because "not on the agent's PATH" is
       # the wrong sentence to hand someone whose Chrome is simply not installed.
       def absolute? = !Array(paths).empty?
+
+      # Nil whenever we cannot tell, which includes the whole `versions: false`
+      # path. Guessing here would file an issue about a working machine, and the
+      # rest of this file is emphatic that a tool refusing `--version` is still
+      # installed.
+      def unsupported_reason(version_string)
+        return nil if unsupported.nil? || version_string.nil?
+        unsupported.call(version_string)
+      end
+    end
+
+    # Major version out of whatever `--version` printed: `v26.6.0` and `26.6.0`
+    # both give 26. Nil rather than 0 when there is no number to read, so an
+    # unrecognised format is "cannot tell" and not "version zero, condemn it".
+    def self.major(version_string)
+      version_string.to_s[/(\d+)\./, 1]&.to_i
+    end
+
+    # WHY NODE 26 IS REFUSED (ISS-781), measured on a runner on 2026-08-07.
+    #
+    # `playwright install` downloads a browser fine and then deadlocks unpacking
+    # it — no crash, no error, no exit, 0% CPU, indefinitely. Two sessions before
+    # this one lost about an hour each to waiting it out, and the workaround they
+    # left behind (curl the zip, `unzip` it into the version directory by hand,
+    # touch INSTALLATION_COMPLETE and DEPENDENCIES_VALIDATED) is a cost every
+    # frontend session was going to keep paying.
+    #
+    # It is a Node regression, not a Playwright bug and not this fleet. Same
+    # archive, same machine, same minute: v22.14.0, v24.9.0 and v25.9.0 all
+    # extract it; v26.6.0 and v26.7.0 both wedge at the identical byte. The
+    # deadlock is a lost pipe wakeup between yauzl's fd-slicer Readable and
+    # zlib's InflateRaw Writable — the source ends up paused with 40564 bytes
+    # buffered while the sink sits empty with `needDrain=false`, so no `drain` is
+    # ever emitted and nothing resumes the source. It bites the first zip entry
+    # whose compressed size exceeds one read chunk, which makes it perfectly
+    # deterministic and is why "it always stops on the same file" looked like a
+    # corrupt archive. It is not: `unzip` of the identical bytes takes 5 seconds.
+    #
+    # SCOPE, stated narrowly on purpose. Node 26 runs everything else here,
+    # including Playwright ITSELF — with browsers already on disk, playbook-www's
+    # suite is 34 passed on 26.6.0. Only the installer's extract step hangs. The
+    # message says so, because a reason that overclaims is one an operator
+    # correctly ignores.
+    #
+    # WHY IT IS REQUIRED RATHER THAN A WARNING. A runner in this state cannot run
+    # any frontend e2e suite it does not already have browsers for, and reports
+    # nothing — ISS-779 shipped two playbook-www PRs with the suite unrun on
+    # exactly that machine (ISS-780).
+    NODE_EXTRACT_DEADLOCK = lambda do |version_string|
+      major = Agent::Toolchain.major(version_string)
+      next nil if major.nil? || major < 26
+      "node #{version_string.to_s.strip} deadlocks `playwright install` while unpacking a browser " \
+        "(ISS-781): the download succeeds, extraction wedges forever at 0% CPU on the first zip " \
+        "entry larger than one read chunk. A Node >=26 regression in stream pipe wakeup, not a " \
+        "Playwright bug — 22, 24 and 25 all extract the same archive. Node 26 is otherwise fine " \
+        "here, including RUNNING Playwright once browsers are on disk; it is only the installer " \
+        "that hangs. Node 24 is the current Active LTS"
     end
 
     # Everything the dispatcher, its producers and its claimed sessions shell out
@@ -73,20 +140,39 @@ module Agent
         producers: %w[depsguard],
         install: "brew install depsguard",
       ),
-      # `brew install node`, NOT nvm. nvm's node is real and installed on this
-      # box; it is simply invisible to `/bin/zsh -lc`, which is the only shell
-      # the agent ever runs in. See the module comment.
+      # Homebrew, NOT nvm. nvm's node is real and installed on this box; it is
+      # simply invisible to `/bin/zsh -lc`, which is the only shell the agent ever
+      # runs in. See the module comment.
+      #
+      # PINNED TO 24, and the pin is the whole fix for ISS-781: plain
+      # `brew install node` is what put a Current release on this fleet, and
+      # Current is 26, which deadlocks `playwright install`. 24 is the Active LTS
+      # ("Krypton"). See NODE_EXTRACT_DEADLOCK above for the measurements.
+      #
+      # `brew uninstall node` is part of the literal command rather than an
+      # afterthought: node@24 is keg-only, so it only reaches the login PATH via
+      # `brew link --force`, and leaving the unversioned `node` formula installed
+      # alongside means the next `brew upgrade` relinks 26 over the top and the
+      # hang comes back with nothing to show why.
       Tool.new(
         name: "node",
         required_by: "`dev browserslist update`, and every JS repo a claimed session builds",
         producers: %w[browserslist-update],
-        install: "brew install node",
+        install: "brew install node@24 && brew uninstall --ignore-dependencies node " \
+                 "; brew link --overwrite --force node@24",
+        unsupported: NODE_EXTRACT_DEADLOCK,
       ),
+      # No `unsupported:` here even though npx ships with node, and that is
+      # deliberate rather than an omission: `npx --version` prints NPM's version
+      # (11.x today), so NODE_EXTRACT_DEADLOCK would be reading the wrong number
+      # off it — silently nil now, and a false positive the day npm reaches 26.
+      # The node entry above is where this is judged.
       Tool.new(
         name: "npx",
         required_by: "`npx --yes update-browserslist-db@latest` in `dev browserslist update`",
         producers: %w[browserslist-update],
-        install: "brew install node",
+        install: "brew install node@24 && brew uninstall --ignore-dependencies node " \
+                 "; brew link --overwrite --force node@24",
       ),
       # The one tool here devops SHIPS rather than installs: `api` sits in
       # `bin/` next to `dev` itself. It is on this list anyway because the plist
@@ -224,21 +310,47 @@ module Agent
     # seconds between ticks.
     PROBE_TIMEOUT_SECONDS = 10
 
-    Found = Struct.new(:tool, :path, :version, keyword_init: true) do
+    Found = Struct.new(:tool, :path, :version, :unsupported_reason, keyword_init: true) do
       def present? = !path.nil?
       def missing? = path.nil?
+
+      # Resolved, and unusable anyway. Kept distinct from `missing?` all the way
+      # out to the operator: "install node" and "you have the wrong node" send
+      # whoever is fixing the box to different places.
+      def unsupported? = !unsupported_reason.nil?
     end
 
     Result = Struct.new(:at, :path, :found, keyword_init: true) do
       def missing_required = found.select { |f| f.missing? && f.tool.required? }.map(&:tool)
       def missing_optional = found.select { |f| f.missing? && f.tool.optional? }.map(&:tool)
-      def ok? = missing_required.empty?
+
+      # Founds rather than Tools, because the reason and the version that produced
+      # it are the whole content of the report and both live here.
+      def unsupported = found.select { |f| f.unsupported? && f.tool.required? }
+
+      def ok? = missing_required.empty? && unsupported.empty?
 
       # Producer keys whose PLAYBOOK cannot be carried out on this machine, deduped
       # and ordered as TOOLS orders them. This is the sentence the filed issue
       # leads with: "missing depsguard" is a fact about a laptop, "the depsguard
       # producer has never run" is the failure.
-      def blocked_producers = missing_required.flat_map(&:producers).uniq
+      #
+      # An unsupported tool blocks its producers exactly as an absent one does —
+      # `browserslist-update` shells out to `npx`, and it does not care whether
+      # node is missing or wedged.
+      def blocked_producers = (missing_required + unsupported.map(&:tool)).flat_map(&:producers).uniq
+
+      # The one line the tick logs and the doctor headlines. Here rather than in
+      # either caller so the two cannot drift, and so "MISSING" stops being
+      # printed with nothing after it on a machine whose only problem is a
+      # version (which is what a `missing_required`-only summary did).
+      def summary
+        return "all required tools present" if ok?
+        parts = []
+        parts << "MISSING #{missing_required.map(&:name).join(', ')}" unless missing_required.empty?
+        parts << "UNSUPPORTED #{unsupported.map { |f| "#{f.tool.name} #{f.version}" }.join(', ')}" unless unsupported.empty?
+        parts.join(" / ")
+      end
     end
 
     module_function
@@ -292,11 +404,16 @@ module Agent
                        .find { |c| File.file?(c) && File.executable?(c) }
     end
 
-    # Best-effort `--version`, purely for the operator's report. Never used to
-    # decide present/absent: a tool that resolves but refuses `--version` is
-    # installed, and treating it as missing would file an issue about a working
-    # machine. A tool that HANGS on `--version` is the same fact — it resolved —
-    # so a timeout drops the version string and nothing else.
+    # Best-effort `--version`. Still never used to decide present/absent: a tool
+    # that resolves but refuses `--version` is installed, and treating it as
+    # missing would file an issue about a working machine. A tool that HANGS on
+    # `--version` is the same fact — it resolved — so a timeout drops the version
+    # string and nothing else.
+    #
+    # It is no longer PURELY for the report, though: a `Tool#unsupported` is
+    # judged from this string (ISS-781). The failure mode that buys is bounded in
+    # the same direction as everything above — no string means no judgement, so a
+    # tool this cannot read stays usable rather than being condemned on a guess.
     def version(path)
       result = Agent::Shell.capture(path, "--version", timeout: PROBE_TIMEOUT_SECONDS)
       return nil unless result.ok?
@@ -305,11 +422,16 @@ module Agent
       nil
     end
 
+    # `versions: false` therefore means "resolution only", and cannot report an
+    # unsupported version — there is nothing to read one out of. Every caller that
+    # passes it is a resolution test; the tick and the doctor both leave it on.
     def check(tools: TOOLS, now: Time.now, path: nil, versions: true)
       resolved = path || agent_path
       found = tools.map do |tool|
         binary = resolve(tool, path: resolved)
-        Found.new(tool: tool, path: binary, version: binary && versions ? version(binary) : nil)
+        found_version = binary && versions ? version(binary) : nil
+        Found.new(tool: tool, path: binary, version: found_version,
+                  unsupported_reason: binary && tool.unsupported_reason(found_version))
       end
       Result.new(at: now, path: resolved, found: found)
     end
@@ -339,6 +461,7 @@ module Agent
           "at" => result.at.utc.iso8601,
           "missing" => result.missing_required.map(&:name),
           "missing_optional" => result.missing_optional.map(&:name),
+          "unsupported" => result.unsupported.map { |f| f.tool.name },
         },
         mode: 0600,
       )
@@ -350,12 +473,23 @@ module Agent
     # server does not re-file while a non-terminal issue with the same
     # fingerprint exists, and an order-dependent key would file a second issue
     # for the same machine the day someone reorders the list above.
-    def missing_key(result) = result.missing_required.map(&:name).sort.join("+")
+    #
+    # An unsupported tool contributes `name:unsupported` and deliberately NOT its
+    # version. Keying on `node@26.6.0` would file a fresh issue on every patch
+    # bump of a node that is broken for the same reason, and re-filing four times
+    # while nobody has fixed it once is how a queue stops being read.
+    def problem_key(result)
+      (result.missing_required.map(&:name) +
+       result.unsupported.map { |f| "#{f.tool.name}:unsupported" }).sort.join("+")
+    end
 
-    def issue_fingerprint(result, hostname) = "toolchain:#{hostname}:#{missing_key(result)}"
+    def issue_fingerprint(result, hostname) = "toolchain:#{hostname}:#{problem_key(result)}"
 
     def issue_title(result, hostname)
-      "dev-agent: #{hostname} is missing #{result.missing_required.map(&:name).sort.join(', ')}"
+      parts = []
+      parts << "is missing #{result.missing_required.map(&:name).sort.join(', ')}" unless result.missing_required.empty?
+      parts << "cannot use #{result.unsupported.map { |f| "#{f.tool.name} #{f.version}" }.sort.join(', ')}" unless result.unsupported.empty?
+      "dev-agent: #{hostname} #{parts.join(', and ')}"
     end
 
     # The body is written to be actionable without an ssh session: what is
@@ -364,12 +498,32 @@ module Agent
     # sees a quiet producer, and the whole finding is that quiet and healthy look
     # identical from there.
     def issue_body(result, hostname)
-      lines = ["`#{hostname}` is missing #{result.missing_required.length} required tool(s).", ""]
-      result.missing_required.each do |tool|
-        lines << "- **#{tool.name}** — needed by #{tool.required_by}"
-        lines << "  - looked for at: `#{tool.paths.join('`, `')}` (not on PATH)" if tool.absolute?
-        lines << "  - install: `#{tool.install}`"
-        lines << "  - blocks producer(s): #{tool.producers.map { |k| "`#{k}`" }.join(', ')}" unless tool.producers.empty?
+      lines = []
+      unless result.missing_required.empty?
+        lines += ["`#{hostname}` is missing #{result.missing_required.length} required tool(s).", ""]
+        result.missing_required.each do |tool|
+          lines << "- **#{tool.name}** — needed by #{tool.required_by}"
+          lines << "  - looked for at: `#{tool.paths.join('`, `')}` (not on PATH)" if tool.absolute?
+          lines << "  - install: `#{tool.install}`"
+          lines << "  - blocks producer(s): #{tool.producers.map { |k| "`#{k}`" }.join(', ')}" unless tool.producers.empty?
+        end
+      end
+      # Its own section, because the fix is not the same shape. "Missing" is
+      # answered by installing something; this is answered by installing a
+      # DIFFERENT VERSION of something already there, and an operator who reads
+      # "missing node" on a box where `node --version` answers fine concludes the
+      # report is broken and stops reading (ISS-781).
+      unless result.unsupported.empty?
+        lines += [""] unless lines.empty?
+        lines += ["`#{hostname}` has #{result.unsupported.length} required tool(s) installed at a version " \
+                  "that does not work here. Nothing is absent — these resolve, run, and answer " \
+                  "`--version`.", ""]
+        result.unsupported.each do |f|
+          lines << "- **#{f.tool.name}** #{f.version} at `#{f.path}` — needed by #{f.tool.required_by}"
+          lines << "  - why it cannot be used: #{f.unsupported_reason}"
+          lines << "  - install: `#{f.tool.install}`"
+          lines << "  - blocks producer(s): #{f.tool.producers.map { |k| "`#{k}`" }.join(', ')}" unless f.tool.producers.empty?
+        end
       end
       unless result.blocked_producers.empty?
         lines += ["", "Until this is fixed, these producers record `check_failed` on this machine and file " \

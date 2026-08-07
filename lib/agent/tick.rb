@@ -599,7 +599,7 @@ module Agent
       return unless Agent::Toolchain.due?(now: @now)
 
       result = Agent::Toolchain.check(now: @now)
-      summary = result.ok? ? "all required tools present" : "MISSING #{result.missing_required.map(&:name).join(', ')}"
+      summary = result.summary
       if @dry_run
         decide("toolchain", "#{summary} — would #{result.ok? ? 'record the check' : 'file an issue'}")
         return
@@ -617,9 +617,9 @@ module Agent
     # issue, and the marker is already written so the next cadence retries.
     def file_toolchain_issue(result)
       host = hostname
-      Agent::Notify.once("toolchain", "#{host}:#{Agent::Toolchain.missing_key(result)}", now: @now) do
-        push("toolchain", "dev-agent: #{host} is missing #{result.missing_required.map(&:name).join(', ')} " \
-                          "— #{result.blocked_producers.join(', ')} cannot run there")
+      Agent::Notify.once("toolchain", "#{host}:#{Agent::Toolchain.problem_key(result)}", now: @now) do
+        push("toolchain", "dev-agent: #{host} — #{result.summary}; " \
+                          "#{result.blocked_producers.join(', ')} cannot run there")
       end
       Agent::Api.create_issue(
         {
