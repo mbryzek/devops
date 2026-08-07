@@ -164,6 +164,75 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- the give-up count, at the reap (ISS-734) ----
+  #
+  # `Agent::Outcome.attempt_number` is pinned in test_dev_agent_outcome.rb; these
+  # two pin the wiring around it, which is where the defect actually lived: the
+  # reap handed classification a COUNT OF LEASES, and released every lease as an
+  # undifferentiated hand-back so no later reap could tell a failure from an
+  # ordinary release. Both halves go through the real HTTP seam — an outcome the
+  # release stopped sending would land as an unstubbed-request flunk.
+
+  # One lease row as the platform returns it; `outcome` nil is a live lease.
+  def lease_row(id, outcome, at:)
+    { "id" => id, "outcome" => outcome, "created" => { "at" => at }, "runner_id" => RUNNER_ID }
+  end
+
+  # A reap of a session that left nothing behind, over a given lease history.
+  def reap_with_history(history)
+    seen = { statuses: [], released: [] }
+    with_agent_home do
+      register_identity
+      with_ai_token do
+        subject = tick(dry_run: false)
+        record = Agent::Jobs.write("issue" => 707, "pid" => 999_999, "slug" => "i707_abc", "branch" => "i707_abc",
+                                   "lease_id" => "lse-now", "started_at" => (Time.now - 60).utc.iso8601,
+                                   "timeout_at" => (Time.now + 3600).utc.iso8601)
+        live, closed = history.partition { |l| l["outcome"].nil? }
+        api = {
+          "GET /playbook/issue/leases?is_active=true&issue_number=707&limit=100&offset=0" => live,
+          "GET /playbook/issue/leases?is_active=false&issue_number=707&limit=100&offset=0" => closed,
+          "GET /playbook/issues/707" => { "number" => 707, "status" => "claimed" },
+          "PUT /playbook/issues/707/status" => ->(b) { seen[:statuses] << b; {} },
+          # The lease says HOW this attempt ended, and nothing else does.
+          "DELETE /playbook/issue/leases/lse-now?outcome=failed" => ->(_b) { seen[:released] << "failed"; {} },
+        }
+        stubs = {
+          Agent::Github => { prs_in_workspace: ->(*) { [] }, search_prs: ->(*) { [] },
+                             plans_committed_since?: ->(*) { false } },
+          subject => { cleanup: ->(*) {} },
+        }
+        with_stubbed_methods(stubs) do
+          with_stubbed_api(api) { capture_stdout { subject.send(:reap_one, record, Agent::Host.cached_identity) } }
+        end
+      end
+    end
+    seen
+  end
+
+  # THE bug. Two leases that failed at nothing — the issue was reopened for a
+  # regression, reclaimed, handed back — and then a session that really did fail.
+  # Counting rows made that first real failure the third and parked the issue in
+  # `needs_input`, which `dev issues claim` never offers again.
+  def test_an_ordinary_lease_history_does_not_give_up_on_the_first_real_failure
+    seen = reap_with_history([lease_row("lse-1", "released", at: "2026-08-01T00:00:00Z"),
+                              lease_row("lse-2", "released", at: "2026-08-02T00:00:00Z"),
+                              lease_row("lse-now", nil, at: "2026-08-03T00:00:00Z")])
+    assert_equal ["failed"], seen[:released], "the reap must record how the attempt ended on its lease"
+    assert_equal "open", seen[:statuses].first[:status]
+    assert_match(/Failure 1 of 3 in a row/, seen[:statuses].first[:comment])
+  end
+
+  # And the threshold still fires when the failures really are consecutive.
+  def test_three_failed_leases_in_a_row_still_reach_needs_input
+    seen = reap_with_history([lease_row("lse-0", "completed", at: "2026-08-01T00:00:00Z"),
+                              lease_row("lse-1", "failed", at: "2026-08-02T00:00:00Z"),
+                              lease_row("lse-2", "cancelled", at: "2026-08-03T00:00:00Z"),
+                              lease_row("lse-now", nil, at: "2026-08-04T00:00:00Z")])
+    assert_equal "needs_input", seen[:statuses].first[:status]
+    assert_match(/Failure 3 of 3 in a row/, seen[:statuses].first[:comment])
+  end
+
   # stub_singleton, applied to a whole table at once — six nested blocks say
   # nothing the table does not.
   def with_stubbed_methods(table, &block)

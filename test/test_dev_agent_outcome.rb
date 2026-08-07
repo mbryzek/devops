@@ -33,7 +33,7 @@ class TestDevAgentOutcome < Minitest::Test
     assert_equal "merged_pr", result.name
     assert_equal "fixed", result.status
     assert_equal URL, result.url
-    assert_equal "succeeded", result.lease_outcome
+    assert_equal "completed", result.lease_outcome
 
     assert_equal "merged_pr", classify(pr: MERGED_PR, exit_code: 2).name
     assert_equal "merged_pr", classify(pr: MERGED_PR, exit_code: nil, timed_out: true).name
@@ -55,7 +55,7 @@ class TestDevAgentOutcome < Minitest::Test
     assert_equal "ready_pr", result.name
     assert_equal "fixed", result.status
     assert_equal READY_PR["url"], result.url
-    assert_equal "succeeded", result.lease_outcome
+    assert_equal "completed", result.lease_outcome
   end
 
   # A ready PR wins even over a non-zero exit: the artifact is the outcome, and
@@ -86,15 +86,102 @@ class TestDevAgentOutcome < Minitest::Test
     assert_equal "nothing_to_do", classify(producer_filed: false).name
   end
 
-  def test_crash_is_retryable_until_the_attempt_limit
+  def test_crash_is_retryable_until_three_failures_in_a_row
     assert_equal "open", classify(exit_code: 2).status
     assert_equal "failed", classify(exit_code: 2).name
     assert_equal "open", classify(exit_code: 2, attempt: 2).status
 
-    gave_up = classify(exit_code: 2, attempt: Agent::Outcome::MAX_ATTEMPTS)
+    gave_up = classify(exit_code: 2, attempt: Agent::Outcome::GIVE_UP_AFTER_FAILURES)
     assert_equal "gave_up", gave_up.name
     assert_equal "needs_input", gave_up.status
     assert_equal "failed", gave_up.lease_outcome
+    assert_match(/Failure 3 of 3 in a row/, gave_up.reason)
+    assert_match(/Failure 1 of 3 in a row/, classify(exit_code: 2).reason)
+  end
+
+  # ---- the give-up count: failures IN A ROW, not leases (ISS-734) ----
+  #
+  # Every lease this issue ever had was counted as an attempt, so an issue with
+  # an ordinary lifetime — reopened for a regression, reclaimed, handed back —
+  # gave up on its FIRST real failure and landed in `needs_input`, which
+  # `dev issues claim` never offers again. No test exercised a mixed history,
+  # which is exactly why the same defect went unnoticed in two repos.
+
+  # One lease row as the platform returns it. `outcome` nil is a LIVE lease.
+  def lease(id, outcome, at: "2026-08-06T00:00:0#{id}Z")
+    { "id" => "lse-#{id}", "outcome" => outcome, "created" => { "at" => at } }
+  end
+
+  def attempt_number(history, lease_id: "lse-now")
+    Agent::Outcome.attempt_number(history, lease_id: lease_id)
+  end
+
+  # THE reported failure. Two ordinary released leases and a live one: the next
+  # failure is the issue's first, not its third.
+  def test_leases_that_failed_at_nothing_do_not_spend_the_give_up_budget
+    history = [lease(1, "released"), lease(2, "released"), lease("now", nil)]
+    assert_equal 1, attempt_number(history)
+    assert_equal "open", classify(pr: DRAFT_PR, attempt: attempt_number(history)).status
+  end
+
+  def test_three_failures_in_a_row_still_give_up
+    history = [lease(1, "failed"), lease(2, "failed"), lease("now", nil)]
+    assert_equal 3, attempt_number(history)
+    assert_equal "gave_up", classify(exit_code: 1, attempt: attempt_number(history)).name
+  end
+
+  # The other half: an attempt that ENDED WELL starts the run over, so a issue
+  # that failed twice a month ago and has since been fixed and reopened gets a
+  # full budget again.
+  def test_an_attempt_that_ended_well_starts_the_count_over
+    history = [lease(1, "failed"), lease(2, "failed"), lease(3, "completed"), lease(4, "failed"),
+               lease("now", nil)]
+    assert_equal 2, attempt_number(history)
+    assert_equal 1, attempt_number([lease(1, "failed"), lease(2, "released"), lease("now", nil)])
+  end
+
+  # `expired` (nobody was there — the platform's sweeper wrote it) and
+  # `cancelled` (the tick killed the session) are failures too: all three mean
+  # the attempt delivered nothing and the next one is a retry.
+  def test_expired_and_cancelled_leases_count_as_failures
+    history = [lease(1, "expired"), lease(2, "cancelled"), lease("now", nil)]
+    assert_equal 3, attempt_number(history)
+  end
+
+  # This attempt's own lease is the +1. When the sweeper closed it as `expired`
+  # out from under the session the reap is classifying right now, it must be
+  # counted once — not once as history and once as this attempt.
+  def test_this_attempts_own_lease_is_never_counted_twice
+    history = [lease(1, "failed"), lease("now", "expired")]
+    assert_equal 2, attempt_number(history)
+  end
+
+  # A lease that has not ended yet says nothing either way: it is not a failure,
+  # and it is not the clean answer that would reset the run.
+  def test_a_live_lease_neither_counts_nor_resets
+    assert_equal 2, attempt_number([lease(1, "failed"), lease(2, nil), lease("now", nil)])
+    assert_equal 1, attempt_number([])
+  end
+
+  # The lease is where the count is read from, so the executor has to write it —
+  # in the platform's own vocabulary. `succeeded` was never one of
+  # `issue_lease_outcome`'s values (completed/failed/expired/released/cancelled).
+  def test_every_result_closes_its_lease_with_a_platform_outcome
+    valid = %w[completed failed expired released cancelled]
+    [classify(pr: MERGED_PR), classify(pr: READY_PR), classify(plans_committed: true),
+     classify(producer_filed: true), classify(producer_filed: false), classify(pr: DRAFT_PR),
+     classify(exit_code: 1), classify(killed: { "reason" => "timeout" }),
+     classify(exit_code: 1, attempt: 3)].each do |result|
+      assert_includes valid, result.lease_outcome, "#{result.name} closes its lease with an unknown outcome"
+    end
+  end
+
+  # The enum's own word for a session the executor stopped: "the executor killed
+  # the session on a 409 heartbeat, or the hard timeout fired".
+  def test_a_killed_session_closes_its_lease_as_cancelled
+    assert_equal "cancelled", classify(killed: { "reason" => "lease_lost" }).lease_outcome
+    assert_equal "cancelled", classify(killed: { "reason" => "timeout" }, attempt: 3).lease_outcome
+    assert_equal "failed", classify(exit_code: 1).lease_outcome
   end
 
   # A killed session never writes an exit code. Treated as a failure, never as a
@@ -146,7 +233,7 @@ class TestDevAgentOutcome < Minitest::Test
   # attempts remain: `needs_input` means "a human must decide something".
   def test_a_killed_human_filed_issue_is_not_parked_for_a_human
     assert_equal "open", classify(killed: { "reason" => "lease_lost" }, producer_filed: false).status
-    gave_up = classify(killed: { "reason" => "lease_lost" }, attempt: Agent::Outcome::MAX_ATTEMPTS)
+    gave_up = classify(killed: { "reason" => "lease_lost" }, attempt: Agent::Outcome::GIVE_UP_AFTER_FAILURES)
     assert_equal "gave_up", gave_up.name
   end
 
