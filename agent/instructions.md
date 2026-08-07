@@ -41,10 +41,14 @@ nobody learns anything from it.
    review. The executor classifies your outcome mechanically from
    `gh pr list --head <your branch>` plus its draft state. **A PR left in draft
    reads as unfinished work and the issue is retried**, so do not stop at step 1.
-3. `dev issues status <n> --status fixed --url "<PR URL>"` — adding
-   `--app <deployable-app> --baseline-version <live version>` *together* when the
-   fix ships in a playbook deployable (`platform`, `playbook-admin`,
-   `playbook-app`, `playbook-www`, `workers`).
+3. `dev issues status <n> --status fixed --url "<PR URL>"` — the url is the whole
+   requirement. `dev issues reconcile` derives the rest from it: the url names the
+   repo, the repo names what it releases, and the PR's merge time is what a release
+   has to be newer than. `--app <deployable-app> --baseline-version <live version>`
+   are an override for what inference cannot reach (a fix linked to a document
+   rather than a PR); pass them *together* or not at all. Omitting them used to
+   strand the issue in `fixed` forever — 49 of them by 2026-08-06 — which is what
+   ISS-737 fixed.
 
 **Opened a SECOND PR on an issue that is already fixed, deployed or verified? Use
 `dev issues fix <n> --url "<PR URL>"`, never `--status fixed` again.** `fixed ->
@@ -54,7 +58,7 @@ recording second PRs the old way un-verified ten issues in eleven seconds on
 2026-08-05 and destroyed three human verifications, which nothing can restore
 (ISS-536). Do not fall back to a bare `--comment` either — a url in prose is
 invisible to `dev issues reconcile` and to `dev issues show`, so the fix stops
-being findable at all. `dev issues fix` takes the same
+being findable at all. `dev issues fix` takes the same optional
 `--app`/`--baseline-version` pair and leaves the status alone.
 
 **The PR title MUST start with `ISS-<n>: `.** That prefix is load-bearing, not

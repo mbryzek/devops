@@ -152,6 +152,22 @@ class TestAgentSiblingPrs < Minitest::Test
     assert_includes Agent::Github::PR_FIELDS, "headRefName", "…while `gh pr list` does ask for it"
   end
 
+  # `dev issues reconcile` compares an app's live release against this, so the
+  # field has to be asked for as well as read (ISS-737).
+  def test_merged_at_reads_the_merge_time_of_a_merged_pr
+    assert_includes Agent::Github::PR_FIELDS, "mergedAt"
+    assert_equal "2026-08-06T15:41:05Z",
+                 Agent::Github.merged_at(pr(number: 1, head: BRANCH, state: "MERGED").merge("mergedAt" => "2026-08-06T15:41:05Z"))
+  end
+
+  # An OPEN PR carries mergedAt: null, and a CLOSED-unmerged one does too — but
+  # neither may ever answer with a time, whatever the field happens to hold.
+  def test_merged_at_is_nil_for_anything_not_merged
+    assert_nil Agent::Github.merged_at(pr(number: 1, head: BRANCH, state: "OPEN").merge("mergedAt" => nil))
+    assert_nil Agent::Github.merged_at(pr(number: 1, head: BRANCH, state: "CLOSED").merge("mergedAt" => "2026-08-06T15:41:05Z"))
+    assert_nil Agent::Github.merged_at(nil)
+  end
+
   def with_stubbed_github(stubs, &block)
     stubs.reduce(block) { |inner, (name, impl)| -> { stub_singleton(Agent::Github, name, impl, &inner) } }.call
   end
