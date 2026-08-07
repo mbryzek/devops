@@ -1,7 +1,7 @@
-require 'open3'
 require 'time'
 require 'agent/gc'
 require 'agent/paths'
+require 'agent/shell'
 
 # Runner-local housekeeping (ISS-520): collect this machine's agent logs, prune
 # this machine's feature dirs, reap this machine's session databases and the
@@ -123,6 +123,27 @@ module Agent
     # Agent::Errors sources. Fixed strings rather than derived, for the same
     # reason CHECKOUT_PULL_ERROR_SOURCE is: the recorder, the streak count and
     # the escalation must all agree on what they are counting.
+    # Hard deadline for ONE shell chore (ISS-740). Generous, because a first pass
+    # on a neglected machine legitimately runs for minutes and a deadline that
+    # cuts real work short would report a failure for the thing working: the tick
+    # comment above already accepts that "a full `docker prune` runs for
+    # minutes", and this phase holds only the work lock, so a slow pass delays
+    # this tick's claim rather than any running job.
+    #
+    # What it refuses is the unbounded case, which is the one this file is most
+    # exposed to: `docker prune` under the disk pressure it exists to relieve is
+    # exactly when the daemon wedges, and today that chore would hold the work
+    # lock forever and stop the machine claiming anything, permanently, with
+    # nothing logged — a hang is not an exception. Three chores at 5 minutes
+    # bounds the worst case at 15, after which the machine claims again and the
+    # failures are on the heartbeat where Agent::Errors counts them.
+    CHORE_TIMEOUT_SECONDS = 300
+
+    # `df` on a healthy volume answers instantly; on a stalled network mount it
+    # does not answer at all, and this is called twice per pass plus once per
+    # heartbeat report.
+    DISK_TIMEOUT_SECONDS = 10
+
     GC_SOURCE = "agent_gc".freeze
     AIDIRS_SOURCE = "aidirs_prune".freeze
     CLAUDE_DB_SOURCE = "claude_db_gc".freeze
@@ -157,9 +178,9 @@ module Agent
     # long device name wraps and the columns below read off the wrong line.
     def disk(path = Agent::Paths.workspace_root)
       target = existing_ancestor(path) or return nil
-      out, status = Open3.capture2("df", "-Pk", target)
-      return nil unless status.success?
-      cols = out.lines[1].to_s.split
+      result = Agent::Shell.capture("df", "-Pk", target, timeout: DISK_TIMEOUT_SECONDS, stderr: :inherit)
+      return nil unless result.ok?
+      cols = result.output.lines[1].to_s.split
       return nil if cols.length < 4
       total = cols[1].to_i * 1024
       free = cols[3].to_i * 1024
@@ -272,16 +293,31 @@ module Agent
       Outcome.new(source: GC_SOURCE, label: "agent gc", ok: false, message: "#{e.class}: #{e.message}")
     end
 
+    # `SystemCallError`, not `Errno::ENOENT` (ISS-740). ENOENT is only the most
+    # likely way one of these binaries fails to START; a `bin/dev` that lost its
+    # +x bit raises EACCES, and an uncaught one propagates out of `run`, out of
+    # the tick's work phase, and kills the tick every hour — a chore that cannot
+    # run must be a recorded chore failure like any other, never the reason the
+    # machine stops claiming. Every Errno is a SystemCallError, so this catches
+    # the shape rather than today's example of it.
     def run_shell(source, trigger)
       cmd = shell_command(source, trigger)
       label = cmd.drop(1).reject { |a| a.start_with?("--") || a =~ /\A\d+\z/ }.join(" ")
-      out, status = Open3.capture2e({ "LC_ALL" => "en_US.UTF-8" }, *cmd)
-      return Outcome.new(source: source, label: label, ok: true, message: "ok") if status.success?
+      result = Agent::Shell.capture(*cmd, timeout: CHORE_TIMEOUT_SECONDS, env: { "LC_ALL" => "en_US.UTF-8" })
+      return Outcome.new(source: source, label: label, ok: true, message: "ok") if result.ok?
 
       Outcome.new(source: source, label: label, ok: false,
-                  message: "`#{cmd.join(' ')}` exited #{status.exitstatus}: #{tail(out)}")
-    rescue Errno::ENOENT => e
+                  message: "`#{cmd.join(' ')}` #{result.summary}#{failure_detail(result)}")
+    rescue SystemCallError => e
       Outcome.new(source: source, label: label, ok: false, message: "could not run #{cmd.first}: #{e.message}")
+    end
+
+    # The command's own words, when it had any. A killed chore often has none,
+    # and `exited 1: ` with nothing after the colon reads like truncation rather
+    # than silence.
+    def failure_detail(result)
+      detail = tail(result.output)
+      detail.empty? ? "" : ": #{detail}"
     end
 
     # Enough of a failing command's output to diagnose it, bounded because this

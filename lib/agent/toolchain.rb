@@ -1,6 +1,6 @@
-require 'open3'
 require 'time'
 require 'agent/paths'
+require 'agent/shell'
 
 # The host prerequisites a runner needs, as CODE instead of prose (ISS-531).
 #
@@ -195,6 +195,16 @@ module Agent
     # first tick rather than a day into pretending to work.
     CADENCE_SECONDS = 24 * 3600
 
+    # Every probe below is a question a healthy binary answers in milliseconds,
+    # and this check runs in Phase B ahead of reap and claim — so a tool that
+    # does not answer must cost this machine one report, not every future tick
+    # (ISS-740). The candidates are ordinary rather than exotic: `docker
+    # --version` waits on a wedged daemon, `sbt --script-version` on a launcher
+    # that wants the network, `zsh -lc` on a .zprofile that itself shells out to
+    # something hung. 10 seconds is ~100x a slow answer and still under the 30
+    # seconds between ticks.
+    PROBE_TIMEOUT_SECONDS = 10
+
     Found = Struct.new(:tool, :path, :version, keyword_init: true) do
       def present? = !path.nil?
       def missing? = path.nil?
@@ -222,10 +232,16 @@ module Agent
     # launchd the two are the same string anyway (the tick IS already inside that
     # shell), so the fallback only ever affects a human running this by hand on a
     # box with a broken profile.
+    # `stderr: :inherit` rather than merged, and it matters: a .zprofile that
+    # prints a deprecation warning would otherwise be spliced into the PATH every
+    # probe below then scans, and the doctor would report a machine missing every
+    # tool it has.
     def agent_path(env: ENV)
-      out, status = Open3.capture2("/bin/zsh", "-lc", "printf %s \"$PATH\"")
-      return env["PATH"].to_s if !status.success? || out.strip.empty?
-      out.strip
+      result = Agent::Shell.capture("/bin/zsh", "-lc", "printf %s \"$PATH\"",
+                                    timeout: PROBE_TIMEOUT_SECONDS, stderr: :inherit)
+      return env["PATH"].to_s unless result.ok?
+      out = result.output.strip
+      out.empty? ? env["PATH"].to_s : out
     rescue Errno::ENOENT
       env["PATH"].to_s
     end
@@ -260,11 +276,12 @@ module Agent
     # Best-effort `--version`, purely for the operator's report. Never used to
     # decide present/absent: a tool that resolves but refuses `--version` is
     # installed, and treating it as missing would file an issue about a working
-    # machine.
+    # machine. A tool that HANGS on `--version` is the same fact — it resolved —
+    # so a timeout drops the version string and nothing else.
     def version(path)
-      out, status = Open3.capture2e(path, "--version")
-      return nil unless status.success?
-      out.lines.first.to_s.strip[0, 60]
+      result = Agent::Shell.capture(path, "--version", timeout: PROBE_TIMEOUT_SECONDS)
+      return nil unless result.ok?
+      result.output.lines.first.to_s.strip[0, 60]
     rescue StandardError
       nil
     end

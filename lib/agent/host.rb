@@ -1,6 +1,6 @@
 require 'json'
-require 'open3'
 require 'agent/paths'
+require 'agent/shell'
 
 # Machine identity and self-registration (design §4.5).
 #
@@ -21,9 +21,17 @@ module Agent
 
     module_function
 
+    # Bounded, because `tool_versions` below runs `docker`, `sbt` and `claude`
+    # for their version strings on the REGISTRATION path (ISS-740). A wedged
+    # Docker daemon or an sbt launcher reaching for the network would otherwise
+    # hang registration itself — and a machine that never registers never claims
+    # anything, forever, having reported nothing to anyone. A version string is
+    # decoration; the registration it decorates is not.
+    PROBE_TIMEOUT_SECONDS = 10
+
     def capture(cmd)
-      out, status = Open3.capture2(*cmd)
-      status.success? ? out.strip : nil
+      result = Agent::Shell.capture(*cmd, timeout: PROBE_TIMEOUT_SECONDS, stderr: :inherit)
+      result.ok? ? result.output.strip : nil
     rescue Errno::ENOENT
       nil
     end

@@ -112,8 +112,29 @@ class TestDevAgentToolchain < Minitest::Test
   # close rather than every tool missing at once — which would file an issue
   # naming nine tools that are all installed.
   def test_agent_path_falls_back_to_this_process_when_the_login_shell_cannot_be_asked
-    stub_singleton(Open3, :capture2, ->(*_args) { raise Errno::ENOENT }) do
+    stub_shell(->(*) { raise Errno::ENOENT }) do
       assert_equal "/sentinel/bin", T.agent_path(env: { "PATH" => "/sentinel/bin" })
+    end
+  end
+
+  # A login shell that HANGS is the same fact as one that cannot be asked, and it
+  # is the more dangerous of the two: this check runs in Phase B ahead of reap
+  # and claim, so before ISS-740 a `.zprofile` waiting on something that never
+  # answers stopped the machine claiming work on every subsequent tick, with
+  # nothing logged because a hang is not an exception.
+  def test_agent_path_falls_back_when_the_login_shell_never_answers
+    stub_shell(->(*) { shell_result(timed_out: true, timeout: T::PROBE_TIMEOUT_SECONDS) }) do
+      assert_equal "/sentinel/bin", T.agent_path(env: { "PATH" => "/sentinel/bin" })
+    end
+  end
+
+  # `docker --version` against a wedged daemon is the standing example. The tool
+  # RESOLVED, so it is installed; the version string is decoration, and dropping
+  # it is the whole cost of the deadline. Reporting the tool missing instead
+  # would file an issue about a machine that has it.
+  def test_a_version_probe_that_hangs_loses_the_string_and_nothing_else
+    stub_shell(->(*) { shell_result(timed_out: true, timeout: T::PROBE_TIMEOUT_SECONDS) }) do
+      assert_nil T.version("/opt/homebrew/bin/docker")
     end
   end
 

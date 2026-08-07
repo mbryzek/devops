@@ -1,8 +1,8 @@
 require 'fileutils'
-require 'open3'
 require 'securerandom'
 require 'agent/github'
 require 'agent/paths'
+require 'agent/shell'
 
 # Workspace materialization (design §4.3).
 #
@@ -152,20 +152,8 @@ module Agent
     end
 
     def run(cmd, chdir:)
-      Open3.popen2e({ "GIT_TERMINAL_PROMPT" => "0" }, *cmd, chdir: chdir) do |stdin, out, wait_thr|
-        stdin.close
-        unless wait_thr.join(CLONE_TIMEOUT_SECONDS)
-          begin
-            Process.kill("KILL", wait_thr.pid)
-          rescue Errno::ESRCH
-            nil
-          end
-          out.read
-          return false
-        end
-        out.read
-        wait_thr.value.success?
-      end
+      Agent::Shell.capture(*cmd, timeout: CLONE_TIMEOUT_SECONDS,
+                           env: { "GIT_TERMINAL_PROMPT" => "0" }, chdir: chdir).ok?
     rescue Errno::ENOENT
       false
     end

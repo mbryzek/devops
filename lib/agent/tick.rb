@@ -1,4 +1,3 @@
-require 'open3'
 require 'time'
 require 'agent/api'
 require 'agent/checkout'
@@ -16,6 +15,7 @@ require 'agent/outcome'
 require 'agent/paths'
 require 'agent/playbook'
 require 'agent/prompt'
+require 'agent/shell'
 require 'agent/toolchain'
 require 'agent/workspace'
 
@@ -59,6 +59,14 @@ module Agent
     # failure. Fixed rather than derived so Agent::Errors.count and the
     # escalation below always agree on what they are counting.
     CHECKOUT_PULL_ERROR_SOURCE = "checkout_pull".freeze
+
+    # Hard deadline for the `claude-db end` that reclaims a dead session's own
+    # databases (ISS-740). It talks to Docker, which is the one dependency here
+    # that hangs rather than fails, and this runs inside the reap that has to
+    # finish for the lease to be released at all. Losing the databases of one
+    # session is what the hourly age-based gc is a backstop for; losing the reap
+    # has no backstop.
+    CLAUDE_DB_END_TIMEOUT_SECONDS = 120
 
     # Agent::Errors source name for a `~/code/.claude` this machine cannot make
     # resolve on its own — see Agent::ClaudeConfig. Only the states a human has
@@ -825,10 +833,11 @@ module Agent
     # still has an outcome to record and a lease to release, and the hourly gc is
     # the backstop for whatever this could not drop.
     def drop_session_databases(slug)
-      out, status = Open3.capture2e({ "CLAUDE_SESSION_ID" => slug },
-                                    Agent::Paths.claude_db_bin, "end")
-      return if status.success?
-      log("claude-db end for #{slug} exited #{status.exitstatus}: #{Agent::Maintenance.tail(out)}")
+      result = Agent::Shell.capture(Agent::Paths.claude_db_bin, "end",
+                                    timeout: CLAUDE_DB_END_TIMEOUT_SECONDS,
+                                    env: { "CLAUDE_SESSION_ID" => slug })
+      return if result.ok?
+      log("claude-db end for #{slug} #{result.summary}: #{Agent::Maintenance.tail(result.output)}")
     rescue StandardError => e
       log("claude-db end for #{slug} failed: #{e.class}: #{e.message}")
     end

@@ -139,6 +139,10 @@ module DevTestSupport
       @saved.each { |name, original| Agent::Maintenance.define_singleton_method(name, original) }
       @saved = nil
     end
+
+    # The real method, for the one kind of test that is ABOUT it. See
+    # `with_real_run_shell`, which is the only supported way to ask.
+    def self.real(name) = @saved.fetch(name)
   end
 
   # The same reasoning again, for the toolchain probe the tick runs once a day
@@ -327,6 +331,34 @@ module DevTestSupport
     yield
   ensure
     obj.define_singleton_method(name, original)
+  end
+
+  # Stubs the ONE place lib/agent shells out (Agent::Shell.capture — ISS-740, and
+  # test_dev_agent_shell.rb keeps it the only one). `impl` receives the command
+  # as an array and the options hash, so a test asserts on the flags that were
+  # passed as well as on what came back.
+  def stub_shell(impl, &block)
+    stub_singleton(Agent::Shell, :capture, ->(*cmd, **opts) { impl.call(cmd, opts) }, &block)
+  end
+
+  # The REAL Agent::Maintenance.run_shell, for a test about run_shell itself.
+  #
+  # MaintenanceGuard replaces it globally so that no suite run can prune the
+  # machine it is running on, and handing it back on its own would defeat that.
+  # So it comes with the shell stub attached: the real chore logic runs and the
+  # subprocess it would have spawned does not exist. There is deliberately no
+  # way to ask for one without the other.
+  def with_real_run_shell(impl, &block)
+    stub_singleton(Agent::Maintenance, :run_shell, MaintenanceGuard.real(:run_shell)) do
+      stub_shell(impl, &block)
+    end
+  end
+
+  # What Agent::Shell.capture would have returned. `timed_out: true` is a killed
+  # command, which is why it has no exit status of its own.
+  def shell_result(output: "", exitstatus: 0, timed_out: false, timeout: 60)
+    status = timed_out ? nil : Struct.new(:success?, :exitstatus).new(exitstatus.zero?, exitstatus)
+    Agent::Shell::Result.new(output: output, status: status, timed_out: timed_out, timeout: timeout)
   end
 
   # Same, for a top-level `dev` function (they land as private methods on

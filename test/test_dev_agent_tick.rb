@@ -123,9 +123,9 @@ class TestDevAgentTick < Minitest::Test
   def test_a_dead_session_has_its_own_databases_dropped_by_name
     with_agent_home do
       seen = []
-      stub_singleton(Open3, :capture2e, lambda { |*args|
-        seen << args
-        ["", Struct.new(:success?, :exitstatus).new(true, 0)]
+      stub_shell(lambda { |cmd, opts|
+        seen << [opts[:env], *cmd]
+        shell_result
       }) do
         capture_stdout { tick(dry_run: false).send(:drop_session_databases, "i707_abc") }
       end
@@ -250,9 +250,23 @@ class TestDevAgentTick < Minitest::Test
   # could not drop. What must NOT happen is the tick dying here.
   def test_a_failing_database_reap_is_logged_and_does_not_stop_the_reap
     with_agent_home do
-      stub_singleton(Open3, :capture2e, ->(*) { raise Errno::ENOENT, "claude-db" }) do
+      stub_shell(->(*) { raise Errno::ENOENT, "claude-db" }) do
         out = capture_stdout { tick(dry_run: false).send(:drop_session_databases, "i707_abc") }
         assert_match(/claude-db end for i707_abc failed/, out)
+      end
+    end
+  end
+
+  # A Docker that hangs rather than fails is the worse half of the same case
+  # (ISS-740): this runs inside the reap that has to finish for the lease to be
+  # released at all, so an unbounded `claude-db end` stranded the lease AND the
+  # runner. Losing one session's databases has a backstop — the hourly age-based
+  # gc; losing the reap has none.
+  def test_a_hanging_database_reap_is_bounded_and_reported
+    with_agent_home do
+      stub_shell(->(*) { shell_result(timed_out: true, timeout: Agent::Tick::CLAUDE_DB_END_TIMEOUT_SECONDS) }) do
+        out = capture_stdout { tick(dry_run: false).send(:drop_session_databases, "i707_abc") }
+        assert_match(/claude-db end for i707_abc timed out after 120s/, out)
       end
     end
   end

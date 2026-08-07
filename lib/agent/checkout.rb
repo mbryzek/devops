@@ -1,5 +1,5 @@
-require 'open3'
 require 'agent/paths'
+require 'agent/shell'
 
 # The devops checkout the tick runs out of, and how it keeps itself current.
 #
@@ -56,6 +56,12 @@ module Agent
     # normal fetch of this repo.
     PULL_TIMEOUT_SECONDS = 60
 
+    # The local reads around the pull -- rev-parse, status. They touch no network
+    # and answer instantly on a healthy machine, so the only way one takes 10
+    # seconds is a wedged filesystem or an index lock nobody is releasing, and
+    # both are things Phase A must report rather than wait through (ISS-740).
+    QUERY_TIMEOUT_SECONDS = 10
+
     # Nothing on the tick path may ever block on a prompt. A repo whose remote
     # asks for credentials must fail immediately and be reported, not sit there
     # waiting for a human who is not logged in.
@@ -74,8 +80,8 @@ module Agent
     def devops_repo = Agent::Paths.devops_repo
 
     def head_sha(repo = devops_repo)
-      out, status = Open3.capture2e("git", "-C", repo, "rev-parse", "HEAD")
-      status.success? ? out.strip : nil
+      result = Agent::Shell.capture("git", "-C", repo, "rev-parse", "HEAD", timeout: QUERY_TIMEOUT_SECONDS)
+      result.ok? ? result.output.strip : nil
     rescue Errno::ENOENT
       nil
     end
@@ -127,15 +133,16 @@ module Agent
     # untracked. A `git status` that itself fails is treated as dirty: "cannot
     # tell" must never be the reason a hard reset runs.
     def dirty?(repo)
-      out, status = Open3.capture2e("git", "-C", repo, "status", "--porcelain")
-      !status.success? || !out.strip.empty?
+      result = Agent::Shell.capture("git", "-C", repo, "status", "--porcelain", timeout: QUERY_TIMEOUT_SECONDS)
+      !result.ok? || !result.output.strip.empty?
     rescue Errno::ENOENT
       true
     end
 
     def current_branch(repo)
-      out, status = Open3.capture2e("git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD")
-      status.success? ? out.strip : nil
+      result = Agent::Shell.capture("git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD",
+                                    timeout: QUERY_TIMEOUT_SECONDS)
+      result.ok? ? result.output.strip : nil
     rescue Errno::ENOENT
       nil
     end
@@ -153,23 +160,17 @@ module Agent
     end
 
     # Runs a command with a hard deadline, non-interactively. Returns
-    # [combined_output, ok]. A process that outlives the deadline is KILLed --
-    # TERM would be politer, but a git that is wedged on a network read is
-    # exactly the process that ignores it.
+    # [combined_output, ok].
+    #
+    # The deadline itself lives in Agent::Shell now (ISS-740): this was the first
+    # place in lib/agent to bound a subprocess and the reasoning above generalised
+    # to every other one, so the mechanism moved and this kept the git-shaped
+    # interface its callers read. A timeout is reported in git's own vocabulary
+    # because `first_error_line` looks for `fatal:`.
     def run_bounded(*cmd, timeout: PULL_TIMEOUT_SECONDS)
-      Open3.popen2e(NON_INTERACTIVE, *cmd) do |stdin, out, wait_thr|
-        stdin.close
-        unless wait_thr.join(timeout)
-          begin
-            Process.kill("KILL", wait_thr.pid)
-          rescue Errno::ESRCH
-            nil
-          end
-          wait_thr.join
-          next ["fatal: timed out after #{timeout}s", false]
-        end
-        [out.read, wait_thr.value.success?]
-      end
+      result = Agent::Shell.capture(*cmd, timeout: timeout, env: NON_INTERACTIVE)
+      return ["fatal: timed out after #{timeout}s", false] if result.timed_out?
+      [result.output, result.ok?]
     end
 
     def short(sha) = sha.to_s[0, 8]
