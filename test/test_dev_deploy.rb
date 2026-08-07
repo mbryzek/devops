@@ -197,6 +197,17 @@ module DeployReleaseStubs
     def manual_commands = ["api publish", "dev features reconcile --apply", "dev issues reconcile --apply"]
   end
 
+  # A released checkout the work cannot even read — a `.api/config.pkl` whose
+  # spec_glob matches nothing, which is how ISS-867 actually failed. `any?` aborts
+  # through Util.exit_with_error, so the deploy sees a SystemExit rather than a
+  # StandardError. `manual_commands` raises because deriving it re-runs the tasks
+  # that just failed, and the failure narration must never ask for it.
+  class AbortingWork
+    def any? = Util.exit_with_error("spec_glob 'dao/spec/*.json' matched no files")
+    def file! = raise("never reached")
+    def manual_commands = raise("manual_commands re-derived from the tasks that just failed")
+  end
+
   def stub_release_seams
     @released = []
     @released_mutex = Mutex.new
@@ -1772,6 +1783,32 @@ class TestDeployPostDeployFiling < Minitest::Test
     assert_equal 1, exited&.status
     assert_includes out, "Post-deploy work NOT FILED"
     assert_includes out, "dev issues reconcile --apply"
+  end
+
+  # The same failure one step earlier, and the one that actually happened on
+  # 2026-08-07: the work aborted while working out what it owed, through
+  # Util.exit_with_error. That raises SystemExit, which is NOT a StandardError, so
+  # the plain `rescue => e` never ran — platform 0.19.22 went live and the deploy
+  # died on a bare one-line ERROR with nothing tracking the four commands left
+  # (ISS-867).
+  def test_an_abort_working_out_the_work_is_narrated_with_the_fallback_commands
+    @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    stub_global_for_test(:post_deploy_work) { |_names| DeployReleaseStubs::AbortingWork.new }
+
+    out, exited = silence_stderr { capture_io_with_exit { cmd_deploy_all([]) } }
+    assert_equal 1, exited&.status
+    assert_includes out, "Post-deploy work NOT FILED"
+    PostDeployWork::MANUAL_COMMANDS_FALLBACK.each { |cmd| assert_includes out, cmd }
+  end
+
+  # Util.exit_with_error writes the reason to stderr on its way out; a test that
+  # expects one should not spray it across the suite's output.
+  def silence_stderr
+    old = $stderr
+    $stderr = StringIO.new
+    yield
+  ensure
+    $stderr = old
   end
 
   # Last, after every phase: work filed before Phase 3's contracting migration or

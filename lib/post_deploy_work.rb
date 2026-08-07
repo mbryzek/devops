@@ -68,6 +68,18 @@ class PostDeployWork
     ["issues", "`fixed` -> `deployed` transitions"],
   ].freeze
 
+  # What to tell an operator to run by hand when the filing failed BEFORE this
+  # work could say what it owed. `manual_commands` is derived from `tasks`, and
+  # `tasks` is exactly what fails in that case (it reads every released
+  # checkout's `.api` config, which aborts on a broken one) — so the narration of
+  # that failure cannot ask `tasks` what to print. Deliberately app-agnostic:
+  # nothing is known about the released apps at that point beyond their names.
+  MANUAL_COMMANDS_FALLBACK = [
+    "api publish (in each released app)",
+    "dev features reconcile --apply",
+    "dev issues reconcile --apply",
+  ].freeze
+
   # An app this deploy released, and the checkout it released from. The
   # directory is what answers "does this one own apibuilder specs" — `dev deploy`
   # knows it as `deploy_item_dir(name)`, a standalone release as `Dir.pwd`.

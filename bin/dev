@@ -9421,22 +9421,30 @@ def run_post_deploy_filing(app_pending, results)
   released = app_pending.select { |n| results[n] && results[n][:ok] }
   return true if released.empty?
 
-  work = nil
+  # Captured as the work works out what it owes, and never re-derived in the
+  # rescue below: `manual_commands` IS `tasks`, and `tasks` — which reads every
+  # released checkout's `.api` config — is the thing most likely to have failed
+  # here, so a handler that asked it what to print would die inside itself.
+  commands = PostDeployWork::MANUAL_COMMANDS_FALLBACK
   work = post_deploy_work(released)
   return true unless work.any?
+  commands = work.manual_commands
 
   filed = work.file!
   puts ""
   puts Util.underline("Post-deploy work")
   filed.report_lines.each { |line| puts "  #{line}" }
   true
-rescue => e
+# SystemExit is not a StandardError, so the bare `rescue => e` this replaces was
+# not the catch-all it read as: Util.exit_with_error — how `work.any?` fails when
+# a released checkout's .api config cannot be parsed — went straight past it, and
+# the operator got a one-line ERROR with none of this narration (ISS-867).
+rescue SystemExit, StandardError => e
   puts ""
   puts Util.underline("Post-deploy work NOT FILED")
-  puts "  #{e.class}: #{e.message}"
+  puts "  #{Util.abort_reason(e)}"
   puts "  The apps above ARE live. Nothing is tracking what is left — run these by hand:"
-  (work ? work.manual_commands : ["api publish (in each released app)", "dev features reconcile --apply",
-                                  "dev issues reconcile --apply"]).each { |cmd| puts "    #{cmd}" }
+  commands.each { |cmd| puts "    #{cmd}" }
   false
 end
 

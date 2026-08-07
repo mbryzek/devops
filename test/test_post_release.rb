@@ -2,6 +2,7 @@
 require 'minitest/autorun'
 require 'stringio'
 require 'tmpdir'
+require 'fileutils'
 require_relative '../lib/common'
 require_relative 'test_helper'
 
@@ -144,7 +145,98 @@ class TestPostRelease < Minitest::Test
     Dir.mktmpdir { |dir| refute PostRelease.owns_specs?(dir) }
   end
 
+  # ISS-867. This is asked about a checkout that is NOT the cwd every time `dev
+  # deploy` asks it — the deploy runs from wherever the human typed it — so a
+  # `spec_glob` block has to resolve against the repo. It did not: platform's
+  # "dao/spec/*.json" matched nothing relative to the cwd, ApiConfig aborted, and
+  # a deploy whose apps were already live died with its bookkeeping unfiled.
+  def test_owns_specs_resolves_a_spec_glob_against_the_repo_not_the_cwd
+    with_spec_glob_repo do |repo|
+      Dir.mktmpdir("unrelated-cwd") do |elsewhere|
+        Dir.chdir(elsewhere) { assert PostRelease.owns_specs?(repo) }
+      end
+    end
+  end
+
+  # A repo whose glob genuinely matches nothing still fails loudly rather than
+  # answering "owns no specs" — the silent no-op ApiConfig exists to prevent. The
+  # bug was the base directory, never the strictness.
+  def test_owns_specs_still_aborts_when_the_glob_really_matches_nothing
+    with_spec_glob_repo do |repo|
+      FileUtils.rm_rf(File.join(repo, "dao"))
+      capture_stderr { assert_raises(SystemExit) { PostRelease.owns_specs?(repo) } }
+    end
+  end
+
+  # The abort above used to escape the release's own error handling entirely:
+  # Util.exit_with_error raises SystemExit, SystemExit is not a StandardError, and
+  # the handler was a plain `rescue StandardError`. The operator got a one-line
+  # ERROR and nothing saying what was now untracked (ISS-867).
+  def test_an_abort_working_out_what_is_owed_still_names_the_manual_commands
+    err = capture_stderr { run_quiet(post_release(work: AbortingWork.new)) }
+    assert_equal 1, @exit_status
+    assert_includes err, "The release itself is DONE"
+    PostDeployWork::MANUAL_COMMANDS_FALLBACK.each { |cmd| assert_includes err, cmd }
+  end
+
+  # ...and the stage still closes rather than leaving the deploy display reading a
+  # dangling "label... " as a stage that never ended.
+  def test_the_stage_renders_failed_when_working_out_what_is_owed_aborts
+    out = nil
+    capture_stderr { out = run_quiet(post_release(work: AbortingWork.new)) }
+    assert_equal [["Filing post-deploy work", "failed"]], stages(out)
+  end
+
+  # `work.any?` moved INSIDE the stage, because that is where the abort above
+  # comes from and an abort outside the stage leaves a dangling line nothing
+  # closes. A release that owes nothing therefore runs the stage and reports no
+  # issues, rather than skipping the stage entirely.
+  def test_a_release_that_owes_no_work_runs_the_stage_and_reports_nothing
+    work = FakeWork.new(filed, nil)
+    work.define_singleton_method(:any?) { false }
+    out = run_quiet(post_release(work: work))
+    assert_equal [["Filing post-deploy work", "done"]], stages(out)
+    refute_includes out, "Post-deploy work filed:"
+  end
+
   private
+
+  # A checkout the work cannot even read: `any?` aborts the way a `spec_glob` over
+  # the wrong tree does. `manual_commands` raises on purpose — deriving it re-runs
+  # the very tasks that just failed, so the failure narration must not ask for it.
+  class AbortingWork
+    def any? = Util.exit_with_error("spec_glob 'dao/spec/*.json' matched no files")
+    def file! = raise("never reached")
+    def manual_commands = raise("manual_commands re-derived from the tasks that just failed")
+  end
+
+  # A checkout that owns specs the way platform does — through a `spec_glob`
+  # block, whose pattern is what has to resolve against the repo rather than the
+  # cwd — plus a spec file for it to match.
+  def with_spec_glob_repo
+    Dir.mktmpdir do |dir|
+      repo = File.join(dir, "some-repo")
+      FileUtils.mkdir_p(File.join(repo, "dao", "spec"))
+      IO.write(File.join(repo, "dao", "spec", "widget.json"), "{}\n")
+      FileUtils.mkdir_p(File.join(repo, ".api"))
+      IO.write(File.join(repo, ".api", "config.pkl"), <<~PKL)
+        amends "#{ApiConfig::BASE_MODULE_URI}"
+
+        org = "bryzek"
+
+        applications = new Listing<AppGroup> {
+          new {
+            specGlob = "dao/spec/*.json"
+            group = "dao"
+            generators = new Listing<Generator> {
+              new { key = "psql_scala"; target = "generated/app" }
+            }
+          }
+        }
+      PKL
+      yield repo
+    end
+  end
 
   # Util.exit_with_error writes the recovery hint to stderr on its way out.
   def capture_stderr

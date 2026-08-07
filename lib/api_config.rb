@@ -33,16 +33,23 @@ class ApiConfig
   # majority of repos, which have exactly one config.
   attr_reader :nested_configs
 
-  # base_dir is the directory that spec_glob patterns resolve against. It
-  # defaults to Dir.pwd so callers running from a repo root (the `api` command)
-  # are unaffected. Callers that parse a config for a repo other than the
-  # current working directory (e.g. `dev codegen sync`, which parses cloned
-  # repos from an unrelated cwd) MUST pass the repo dir explicitly — otherwise a
-  # spec_glob like "dao/spec/*.json" resolves against the wrong tree. Passing it
-  # (rather than Dir.chdir) keeps parsing thread-safe for parallel callers.
-  def initialize(path = nil, base_dir: nil)
-    path ||= File.join(Dir.pwd, ".api", "config.pkl")
-    @base_dir = base_dir || Dir.pwd
+  # base_dir is the directory that spec_glob patterns resolve against, and it is
+  # REQUIRED — a caller parsing a config for a repo other than the current
+  # working directory has to name that repo, or a spec_glob like
+  # "dao/spec/*.json" resolves against the wrong tree. Passing it (rather than
+  # Dir.chdir) keeps parsing thread-safe for parallel callers.
+  #
+  # It used to default to Dir.pwd, and that default is what made forgetting it
+  # silent: it is invisible on a repo with no spec_glob, and invisible again on
+  # one that IS the cwd, so the mistake only surfaces on the caller that had the
+  # least reason to expect it. The same omission has now shipped twice — `dev
+  # codegen sync`, which is why this parameter exists, and PostRelease.
+  # owns_specs?, which aborted a `dev deploy` after platform 0.19.22 was already
+  # live (ISS-867). A "callers MUST" comment is not a mechanism; a required
+  # keyword is. Callers that genuinely mean the cwd say `base_dir: Dir.pwd`.
+  def initialize(path = nil, base_dir:)
+    path ||= File.join(base_dir, ".api", "config.pkl")
+    @base_dir = base_dir
     if !File.exist?(path)
       Util.exit_with_error("No .api/config.pkl found at #{path}")
     end

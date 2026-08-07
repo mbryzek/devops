@@ -10,12 +10,18 @@ class TestApiConfig < Minitest::Test
   FIXTURE = File.expand_path('fixtures/sample_config.pkl', __dir__)
 
   def setup
-    # The fixture uses `spec_glob = "dao/spec/*.json"`, which is resolved
-    # relative to Dir.pwd. Use the block form so cwd is restored afterwards
-    # and doesn't leak into other tests.
-    Dir.chdir(File.dirname(FIXTURE)) do
-      @config = ApiConfig.new(FIXTURE)
-    end
+    # The fixture uses `spec_glob = "dao/spec/*.json"`, resolved against
+    # base_dir — which is the fixture directory here, and is required precisely
+    # so no caller has to know what the cwd happens to be.
+    @config = ApiConfig.new(FIXTURE, base_dir: File.dirname(FIXTURE))
+  end
+
+  # `base_dir` is required rather than defaulting to Dir.pwd, because a caller
+  # that forgets it is silent on every repo without a spec_glob and silent again
+  # on one that IS the cwd — it surfaces only where it is least expected, which
+  # is how it aborted a `dev deploy` after the app was already live (ISS-867).
+  def test_base_dir_is_required
+    assert_raises(ArgumentError) { ApiConfig.new(FIXTURE) }
   end
 
   def test_orgs

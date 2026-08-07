@@ -402,7 +402,7 @@ end
 def run_result(profile, dry_run)
   config_path = File.join(Dir.pwd, ".api", "config.pkl")
   Util.exit_with_error("Config file not found: #{config_path}") unless File.exist?(config_path)
-  config = ApiConfig.new(config_path)
+  config = ApiConfig.new(config_path, base_dir: Dir.pwd)
 
   # `result` has one root by definition — it generates from this repo's own config.
   sources = build_spec_sources([[config, Dir.pwd]])
@@ -647,7 +647,7 @@ def run_lint(profile, file_path, apps_filter:, group_filter:)
   if file_path
     Util.exit_with_error("File not found: #{file_path}") unless File.exist?(file_path)
   end
-  config = ApiConfig.new(config_path)
+  config = ApiConfig.new(config_path, base_dir: Dir.pwd)
   validate_filters(config, apps_filter.empty? ? nil : apps_filter, group_filter)
 
   client = ApibuilderClient.new(profile)
