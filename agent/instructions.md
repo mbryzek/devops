@@ -92,19 +92,63 @@ matches `<assigned>`, the `<assigned>_` family, and the title prefix, and nothin
 else. That is the whole allowance — a sibling is not a rename, and renaming is
 still the one thing you may not do.
 
-**Record every PR, or the ones you do not record did not happen.** The status
-write carries exactly one url, so:
+Then answer ONE question about the extra PRs, because it decides which number
+they carry and everything downstream follows from it.
+
+#### Is it one change, or several?
+
+**One change, several PRs.** A spec change ships as a platform PR plus a
+consumer regen plus a migration: three PRs, one behaviour, one thing to confirm
+in production. They all carry `ISS-<n>: ` and they all go on this issue:
 
     dev issues status <n> --status fixed --url "<primary PR>"
     dev issues fix <n> --url "<sibling PR>"      # once per additional PR
 
 `dev issues fix` appends to the same fix list `dev issues show` and the deploy
 reconciler read, and leaves the status where it is. A url mentioned only in a
-comment is invisible to both.
+comment is invisible to both. Never `--status fixed` twice — that walks a
+`fixed → deployed → verified` issue backwards, which the server refuses.
+
+**Several changes.** A weekly review confirms four unrelated defects; a perf run
+fixes two unrelated routes. Nothing about those belongs together: each is
+reviewed on its own, merges on its own, breaks on its own and is confirmed in
+production on its own. **Give each one its own issue number, before you open its
+PR**:
+
+    dev issues split <n> --title "<what this change is>" --body "<the finding>"
+
+The first call promotes ISS-`<n>` into an epic and adopts it as the first child,
+so it keeps the PR it already has; later calls reuse that epic. Each split
+prints the number its PR must carry. Then, per split child:
+
+    # branch: <assigned>_<suffix>, as above.  title: ISS-<child>: <title>
+    dev issues status <child> --status fixed --url "<its PR>"
+
+Do NOT verify a child and do not close the epic by hand: it advances to
+`deployed` on its own once every child has, and IT is the one thing verified.
+
+**Split LATE and close EARLY** — immediately before you open that PR, and out to
+`fixed` the moment it is ready. A split child is filed `claimed`, so one you
+never close is a claimed issue no runner will ever pick up, holding its epic open
+with nothing on it saying why. Never split for work you have not done yet.
+
+**Why this and not five urls on one number.** A status write carries exactly one
+url. Before `split`, four independent fixes behind one number could not be
+closed out, deployed, verified or auto-merged apart from each other — measured
+2026-08-06, ISS-735 carried devops #371–#375 and ISS-723 carried platform
+#2138–#2140, and not one of those PRs could be tracked on its own (ISS-759).
+
+**Where a playbook's close-out section still says to prefix every PR with this
+issue's number, this rule wins.** That prose predates `dev issues split`; the
+branch-family rule above is unchanged either way.
 
 **Do not split work to look thorough.** The test is whether each piece is
-reviewable and mergeable on its own. Related edits to one behaviour are ONE PR,
-and forcing them apart is worse than the problem this section solves.
+reviewable and mergeable on its own AND worth confirming in production on its
+own. Related edits to one behaviour are ONE PR, and forcing them apart is worse
+than the problem this section solves. A finding you are NOT fixing in this run is
+not a split either — file it standalone with `dev issues create --status open`,
+never as a child, or it is closed out silently with the epic having had nobody
+look at it.
 
 ### Before you close out: file what you WORKED AROUND
 

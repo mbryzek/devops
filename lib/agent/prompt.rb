@@ -75,9 +75,17 @@ module Agent
       # disjoint PRs improvises, and the ISS-651 run did.
       lines << "**More than one PR?** `#{slug}` carries the primary one; name every additional PR's"
       lines << "branch `#{slug}_<suffix>` (≤19 chars, off latest `origin/main`, disjoint files, never"
-      lines << "stacked), title them all `ISS-#{issue['number']}: `, and record the extras with"
-      lines << "`dev issues fix #{issue['number']} --url ...`. A branch that does not START with `#{slug}` is"
-      lines << "invisible to the executor. See §1 of the standing instructions above."
+      lines << "stacked). A branch that does not START with `#{slug}` is invisible to the executor."
+      lines << ""
+      # Which NUMBER those PRs carry is the other half, and it is not a branch
+      # question (ISS-759): several PRs that are one change stay on this issue,
+      # several INDEPENDENT changes each need their own, or none of them can be
+      # closed out, deployed, verified or auto-merged apart from the others.
+      lines << "**One change spread across repos?** Title them all `ISS-#{issue['number']}: ` and record the"
+      lines << "extras with `dev issues fix #{issue['number']} --url ...`. **Several INDEPENDENT changes?** Give"
+      lines << "each its OWN issue number BEFORE opening its PR — `dev issues split #{issue['number']} --title ...`"
+      lines << "— then title and close out each one against the number it prints. See §1 of the"
+      lines << "standing instructions above."
       lines << ""
       if resume_repo
         lines << "**This is a RESUME, not a fresh attempt.** `#{resume_repo}` is already cloned in your"
