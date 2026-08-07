@@ -218,6 +218,51 @@ class TestAgentMergeLane < Minitest::Test
     assert candidate.review_in_flight, "a red PR under review must still report the review"
   end
 
+  # ---- the cross-repo arm (ISS-758) ----------------------------------------
+
+  # The one fact a per-PR check structurally cannot see. This PR is green, fresh,
+  # ahead of main and unreviewed — everything the lane asks for — and it still
+  # must not merge, because its producer in another repo has not shipped.
+  def test_a_sibling_hold_stops_an_otherwise_mergeable_pr
+    v = ML.verdict(green_pr, repo: "mbryzek/playbook-admin", base_status: "ahead",
+                   sibling_hold: "platform#2133 merged but has not deployed")
+    assert_equal :waits_on_sibling, v.code
+    assert_equal :wait, v.action
+    assert_match(/has not deployed/, v.message)
+  end
+
+  # Nothing was passed and nothing changes: every caller and every test that
+  # predates ISS-758 asks exactly the question it asked before.
+  def test_no_sibling_hold_leaves_the_verdict_untouched
+    assert_equal :mergeable, ML.verdict(green_pr, repo: "mbryzek/platform", base_status: "ahead").code
+    assert_equal :mergeable, ML.verdict(green_pr, repo: "mbryzek/platform", base_status: "ahead",
+                                        sibling_hold: nil).code
+    assert_equal :mergeable, ML.verdict(green_pr, repo: "mbryzek/platform", base_status: "ahead",
+                                        sibling_hold: "").code
+  end
+
+  # A red PR held by a sibling verdicts as RED. Same ordering argument as the
+  # review deferral above: `:waits_on_sibling` says "this would merge as soon as
+  # its producer ships", and a red PR would not.
+  def test_a_red_pr_with_a_sibling_hold_still_verdicts_as_red
+    pr = green_pr("statusCheckRollup" => [check_run("ci", "FAILURE")])
+    v = ML.verdict(pr, repo: "mbryzek/playbook-admin", base_status: "ahead",
+                   sibling_hold: "platform#2133 has not merged")
+    assert_equal :ci_failed, v.code
+  end
+
+  # The lane asks per PR, and it must ask about THIS PR — an off-by-one in the
+  # lookup would hold the wrong one and let the held one through. Asked ONCE,
+  # too: `candidate` verdicts twice when the base is unknown, and re-asking there
+  # would double every caller's cost for an answer that cannot have changed.
+  def test_the_candidate_asks_the_hold_once_about_its_own_repo_and_number
+    asked = []
+    hold = ->(repo, number) { asked << [repo, number]; "platform#1 has not merged" }
+    candidate = ML.candidate("mbryzek/playbook-admin", green_pr, sibling_hold: hold)
+    assert_equal [["mbryzek/playbook-admin", 41]], asked
+    assert_equal :waits_on_sibling, candidate.verdict.code
+  end
+
   # `mergeStateStatus` is deliberately NOT the source for the review deferral:
   # UNSTABLE is the same fact, but the field also reports DIRTY, BEHIND and
   # UNKNOWN, and skipping on "not CLEAN" would fold three unrelated states in.

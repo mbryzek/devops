@@ -318,7 +318,7 @@ module Agent
     # before the next one asks a more expensive question, and the message a
     # reader gets is the FIRST real reason rather than the last. `review_in_flight`
     # is the one fact deliberately computed outside this ordering (see Candidate).
-    def verdict(pr, repo:, base_status: nil)
+    def verdict(pr, repo:, base_status: nil, sibling_hold: nil)
       repo_name = repo.to_s.split("/").last
       if SELF_DEPLOYING_REPOS.include?(repo_name)
         return v(:self_deploying_repo, :skip,
@@ -355,6 +355,26 @@ module Agent
         return v(:review_in_flight, :defer,
                  "#{REVIEW_CONTEXT} is not SUCCESS — a human is mid-review, and merging destroys the " \
                  "pass rather than the code")
+      end
+
+      # THE CROSS-REPO INVARIANT (ISS-758). Everything above this line is a fact
+      # about one pull request; this is the one fact that is not, and it is the
+      # one a per-PR check structurally cannot see.
+      #
+      # A change that spans repos lands as several PRs that must merge in order —
+      # migration, then the spec owner, then the consumer regens. Each of them can
+      # be green, fresh, ahead of main and reviewed, and merging the consumer
+      # first still ships a frontend calling a field the running backend does not
+      # serve: playbook-admin #760, a swallowed 404 rendered as "No data". FRESH
+      # and AHEAD say the tree is main-plus-this-PR; neither says anything about
+      # the sibling in another repo.
+      #
+      # Computed by `Prs::Group` and passed in, for the same reason `base_status`
+      # is: `verdict` stays a pure function over facts somebody else established.
+      # A nil hold is "no sibling is waiting on anything", NOT "unknown" — the
+      # group builder resolves its own unknowns into holds before we get here.
+      unless sibling_hold.to_s.empty?
+        return v(:waits_on_sibling, :wait, sibling_hold.to_s)
       end
 
       base_verdict(pr, base_status)
@@ -491,15 +511,24 @@ module Agent
     # `base_status` is asked for ONLY once a PR has survived every cheaper check.
     # It is one API call per PR, and a repo with 23 open PRs of which 20 are
     # drafts or unverified has no reason to make 23.
-    def candidates(repo)
-      open_prs(repo).map { |raw| candidate(repo, raw) }
+    # `sibling_hold` is asked per PR — `->(repo, number) { reason_or_nil }` — so
+    # the caller can build the cross-repo picture once and answer from it, rather
+    # than this file learning how to enumerate every repo in the account. Default
+    # is "nothing is holding anything", which keeps every existing caller and
+    # every test that predates ISS-758 asking exactly the question it asked before.
+    NO_SIBLING_HOLD = ->(_repo, _number) { nil }
+
+    def candidates(repo, sibling_hold: NO_SIBLING_HOLD)
+      open_prs(repo).map { |raw| candidate(repo, raw, sibling_hold: sibling_hold) }
     end
 
-    def candidate(repo, raw)
-      cheap = verdict(raw, repo: repo, base_status: nil)
+    def candidate(repo, raw, sibling_hold: NO_SIBLING_HOLD)
+      hold = sibling_hold.call(repo, raw["number"])
+      cheap = verdict(raw, repo: repo, base_status: nil, sibling_hold: hold)
       final =
         if cheap.code == :base_unknown
-          verdict(raw, repo: repo, base_status: compare_status(repo, raw["baseRefName"], raw["headRefOid"]))
+          verdict(raw, repo: repo, sibling_hold: hold,
+                  base_status: compare_status(repo, raw["baseRefName"], raw["headRefOid"]))
         else
           cheap
         end
@@ -534,10 +563,10 @@ module Agent
     # earlier: a candidate list is a snapshot, and the session that acts on it has
     # since rebased branches, waited on CI and merged other PRs — each of which
     # can have invalidated it.
-    def assess(repo, number)
+    def assess(repo, number, sibling_hold: NO_SIBLING_HOLD)
       raw = pr(repo, number)
       return nil if raw.nil?
-      candidate(repo, raw)
+      candidate(repo, raw, sibling_hold: sibling_hold)
     end
 
     # The merge. The ONLY mutation in this file, and it re-states two of the
