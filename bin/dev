@@ -83,7 +83,8 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "tasks delete"        => 'tasks delete (--id TASK_ID... | --discriminator NAME) [--app APP] [--localhost] [--yes]',
-  "queries top"         => 'queries [top] [--days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
+  "queries top"         => 'queries [top] [--hours N | --days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
+  "queries show"        => 'queries show <sample-id> [--hours N | --days N] [--localhost]',
   "claude-usage top"    => 'claude-usage [top] [--days N] [--limit N] [--sort cost_usd|input_tokens|output_tokens|requests] [--localhost]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "deploy status"       => 'deploy [status] [--app APP]',
@@ -286,10 +287,33 @@ USAGE = <<~USAGE
         statement in it, so at a high share the cost belongs partly to a sibling
         and the statement shown is not the thing to optimize.
 
+        Under each row: how many samples it aggregates, the span they cover, and
+        the `dev queries show` line for that statement. One sample means every
+        call landed in a single flush window on a single node -- a burst -- and a
+        span of days means a standing hot path. That distinction is the first
+        question an expensive query raises and the ranking alone cannot answer it.
+
+        --hours takes a window finer than a day; --days is the same window in
+        multiples of 24. The samples are written every 6 hours, so a window under
+        6 hours can legitimately come back empty.
+
         Rows are numbered: at the prompt, pick any of them to file an
         `improvement` issue holding those queries and hand it straight to a
         Claude session, the way `dev issues create` does. Blank input files
         nothing, and nothing is offered when output is piped.
+
+    #{INVOCATIONS["queries show"]}
+        The raw samples behind ONE statement, oldest first: one row per node per
+        flush window, with the window it covers and what that node accumulated in
+        it. This is the shape over time that `top` sums away -- read it to tell a
+        burst from sustained load, and to see whether one node carried the cost or
+        the whole fleet did.
+
+        <sample-id> is any sample id of the statement (a `qs-...`): the one under
+        a `dev queries top` row, or the one a query-stats invariant reports as its
+        example. It names the statement, not the row -- every node's samples come
+        back either way. An id that does not exist is an error; a statement with
+        no samples in the window is an empty list, which is a different fact.
 
     #{INVOCATIONS["claude-usage top"]}
         Rank Claude API token usage/cost by (feature, model), from the daily
@@ -1325,7 +1349,7 @@ SUBCOMMANDS = {
   "issues"       => %w[create list parent split block duplicate workaround handoff claim review show status fix snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
-  "queries"      => %w[top],
+  "queries"      => %w[top show],
   "claude-usage" => %w[top],
   "agent"        => %w[tick status logs run-op pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
@@ -10844,7 +10868,7 @@ end
 # talks to a database directly and the endpoint applies its own platform-admin auth.
 def cmd_queries_top(args)
   limit = 25
-  days = 7
+  hours = QUERIES_DEFAULT_HOURS
   sort = "total_ms"
   use_localhost = false
   i = 0
@@ -10853,8 +10877,8 @@ def cmd_queries_top(args)
     when "--limit"
       limit = Integer(args[i + 1] || usage_exit("--limit requires a value", example: usage_for("queries top")))
       i += 1
-    when "--days"
-      days = Integer(args[i + 1] || usage_exit("--days requires a value", example: usage_for("queries top")))
+    when "--days", "--hours"
+      hours = queries_window_hours(args[i], args[i + 1], "queries top")
       i += 1
     when "--by-mean"  then sort = "mean_ms"
     when "--by-calls" then sort = "calls"
@@ -10864,20 +10888,21 @@ def cmd_queries_top(args)
     i += 1
   end
 
+  window = queries_window_label(hours)
   endpoint = platform_endpoint(use_localhost)
   handle_errors do
     stats = ApiClient.request(
       endpoint, :get,
-      "/dev/query/stats?days=#{days}&sort=#{sort}&limit=#{limit}&offset=0"
+      "/dev/query/stats?hours=#{hours}&sort=#{sort}&limit=#{limit}&offset=0"
     )
 
     if stats.nil? || stats.empty?
-      puts "No query samples in the last #{days} day(s)."
+      puts "No query samples in the last #{window}."
       next
     end
 
     puts ""
-    puts Util.underline("Top #{stats.length} queries by #{sort} (last #{days} day(s))")
+    puts Util.underline("Top #{stats.length} queries by #{sort} (last #{window})")
     puts ""
     printf(
       "%4s  %12s  %10s  %9s  %9s  %7s  %s\n",
@@ -10890,12 +10915,175 @@ def cmd_queries_top(args)
         queries_multi_share(s),
         s["call_site"] || "(never got hot)"
       )
+      puts "#{QUERIES_SQL_INDENT}#{queries_span_line(s, hours: hours, use_localhost: use_localhost)}"
       queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
     end
     puts ""
 
-    queries_offer_investigation(stats, days: days, sort: sort, use_localhost: use_localhost)
+    queries_offer_investigation(stats, hours: hours, sort: sort, use_localhost: use_localhost)
   end
+end
+
+# The raw samples behind one statement, oldest first.
+#
+# The counterpart to `top`, and the reason it exists: `top` sums a statement across every
+# node and window, which is the right ranking and destroys the one fact a triage actually
+# turns on -- whether N calls were a burst or a hot path. ISS-850 could establish only that
+# 1051 calls fell "inside roughly one day", because whole days were the finest window
+# available and nothing exposed the underlying rows at all; the threshold that came out of
+# it had to be argued from the flush interval rather than measured (ISS-854).
+#
+# Takes any ONE sample id of the statement and returns every node's, because that is the id
+# the callers already hold -- `top` prints one per row and the query-stats invariants report
+# one as their example -- while the statement itself is a multi-kilobyte string.
+def cmd_queries_show(args)
+  hours = QUERIES_DEFAULT_HOURS
+  use_localhost = false
+  id = nil
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--days", "--hours"
+      hours = queries_window_hours(args[i], args[i + 1], "queries show")
+      i += 1
+    when "--localhost", "--local" then use_localhost = true
+    when /\A--/ then usage_exit("Unknown flag: #{args[i]}", example: usage_for("queries show"))
+    else
+      usage_exit("Expected one sample id, got a second: #{args[i]}", example: usage_for("queries show")) if id
+      id = args[i]
+    end
+    i += 1
+  end
+  usage_exit("A sample id is required", example: usage_for("queries show")) unless id
+
+  window = queries_window_label(hours)
+  endpoint = platform_endpoint(use_localhost)
+  handle_errors do
+    history = begin
+      ApiClient.request(endpoint, :get, "/dev/query/stats/#{URI.encode_www_form_component(id)}?hours=#{hours}")
+    rescue ApiError => e
+      # Reworded rather than passed through: the raw "HTTP 404" says the request failed,
+      # where what happened is that this id names nothing -- and the id came from a ranking
+      # or an invariant, so the next question is which.
+      raise unless e.code == 404
+
+      warn "No sample `#{id}`. Sample ids come from a `dev queries top` row or a query-stats " \
+           "invariant's details, and are purged at 90 days."
+      exit 1
+    end
+
+    samples = history["samples"] || []
+    puts ""
+    puts Util.underline("Samples for #{history['call_site'] || '(never got hot)'} (last #{window})")
+    puts ""
+    queries_sql_lines(history["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
+    puts ""
+
+    if samples.empty?
+      puts "No samples in the last #{window} — this statement exists but has not run recently."
+      next
+    end
+
+    printf(
+      "%-22s  %8s  %10s  %12s  %9s  %9s  %7s  %s\n",
+      "WINDOW ENDING", "WINDOW", "CALLS", "TOTAL MS", "MEAN MS", "MAX MS", "MULTI", "NODE"
+    )
+    samples.each do |s|
+      calls = s["calls"].to_i
+      printf(
+        "%-22s  %8s  %10d  %12d  %9d  %9d  %7s  %s\n",
+        queries_format_time(s["created_at"]),
+        Util.duration(s["window_seconds"].to_i),
+        calls, s["total_ms"].to_i,
+        calls.zero? ? 0 : s["total_ms"].to_i / calls,
+        s["max_ms"].to_i,
+        queries_multi_share(s),
+        s["node"]
+      )
+    end
+    puts ""
+    puts queries_show_summary(samples)
+  end
+end
+
+# What the table above adds up to, said once so the burst-vs-sustained call does not have to
+# be made by eye. The span is a LOWER bound on how long the statement ran: a sample's window
+# ends at created_at and covers window_seconds before it, so the true span reaches one window
+# further back than the first row.
+def queries_show_summary(samples)
+  times = samples.filter_map { |s| queries_parse_time(s["created_at"]) }
+  nodes = samples.map { |s| s["node"] }.uniq.length
+  calls = samples.sum { |s| s["calls"].to_i }
+  total = samples.sum { |s| s["total_ms"].to_i }
+  span = times.length > 1 ? " spanning at least #{Util.duration(times.max - times.min)}" : ""
+  "#{samples.length} #{samples.length == 1 ? 'sample' : 'samples'} across " \
+    "#{nodes} #{nodes == 1 ? 'node' : 'nodes'}#{span}: #{calls} calls, #{total} ms."
+end
+
+# Seven days, the default window, carried in the unit the endpoint takes.
+QUERIES_DEFAULT_HOURS = 168
+
+# --days and --hours name ONE window, in hours.
+#
+# Days is kept because it is how the window is asked for most of the time (and how every
+# existing playbook and issue body words it), and hours is added because days was the only
+# resolution there was: the samples are written every 6 hours, so days=1 and days=7 were the
+# two adjacent readings a caller could take, and neither can measure a spread of hours. That
+# is the wall ISS-850 hit -- it could show 1048 of 1051 calls fell inside "roughly one day"
+# and could not narrow it further, so the invariant threshold it produced had to be argued
+# from the flush interval instead of measured (ISS-854).
+def queries_window_hours(flag, value, command)
+  n = Integer(value || usage_exit("#{flag} requires a value", example: usage_for(command)))
+  usage_exit("#{flag} must be at least 1", example: usage_for(command)) if n < 1
+
+  flag == "--days" ? n * 24 : n
+end
+
+# How the window reads back. Hours is what the window IS, but "last 168 hour(s)" is nobody's
+# mental model of a week, so a whole number of days says days and anything finer -- which is
+# the resolution this exists for -- says hours.
+def queries_window_label(hours)
+  hours % 24 == 0 ? "#{hours / 24} day(s)" : "#{hours} hour(s)"
+end
+
+# The line under each ranked row: how many samples it aggregates, what they span, and the
+# command that opens them.
+#
+# This is the burst-vs-sustained answer at a glance. One sample means every call landed in a
+# single flush window on a single node, which is a burst and nothing else; several samples
+# spread over days are a standing hot path. The ranking on its own cannot tell those apart,
+# and telling them apart is the first thing anyone does with an expensive query.
+#
+# "at least", because a sample's window ENDS at created_at and covers window_seconds before
+# it -- so the real span reaches one flush window further back than the first sample. Saying
+# the bound is a bound is the difference between a measurement and a guess with a number on
+# it, which is precisely what ISS-854 is about.
+def queries_span_line(stat, hours:, use_localhost:)
+  count = stat["sample_count"].to_i
+  first = queries_parse_time(stat["first_sample_at"])
+  last = queries_parse_time(stat["last_sample_at"])
+  shape =
+    if count <= 1 || first.nil? || last.nil? || last <= first
+      "#{count} #{count == 1 ? 'sample' : 'samples'} at #{queries_format_time(stat['last_sample_at'])}"
+    else
+      "#{count} samples spanning at least #{Util.duration(last - first)}, " \
+        "#{queries_format_time(stat['first_sample_at'])} -> #{queries_format_time(stat['last_sample_at'])}"
+    end
+  flags = [hours == QUERIES_DEFAULT_HOURS ? nil : "--hours #{hours}", use_localhost ? "--localhost" : nil].compact
+  "#{shape} · dev queries show #{stat['id']}#{flags.empty? ? '' : " #{flags.join(' ')}"}"
+end
+
+# UTC, to the minute. These timestamps are compared against deploy times and log windows from
+# other machines, and a local-time rendering is the one that quietly loses an hour.
+def queries_format_time(value)
+  t = queries_parse_time(value)
+  t ? t.utc.strftime("%Y-%m-%d %H:%M UTC") : "(unknown)"
+end
+
+def queries_parse_time(value)
+  Time.parse(value.to_s)
+rescue ArgumentError, TypeError
+  nil
 end
 
 # What share of a statement's calls came from a block that ran more than one statement, so its
@@ -10930,7 +11118,7 @@ end
 #
 # Skipped entirely when stdin is not a tty — piping this command must print the
 # table and exit, never block on a prompt nobody can answer.
-def queries_offer_investigation(stats, days:, sort:, use_localhost:)
+def queries_offer_investigation(stats, hours:, sort:, use_localhost:)
   return unless $stdin.tty?
 
   answer = Ask.for_string(
@@ -10948,7 +11136,7 @@ def queries_offer_investigation(stats, days:, sort:, use_localhost:)
   form = {
     category: QUERIES_ISSUE_CATEGORY,
     title: queries_issue_title(selected),
-    body: queries_issue_body(selected, days: days, sort: sort),
+    body: queries_issue_body(selected, hours: hours, sort: sort),
   }
   issue_file_and_start(
     endpoint: issue_endpoint(use_localhost), form: form, category: QUERIES_ISSUE_CATEGORY, status: "claimed"
@@ -10994,9 +11182,9 @@ end
 # query rather than left as a caveat to remember.
 #
 # The per-instance data (the selected queries and their numbers) goes last.
-def queries_issue_body(selected, days:, sort:)
+def queries_issue_body(selected, hours:, sort:)
   <<~BODY
-    #{selected.length} #{selected.length == 1 ? 'query' : 'queries'} selected from `dev queries top` (ranked by #{sort}, last #{days} day(s)).
+    #{selected.length} #{selected.length == 1 ? 'query' : 'queries'} selected from `dev queries top` (ranked by #{sort}, last #{queries_window_label(hours)}).
     Work out why #{selected.length == 1 ? 'it costs' : 'they cost'} what #{selected.length == 1 ? 'it does' : 'they do'} and make #{selected.length == 1 ? 'it' : 'them'} cheaper — or establish that the
     cost is justified and say why. Either outcome closes this issue; a query that is
     correctly expensive is a real finding, not a failure.
@@ -11047,6 +11235,13 @@ def queries_issue_body(selected, days:, sort:)
     - **`calls`, `total_ms` and `multi-statement` are sums across nodes and windows.**
       Per-node cost is roughly this divided by the number of pods serving; `max_ms` is a
       true single-call worst case, not an average of maxima.
+    - **A total says nothing about whether this was a burst or a hot path**, and those are
+      different bugs: one batch job that ran once is not the same finding as a query on
+      every request. `samples` and the span below are that answer, and
+      `dev queries show <sample-id>` opens the underlying rows — one per node per 6-hour
+      window, oldest first — so the shape over time is visible rather than inferred. The
+      span is a LOWER bound: a window ENDS at its sample's timestamp and covers the six
+      hours before it, so the real span reaches one window further back.
     - **The call site is the application caller, not the DAO**: generated `generated.db.`
       frames are skipped, because the statement already names the table and the shape. Two
       different callers can issue byte-identical SQL and so share one entry — a batch
@@ -11061,6 +11256,10 @@ def queries_issue_body(selected, days:, sort:)
        itself and needs no plan. If `multi-statement` is high, establish what ELSE runs in
        the block before you time this statement at all — a select that reads as 107ms mean
        can be a 20ms select in front of a 500-row write.
+       Then measure the shape rather than assuming it: `dev queries show <sample-id>`
+       (the id is under each query below) lists every sample of this statement over time,
+       so a one-off backfill and a query on the request path stop looking alike. Narrow
+       the window with `--hours N` when the samples cluster.
     2. Get an execution plan. Use the session Postgres, never production:
        `export CLAUDE_SESSION_ID=<feature>` then
        `eval "$(~/code/devops/bin/claude-db start --app platform | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')"`,
@@ -11074,7 +11273,7 @@ def queries_issue_body(selected, days:, sort:)
     4. Consider the caller, not only the query: fetching columns nobody reads, paging
        through rows that could be filtered in SQL, or re-running per row what could run
        once are all cheaper to fix than the statement itself.
-    5. Confirm the win. Re-run `dev queries top --days 1` after the fix is deployed and
+    5. Confirm the win. Re-run `dev queries top --hours 24` after the fix is deployed and
        compare `total_ms` — the ranking is the same instrument that found it. Note that
        a 6-hour flush window means the effect is not visible immediately.
 
@@ -11094,6 +11293,8 @@ def queries_issue_body_entry(s, position)
     - total: #{s['total_ms']} ms across #{s['calls']} calls
     - mean: #{s['mean_ms']} ms, max: #{s['max_ms']} ms
     - multi-statement: #{queries_issue_body_multi(s)}
+    - samples: #{queries_issue_body_span(s)}
+    - open them: `dev queries show #{s['id']}`
 
     ```sql
     #{s['sql'].to_s.gsub(/\s+/, ' ').strip}
@@ -11104,6 +11305,24 @@ end
 # Spelled out rather than shown as the terminal's bare percentage: the issue is read by a session
 # with no other context, and the number is worthless without the sentence that says what to do with
 # it. The percentage alone invited exactly the reading it exists to prevent.
+# Spelled out for the same reason as the multi-statement share: the receiving session has no
+# other context, and "3 samples" is a number that means nothing without the sentence saying
+# what one sample IS and what a small count therefore implies.
+def queries_issue_body_span(s)
+  count = s["sample_count"].to_i
+  first = queries_parse_time(s["first_sample_at"])
+  last = queries_parse_time(s["last_sample_at"])
+  if count <= 1 || first.nil? || last.nil? || last <= first
+    return "#{count} — every call above landed in ONE 6-hour flush window on ONE node, at " \
+      "#{queries_format_time(s['last_sample_at'])}. That is a burst, not a hot path: look for a job " \
+      "or a backfill before assuming this runs continuously"
+  end
+
+  "#{count}, from #{queries_format_time(s['first_sample_at'])} to #{queries_format_time(s['last_sample_at'])} — " \
+    "at least #{Util.duration(last - first)} of wall clock, and up to one 6-hour window more, since a " \
+    "window ENDS at its timestamp"
+end
+
 def queries_issue_body_multi(s)
   calls = s["calls"].to_i
   multi = s["multi_statement_calls"].to_i
@@ -14248,8 +14467,9 @@ when "dependencies"
 when "queries"
   sub = resolve_subcommand(argv, default: "top")
   case sub
-  when "top" then cmd_queries_top(argv)
-  else            unknown("queries subcommand", sub, SUBCOMMANDS["queries"])
+  when "top"  then cmd_queries_top(argv)
+  when "show" then cmd_queries_show(argv)
+  else             unknown("queries subcommand", sub, SUBCOMMANDS["queries"])
   end
 when "claude-usage"
   sub = resolve_subcommand(argv, default: "top")
