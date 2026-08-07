@@ -595,7 +595,21 @@ module Agent
       unless result.missing_optional.empty?
         lines += ["", "Also absent, not required: #{result.missing_optional.map { |t| "`#{t.name}`" }.join(', ')}."]
       end
-      lines += ["", "Resolution is the agent's own PATH (`/bin/zsh -lc`), NOT an interactive shell's — a tool " \
+      # EVERY `install:` line above is a SHELL line, not an argv, and an
+      # autonomous session running one has to put it through `dev agent run-op`
+      # — which takes argv. That translation is where ISS-894 went wrong and
+      # ISS-896 came from, so the body does the translation rather than leaving
+      # each session to invent one. The hints genuinely need a shell: NODE_INSTALL
+      # contains both `&&` and `;`, and its leading `HOMEBREW_NO_AUTOREMOVE=1` is
+      # load-bearing (ISS-852), so there is no argv spelling to fall back on.
+      lines += ["", "**Each `install:` line above is a SHELL line** — several contain `&&`, `;` or a " \
+                    "leading `VAR=1` assignment, none of which argv can express. An autonomous session " \
+                    "runs one by handing it to a shell explicitly:",
+                "", "```", "dev agent run-op <name> -- /bin/zsh -lc '<the install line>'", "```",
+                "", "Do NOT translate it by prepending `env`: `dev agent run-op` takes argv, and " \
+                    "`--env KEY=VALUE` is the flag for a single assignment. A failed run-op record " \
+                    "returns this issue to the queue even if the session then fixed the machine.",
+                "", "Resolution is the agent's own PATH (`/bin/zsh -lc`), NOT an interactive shell's — a tool " \
                     "that only a version manager loaded from `.zshrc` provides (nvm, rbenv, asdf) is present " \
                     "in your terminal and invisible to every process launchd starts. Install into homebrew.",
                 "", "Verify with `dev agent doctor` on that machine.",

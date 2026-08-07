@@ -136,7 +136,7 @@ INVOCATIONS = {
   "agent tick"          => 'agent tick [--dry-run] [--localhost]',
   "agent status"        => 'agent [status] [--localhost]',
   "agent logs"          => 'agent logs <issue> [--follow]',
-  "agent run-op"        => 'agent run-op <operation> [--timeout SECONDS] -- <command> [args...]',
+  "agent run-op"        => 'agent run-op <operation> [--timeout SECONDS] [--env KEY=VALUE]... -- <command> [args...]',
   "agent pause"         => 'agent pause [--localhost]',
   "agent resume"        => 'agent resume [--localhost]',
   "agent runners"       => 'agent runners [--localhost]',
@@ -1101,6 +1101,12 @@ USAGE = <<~USAGE
         Refuses to run outside an agent session (it reads DEV_AGENT_ISSUE from the
         environment the executor set, and takes no flag to override it). Exits
         with the operation's own status, so `&&` chains behave.
+        --env KEY=VALUE (repeatable) sets a variable for the operation. Use it
+        rather than prepending `env` to the command: leading assignments are
+        shell syntax and this takes argv, and only the variable NAMES are echoed
+        or recorded, never the values. A command written as a shell LINE — one
+        with `&&`, `;` or a pipe in it, which no argv can express — goes to a
+        shell explicitly: `-- /bin/zsh -lc '<the line>'`.
 
     #{INVOCATIONS["agent pause"]}
     #{INVOCATIONS["agent resume"]}
@@ -12994,6 +13000,13 @@ end
 # Everything after `--` is handed to the operation untouched — never through
 # parse_common_flags, which would eat the `--app` and `--localhost` that belong
 # to the operation and not to this wrapper.
+#
+# `--env KEY=VALUE` (repeatable) is how an operation gets an environment
+# variable, and it is here because this command takes ARGV while the things
+# sessions are sent to run are written as SHELL lines: a toolchain install hint
+# is `HOMEBREW_NO_AUTOREMOVE=1 brew uninstall --ignore-dependencies node`, and
+# leading assignments have no argv spelling at all. Prepending `env` was the
+# natural translation and it is what ISS-896 is — see Agent::Ops.run.
 def cmd_agent_run_op(args)
   separator = args.index("--")
   mine = separator ? args[0...separator] : args
@@ -13002,10 +13015,17 @@ def cmd_agent_run_op(args)
   rest, app_filter, _use_localhost = parse_common_flags(mine)
   timeout = Agent::Ops::DEFAULT_TIMEOUT_SECONDS
   positional = []
+  env = {}
+  bad_env = []
   i = 0
   while i < rest.length
-    if rest[i] == "--timeout"
+    case rest[i]
+    when "--timeout"
       timeout = rest[i + 1]
+      i += 2
+    when "--env"
+      pair = Agent::Ops.env_assignment(rest[i + 1])
+      pair ? env.store(*pair) : bad_env << rest[i + 1].to_s
       i += 2
     else
       positional << rest[i]
@@ -13023,9 +13043,15 @@ def cmd_agent_run_op(args)
   problems << "unexpected --app" if app_filter
   problems << "missing `-- <command>`: name the command to run after a bare `--`" if argv.empty?
   problems << "--timeout must be a positive number of seconds, got '#{timeout}'" unless timeout.to_s.match?(/\A\d+\z/) && timeout.to_i.positive?
+  # Refused here, at parse time, rather than allowed to become a failed run. A
+  # mis-invocation that reaches Agent::Ops.run writes a FAILED record, and one
+  # failed record makes the executor return the whole issue to the queue however
+  # well the session then did the work — which is the second and worse half of
+  # ISS-896. Nothing about a typo'd flag should cost a run its classification.
+  bad_env.each { |pair| problems << "--env must be KEY=VALUE with KEY a variable name, got '#{pair}'" }
   report_arg_problems("agent run-op", problems, usage_for("agent run-op"))
 
-  cmd_agent_run_op_apply(agent_run_op_issue!, operation, argv, timeout.to_i)
+  cmd_agent_run_op_apply(agent_run_op_issue!, operation, argv, timeout.to_i, env)
 end
 
 # The issue this record is filed under, from the environment the EXECUTOR set —
@@ -13043,9 +13069,12 @@ def agent_run_op_issue!
   )
 end
 
-def cmd_agent_run_op_apply(number, operation, argv, timeout)
-  puts "Running #{operation} for ISS-#{number}: #{argv.join(' ')}"
-  record, visible = Agent::Ops.run(number: number, operation: operation, argv: argv, timeout: timeout)
+def cmd_agent_run_op_apply(number, operation, argv, timeout, env = {})
+  # The echo shows the variable NAMES, not their values, for the reason
+  # Agent::Ops::Record.env_keys does: this line lands in claude.log verbatim.
+  setting = env.empty? ? "" : " (with #{env.keys.sort.join(', ')} set)"
+  puts "Running #{operation} for ISS-#{number}: #{argv.join(' ')}#{setting}"
+  record, visible = Agent::Ops.run(number: number, operation: operation, argv: argv, timeout: timeout, env: env)
   print(visible)
 
   puts ""
