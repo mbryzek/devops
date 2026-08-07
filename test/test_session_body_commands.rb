@@ -17,8 +17,15 @@ require_relative '../lib/common'
 class TestSessionBodyCommands < Minitest::Test
   ROOT = File.expand_path("..", __dir__)
 
+  # agent/instructions.md belongs in this glob and was missing from it. It is not
+  # a README about the briefs -- Agent::Prompt.build puts it FIRST in the prompt of
+  # every autonomous session, ahead of the issue body and the playbook, so it is
+  # the most widely executed brief in the repo. Excluding it is how the idiom in
+  # test_no_session_body_swallows_a_failed_command below survived ISS-581, which
+  # fixed this same class of bug in the claude-issues/ bodies beside it.
   def bodies
-    Dir.glob(File.join(ROOT, "claude-{issues,invariants}", "*-body.md"))
+    Dir.glob(File.join(ROOT, "claude-{issues,invariants}", "*-body.md")) +
+      [File.join(ROOT, "agent", "instructions.md")]
   end
 
   def test_there_are_bodies_to_check
@@ -59,6 +66,35 @@ class TestSessionBodyCommands < Minitest::Test
       end
     end
     assert_empty offenders, "agent/bodies/ was deleted by ISS-526:\n#{offenders.join("\n")}"
+  end
+
+  # A pipeline reports only its LAST command's exit status, so wrapping a command
+  # whose failure MATTERS in `eval "$(cmd | grep ... | sed ...)"` discards it: the
+  # failed command prints nothing, grep and sed match nothing, `eval ""` exits 0,
+  # and whatever is chained after `&&` runs as if it had succeeded.
+  #
+  # lib/session_db.rb's own error message already tells sessions not to do this,
+  # in as many words -- and agent/instructions.md handed every session exactly
+  # that command for `claude-db start`. A start that failed left CONF_DB_DEV_URL
+  # unset and `sbt test` running against the shared :5432 database, which is the
+  # single outcome that whole guard exists to prevent (ISS-318).
+  # Deliberately NOT `[^)]*` before the pipe. The line this was written for nests a
+  # second substitution inside the first (`--port "$(claude-db next-port)"`), so a
+  # class excluding `)` stops at that inner close-paren and never reaches the pipe
+  # -- the regex missed the exact line it exists to catch. Matching any character
+  # over-matches instead of under-matching, which is the right direction for a
+  # lint: prose can be reworded around it, a session running the command cannot.
+  SWALLOWING_EVAL = /eval\s+"?\$\(.*\|/
+
+  def test_no_session_body_swallows_a_failed_command_in_an_eval_pipeline
+    offenders = bodies.flat_map do |path|
+      File.readlines(path).each_with_index.filter_map do |line, i|
+        "#{File.basename(path)}:#{i + 1}: #{line.strip}" if line.match?(SWALLOWING_EVAL)
+      end
+    end
+    assert_empty offenders,
+                 "a pipeline's exit status is its LAST command's, so these hand a session a command " \
+                 "that proceeds after a failure:\n" + offenders.join("\n")
   end
 
   # Reporting a Reviewable URL is explicitly forbidden -- Mike navigates there
