@@ -3008,6 +3008,135 @@ class TestDevIssues < Minitest::Test
     assert_match(/--category must be one of/, out)
   end
 
+  # ---- ISS-888: `dev issues list --snoozed` / `--awake` ----
+  # Before this the only way to see snoozed issues was to list the whole tracker and
+  # grep the "(snoozed until ...)" annotation off the rendered lines — which reads a
+  # page capped at 100 rows, so on a tracker past that a snoozed issue could simply
+  # not appear. The filter the server already had (`is_snoozed`) is now reachable.
+  #
+  # with_stubbed_api flunks on any path it was not given, so each of these fails if
+  # the flag stops reaching the wire rather than silently listing everything again.
+
+  def snoozed_issue(number, wakes_at)
+    { "number" => number, "status" => "open", "category" => "bug", "title" => "Deferred #{number}",
+      "snoozed_until" => wakes_at }
+  end
+
+  def test_list_asks_the_server_for_snoozed_issues_only
+    path = issues_list_path(statuses: [], is_snoozed: true)
+    out, = capture_io do
+      with_stubbed_api("GET #{path}" => [snoozed_issue("030", "2099-01-02T00:00:00Z")]) do
+        cmd_issues_list(["--snoozed"])
+      end
+    end
+    assert_match(/ISS-030/, out)
+  end
+
+  def test_list_asks_the_server_for_awake_issues_only
+    path = issues_list_path(statuses: [], is_snoozed: false)
+    out, = capture_io do
+      with_stubbed_api("GET #{path}" => [{ "number" => "031", "status" => "open", "category" => "bug", "title" => "x" }]) do
+        cmd_issues_list(["--awake"])
+      end
+    end
+    assert_match(/ISS-031/, out)
+  end
+
+  # A snooze is orthogonal to status — a snoozed issue is still `open` — so the flag
+  # NARROWS whatever --status and --category already asked for. If it replaced them
+  # the stub would go unmatched and this flunks.
+  def test_snoozed_composes_with_status_and_category
+    path = issues_list_path(statuses: %w[open], category: "bug", is_snoozed: true)
+    out, = capture_io do
+      with_stubbed_api("GET #{path}" => [snoozed_issue("032", "2099-01-02T00:00:00Z")]) do
+        cmd_issues_list(["--status", "open", "--category", "bug", "--snoozed"])
+      end
+    end
+    assert_match(/ISS-032/, out)
+  end
+
+  # Neither flag = the param is off the wire entirely, which the server reads as both.
+  # Existing callers must see exactly what they saw before.
+  def test_list_without_a_snooze_flag_leaves_the_param_off_the_wire
+    refute_includes issues_list_path(statuses: []), "is_snoozed"
+  end
+
+  # The ordering decision. Deferred work is read to decide what to pick back up, so
+  # the useful order is by wake time — the endpoint has no sort parameter, so the CLI
+  # orders the page it got back.
+  def test_snoozed_orders_soonest_to_wake_first
+    issues = [
+      snoozed_issue("040", "2099-03-01T00:00:00Z"),
+      snoozed_issue("041", "2099-01-01T00:00:00Z"),
+      snoozed_issue("042", "2099-02-01T00:00:00Z"),
+    ]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [], is_snoozed: true)}" => issues) do
+        cmd_issues_list(["--snoozed"])
+      end
+    end
+    assert_equal %w[ISS-041 ISS-042 ISS-040], out.scan(/ISS-\d+/)
+  end
+
+  # An issue with no parseable wake time sorts LAST, never first: `is_snoozed=true`
+  # means the server found a future one, so this is defence against a shape change,
+  # and "wakes soonest" is the one thing an unknown must not be mistaken for.
+  def test_snoozed_sorts_an_unparseable_wake_time_last
+    issues = [
+      snoozed_issue("050", "not a timestamp"),
+      snoozed_issue("051", "2099-01-01T00:00:00Z"),
+    ]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [], is_snoozed: true)}" => issues) do
+        cmd_issues_list(["--snoozed"])
+      end
+    end
+    assert_equal %w[ISS-051 ISS-050], out.scan(/ISS-\d+/)
+  end
+
+  # The default listing is left alone — no snooze filter, no re-sort.
+  def test_list_without_a_snooze_flag_keeps_the_servers_order
+    issues = [
+      { "number" => "060", "status" => "open", "category" => "bug", "title" => "b" },
+      snoozed_issue("061", "2099-01-01T00:00:00Z"),
+    ]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [])}" => issues) do
+        cmd_issues_list([])
+      end
+    end
+    assert_equal %w[ISS-060 ISS-061], out.scan(/ISS-\d+/)
+  end
+
+  # Last-flag-wins would answer a question nobody asked, so asking for both disjoint
+  # sets is an argument error.
+  def test_list_rejects_snoozed_and_awake_together
+    out, status = capture_stderr_and_exit { cmd_issues_list(["--snoozed", "--awake"]) }
+    assert_equal 1, status
+    assert_match(/--snoozed and --awake are mutually exclusive/, out)
+  end
+
+  # "nothing is deferred" and "nothing matched" read the same otherwise, and naming
+  # the filter is the only evidence the caller gets that it was applied at all.
+  def test_list_names_the_snooze_filter_when_nothing_comes_back
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [], is_snoozed: true)}" => []) do
+        cmd_issues_list(["--snoozed"])
+      end
+    end
+    assert_match(/No snoozed issues found/, out)
+  end
+
+  def test_issues_list_path_can_filter_to_snoozed_issues
+    assert_includes issues_list_path(statuses: "open", is_snoozed: true), "is_snoozed=true"
+  end
+
+  # The invocation line is where a reader discovers the flags exist.
+  def test_issues_list_invocation_names_both_snooze_flags
+    assert_includes INVOCATIONS["issues list"], "--snoozed"
+    assert_includes INVOCATIONS["issues list"], "--awake"
+  end
+
   def test_a_credentialed_issue_list_still_cannot_reach_production
     with_credentials do
       err = assert_raises(DevTestSupport::NetworkBlocked) do

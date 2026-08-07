@@ -103,7 +103,7 @@ INVOCATIONS = {
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
   "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
-  "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--localhost]',
+  "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--snoozed | --awake] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
   "issues split"        => 'issues split <number> --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues block"        => 'issues block <number> --on NUMBER [--remove] [--localhost]',
@@ -678,6 +678,10 @@ USAGE = <<~USAGE
         scope to one category. Use this to check whether work is already
         tracked before filing a new issue — unlike `issues claim`, this never
         claims anything. Pass --epic NUMBER to list just that epic's children.
+        --snoozed lists only the deferred issues, soonest to wake first, and
+        --awake only the ones actually in play; neither is a status filter, so
+        both compose with --status and --category (a snoozed issue is still
+        `open`). Omit both to see everything, snoozed and awake together.
         Authenticates with your persisted playbook session —
         run `dev auth login --app playbook` once first.
 
@@ -919,7 +923,8 @@ USAGE = <<~USAGE
         `issues claim`, and out of the daily nudge email until then, keeping its
         status. Use --comment to record why you are coming back ("confirm the
         data migration completed"). --wake clears the snooze and returns the
-        issue to the queue now.
+        issue to the queue now. `dev issues list --snoozed` is the view of
+        everything currently deferred, soonest to wake first.
 
     #{INVOCATIONS["issues reconcile"]}
         Two passes, in order. First: adopt every `claimed` issue whose fix has
@@ -3245,6 +3250,26 @@ def issue_snooze_note(issue)
   " (snoozed until #{at.localtime.strftime('%b %-d')})"
 end
 
+# Sort key for a deferred-work view: soonest to wake first.
+#
+# Client-side because there is nothing to ask the server for — `GET /:tenant/issues`
+# takes no sort parameter at all (spec/issues.json: q, numbers, categories, types,
+# statuses, is_snoozed, limit, offset and friends, and no ordering knob). It orders
+# the page that came back, which under `is_snoozed=true` is every snoozed issue long
+# before the 100-row cap bites.
+#
+# An unparseable or absent wake time sorts LAST rather than first: `is_snoozed=true`
+# means the server found a future `snoozed_until`, so this is defence against a shape
+# change, and "wakes soonest" is the one thing an unknown must not be mistaken for.
+def issue_snooze_order_key(issue)
+  at = begin
+    Time.parse(issue["snoozed_until"].to_s)
+  rescue ArgumentError, TypeError
+    nil
+  end
+  [at.nil? ? 1 : 0, at || Time.at(0)]
+end
+
 def issue_summary_line(issue, index)
   # club is playbook-only context: absent on fleet-wide auto-filed issues.
   club = issue["club"] ? "#{issue_club_label(issue)} · " : ""
@@ -4839,6 +4864,17 @@ def issue_split_body(body, source)
     "reviewed, merged and verified on its own."
 end
 
+# An empty result says something different once a snooze filter is on: "nothing is
+# deferred" and "nothing matched" read the same, and only one of them is an answer.
+# Naming the filter is also the only evidence the caller gets that it was applied.
+def issue_list_empty_message(is_snoozed)
+  case is_snoozed
+  when true  then "No snoozed issues found — nothing is deferred."
+  when false then "No awake issues found."
+  else "No issues found."
+  end
+end
+
 # Read-only. Unlike `issues claim`, which lists open issues but also claims
 # whatever is selected, this never has a side effect — it exists so a caller
 # (a human, or Claude checking for a duplicate before filing) can see what is
@@ -4850,6 +4886,11 @@ def cmd_issues_list(args)
   # Empty = no statuses param at all on the wire, which the server reads as "every
   # status" (see issues_list_path) — the default is everything, not just open/claimed.
   statuses = []
+  # Which side of the snooze line was asked for, by flag name. Collected rather than
+  # resolved in the loop so `--snoozed --awake` is an ARGUMENT ERROR instead of
+  # last-flag-wins: the two ask for disjoint sets, so silently honouring one of them
+  # answers a question that was not asked.
+  snooze_flags = []
   leftover = []
   i = 0
   while i < rest.length
@@ -4868,6 +4909,9 @@ def cmd_issues_list(args)
       epic = rest[i + 1]
       usage_exit("--epic requires an issue number", example: usage_for("issues list")) if epic.nil?
       i += 2
+    when "--snoozed", "--awake"
+      snooze_flags << a
+      i += 1
     else
       leftover << a
       i += 1
@@ -4879,7 +4923,17 @@ def cmd_issues_list(args)
   problems << "--category must be one of: #{ISSUE_CATEGORIES.join(', ')}" if category && !ISSUE_CATEGORIES.include?(category)
   bad = statuses - ISSUE_STATUSES
   problems << "--status must be one or more of: #{ISSUE_STATUSES.join(', ')}" unless bad.empty?
+  if snooze_flags.uniq.length > 1
+    problems << "--snoozed and --awake are mutually exclusive: they ask for disjoint sets. " \
+                "Omit both to list snoozed and awake issues together."
+  end
   report_arg_problems("issues list", problems, usage_for("issues list"))
+
+  # nil = the param is left off the wire entirely, which the server reads as "both"
+  # (see issues_list_path). A snooze is orthogonal to status — a snoozed issue is
+  # still `open` — so this narrows whatever --status and --category already asked
+  # for rather than replacing it.
+  is_snoozed = snooze_flags.empty? ? nil : snooze_flags.first == "--snoozed"
 
   require_playbook_session!(use_localhost)
 
@@ -4890,10 +4944,15 @@ def cmd_issues_list(args)
   handle_errors do
     endpoint = issue_endpoint(use_localhost)
     issues = ApiClient.request(
-      endpoint, :get, issues_list_path(statuses: statuses, category: category, parent_number: epic)
+      endpoint, :get,
+      issues_list_path(statuses: statuses, category: category, parent_number: epic, is_snoozed: is_snoozed),
     ) || []
+    # Deferred work is read to decide what to pick back up, so the useful order is
+    # by wake time rather than the endpoint's default. See issue_snooze_order_key
+    # for why this is sorted here and not asked of the server.
+    issues = issues.sort_by { |issue| issue_snooze_order_key(issue) } if is_snoozed
     if issues.empty?
-      puts "No issues found."
+      puts issue_list_empty_message(is_snoozed)
     elsif epic
       # Scoped to one epic, the question is "what do I work next", and the answer is
       # the READY/BLOCKED split — the same renderer `issues show` uses on the epic.
@@ -5216,7 +5275,7 @@ def cmd_issues_claim(args)
     present = issue_categories_present(open)
     if present.empty?
       puts category ? "No open #{category} issues to claim." : "No open issues to claim."
-      puts "(Snoozed issues and epics are not offered — `dev issues list` shows them; `dev issues snooze <n> --wake` brings a snoozed one back, and an epic is worked through its children.)"
+      puts "(Snoozed issues and epics are not offered — `dev issues list --snoozed` shows the deferred ones, soonest to wake first; `dev issues snooze <n> --wake` brings one back, and an epic is worked through its children.)"
       issue_print_blocked(blocked)
       issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
       return
@@ -5433,7 +5492,7 @@ def cmd_issues_review(args)
     if issues.empty?
       puts ""
       puts "Nothing is blocked on you. Every issue is either being worked or already closed out."
-      puts "(`dev issues list` shows the whole tracker; snoozed issues stay out of this walk until they wake.)"
+      puts "(`dev issues list` shows the whole tracker; snoozed issues stay out of this walk until they wake, and `dev issues list --snoozed` is where they are.)"
       puts ""
       return
     end
@@ -5461,7 +5520,7 @@ def issue_review_queue(endpoint, requested)
       "Not waiting on an answer: #{unknown.join(', ')}. " \
       "This walk covers #{ISSUE_REVIEW_STATUSES.join(' and ')} only, and skips snoozed issues. " \
       "Waiting now: #{ordered.empty? ? 'nothing' : ordered.map { |c| c['number'] }.join(', ')}. " \
-      "Wake a snoozed one with `dev issues snooze <n> --wake`."
+      "See the snoozed ones with `dev issues list --snoozed`, and wake one with `dev issues snooze <n> --wake`."
     )
   end
   resolved
