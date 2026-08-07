@@ -27,6 +27,26 @@
 #   lands, set it explicitly and size it against the machine you installed the
 #   runner on — a 12G heap on a 24G Mac running two CI slots is an OOM waiting
 #   for the second job.
+#
+#   ONE DATABASE PER JOB, AND IT IS FRESH. The suite is not idempotent against
+#   its own database: eight consecutive platform runs on one session database, on
+#   unmodified main, went from 6m26s and 3 failures to 3h35m and 23 failures, with
+#   131,632 rows left in `tasks` (ISS-801). A runner that reuses a database
+#   degrades run over run and starts parking good PRs, and the reds it produces
+#   look like flaky tests. CLAUDE_SESSION_ID below is what buys freshness, and it
+#   has to name the ATTEMPT and the SHARD, not just the run:
+#
+#     github.run_id       stable across re-runs. On its own, a re-run of a job
+#                         whose `claude-db end` never fired (cancelled hard, runner
+#                         rebooted) inherits the failed attempt's rows.
+#     github.job          the job's key in this YAML — `build` for every shard.
+#                         On its own, all matrix shards share ONE database and
+#                         write over each other.
+#
+#   ci/build.sh then RESETS it rather than assuming, because "fresh by
+#   construction" is exactly the kind of property that stops being true when
+#   somebody edits this env block. The reset is a no-op on a database that was
+#   just created from the template, and it costs seconds.
 name: ci
 
 on:
@@ -39,12 +59,6 @@ on:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  # `claude-db` keys its databases on this, so the cleanup step below can reclaim
-  # exactly this job's containers and nobody else's. A CI job that leaked one
-  # would hold a port from a range the whole box shares.
-  CLAUDE_SESSION_ID: ci-${{ github.run_id }}-${{ github.job }}
 
 jobs:
   build:
@@ -60,6 +74,20 @@ jobs:
         # The `ci` gate below aggregates them into the one check the lane reads,
         # so this list can change freely without touching the lane.
         shard: [all]
+    env:
+      # `claude-db` keys its databases on this, so the cleanup step below can
+      # reclaim exactly this job's containers and nobody else's. A CI job that
+      # leaked one would hold a port from a range the whole box shares.
+      #
+      # RUN, ATTEMPT AND SHARD, all three — see the header. Two shards on one id
+      # share a database and corrupt each other; a re-run on one id inherits the
+      # previous attempt's rows when its cleanup never fired.
+      #
+      # ON THE JOB rather than on the workflow, and that is forced rather than
+      # stylistic: `matrix` is not in scope for a workflow-level `env`, so the
+      # shard could not be part of the name up there. It would expand to the empty
+      # string and every shard would silently share one database again.
+      CLAUDE_SESSION_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
     steps:
       - name: preflight
         run: $HOME/code/devops/bin/dev ci preflight --needs docker,registry,database
@@ -87,6 +115,7 @@ jobs:
         #   db_out=$(claude-db start --app platform --port "$(claude-db next-port)")
         #   export CONF_DB_DEV_URL=$(printf '%s\n' "$db_out" | sed -n 's/^CONF_DB_DEV_URL=//p')
         #   [ -n "$CONF_DB_DEV_URL" ] || { echo "no CONF_DB_DEV_URL" >&2; exit 1; }
+        #   claude-db reset --app platform          # ISS-801 — see the header
         #   sbt -J-Xmx12G "$@"
         #
         # Run only the subprojects the PR affects, failing OPEN to the full build

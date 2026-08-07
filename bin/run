@@ -12,6 +12,13 @@
 #                           # (without --fix, you're prompted before exiting)
 #   ./run.sh test --make-faster
 #                           # on a GREEN run, launch claude to speed the suite up
+#   ./run.sh test --no-reset-db
+#                           # keep the session database as the last run left it
+#
+# Every test run starts by RESETTING the session database (bin/reset-session-db),
+# because the suite is not idempotent against its own: repeated runs against one
+# database get slower and redder until the failures stop being about the code at
+# all (ISS-801). --no-reset-db opts out; the test summary says which happened.
 #
 # Every `test` run prints a timing summary (see bin/test-timings) and appends a
 # row to ~/.cache/devops-test-timings/<project>.tsv, so a slowdown shows up as a
@@ -28,7 +35,60 @@ PROJECT=$(basename "$PWD")
 #
 # Resolved via this script's own path so a checkout under ~/code/ai/<feature>/devops
 # exercises its own copy, the same way $TIMINGS does below.
-"$(dirname "$0")/assert-session-db" "$PROJECT" "$@" || exit 1
+#
+# It is given the arguments with --no-reset-db already removed, so what it sees is
+# exactly the list sbt will see.
+assert_session_db() {
+  "$(dirname "$0")/assert-session-db" "$PROJECT" "$@" || exit 1
+}
+
+# --no-reset-db: keep the session database as the last run left it. Stripped here,
+# ahead of everything, because the reset below happens before BOTH branches —
+# `./run.sh test` and `./run.sh core/testOnly ...` are the same hazard and only
+# the first goes through the test branch's own flag parsing.
+NO_RESET_DB=0
+argc=$#
+while [ "$argc" -gt 0 ]; do
+  arg="$1"
+  shift
+  if [ "$arg" = "--no-reset-db" ]; then
+    NO_RESET_DB=1
+  else
+    set -- "$@" "$arg"
+  fi
+  argc=$((argc - 1))
+done
+
+assert_session_db "$@"
+
+# A test run starts from a database in a known state, or it is not measuring the
+# code. The platform suite leaves its rows behind: eight consecutive runs on one
+# session database, on unmodified main, went 6m26s -> 3h35m and 3 -> 23 failures,
+# with 131,632 rows in `tasks` (ISS-801). Nothing noticed, and the failures read
+# as flaky tests.
+#
+# Only test tasks, only session databases, never :5432 — see bin/reset-session-db
+# for what it refuses to touch and why.
+DB_RESET="not reset"
+if [ "$NO_RESET_DB" -eq 1 ]; then
+  DB_RESET="not reset (--no-reset-db)"
+else
+  # Output is NOT captured: a refusal has to reach the terminal as it happens,
+  # and the exit status — not a string in the output — is what says which of the
+  # three outcomes this was. See bin/reset-session-db's header.
+  "$(dirname "$0")/reset-session-db" "$PROJECT" "$@"
+  case $? in
+    0) ;;                                  # nothing to reset, or nothing could be
+    9) DB_RESET="reset from template" ;;
+    *)
+      echo ""
+      echo "ERROR: the session database could not be reset, so this run would start from"
+      echo "whatever the last one left behind. Fix the above, or re-run with --no-reset-db"
+      echo "if you accept results measured against a dirty database."
+      exit 1
+      ;;
+  esac
+fi
 
 # Larger of two integers.
 max() {
@@ -47,6 +107,7 @@ Investigate and fix the errors:
 - Fix the underlying cause, not the symptom. Read the relevant ~/code/claude/rules/*.mdc files before writing code.
 - Do NOT change production behavior unless you first prove it is in fact a production bug. Starting assumption is the tests need to be updated.
 - Check CONF_DB_DEV_URL is set to this session's DB first (the port is per container — use the URL 'claude-db start' handed you, shown again by 'claude-db status'). A suite that silently ran against the :5432 dev DB produces mass stale-data failures that are environmental, not code bugs.
+- The session database for this run was: $DB_RESET. If it was NOT reset, the failures may be residue rather than code: the suite leaves its rows behind, and a database carrying earlier runs' rows produces failures in the task/queue specs and a suite that gets progressively slower (ISS-801). Re-run without --no-reset-db and see whether the failures survive a clean database before reading the diff.
 - After fixing, re-run './run.sh test' (or a targeted 'testOnly') and confirm the suite is green before declaring done.
 - Work on a feature branch and directory per CLAUDE.md; do not commit to main."
 }
@@ -198,6 +259,11 @@ if [ "$1" = "test" ]; then
   echo ""
   echo "================ test summary ================"
   echo "  project:        $PROJECT"
+  # In the summary because this is the block a person reads when a run goes red,
+  # and "the database was not reset" is the single cheapest explanation for a red
+  # that has nothing to do with the diff (ISS-801). A run that did reset says so
+  # too — a fact stated only on the bad path is a fact nobody learns to trust.
+  echo "  session db:     $DB_RESET"
   echo "  sbt exit:       $SBT_STATUS"
   echo "  failed:         $FAILURES"
   echo "  canceled:       $CANCELED"

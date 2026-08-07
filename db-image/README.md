@@ -299,6 +299,25 @@ in either case. platform's own startup check (`core.util.DbLocalUrlChecker`) is
 still there as the backstop for anything reaching sbt without going through
 `run.sh`.
 
+### And then it resets the database
+
+Having the right database is not the same as having a usable one. The suite
+leaves its rows behind, so run 8 against one session database is not run 2
+against it: eight consecutive platform runs on unmodified `main` went from 6m26s
+and 3 failures to 3h35m and 23 failures, leaving 131,632 rows in `tasks`, and the
+reds that produced read as flaky tests (ISS-801).
+
+So `bin/run` also calls `bin/reset-session-db`, which runs `claude-db reset` —
+drop, re-clone from `<database>_template`, re-sync — before the suite starts. On
+platform that costs **~3 seconds** and returns the database to byte-identical
+baseline; one run leaves **193,541 rows across 359 tables** behind it otherwise.
+
+Same keying discipline as the check above, plus two more: only **test** tasks
+(`run` and `runMain` open a database too, and resetting there would wipe state a
+developer put in on purpose), and never a database anything else is connected to
+(that is another run in flight, and dropping it would kill that run). The test
+summary prints which happened, and `--no-reset-db` opts out.
+
 ---
 
 ## Self-heal and retention

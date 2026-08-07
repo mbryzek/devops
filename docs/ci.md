@@ -1,6 +1,6 @@
 # CI on self-hosted runners
 
-How the runners the merge lane depends on are provisioned, and the three ways a
+How the runners the merge lane depends on are provisioned, and the four ways a
 correctly-written workflow still produces a wrong answer.
 
 ISS-754 built the lane: it merges a PR only when the `ci` check passed on the
@@ -130,11 +130,11 @@ why self-hosted is fast, and it is the bigger effect.**
 
 ---
 
-## Three failures that fake a red build (or worse, a green one)
+## Four failures that fake a red build (or worse, a green one)
 
 ### 1. Stale incremental state → a FALSE GREEN
 
-The cost of the section above, and **the only one of the three with no human
+The cost of the section above, and **the only one of the four with no human
 downstream**: a red is read by whoever opened the PR, while a wrong green is
 merged by the lane without anyone looking.
 
@@ -153,7 +153,51 @@ is cold until it is deliberately made warm. The nightly is not optional: without
 it, "the PR builds have been silently wrong since Tuesday" has nothing that would
 ever discover it.
 
-### 2. DigitalOcean auth expires
+### 2. A reused database → a red that is not the branch
+
+**A CI job must get a fresh database, every time.** This is a requirement on the
+runner, not a nicety.
+
+The suite is not idempotent against its own database. Eight consecutive platform
+runs on **one** session database, on unmodified `main` (`25b091124`), measured
+under ISS-761:
+
+| run | wall | failed |
+|---|---|---|
+| 2 | 6m26s | 3 |
+| 5 | 8m47s | 9 |
+| 7 | 3h45m | 39 |
+| 8 | 3h35m | 23 |
+
+Identical code every run. After eight runs the database held **131,632 rows in
+`tasks`**, and the specs that went red are the ones that scan or claim from a
+task lane — a spec asserting "at most `maxConcurrency` rows per pass" was
+asserting against a table holding six figures of other runs' rows.
+
+A lane fed by a runner that reuses its database therefore degrades run over run
+and **starts parking good PRs**, and what it produces looks like a flaky suite
+rather than a dirty fixture. Nothing in the suite noticed (ISS-801).
+
+Two mechanisms, and both are in `templates/ci/ci-scala.yml`:
+
+- **`CLAUDE_SESSION_ID` names the run, the attempt AND the shard.** `claude-db`
+  keys a database on it, so a name missing the attempt lets a re-run inherit the
+  rows of an attempt whose `claude-db end` never fired, and a name missing the
+  shard hands every matrix shard the same database to write over. It lives on the
+  **job**, not on the workflow — `matrix` is out of scope in a workflow-level
+  `env`, where it would expand to the empty string and silently re-share.
+- **`ci/build.sh` calls `claude-db reset --app <app>`** before sbt. Freshness by
+  construction is exactly the property that stops holding when somebody edits an
+  `env` block, and the reset is a no-op on a database just cloned from the
+  template.
+
+Outside CI the same guarantee comes from `./run.sh test`, which resets the
+session database before every suite run (`bin/reset-session-db`) and reports what
+it did in the test summary. `--no-reset-db` opts out. Neither path can ever touch
+`:5432`: that is Mike's own Postgres.app, it is not a session database, and the
+port check in `SessionDb.shared_default_url?` is what guarantees it.
+
+### 3. DigitalOcean auth expires
 
 A runner that silently loses registry access cannot pull the platform DB image,
 and the result is a wall of red that looks like a code failure.
@@ -167,7 +211,7 @@ build, rather than letting the failure surface minutes later as spec failures.
 
 Fix: `doctl auth init` on the runner. The preflight prints it.
 
-### 3. Everything else that is not the code
+### 4. Everything else that is not the code
 
 A full disk has already faked spec failures on this fleet once. `dev ci
 preflight` covers disk headroom, the Docker daemon, doctl, and a free

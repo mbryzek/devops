@@ -1,0 +1,117 @@
+#!/usr/bin/env ruby
+# reset-session-db — put this session's database back into the state a brand-new
+# one is in, before a test run reads it. Invoked by bin/run alongside
+# bin/assert-session-db; not a command anyone types.
+#
+# Usage:
+#   reset-session-db <app> [sbt args...]
+#
+# WHY. A suite is not idempotent against its own database. Eight consecutive
+# platform runs on ONE session database, on unmodified main, went from 6m26s and
+# 3 failures to 3h35m and 23 failures, with 131,632 rows left behind in `tasks` —
+# and every one of those failures reads as a flaky test rather than as a dirty
+# fixture, because nothing anywhere noticed the residue (ISS-801).
+#
+# The alternative was making each spec own the rows it creates. That is N places
+# that can each be forgotten, and a spec added next year is not covered by any of
+# them; a reset at the head of the run is one place that cannot be forgotten and
+# covers everything, including tables nobody has thought about yet.
+#
+# WHAT IT DELIBERATELY DOES NOT DO:
+#
+#   Nothing, unless this run is a TEST run against a SESSION database. `./run.sh
+#   run` opens a database too and is not a test — resetting there would wipe the
+#   state a developer put in deliberately, on every restart. And :5432 is Mike's
+#   own Postgres.app: it is never a session database, it is never reset, and the
+#   port check in SessionDb.shared_default_url? is what guarantees that.
+#
+#   Nothing, when CONF_DB_DEV_URL is unset. bin/assert-session-db has already
+#   refused an agent run in that state; an interactive run with no session
+#   database is on :5432 and is covered by the paragraph above.
+#
+#   It never exits nonzero for a reason of its own making. A reset is preparation,
+#   and preparation that turns a working `./run.sh test` into a failure is a worse
+#   bug than the one it fixes — so an unusable claude-db is reported and stepped
+#   over. claude-db's OWN refusals are different: they are deliberate, they name a
+#   real problem with the database this run is about to use, and they are passed
+#   through as failures.
+#
+# EXIT STATUS is the whole protocol with bin/run, and it distinguishes three
+# outcomes rather than two, because "reset" and "decided not to reset" are both
+# success and bin/run has to report which one happened:
+#
+#   0             nothing needed doing, or nothing could be done. Proceed.
+#   PERFORMED     the database was dropped and re-cloned. Proceed, and say so.
+#   anything else claude-db refused. Do not run the suite.
+#
+# A status rather than a line of output bin/run greps for: this script's stdout
+# is inherited so a refusal reaches the person unbuffered, and a caller that
+# reads the decision out of that same text would silently start reporting
+# "not reset" the day a message is reworded.
+
+DIR = File.dirname(__FILE__)
+load File.join(DIR, '../lib/common.rb')
+
+# "The database was reset", as distinct from "there was nothing to reset". Both
+# are success; only bin/run's summary line tells them apart. Out of the way of
+# anything a shell assigns meaning to (1 is a refusal, 126/127 are exec
+# failures, 128+n is a signal).
+PERFORMED = 9
+
+app = ARGV.first.to_s
+sbt_args = ARGV.drop(1)
+
+exit 0 if app.empty?
+exit 0 unless SessionDb.test_task?(sbt_args)
+
+url = ENV[SessionDb::SESSION_URL].to_s.strip
+exit 0 if url.empty?
+exit 0 if SessionDb.shared_default_url?(url)
+
+# bin/run is shared by every scala project and takes the app name from the
+# directory it was invoked in, so a repo that adopts ./run.sh without being a
+# claude-db app lands here with a name claude-db would reject — and the rejection
+# would fail a test run that has no session database to reset in the first place.
+#
+# Checked AFTER the URL, deliberately: a CONF_DB_DEV_URL inherited from a sibling
+# app's session in the same shell is exactly how such a project acquires one, and
+# checking the name first would print this repo's app list on every compile.
+# `DbApp.names` reads app config, which is why it is not the first thing asked.
+unless DbApp.names.include?(app)
+  warn "NOTE: #{app} is not a claude-db app (#{DbApp.names.join(', ')}) — no session " \
+       "database to reset."
+  exit 0
+end
+
+# The sibling, resolved through this script's own path so a checkout under
+# ~/code/ai/<feature>/devops exercises its own copy — the same rule bin/run
+# applies to this script and to bin/test-timings.
+#
+# CLAUDE_DB_BIN overrides it, and exists for exactly one reason: the wiring test
+# needs to observe that the reset is invoked with the right app and NOT invoked
+# on the paths that must never touch a database. Driving the real claude-db there
+# would mean docker, an image pull and a container. It is not an operator knob.
+claude_db = ENV['CLAUDE_DB_BIN'].to_s.strip
+claude_db = File.join(DIR, 'claude-db') if claude_db.empty?
+unless File.executable?(claude_db)
+  warn "NOTE: #{claude_db} is not executable — skipping the pre-test database reset."
+  exit 0
+end
+
+puts ""
+puts "Resetting the session database before the suite runs (ISS-801 — the suite is"
+puts "not idempotent against its own database). Skip with: ./run.sh test --no-reset-db"
+
+# stdout/stderr are inherited all the way out to the terminal, so claude-db's
+# refusals are read as they happen rather than swallowed into a variable.
+ok = system(claude_db, 'reset', '--app', app)
+
+# `nil` is "could not run it at all" (not found, not executable); `false` is
+# "ran and refused". Only the second is a reason to stop — see the header.
+if ok.nil?
+  warn "NOTE: could not run #{claude_db} — skipping the pre-test database reset."
+  exit 0
+end
+
+exit 1 unless ok
+exit PERFORMED

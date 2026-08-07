@@ -27,6 +27,12 @@
 #                      its port is reused and re-running without --port works.
 #                      Prints: CONF_DB_DEV_URL=jdbc:postgresql://localhost:<port>/<db>
 #
+#   claude-db reset --app APP
+#                      Drop this session's DB and re-clone it from the template,
+#                      then sync. `./run.sh test` does this before every suite
+#                      run, because the suite is not idempotent against its own
+#                      database — see do_reset and ISS-801.
+#
 #   claude-db sync --app APP [--repo-dir DIR]
 #                      Apply the migrations this session's DB is missing. `start`
 #                      does this for you; run it again after rebasing onto a main
@@ -100,6 +106,14 @@ def show_usage
                                    --port is required only when that container does
                                    not exist yet.
                                    Prints CONF_DB_DEV_URL for the caller to export.
+
+      reset --app APP              Put this session's database back into the state a
+                                   brand-new one is in: drop it, re-clone it from
+                                   <database>_template, re-sync it.  Refuses when
+                                   anything else is connected.  Run at the head of a
+                                   test run — the suite is not idempotent against its
+                                   own database (ISS-801), and `./run.sh test` now
+                                   does this for you.
 
       sync --app APP               Apply the migrations this session's database is
            [--repo-dir DIR]        missing, from the schema repo checkout.  Run after
@@ -180,12 +194,7 @@ def do_start(app, requested_port)
   if DbImages.database_exists?(port, db)
     puts "Database #{db} already exists — reusing."
   else
-    puts ""
-    puts "Creating #{db} from template #{app.template_db}..."
-    DbImages.psql_exec(
-      port,
-      "CREATE DATABASE #{db} TEMPLATE #{app.template_db} OWNER #{app.role}"
-    )
+    clone_from_template(app, port, db)
   end
 
   # The session DB must be owned by the app role so that migrations applied via
@@ -206,6 +215,146 @@ def do_start(app, requested_port)
   puts ""
   puts "CONF_DB_DEV_URL=#{url}"
   puts ""
+end
+
+def clone_from_template(app, port, db)
+  puts ""
+  puts "Creating #{db} from template #{app.template_db}..."
+  DbImages.psql_exec(
+    port,
+    "CREATE DATABASE #{db} TEMPLATE #{app.template_db} OWNER #{app.role}"
+  )
+end
+
+# ── reset ──────────────────────────────────────────────────────────────────
+
+# Put this session's database back into the state a brand-new one is in: drop it,
+# re-clone it from the template, re-apply the migrations the template is missing.
+#
+# WHY THIS EXISTS. A test suite is not idempotent against its own database. Eight
+# consecutive platform runs on ONE session database, on unmodified main, went
+# from 6m26s and 3 failures to 3h35m and 23 failures, with 131,632 rows left in
+# `tasks` — and the failures read as flaky tests rather than as a dirty fixture,
+# because nothing anywhere noticed the residue (ISS-801). Fixing every spec to
+# own the rows it creates is N places that can each be forgotten; making the
+# database identical at the head of every run is one place that cannot.
+#
+# IT RESETS THE DATABASE THE CALLER IS ACTUALLY USING, which is why it finds the
+# container by scanning for the database rather than recomputing the container
+# from the current schema tag the way `start` does. A session that started
+# before the schema tag moved holds its database in the OLDER container, and
+# `start` would happily create a fresh database in the NEW one — leaving the
+# caller's exported CONF_DB_DEV_URL pointing at the un-reset original and the
+# run silently proceeding against it. `end` scans for exactly this reason.
+#
+# CONF_DB_DEV_URL, when set, is checked rather than trusted: it names the
+# database the run about to happen will use, so a reset that would land anywhere
+# else is a reset that does nothing and says it did something.
+def do_reset(app)
+  sid = DbImages.session_id
+  db  = app.session_db_name(sid)
+
+  puts ""
+  puts Util.underline("claude-db reset  [app: #{app.name}]")
+  puts ""
+  puts "Session ID : #{sid}"
+  puts "Session DB : #{db}"
+
+  holders = app.running_containers_with_ports.select { |(_name, port)|
+    DbImages.database_exists?(port, db)
+  }
+
+  if holders.empty?
+    Util.exit_with_error(
+      "No database #{db} in any running #{app.container_prefix}* container.\n\n" \
+      "There is nothing to reset — start one instead:\n\n" \
+      "  claude-db start --app #{app.name} --port \"$(claude-db next-port)\""
+    )
+  end
+
+  name, port = select_reset_target(app, db, holders)
+
+  live = DbImages.connection_count(port, db)
+  if live.nil?
+    Util.exit_with_error(
+      "Could not read pg_stat_activity on :#{port}, so it is not knowable whether " \
+      "another run is connected to #{db}.\n" \
+      "Refusing to drop a database that may be in use."
+    )
+  end
+  if live.positive?
+    Util.exit_with_error(
+      "#{live} connection(s) are open on #{db} in #{name} (:#{port}).\n\n" \
+      "Something else is using this database — most likely another `./run.sh test` " \
+      "still running, or an app started with `./run.sh run`. Dropping it now would " \
+      "kill that run and leave it reporting failures against a database that " \
+      "vanished under it.\n\n" \
+      "Wait for it to finish, or run this test without the reset:\n\n" \
+      "  ./run.sh test --no-reset-db"
+    )
+  end
+
+  puts ""
+  puts "Dropping #{db} from #{name} (:#{port})."
+  DbImages.psql_exec(port, "DROP DATABASE #{db}")
+  clone_from_template(app, port, db)
+  DbImages.psql_exec_quiet(port, "ALTER DATABASE #{db} OWNER TO #{app.role}")
+
+  # The template is only ever as current as the last schema RELEASE, so the
+  # freshly cloned database is behind the checkout by every script merged since —
+  # including any this branch added. Skipping this would turn a reset into a wall
+  # of "relation does not exist" (ISS-276).
+  puts ""
+  do_sync(app)
+
+  # The same URL that went in. Printed so `reset` composes into a shell the same
+  # way `start` does, and so a caller can see that the reset did not move the
+  # database out from under the URL it already exported.
+  puts ""
+  puts "CONF_DB_DEV_URL=jdbc:postgresql://#{DbImages::HOST}:#{port}/#{db}"
+  puts ""
+end
+
+# Which of the containers holding `db` to reset.
+#
+# One holder is the ordinary case. More than one means the same session database
+# name exists in two containers — a session that spanned a schema-tag change —
+# and then only CONF_DB_DEV_URL can say which one the run will use. Guessing
+# there resets a database nobody is about to read.
+def select_reset_target(app, db, holders)
+  url = ENV[SessionDb::SESSION_URL].to_s.strip
+  if url.empty?
+    return holders.first if holders.length == 1
+    Util.exit_with_error(
+      "#{db} exists in #{holders.length} containers " \
+      "(#{holders.map { |(n, p)| "#{n} :#{p}" }.join(', ')}) and " \
+      "#{SessionDb::SESSION_URL} is not set, so there is no way to tell which one " \
+      "this run will use.\n\n" \
+      "Export the URL `claude-db start` printed (or `claude-db status` shows) and " \
+      "re-run."
+    )
+  end
+
+  port, named_db = SessionDb.parse_url(url)
+  if named_db != db
+    Util.exit_with_error(
+      "#{SessionDb::SESSION_URL} names database #{named_db.inspect}, but this " \
+      "session's #{app.name} database is #{db}.\n\n" \
+      "Resetting #{db} would leave the run pointing at #{named_db.inspect}, " \
+      "un-reset, with nothing saying so. Fix the URL — `claude-db status` prints " \
+      "the right one — or pass --app for the app that URL belongs to."
+    )
+  end
+
+  match = holders.find { |(_name, holder_port)| holder_port == port }
+  return match if match
+
+  Util.exit_with_error(
+    "#{SessionDb::SESSION_URL} points at :#{port}, but #{db} was found only in " \
+    "#{holders.map { |(n, p)| "#{n} (:#{p})" }.join(', ')}.\n\n" \
+    "The container this URL names is not running. Re-run " \
+    "`claude-db start --app #{app.name}` and export the URL it prints."
+  )
 end
 
 # Ensure the container for this app + schema tag is up, and return its host port.
@@ -865,10 +1014,11 @@ def parse_args!(argv)
   opts
 end
 
-# `start` creates a database and `sync` migrates one, so both must be told which
-# app's schema is involved — there is no safe default, and inferring one from the
-# cwd is how a session ends up developing against the wrong schema. Every other
-# command either reads or reclaims, and defaults to all apps.
+# `start` creates a database, `reset` re-creates one and `sync` migrates one, so
+# all three must be told which app's schema is involved — there is no safe
+# default, and inferring one from the cwd is how a session ends up developing
+# against the wrong schema. Every other command either reads or reclaims, and
+# defaults to all apps.
 def require_app(opts, command: "start")
   if opts[:app].nil?
     Util.exit_with_error(
@@ -939,6 +1089,7 @@ opts = parse_args!(ARGV)
 
 case subcommand
 when "start"     then do_start(require_app(opts), opts[:port])
+when "reset"     then do_reset(require_app(opts, :command => "reset"))
 when "sync"      then do_sync(require_app(opts, :command => "sync"))
 when "end"       then do_end(apps_for(opts))
 when "status"    then do_status(apps_for(opts))
