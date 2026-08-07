@@ -324,7 +324,19 @@ assigned by the executor; do not rename either.
   `CONF_DB_DEV_URL=jdbc:...` line. Export it **in the same shell call as sbt** —
   environment variables do not persist between separate Bash calls, and sbt forks
   a JVM per subproject:
-  `eval "$(claude-db start --app platform --port "$(claude-db next-port)" | grep '^CONF_DB_DEV_URL=' | sed 's/^/export /')" && sbt test`
+
+      db_out=$(claude-db start --app platform --port "$(claude-db next-port)") || exit 1
+      export CONF_DB_DEV_URL=$(printf '%s\n' "$db_out" | sed -n 's/^CONF_DB_DEV_URL=//p')
+      sbt test
+
+  **Capture the start FIRST, on its own line, and check it.** Do NOT collapse it
+  into a single `eval` of a command substitution that pipes the start through
+  `grep` and `sed`: a pipeline reports only its LAST command's status, so a
+  `claude-db start` that failed leaves grep and sed matching nothing, the eval
+  exiting 0, and anything chained after `&&` running anyway with
+  `CONF_DB_DEV_URL` unset — which is the shared `:5432` database, silently.
+  That is the exact failure `lib/session_db.rb` refuses, and it only refuses the
+  projects that reach a database through `./run.sh`.
   Never hardcode a port. Never `:5432`.
   The migrations it applies come from a schema checkout, and which one it picks
   matters. With no `<app>-postgresql` clone in your workspace it uses one the
