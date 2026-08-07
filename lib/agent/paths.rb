@@ -67,6 +67,15 @@ module Agent
     def toolchain_file = File.join(state_dir, "agent-toolchain.json")
     def work_lock      = File.join(state_dir, "agent-tick.lock")
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
+    # agent-errors.json's own lock, held across Agent::Errors' read-modify-write
+    # (ISS-742). It belongs to the FILE rather than to a phase, because neither
+    # phase lock excludes the other: the tick records failures from Phase A under
+    # vitals_lock and from Phase B under work_lock, and Phase B is designed to
+    # overlap the NEXT tick's Phase A — so a Phase A `clear` reading the log
+    # before a Phase B `record` wrote it silently dropped that failure. Nothing
+    # corrupts (write_atomic renames), what is lost is a row, and a lost row is
+    # a shortened streak.
+    def errors_lock    = File.join(state_dir, "agent-errors.lock")
 
     def tick_log(date)      = File.join(log_root, "tick", "#{date.strftime('%Y-%m-%d')}.log")
     def issues_dir          = File.join(log_root, "issues")
@@ -136,6 +145,39 @@ module Agent
     def append_log(path, line)
       mkdir_p(File.dirname(path))
       File.open(path, "a") { |f| f.puts(line) }
+    end
+
+    # ---- locking
+    #
+    # Ruby's File#flock, NOT the flock(1) command — see the header of Agent::Tick
+    # for why that utility is not an option on these machines. Always on a
+    # DEDICATED lock file and never on the file being protected: every write here
+    # goes through write_atomic, which replaces the path by rename, so a lock
+    # taken on the data file would be held on an inode no later reader can see.
+    #
+    # NON-BLOCKING by default: flock returns false immediately instead of
+    # waiting, which is what stops ticks piling up behind a slow predecessor — a
+    # tick that cannot get the work lock skips its work phase, and that is the
+    # design (Agent::Tick §4.3), not a failure.
+    #
+    # `blocking: true` is for a critical section short enough that waiting costs
+    # less than skipping, and it is safe ONLY for one: Agent::Errors' read-modify-
+    # write is a JSON read and one rename, with no shell-out, no network and no
+    # nested lock inside it. Never give it to anything that clones, prunes or
+    # calls the platform — waiting on one of those behind a lock is precisely the
+    # inversion the two-phase split exists to prevent.
+    #
+    # The lock is released when the process exits, INCLUDING on a crash, so a
+    # killed tick cannot wedge anything.
+    def with_lock(path, blocking: false)
+      mkdir_p(File.dirname(path), mode: 0700)
+      file = File.open(path, File::CREAT | File::RDWR, 0600)
+      # flock returns 0 on success, and false only when LOCK_NB would have blocked.
+      acquired = file.flock(blocking ? File::LOCK_EX : (File::LOCK_EX | File::LOCK_NB)) != false
+      yield acquired
+    ensure
+      file&.flock(File::LOCK_UN) if acquired
+      file&.close
     end
   end
 end
