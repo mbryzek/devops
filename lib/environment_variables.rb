@@ -109,7 +109,7 @@ class EnvironmentVariables
     private
 
     # Both serializations below are SHELL, and their whole contract is that the
-    # caller evals them (`eval "$(bin/env --format sh)"`, and `dotenv` emits
+    # caller evals them (`eval "$(bin/app-env --format sh)"`, and `dotenv` emits
     # `export`). The values are the git-crypt'd app secrets -- passwords, tokens,
     # connection strings -- so quoting them is not cosmetic.
     #

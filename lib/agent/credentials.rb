@@ -103,7 +103,7 @@ module Agent
         usage_example: 'curl -H "x-api-key: $PLAYBOOK_CLAUDE_KEY" -H "anthropic-version: 2023-06-01" ...',
       ),
       # ISS-635. The playbooks that read production out of NewRelic told the
-      # session to source this key from `bin/env --app platform --env production`,
+      # session to source this key from `bin/app-env --app platform --env production`,
       # and that instruction failed twice over: the value there is revoked (401),
       # and `--format sh` emits bare assignments, so `eval`ing it sets a shell
       # variable that no child process ever sees. Both failures are SILENT — an

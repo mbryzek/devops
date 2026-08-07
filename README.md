@@ -14,9 +14,9 @@ this branch break anything" for anything automated.
 
 Two things it deliberately does not do:
 
-- **It does not run `test/env-stdout-is-evalable.sh`.** That guard shells into the
-  sibling `env` checkout, so what it reports depends on whether this machine has
-  one and whether it is unlocked. Run it by hand with `rake test:env_stdout`.
+- **It does not run `test/app-env-stdout-is-evalable.sh`.** That guard shells into
+  the sibling `env` checkout, so what it reports depends on whether this machine
+  has one and whether it is unlocked. Run it by hand with `rake test:app_env_stdout`.
 - **It does not run `test/PlatformMetricsSpec.sc`**, which needs `scala-cli` (see
   [Platform metrics CLI](#tests) below).
 

@@ -197,7 +197,7 @@ if [ "$1" = "test" ]; then
   # no PIPESTATUS. Everything below only ever ADDS problems on top of this.
   STATUS_FILE=$(mktemp "${TMPDIR:-/tmp}/run-status.XXXXXX")
   {
-    eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\""
+    eval "$(~/code/devops/bin/app-env --env development --format sh) sbt -no-share \"\$@\""
     echo $? > "$STATUS_FILE"
   } 2>&1 | tee "$LOG"
   SBT_STATUS=$(cat "$STATUS_FILE" 2>/dev/null)
@@ -329,5 +329,5 @@ if [ "$1" = "test" ]; then
   fi
   exit 0
 else
-  eval "$(~/code/devops/bin/env --env development --format sh) sbt -no-share \"\$@\""
+  eval "$(~/code/devops/bin/app-env --env development --format sh) sbt -no-share \"\$@\""
 fi
