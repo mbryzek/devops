@@ -181,15 +181,26 @@ module Agent
     end
 
     # Every lease an issue has ever had, oldest first. The lease table IS the
-    # attempt history (one row per attempt), so this is what "which attempt is
-    # this" and `dev agent runs --issue N` both read.
+    # attempt history (one row per attempt), so this is what
+    # `Agent::Outcome.attempt_number` and `dev agent runs --issue N` both read.
+    #
+    # OLDEST FIRST IS LOAD-BEARING, not presentation: the give-up count reads the
+    # TRAILING run of failed leases off the end of this list (ISS-734), so an
+    # order that is merely close enough to sorted would silently mis-count. Sort
+    # on the audit stamp's `at` rather than on the whole stamp — sorting the
+    # serialized hash happened to work only because "at" sorts before "by".
     #
     # Two calls because `is_active` is a required boolean: there is no "either"
     # value to ask for. Only the reap path and an explicit history query pay it.
     def issue_lease_history(issue_number, token:, use_localhost:)
       [true, false].flat_map do |active|
         leases(token: token, use_localhost: use_localhost, issue_number: issue_number, is_active: active)
-      end.sort_by { |lease| lease["created"].to_s }
+      end.sort_by { |lease| lease_created_at(lease) }
+    end
+
+    def lease_created_at(lease)
+      stamp = lease["created"]
+      (stamp.is_a?(Hash) ? stamp["at"] : stamp).to_s
     end
 
     # The lease, or nil when nothing is claimable.
@@ -213,8 +224,20 @@ module Agent
     # `claimed`, so a force-release cannot clobber forward progress a session
     # already made. That is why `dev agent release` needs no status check of its
     # own.
-    def release_lease(lease_id, token:, use_localhost:)
-      request(:delete, "/#{TENANT}/issue/leases/#{lease_id}", token: token, use_localhost: use_localhost)
+    #
+    # `outcome` is HOW the attempt ended, in the platform's `issue_lease_outcome`
+    # vocabulary (`completed`, `failed`, `cancelled`). The reap passes what it
+    # classified; every other caller here is a deliberate hand-back and omits it,
+    # which the server records as `released`.
+    #
+    # Recording it is what makes the give-up count countable (ISS-734): with
+    # every lease closed as `released`, "how many times in a row has this issue
+    # failed" has no answer in the data, and the count fell back to counting
+    # every lease the issue had ever had.
+    def release_lease(lease_id, token:, use_localhost:, outcome: nil)
+      path = "/#{TENANT}/issue/leases/#{lease_id}"
+      path += "?#{URI.encode_www_form('outcome' => outcome)}" if outcome
+      request(:delete, path, token: token, use_localhost: use_localhost)
     end
 
     # ---- issues (the tracker itself, AI-token scoped like `dev issues`) ----

@@ -639,7 +639,7 @@ module Agent
       prs = Agent::Github.search_prs(branch, number) if prs.empty?
       pr = Agent::Github.primary_pr(prs, branch)
       plans = Agent::Github.plans_committed_since?(started)
-      attempt = lease_attempts(number, identity)
+      attempt = failed_attempts(number, record, identity)
 
       result = Agent::Outcome.classify(
         pr: pr,
@@ -666,8 +666,18 @@ module Agent
       Agent::Jobs.finish(record, { "name" => result.name, "status" => result.status, "reason" => result.reason, "url" => result.url })
     end
 
-    def lease_attempts(number, identity)
-      Agent::Api.issue_lease_history(number, token: identity.token, use_localhost: @use_localhost).length
+    # Which consecutive failure this attempt would be — the trailing run of
+    # leases that ended badly, plus this one (ISS-734). NOT the length of the
+    # history: an issue reopened for a regression, reclaimed and handed back
+    # carries leases that failed at nothing, and counting those gave up on the
+    # issue's first REAL failure and parked it in `needs_input`, which
+    # `dev issues claim` never offers again.
+    #
+    # A history this runner cannot read is one failure — the same conservative
+    # answer as before, and the safe direction: it retries rather than gives up.
+    def failed_attempts(number, record, identity)
+      history = Agent::Api.issue_lease_history(number, token: identity.token, use_localhost: @use_localhost)
+      Agent::Outcome.attempt_number(history, lease_id: record["lease_id"])
     rescue ApiError
       1
     end
@@ -693,7 +703,7 @@ module Agent
       end
       record_extra_fixes(number, prs, already) if SHIPPED_STATUSES.include?(landed)
 
-      release_lease(record, identity)
+      release_lease(record, identity, outcome: result.lease_outcome)
       notify_outcome(number, result)
     end
 
@@ -734,8 +744,11 @@ module Agent
 
     def pr_label(pr) = [pr["repository"], pr["number"]].compact.join("#").then { |l| l.empty? ? pr["url"] : l }
 
-    def release_lease(record, identity)
-      Agent::Api.release_lease(record["lease_id"], token: identity.token, use_localhost: @use_localhost)
+    # The reap names HOW the attempt ended; the lease is the only place that fact
+    # is recorded, and the next reap counts it (ISS-734).
+    def release_lease(record, identity, outcome: nil)
+      Agent::Api.release_lease(record["lease_id"], token: identity.token, use_localhost: @use_localhost,
+                                                   outcome: outcome)
     rescue ApiError => e
       log("could not release lease #{record['lease_id']} (#{e.message}) — it will expire on its own")
     end
@@ -747,7 +760,9 @@ module Agent
       when "merged_pr"
         push("merged_pr", "dev-agent: ISS-#{number} fixed by an already-merged PR — #{result.url}")
       when "gave_up"
-        push("gave_up", "dev-agent: ISS-#{number} gave up after #{Agent::Outcome::MAX_ATTEMPTS} attempts — needs input")
+        push("gave_up",
+             "dev-agent: ISS-#{number} gave up after #{Agent::Outcome::GIVE_UP_AFTER_FAILURES} " \
+             "failures in a row — needs input")
       end
     end
 

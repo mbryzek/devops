@@ -26,12 +26,32 @@ require 'agent/github'
 
 module Agent
   module Outcome
-    # `status` is the issue status to move to; `lease_outcome` closes the lease.
+    # `status` is the issue status to move to; `lease_outcome` closes the lease
+    # and must be one of the platform's `issue_lease_outcome` values.
     Result = Struct.new(:name, :status, :lease_outcome, :reason, :url, keyword_init: true)
 
-    # Give up after this many lease rows for one issue. The lease table IS the
-    # attempt history (one row per attempt), so no counter column exists.
-    MAX_ATTEMPTS = 3
+    # Give up after this many failures IN A ROW, not after this many leases.
+    #
+    # It used to be leases, and the name said so (ISS-734). The lease table is
+    # the attempt history, but an ordinary lifetime accumulates leases that
+    # failed at nothing — an issue reopened for a regression, reclaimed, handed
+    # back — so counting rows made an issue give up on its FIRST real failure and
+    # land in `needs_input`, which `dev issues claim` never offers. That is not a
+    # stricter retry policy: it is an issue no runner can pick up again until a
+    # human clears it by hand. `attempt_number` below counts the trailing run.
+    GIVE_UP_AFTER_FAILURES = 3
+
+    # How a lease ends when the attempt ENDED BADLY and the next one is a RETRY:
+    # the session ran and delivered nothing (`failed`), the tick killed it
+    # (`cancelled`), or nobody was ever there to report back (`expired`, written
+    # by the platform's own sweeper).
+    #
+    # Every OTHER closed outcome ends the run, because every one of them means
+    # this issue got a clean answer on that attempt: `completed` is a delivered
+    # artifact, and `released` is a deliberate hand-back (a drain on pause, an
+    # operator freeing a stuck lease) that nobody failed at. A live lease —
+    # outcome absent — neither counts nor resets: it has not ended yet.
+    FAILED_LEASE_OUTCOMES = %w[failed cancelled expired].freeze
 
     # Why the tick killed a session, in the words the post-mortem needs. Keyed by
     # what `Agent::Jobs.mark_killed` records.
@@ -43,13 +63,27 @@ module Agent
 
     module_function
 
+    # How many failures in a row this attempt would be, from the issue's lease
+    # history, oldest first. `lease_id` is THIS attempt's lease: it is excluded
+    # and then counted as the +1, so a lease the sweeper closed as `expired` out
+    # from under a session the reap is classifying right now is counted once and
+    # not twice.
+    #
+    # Only leases that have ENDED are read. The trailing run stops at the first
+    # one that ended well, which is what makes an ordinary released-then-failed
+    # history read as "failure 1 of 3" rather than "attempt 3 of 3" (ISS-734).
+    def attempt_number(lease_history, lease_id: nil)
+      closed = lease_history.reject { |lease| lease["id"] == lease_id || lease["outcome"].to_s.empty? }
+      closed.reverse.take_while { |lease| FAILED_LEASE_OUTCOMES.include?(lease["outcome"]) }.length + 1
+    end
+
     # pr:              nil, or { "url" => ..., "isDraft" => ..., "state" => "MERGED"|"OPEN"|"CLOSED" }
     # plans_committed: did the session land new commits under ~/code/claude/plans/?
     # killed:          nil, or the tick's own record of killing it ({ "reason" => ... })
     # exit_code:       the reaped process's exit status (nil if it never wrote one)
     # timed_out:       did Phase A kill it on the 4-hour hard timeout?
     # producer_filed:  was this issue filed by a producer rather than a human?
-    # attempt:         how many leases this issue has had, including this one
+    # attempt:         which consecutive failure this one would be — `attempt_number`
     def classify(pr:, plans_committed:, exit_code:, producer_filed:, attempt: 1, timed_out: false, killed: nil)
       # A MERGED PR outranks every other signal, including a kill and a non-zero
       # exit. It is the strongest possible evidence the work landed, and until
@@ -58,17 +92,17 @@ module Agent
       # the reap looked exactly like a session that did nothing, and the issue was
       # DISMISSED with its fix on main.
       if Agent::Github.merged?(pr)
-        return Result.new(name: "merged_pr", status: "fixed", lease_outcome: "succeeded",
+        return Result.new(name: "merged_pr", status: "fixed", lease_outcome: "completed",
                           reason: "Merged PR #{pr['url']}", url: pr["url"])
       end
 
       if Agent::Github.ready?(pr)
-        return Result.new(name: "ready_pr", status: "fixed", lease_outcome: "succeeded",
+        return Result.new(name: "ready_pr", status: "fixed", lease_outcome: "completed",
                           reason: "Ready PR #{pr['url']}", url: pr["url"])
       end
 
       if plans_committed
-        return Result.new(name: "design_document", status: "needs_review", lease_outcome: "succeeded",
+        return Result.new(name: "design_document", status: "needs_review", lease_outcome: "completed",
                           reason: "Design document committed under ~/code/claude/plans/")
       end
 
@@ -77,7 +111,11 @@ module Agent
       # `failure` returns the issue to the queue: a killed attempt needs
       # RE-RUNNING, not a human's input.
       if killed
-        return failure(killed_reason(killed), attempt, url: pr && pr["url"])
+        # `cancelled` rather than `failed`, because that is the platform enum's
+        # own word for this: "the executor killed the session on a 409 heartbeat,
+        # or the hard timeout fired". Both close the lease as a failure for the
+        # give-up count; only one of them says a machine did it on purpose.
+        return failure(killed_reason(killed), attempt, url: pr && pr["url"], lease_outcome: "cancelled")
       end
 
       # A draft PR is unfinished work, not a result: the session opened it and
@@ -103,25 +141,31 @@ module Agent
       # human-filed work. A producer re-files if the condition recurs, so
       # dismissing its own issue is safe.
       if producer_filed
-        Result.new(name: "nothing_to_do", status: "dismissed", lease_outcome: "succeeded",
+        Result.new(name: "nothing_to_do", status: "dismissed", lease_outcome: "completed",
                    reason: "Producer-filed issue: session completed with nothing to do")
       else
-        Result.new(name: "nothing_to_do", status: "needs_input", lease_outcome: "succeeded",
+        Result.new(name: "nothing_to_do", status: "needs_input", lease_outcome: "completed",
                    reason: "Session completed without opening a PR or writing a plan. " \
                            "A human-authored issue is never auto-dismissed — see the session log for what was checked.")
       end
     end
 
     # A retryable failure returns the issue to `open` (the sweeper applies the
-    # snoozed_until backoff server-side); the attempt limit converts it to a
+    # snoozed_until backoff server-side); the give-up threshold converts it to a
     # question for a human rather than an issue that ages silently.
-    def failure(reason, attempt, url: nil)
-      if attempt >= MAX_ATTEMPTS
-        Result.new(name: "gave_up", status: "needs_input", lease_outcome: "failed", url: url,
-                   reason: "#{reason}. Attempt #{attempt} of #{MAX_ATTEMPTS} — giving up and asking for input.")
+    #
+    # "in a row" is not decoration in these reasons — the old wording ("Attempt 3
+    # of 3") was the bug restated on the timeline, on an issue whose first two
+    # leases had failed at nothing.
+    def failure(reason, attempt, url: nil, lease_outcome: "failed")
+      if attempt >= GIVE_UP_AFTER_FAILURES
+        Result.new(name: "gave_up", status: "needs_input", lease_outcome: lease_outcome, url: url,
+                   reason: "#{reason}. Failure #{attempt} of #{GIVE_UP_AFTER_FAILURES} in a row — " \
+                           "giving up and asking for input.")
       else
-        Result.new(name: "failed", status: "open", lease_outcome: "failed", url: url,
-                   reason: "#{reason}. Attempt #{attempt} of #{MAX_ATTEMPTS} — returning to the queue.")
+        Result.new(name: "failed", status: "open", lease_outcome: lease_outcome, url: url,
+                   reason: "#{reason}. Failure #{attempt} of #{GIVE_UP_AFTER_FAILURES} in a row — " \
+                           "returning to the queue.")
       end
     end
 
