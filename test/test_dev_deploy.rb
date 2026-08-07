@@ -168,16 +168,33 @@ module DeployReleaseStubs
   # Names in the order `release_one` saw them.
   attr_reader :released
 
-  # How many times the deploy ran the global reconcilers. ISS-810 is the whole
-  # reason this is counted rather than asserted present: the bug was N of them,
-  # not none.
-  attr_reader :reconcile_runs
+  # How many times the deploy filed its post-deploy work. Counted rather than
+  # asserted present because the bug both ISS-810 and ISS-816 describe was N of
+  # them, not none: one per app, concurrently, for work that is global.
+  attr_reader :filings
 
-  # Stands in for Reconcilers so a test never runs `features reconcile --apply`
-  # or `issues reconcile --apply` for real — those write live feature-flag and
-  # issue state, and `run_deploys` reaches them on every successful app release.
-  FakeReconciler = Struct.new(:on_run) do
-    def run = on_run.call
+  # The app names of each filing, in order.
+  attr_reader :filed_apps
+
+  # Stands in for PostDeployWork so a test never files against the real tracker —
+  # `run_deploys` reaches it on every successful app release.
+  FakeWork = Struct.new(:names, :on_file) do
+    def any? = true
+
+    def file!
+      on_file.call(names)
+      PostDeployWork::Filed.new(epic: 900, children: [[901, "Reconcile feature flags"]])
+    end
+
+    def manual_commands = []
+  end
+
+  # A tracker the deploy cannot reach. The deploy is already over when this
+  # happens, so what is asserted is the report and the exit code, not a retry.
+  class ExplodingWork
+    def any? = true
+    def file! = raise(ApiError, "no AI API token stored")
+    def manual_commands = ["api publish", "dev features reconcile --apply", "dev issues reconcile --apply"]
   end
 
   def stub_release_seams
@@ -187,7 +204,8 @@ module DeployReleaseStubs
     @registry_apps = default_registry_apps
     @untracked = []
     @contracting = []
-    @reconcile_runs = 0
+    @filings = 0
+    @filed_apps = []
 
     # Each stub body lands on Object, so `self` inside it is NOT the test — but a
     # lambda defined here keeps this test as its own self, so the ivars above
@@ -204,15 +222,20 @@ module DeployReleaseStubs
     # do not have. Default every DB to expanding — what every test written before
     # ISS-317 assumes — and let a test name its contracting repos.
     partition = ->(db_pending) { db_pending.partition { |n| !@contracting.include?(n) } }
-    # The reconcile pass runs after every phase, so it is not concurrent with
+    # The filing happens after every phase, so it is not concurrent with
     # anything — but it is reached from the same run_deploys the release threads
     # feed, so count it under the same mutex as the releases.
-    reconciler = FakeReconciler.new(-> { @released_mutex.synchronize { @reconcile_runs += 1 } })
+    file = lambda do |names|
+      @released_mutex.synchronize do
+        @filings += 1
+        @filed_apps << names
+      end
+    end
 
     stub_global_for_test(:cached_registry) { registry.call }
     stub_global_for_test(:release_one) { |name, _progress| release.call(name) }
     stub_global_for_test(:partition_db_releases) { |db_pending| partition.call(db_pending) }
-    stub_global_for_test(:post_deploy_reconciler) { reconciler }
+    stub_global_for_test(:post_deploy_work) { |names| DeployReleaseStubs::FakeWork.new(names, file) }
   end
 
   # Like capture_io, but tolerates SystemExit (cmd_deploy_all calls `exit 1` on
@@ -1635,15 +1658,19 @@ class TestDeployDevopsPhase < Minitest::Test
   end
 end
 
-# The global reconcilers belong to the DEPLOY, not to each app's release.
+# The post-deploy work belongs to the DEPLOY, not to each app's release.
 #
-# `dev deploy` releases apps in parallel and each release used to run
-# `features reconcile --apply` and `issues reconcile --apply` itself, so a
-# five-app deploy ran each of them five times at once — five unsynchronised
-# writers over one feature-flag and issue state, of which only the first had
-# anything left to apply, at ~7s a run (ISS-810). What is pinned here is
-# therefore a COUNT, and the gate that decides whether the count is one or zero.
-class TestDeployPostDeployReconcile < Minitest::Test
+# `dev deploy` releases apps in parallel and each release used to RUN this work
+# itself — `api publish`, the changelog, and `features reconcile --apply` and
+# `issues reconcile --apply`, the last two of which are global. A five-app deploy
+# therefore ran each reconciler five times at once: five unsynchronised writers
+# over one feature-flag and issue state, of which only the first had anything
+# left to apply, at ~7s a run (ISS-810). It is filed rather than run now
+# (ISS-816), which changes what the redundancy would cost — five EPICS for one
+# deploy, burying the queue `dev issues claim` reads — but not the rule. What is
+# pinned here is therefore a COUNT, and the gate that decides whether the count
+# is one or zero.
+class TestDeployPostDeployFiling < Minitest::Test
   include DeployReleaseStubs
 
   def setup
@@ -1662,8 +1689,8 @@ class TestDeployPostDeployReconcile < Minitest::Test
     $stdout = old
   end
 
-  # The bug, stated as an assertion: four apps, ONE reconcile pass.
-  def test_a_multi_app_deploy_reconciles_exactly_once
+  # The bug, stated as an assertion: four apps, ONE filing, naming all four.
+  def test_a_multi_app_deploy_files_exactly_once_for_every_app
     @rows = [
       ["acumen",   { tag: "0.0.1", ahead: 1, last: "a" }],
       ["rallyd",   { tag: "0.0.2", ahead: 1, last: "b" }],
@@ -1672,19 +1699,28 @@ class TestDeployPostDeployReconcile < Minitest::Test
     ]
     capture_io { cmd_deploy_all(["--concurrency", "4"]) }
     assert_equal 4, @released.length
-    assert_equal 1, @reconcile_runs
+    assert_equal 1, @filings
+    assert_equal %w[acumen hackathon michaelb rallyd], @filed_apps.first.sort
   end
 
-  def test_a_single_app_deploy_still_reconciles_once
+  def test_a_single_app_deploy_still_files_once
     @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
     capture_io { cmd_deploy_all([]) }
-    assert_equal 1, @reconcile_runs
+    assert_equal 1, @filings
   end
 
-  # A deploy in which no app got as far as production has changed nothing either
-  # reconciler reads — and per-app post-release never ran for a failed release
-  # either, so this is the behaviour being preserved, not a new gate.
-  def test_no_reconcile_when_every_app_release_failed
+  # Work moving off the critical path must not also move out of sight: the deploy
+  # reports what it filed.
+  def test_the_deploy_reports_what_it_filed
+    @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    out = capture_io { cmd_deploy_all([]) }
+    assert_includes out, "ISS-900 (epic)"
+  end
+
+  # A deploy in which no app got as far as production has changed nothing for any
+  # of this work to be about — and per-app post-release never ran for a failed
+  # release either, so this is the behaviour being preserved, not a new gate.
+  def test_nothing_is_filed_when_every_app_release_failed
     @rows = [
       ["acumen", { tag: "0.0.1", ahead: 1, last: "a" }],
       ["rallyd", { tag: "0.0.2", ahead: 1, last: "b" }],
@@ -1694,38 +1730,53 @@ class TestDeployPostDeployReconcile < Minitest::Test
       "rallyd" => { ok: false, log: "boom" },
     }
     capture_io_with_exit { cmd_deploy_all([]) }
-    assert_equal 0, @reconcile_runs
+    assert_equal 0, @filings
   end
 
-  # One survivor is enough: what it shipped is exactly what the reconcilers exist
-  # to notice.
-  def test_reconciles_once_when_only_some_apps_released
+  # One survivor is enough — and only the survivor is named: filing a publish for
+  # an app that never released would send the fleet to publish specs for code
+  # that is not running.
+  def test_only_the_apps_that_released_are_filed_for
     @rows = [
       ["acumen", { tag: "0.0.1", ahead: 1, last: "a" }],
       ["rallyd", { tag: "0.0.2", ahead: 1, last: "b" }],
     ]
     @release_results = { "rallyd" => { ok: false, log: "boom" } }
     capture_io_with_exit { cmd_deploy_all([]) }
-    assert_equal 1, @reconcile_runs
+    assert_equal 1, @filings
+    assert_equal ["acumen"], @filed_apps.first
   end
 
   # A database, a library and a devops pull run no post-release at all, so none
-  # of them ever triggered a reconcile — and none of them changes what production
-  # is RUNNING, which is the only question either reconciler asks.
-  def test_no_reconcile_for_a_deploy_with_no_app_in_it
+  # of them ever triggered this — and none of them changes what production is
+  # RUNNING, which is the only question the reconcilers ask.
+  def test_nothing_is_filed_for_a_deploy_with_no_app_in_it
     @rows = [
       ["lib-util", { tag: "0.0.1", ahead: 1, last: "a" }],
       ["devops",   { tag: "abc1234", prod: "def5678", ahead: 1, ahead_noun: "to pull" }],
     ]
     with_tty(true) { capture_io { cmd_deploy_all([]) } }
     assert_equal %w[lib-util devops], @released
-    assert_equal 0, @reconcile_runs
+    assert_equal 0, @filings
   end
 
-  # Last, after every phase: a reconcile that ran before Phase 3's contracting
-  # migration or Phase 5's devops pull would be answering "what is production
-  # running" while the deploy was still changing the answer.
-  def test_reconcile_runs_after_every_release_phase
+  # A deploy that released everything and then could not file what is left has
+  # succeeded at the deploy and lost its bookkeeping. It exits non-zero, and it
+  # prints the commands to run by hand — an unfiled publish is exactly as silent
+  # as the unrun one that used to fail the release.
+  def test_a_filing_failure_fails_the_deploy_and_names_the_manual_commands
+    @rows = [["acumen", { tag: "0.0.1", ahead: 1, last: "a" }]]
+    stub_global_for_test(:post_deploy_work) { |_names| DeployReleaseStubs::ExplodingWork.new }
+
+    out, exited = capture_io_with_exit { cmd_deploy_all([]) }
+    assert_equal 1, exited&.status
+    assert_includes out, "Post-deploy work NOT FILED"
+    assert_includes out, "dev issues reconcile --apply"
+  end
+
+  # Last, after every phase: work filed before Phase 3's contracting migration or
+  # Phase 5's devops pull would describe a deploy that was still changing.
+  def test_filing_happens_after_every_release_phase
     @rows = [
       ["acumen",            { tag: "0.0.1", ahead: 1, last: "a" }],
       ["acumen-postgresql", { tag: "0.0.2", ahead: 1, last: "b" }],
@@ -1735,10 +1786,10 @@ class TestDeployPostDeployReconcile < Minitest::Test
     contracting!("acumen-postgresql")
     # Records into the same list the releases append to, so the assertion is one
     # sequence rather than two that have to be correlated by hand.
-    marker = -> { @released << "RECONCILE" }
-    stub_global_for_test(:post_deploy_reconciler) { DeployReleaseStubs::FakeReconciler.new(marker) }
+    marker = ->(_names) { @released << "FILED" }
+    stub_global_for_test(:post_deploy_work) { |names| DeployReleaseStubs::FakeWork.new(names, marker) }
 
     with_tty(true) { capture_io { cmd_deploy_all([]) } }
-    assert_equal %w[acumen acumen-postgresql lib-util devops RECONCILE], @released
+    assert_equal %w[acumen acumen-postgresql lib-util devops FILED], @released
   end
 end
