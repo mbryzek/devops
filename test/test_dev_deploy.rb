@@ -143,6 +143,115 @@ module DeployRegistryFake
   end
 end
 
+# Every seam `run_deploys` crosses between a list of pending items and a set of
+# released names. A class that releases anything has to replace ALL of them, not
+# the ones it happens to think of, because two of the three reach this machine:
+# phase gating resolves the app <-> schema-repo mapping through the registry
+# (`pkl eval` per app over ~/code/env/apps), and the expanding/contracting split
+# shells out to `sem-info` and git in the REAL checkout the stubbed rows do not
+# have. Miss one and the test asserts on whatever is checked out here.
+#
+# That is what ISS-795 was: TestDeployStatusPrompt stubbed neither, so its
+# DB-before-app ordering test resolved gating against the real fleet — right on
+# an idle box, and wrong when the box was loaded enough for the shell-outs to
+# resolve differently or slowly. Sharing the seams is what stops the next class
+# from picking a different subset of them.
+#
+# Included rather than inherited so a class keeps its own other stubs
+# (DeployStatusStubs); call `stub_release_seams` from setup. Nothing needs a
+# teardown: every stub goes through `stub_global_for_test`, which GuardEveryTest
+# restores after the test.
+module DeployReleaseStubs
+  include DevTestSupport # stub_global_for_test
+  include DeployRegistryFake
+
+  # Names in the order `release_one` saw them.
+  attr_reader :released
+
+  def stub_release_seams
+    @released = []
+    @released_mutex = Mutex.new
+    @release_results = {}
+    @registry_apps = default_registry_apps
+    @untracked = []
+    @contracting = []
+
+    # Each stub body lands on Object, so `self` inside it is NOT the test — but a
+    # lambda defined here keeps this test as its own self, so the ivars above
+    # stay readable (and a test can still change them after setup).
+    registry = -> { fake_registry(@registry_apps, @registry_apps.reject { |a| @untracked.include?(a.name) }) }
+    # Phase 1 releases the serial DB thread alongside the free apps, so these
+    # appends genuinely race — the accumulator is shared mutable state and needs
+    # the mutex, not just the assertion that reads it.
+    release = lambda do |name|
+      @released_mutex.synchronize { @released << name }
+      @release_results.fetch(name) { { ok: true, log: "ok" } }
+    end
+    # Reading a DB repo's new migrations means a git checkout these stubbed rows
+    # do not have. Default every DB to expanding — what every test written before
+    # ISS-317 assumes — and let a test name its contracting repos.
+    partition = ->(db_pending) { db_pending.partition { |n| !@contracting.include?(n) } }
+
+    stub_global_for_test(:cached_registry) { registry.call }
+    stub_global_for_test(:release_one) { |name, _progress| release.call(name) }
+    stub_global_for_test(:partition_db_releases) { |db_pending| partition.call(db_pending) }
+  end
+
+  # Like capture_io, but tolerates SystemExit (cmd_deploy_all calls `exit 1` on
+  # failure). Returns [output, system_exit_or_nil] so callers can assert on both.
+  def capture_io_with_exit
+    buf = StringIO.new
+    old = $stdout
+    $stdout = buf
+    exc = nil
+    begin
+      yield
+    rescue SystemExit => e
+      exc = e
+    end
+    [buf.string, exc]
+  ensure
+    $stdout = old
+  end
+
+  # Phases 3 and 5 (libraries, devops) run only with someone to answer a prompt.
+  def with_tty(interactive)
+    orig = Object.instance_method(:interactive_terminal?)
+    Object.send(:define_method, :interactive_terminal?) { interactive }
+    yield
+  ensure
+    Object.send(:define_method, :interactive_terminal?, orig)
+  end
+
+  def contracting!(*names)
+    @contracting = names
+  end
+
+  # Name a different fleet than the platform / playbook-api / acumen default.
+  def registry!(*apps)
+    @registry_apps = apps
+  end
+
+  # Name an app the registry knows and `dev deploy` does not release (an ignored
+  # deployable sharing another app's repo).
+  def untracked!(*names)
+    @untracked = names
+  end
+
+  # The invariant every DB-first ordering test actually pins: no app released
+  # before a database. Stated as an index comparison rather than an exact list
+  # because phase 1 runs the DB thread and the free apps CONCURRENTLY — an exact
+  # list would also assert a scheduling order nothing guarantees — and because it
+  # reports what it got when it does trip.
+  def assert_dbs_before_apps
+    db_idx  = @released.each_index.select { |i| db_repo?(@released[i]) }
+    app_idx = @released.each_index.reject { |i| db_repo?(@released[i]) }
+    refute_empty db_idx,  "expected a database release, got #{@released.inspect}"
+    refute_empty app_idx, "expected an app release, got #{@released.inspect}"
+    assert db_idx.max < app_idx.min, "expected all DBs before any app, got #{@released.inspect}"
+  end
+end
+
 # deploy_items derives DB repos from the apps registry (scala apps ship a
 # "<repo>-postgresql" repo), NOT from a filesystem glob — so abandoned
 # *-postgresql checkouts next to the apps are never picked up.
@@ -263,72 +372,17 @@ class TestPendingItems < Minitest::Test
   end
 end
 
-# cmd_deploy_all orchestrates DB-first + parallel-app workers.
-# Stub resolve_deploy_items + release_one so tests do no real I/O.
+# cmd_deploy_all orchestrates DB-first + parallel-app workers. DeployReleaseStubs
+# replaces every seam it crosses to release something; the rows it starts from are
+# this class's own.
 class TestPendingReleaseOrchestration < Minitest::Test
-  include DeployRegistryFake
+  include DeployReleaseStubs
 
   def setup
     @rows = []
-    @release_results = {}
-    @released = []
-    @released_mutex = Mutex.new
-
-    @orig_resolve = Object.instance_method(:resolve_deploy_items)
-    @orig_release = Object.instance_method(:release_one)
-
-    # Phase gating resolves app <-> schema repo through the registry, so it has
-    # to be stubbed here too — otherwise these tests shell out to `pkl eval` and
-    # the fleet they assert on becomes whatever this machine happens to have
-    # checked out. `registry!` lets a test name a different fleet; `untracked!`
-    # names an app the registry knows and `dev deploy` does not release (an
-    # ignored deployable sharing another app's repo).
-    @registry_apps = default_registry_apps
-    @untracked = []
-    @orig_cached_registry = Object.instance_method(:cached_registry)
-    registry_ref = -> { fake_registry(@registry_apps, @registry_apps.reject { |a| @untracked.include?(a.name) }) }
-    Object.send(:define_method, :cached_registry) { registry_ref.call }
-
+    stub_release_seams
     rows_ref = -> { @rows }
-    results_ref = -> { @release_results }
-    released_ref = -> { @released }
-    released_mutex = @released_mutex
-
-    Object.send(:define_method, :resolve_deploy_items) { |_| rows_ref.call }
-    Object.send(:define_method, :release_one) do |name, _progress|
-      released_mutex.synchronize { released_ref.call << name }
-      results_ref.call.fetch(name) { { ok: true, log: "ok" } }
-    end
-
-    # Reading a DB repo's new migrations means a git checkout, which these
-    # stubbed rows do not have. Default every DB to expanding — the behavior
-    # every test written before ISS-317 assumes — and let a test that cares name
-    # its contracting repos with `contracting!`.
-    @contracting = []
-    @orig_partition = Object.instance_method(:partition_db_releases)
-    contracting_ref = -> { @contracting }
-    Object.send(:define_method, :partition_db_releases) do |db_pending|
-      db_pending.partition { |n| !contracting_ref.call.include?(n) }
-    end
-  end
-
-  def contracting!(*names)
-    @contracting = names
-  end
-
-  def registry!(*apps)
-    @registry_apps = apps
-  end
-
-  def untracked!(*names)
-    @untracked = names
-  end
-
-  def teardown
-    Object.send(:define_method, :resolve_deploy_items, @orig_resolve)
-    Object.send(:define_method, :release_one, @orig_release)
-    Object.send(:define_method, :partition_db_releases, @orig_partition)
-    Object.send(:define_method, :cached_registry, @orig_cached_registry)
+    stub_global_for_test(:resolve_deploy_items) { |_| rows_ref.call }
   end
 
   def capture_io
@@ -336,24 +390,6 @@ class TestPendingReleaseOrchestration < Minitest::Test
     $stdout = StringIO.new
     yield
     $stdout.string
-  ensure
-    $stdout = old_stdout
-  end
-
-  # Like capture_io, but tolerates SystemExit (cmd_deploy_all calls
-  # `exit 1` on failure). Returns [output, system_exit_or_nil] so callers
-  # can assert on both.
-  def capture_io_with_exit
-    buf = StringIO.new
-    old_stdout = $stdout
-    $stdout = buf
-    exc = nil
-    begin
-      yield
-    rescue SystemExit => e
-      exc = e
-    end
-    [buf.string, exc]
   ensure
     $stdout = old_stdout
   end
@@ -453,9 +489,7 @@ class TestPendingReleaseOrchestration < Minitest::Test
       ["platform-postgresql", { tag: "0.0.4", ahead: 1, last: "d" }],
     ]
     capture_io { cmd_deploy_all([]) }
-    db_idx = @released.each_index.select { |i| @released[i].end_with?("-postgresql") }
-    app_idx = @released.each_index.reject { |i| @released[i].end_with?("-postgresql") }
-    assert db_idx.max < app_idx.min, "expected all DBs before any app, got #{@released.inspect}"
+    assert_dbs_before_apps
   end
 
   def test_db_releases_run_serially
@@ -585,14 +619,6 @@ class TestPendingReleaseOrchestration < Minitest::Test
   # `release-lib` owns the terminal while it prompts (tag confirmation, GPG
   # passphrase), so libraries release last and one at a time — never alongside
   # the parallel app phase, whose output would bury the prompt.
-
-  def with_tty(interactive)
-    orig = Object.instance_method(:interactive_terminal?)
-    Object.send(:define_method, :interactive_terminal?) { interactive }
-    yield
-  ensure
-    Object.send(:define_method, :interactive_terminal?, orig)
-  end
 
   def test_libraries_release_after_apps_and_dbs
     @rows = [
@@ -1140,19 +1166,14 @@ end
 # The deploy prompt `dev deploy` shows when something is pending.
 class TestDeployStatusPrompt < Minitest::Test
   include DeployStatusStubs
+  # The prompt hands its selection to the SAME run_deploys the `deploy all` tests
+  # exercise, so it crosses the same seams and has to replace all of them — it
+  # used to replace only release_one, and resolved gating against this machine
+  # (ISS-795).
+  include DeployReleaseStubs
 
   def setup
-    @released = []
-    @orig_release = Object.instance_method(:release_one)
-    released_ref = @released
-    Object.send(:define_method, :release_one) do |name, _progress|
-      released_ref << name
-      { ok: true, log: "ok" }
-    end
-  end
-
-  def teardown
-    Object.send(:define_method, :release_one, @orig_release)
+    stub_release_seams
   end
 
   def pending_rows
@@ -1208,7 +1229,8 @@ class TestDeployStatusPrompt < Minitest::Test
       ["platform-postgresql", { tag: "0.5.1", ahead: 1, last: "b" }],
     ]
     with_rows(rows, interactive: true) { capture_io { cmd_deploy_status([]) } }
-    assert_equal %w[platform-postgresql platform], @released
+    assert_equal %w[platform platform-postgresql], @released.sort, "both selections must release"
+    assert_dbs_before_apps
   end
 
   # A lone app releases serially, so the banner drops the concurrency detail.
@@ -1532,25 +1554,13 @@ end
 # Phase 4: devops updates last and alone, because its pull rewrites the release
 # scripts every other phase shells out to.
 class TestDeployDevopsPhase < Minitest::Test
+  include DeployReleaseStubs
+
   def setup
     @rows = []
-    @released = []
-    mutex = Mutex.new
+    stub_release_seams
     rows_ref = -> { @rows }
-    released_ref = -> { @released }
-
-    @orig_resolve = Object.instance_method(:resolve_deploy_items)
-    @orig_release = Object.instance_method(:release_one)
-    Object.send(:define_method, :resolve_deploy_items) { |_| rows_ref.call }
-    Object.send(:define_method, :release_one) do |name, _progress|
-      mutex.synchronize { released_ref.call << name }
-      { ok: true, log: "" }
-    end
-  end
-
-  def teardown
-    Object.send(:define_method, :resolve_deploy_items, @orig_resolve)
-    Object.send(:define_method, :release_one, @orig_release)
+    stub_global_for_test(:resolve_deploy_items) { |_| rows_ref.call }
   end
 
   def capture_io
@@ -1560,14 +1570,6 @@ class TestDeployDevopsPhase < Minitest::Test
     $stdout.string
   ensure
     $stdout = old
-  end
-
-  def with_tty(interactive)
-    orig = Object.instance_method(:interactive_terminal?)
-    Object.send(:define_method, :interactive_terminal?) { interactive }
-    yield
-  ensure
-    Object.send(:define_method, :interactive_terminal?, orig)
   end
 
   def test_devops_releases_after_apps_dbs_and_libraries
@@ -1600,31 +1602,11 @@ class TestDeployDevopsPhase < Minitest::Test
       ["acumen-postgresql", { tag: "0.0.1", ahead: 1, last: "a" }],
       ["acumen",            { tag: "0.0.2", ahead: 1, last: "b" }],
     ]
-    released = @released
-    mutex = Mutex.new
-    Object.send(:define_method, :release_one) do |name, _progress|
-      mutex.synchronize { released << name }
-      name == "acumen-postgresql" ? { ok: false, log: "boom" } : { ok: true, log: "" }
-    end
+    @release_results = { "acumen-postgresql" => { ok: false, log: "boom" } }
     out, exc = capture_io_with_exit { cmd_deploy_all([]) }
     assert_includes @released, "devops", "devops must still update: #{out}"
     refute_includes @released, "acumen", "the app whose DB failed is still skipped"
     assert_equal 1, exc&.status
-  end
-
-  def capture_io_with_exit
-    buf = StringIO.new
-    old = $stdout
-    $stdout = buf
-    exc = nil
-    begin
-      yield
-    rescue SystemExit => e
-      exc = e
-    end
-    [buf.string, exc]
-  ensure
-    $stdout = old
   end
 
   def test_up_to_date_devops_is_not_pulled

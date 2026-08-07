@@ -12,6 +12,20 @@ load File.expand_path('../bin/dev', __dir__)
 class TestDevIssues < Minitest::Test
   include DevTestSupport
 
+  # The fleet `issues reconcile` and `issue_app!` resolve against. They load the
+  # registry themselves rather than taking one, and left real that is `pkl eval`
+  # over ~/code/env/apps — so "devops releases nothing" and "playbook-app is a
+  # valid --app" would both mean whatever this machine has checked out
+  # (RegistryGuard, ISS-795). Named here instead, and small on purpose: the
+  # ISSUE_APPS deployables an issue can name, acumen for a repo that releases
+  # something it cannot, and deliberately NO devops or lib-* — their absence is
+  # exactly what "releases nothing, so the merge is the release" reads.
+  RECONCILE_FLEET = (ISSUE_APPS + %w[acumen]).freeze
+
+  def setup
+    registry_fleet(registry_with(*RECONCILE_FLEET.map { |n| Deployable.new(n, n) }))
+  end
+
   def graph_issue
     {
       "id" => "iss-1",
@@ -1388,11 +1402,20 @@ class TestDevIssues < Minitest::Test
     }
   end
 
-  # A deployable stand-in: the adoption path only ever asks for name and repo_name.
-  Deployable = Struct.new(:name, :repo_name)
+  # A deployable stand-in. The adoption path asks only for name and repo_name;
+  # `docker_k8s` is the third thing a live-version probe reads, and nil is the
+  # honest answer for a fake — no k8s rollout to ask about, so the probe reports
+  # that it cannot read a version instead of going looking for one.
+  Deployable = Struct.new(:name, :repo_name, :docker_k8s)
 
+  # `prod_url` answers nil so an unstubbed live-version probe reads as "no prod
+  # url" rather than reaching production: with the REAL registry here,
+  # fetch_app_version resolved a real deployable's real production URL and made
+  # the request for real, every suite run (ISS-795).
   def registry_with(*apps)
-    Struct.new(:deploy_tracked).new(apps)
+    Struct.new(:deploy_tracked) do
+      def prod_url(_app) = nil
+    end.new(apps)
   end
 
   def test_issue_numbers_in_title_finds_every_reference
