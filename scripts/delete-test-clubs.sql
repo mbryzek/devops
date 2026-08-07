@@ -32,6 +32,16 @@
 --     union
 --     select e.child from edges e join closure cl on e.parent=cl.child
 --   ) select distinct child from closure order by 1;
+--
+-- Two nets now catch that drift instead of leaving it to whoever remembers to run
+-- the query above:
+--   * the drift guard near the bottom, which asks the catalog for every table
+--     carrying a club_id column and fails NAMING any that still holds targeted
+--     rows (this also covers the two club_id columns that have no FK at all);
+--   * the FK constraints themselves, for indirect children reached through a
+--     parent rather than through club_id.
+-- Being hand-maintained at all is the real defect: ISS-827 replaces this script
+-- with an itemized delete generated from the club reference registry.
 begin;
 -- A concurrent scalatest run inserting into a child table would otherwise make the
 -- final clubs delete fail on an FK it cannot see. `for update` on the root set takes
@@ -171,6 +181,10 @@ delete from playbook.execution_recipients
 delete from playbook.executions                     where club_id in (select id from _del_clubs);
 delete from playbook.checklist_item_checks          where checklist_item_id in (select id from _del_checklist_items);
 delete from playbook.checklist_item_comments        where checklist_item_id in (select id from _del_checklist_items);
+delete from playbook.checklist_item_reviews         where checklist_item_id in (select id from _del_checklist_items);
+-- playbook_rule_logs references checklist_items AND insights AND clubs, so it has to
+-- precede both. (It was named insight_rule_logs when this script was written.)
+delete from playbook.playbook_rule_logs             where club_id in (select id from _del_clubs);
 delete from playbook.checklist_items                 where club_id in (select id from _del_clubs);
 delete from playbook.checklist_generations          where club_id in (select id from _del_clubs);
 delete from playbook.insight_sections              where insight_id in (select id from _del_insights);
@@ -179,7 +193,6 @@ delete from playbook.insight_tool_calls            where insight_run_id in (sele
 delete from playbook.insight_findings              where insight_run_id in (select id from _del_insight_runs);
 delete from playbook.insight_judgments             where insight_run_id in (select id from _del_insight_runs);
 delete from playbook.insight_run_stages            where insight_run_id in (select id from _del_insight_runs);
-delete from playbook.insight_rule_logs             where club_id in (select id from _del_clubs);
 delete from playbook.insights                       where club_id in (select id from _del_clubs);
 delete from playbook.insight_runs                   where club_id in (select id from _del_clubs);
 delete from playbook.revenue_entries               where club_id in (select id from _del_clubs);
@@ -190,6 +203,11 @@ delete from playbook.club_insight_settings          where club_id in (select id 
 delete from playbook.club_memory_facts              where club_id in (select id from _del_clubs);
 delete from playbook.report_exports                 where club_id in (select id from _del_clubs);
 delete from playbook.watermarks                     where club_id in (select id from _del_clubs);
+
+-- ---- playbook club chats (messages -> chats) --------------------------------
+delete from playbook.club_chat_messages
+  where club_chat_id in (select id from playbook.club_chats where club_id in (select id from _del_clubs));
+delete from playbook.club_chats                      where club_id in (select id from _del_clubs);
 
 -- ---- playbook ---------------------------------------------------------------
 delete from playbook.user_club_notification_optouts  where club_id in (select id from _del_clubs);
@@ -275,6 +293,16 @@ delete from issues.issue_apps                       where issue_id in (select id
 delete from issues.issue_attachments                where issue_id in (select id from _del_issues);
 delete from issues.issue_comments                   where issue_id in (select id from _del_issues);
 delete from issues.issue_fixes                      where issue_id in (select id from _del_issues);
+delete from issues.issue_repositories               where issue_id in (select id from _del_issues);
+-- issue_links references issues twice (issue_id, linked_issue_id): a link is dead if
+-- EITHER end is going away, so scope to both.
+delete from issues.issue_links
+  where issue_id in (select id from _del_issues)
+     or linked_issue_id in (select id from _del_issues);
+delete from issues.issue_intake_message_files
+  where issue_intake_message_id in
+    (select id from issues.issue_intake_messages where issue_id in (select id from _del_issues));
+delete from issues.issue_intake_messages            where issue_id in (select id from _del_issues);
 delete from issues.issues                           where club_id in (select id from _del_clubs);
 
 -- ---- integrations + playbook courts ----------------------------------------
@@ -288,6 +316,46 @@ delete from user_tracking.page_views                where club_id in (select id 
 
 -- ---- club onboarding state -------------------------------------------------
 delete from playbook.club_onboardings               where club_id in (select id from _del_clubs);
+
+-- ---- drift guard ------------------------------------------------------------
+-- Every `delete from` above is hand-maintained, so a new club-scoped table lands
+-- here unnoticed. Rather than a second hand-maintained list to diff against, ask
+-- the catalog: any table carrying a club_id column that still has rows pointing at
+-- a targeted club is a table this script has drifted away from. Names it directly
+-- instead of leaving the FK abort below to report a constraint nobody recognises,
+-- and covers the two club_id columns that have no FK at all
+-- (court_reserve.worker_reports, worker.invocations). journal_* is excluded: those
+-- are append-only audit mirrors handled explicitly above.
+do $$
+declare
+  t record;
+  n bigint;
+  drifted text[] := '{}';
+begin
+  for t in
+    select c.table_schema as s, c.table_name as tbl
+      from information_schema.columns c
+      join information_schema.tables tt
+        on tt.table_schema = c.table_schema and tt.table_name = c.table_name
+     where c.column_name = 'club_id'
+       and tt.table_type = 'BASE TABLE'
+       and c.table_schema not like 'journal\_%'
+     order by 1, 2
+  loop
+    execute format(
+      'select count(*) from %I.%I where club_id in (select id from _del_clubs)',
+      t.s, t.tbl
+    ) into n;
+    if n > 0 then
+      drifted := drifted || format('%s.%s (%s rows)', t.s, t.tbl, n);
+    end if;
+  end loop;
+  if cardinality(drifted) > 0 then
+    raise exception
+      'delete-test-clubs.sql has drifted: these club-scoped tables still hold rows for the targeted clubs: %',
+      array_to_string(drifted, ', ');
+  end if;
+end $$;
 
 -- ---- finally the clubs (self-FK NO ACTION handles parent/child subset) ------
 delete from playbook.clubs where id in (select id from _del_clubs);
