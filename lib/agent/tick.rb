@@ -82,6 +82,14 @@ module Agent
     # is source-agnostic by construction; hard-coding it to `checkout_pull` (as
     # it was when ISS-511 introduced it) was the only thing keeping the machine's
     # other recurring failures — its housekeeping chores above all — silent.
+    #
+    # It reads a number Agent::Errors' eviction has to be able to produce, and
+    # for two years it could not: that log was capped in TOTAL, so with five
+    # sources failing at once no source's count ever reached 3 and this fired on
+    # nobody (ISS-742). The cap is per-source now, and
+    # Agent::Errors::PER_SOURCE_CAP > ERROR_ESCALATE_AT is asserted by the suite
+    # — strictly greater, because a count that SATURATES at the threshold would
+    # match this `==` on every tick forever.
     ERROR_ESCALATE_AT = 3
 
     # An issue waiting on a dependency that has not merged is deferred a day at a
@@ -1126,18 +1134,15 @@ module Agent
 
     # ---------------- plumbing ----------------
 
-    # LOCK_NB is what makes this non-blocking: flock returns false immediately
-    # rather than waiting, so ticks never pile up. The lock is released when the
-    # process exits, INCLUDING on a crash, so a killed tick cannot wedge the
-    # queue.
-    def with_lock(path)
-      Agent::Paths.mkdir_p(File.dirname(path), mode: 0700)
-      file = File.open(path, File::CREAT | File::RDWR, 0600)
-      acquired = file.flock(File::LOCK_EX | File::LOCK_NB)
-      yield acquired
-    ensure
-      file&.flock(File::LOCK_UN) if acquired
-      file&.close
+    # Non-blocking, so ticks never pile up: a tick that cannot take the lock
+    # skips that phase and the next one is 30 seconds away. The mechanics live in
+    # Agent::Paths.with_lock, next to the paths being locked and to the atomic
+    # writes that are the reason a lock is on a separate file at all — Agent::
+    # Errors needs the same primitive with a blocking acquire (ISS-742), and two
+    # hand-rolled copies of an flock dance is exactly how the two of them would
+    # come to disagree.
+    def with_lock(path, &block)
+      Agent::Paths.with_lock(path, &block)
     end
 
     # This machine's name, as it appears in every escalation, claim comment and

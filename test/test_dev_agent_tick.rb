@@ -1441,6 +1441,58 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ---- ISS-742: the streak this threshold reads has to be reachable ----
+
+  # Every source the tick can record a failure against. One tick runs all of
+  # them, which is why they fail ROUND-ROBIN on a broken machine rather than one
+  # at a time.
+  TICK_ERROR_SOURCES = [
+    Agent::Tick::CHECKOUT_PULL_ERROR_SOURCE, Agent::Tick::CLAUDE_CONFIG_ERROR_SOURCE,
+    Agent::Maintenance::GC_SOURCE, Agent::Maintenance::AIDIRS_SOURCE,
+    Agent::Maintenance::CLAUDE_DB_SOURCE, Agent::Maintenance::DOCKER_SOURCE,
+  ].freeze
+
+  # ERROR_ESCALATE_AT and Agent::Errors' eviction were written independently and
+  # never compared, which is the whole of ISS-742: the threshold counts ONE
+  # source's failures and the log evicted across ALL of them. Compared here, in
+  # the suite, rather than in a comment on either side that the other cannot see.
+  def test_the_error_log_can_hold_a_streak_long_enough_to_escalate
+    assert_operator Agent::Errors::PER_SOURCE_CAP, :>, Agent::Tick::ERROR_ESCALATE_AT,
+                    "strictly greater: a count that saturates AT the threshold matches the `==` crossing check " \
+                    "on every tick forever, re-notifying a streak that was already escalated"
+    assert_operator Agent::Errors::MAX_SOURCES, :>=, TICK_ERROR_SOURCES.length,
+                    "every source the tick can record must fit, or one chore's failures evict another's"
+  end
+
+  # The machine this escalation exists for: five or six chores failing at once —
+  # no network, full disk, dead Docker, no claude checkout. Under the old cap of
+  # 10 entries TOTAL that machine filed NOTHING (the first entry for a source was
+  # always evicted before its third arrived, so no count ever reached 3) while a
+  # machine with three failing chores escalated correctly. With four it filed on
+  # EVERY round, because eviction bounced the count 3 → 2 → 3.
+  def test_every_source_escalates_exactly_once_when_all_of_them_fail_together
+    with_agent_home do
+      register_identity
+      filed = []
+      with_ai_token do
+        stubs = { "POST /playbook/issues" => ->(body) { filed << body; { "number" => 42, "occurrence_count" => 1 } } }
+        with_stubbed_api(stubs) do
+          5.times do
+            TICK_ERROR_SOURCES.each do |source|
+              capture_stdout do
+                tick(dry_run: false).record_failure(source, "boom",
+                                                    title: ->(host) { "dev-agent: #{source} failing on #{host}" },
+                                                    explain: "why this matters")
+              end
+            end
+          end
+        end
+      end
+      assert_equal TICK_ERROR_SOURCES.sort, filed.map { |body| body[:fingerprint].split(":").first }.sort,
+                   "each failing source files exactly one issue, on the round its OWN streak crosses the threshold"
+    end
+  end
+
   # ---- ISS-531: a missing host binary has to be LOUD ----
   #
   # The bug: `depsguard` was never installed on the runner, so the weekly
