@@ -683,11 +683,13 @@ USAGE = <<~USAGE
         `needs_review` is how a `suggestion` investigation hands back its findings
         (see suggestion-body.md) — pass --comment with the recommendation. Marking
         `fixed` requires --url:
-        the merged PR, or a document describing a manual/process fix. Pass --app
-        <deployable-app> and --baseline-version <live release tag> TOGETHER (both or
-        neither) for a code fix: they are what let `dev issues reconcile` flip the
-        issue to `deployed` once that app releases past the baseline; a
-        document-linked fix has neither and is advanced by hand. --comment carries
+        the merged PR, or a document describing a manual/process fix. For a PR that
+        is the whole requirement — `issues reconcile` derives the deploy watch from
+        it, since the url names the repo, the registry names what that repo
+        releases, and the PR's merge time is what a release has to be newer than.
+        --app <deployable-app> and --baseline-version <live release tag> are the
+        OVERRIDE for what inference cannot reach (a fix linked to a document rather
+        than a PR); pass them TOGETHER or not at all. --comment carries
         the question (needs_input) or a reason (dismissed). --duplicate-of NUMBER
         records this issue as a duplicate of that one; it applies only to
         `--status dismissed`, and `issues duplicate` is the shorter way to say it. The generated plan tells
@@ -706,9 +708,9 @@ USAGE = <<~USAGE
         whenever the work landed in more than one PR and the issue is already fixed,
         deployed or verified.
         --url is the merged PR (or a document); --comment says why you are recording
-        it; --app and --baseline-version TOGETHER name the deployable, the same pair
-        `issues status` takes, and on an issue still at `fixed` they become what
-        `issues reconcile` watches.
+        it; --app and --baseline-version TOGETHER name the deployable, the same
+        optional pair `issues status` takes, and on an issue still at `fixed` they
+        override what `issues reconcile` would otherwise derive from the PR url.
 
         Never name a status to do this. `issues status --status fixed --url ...` on
         an issue at `verified` or `deployed` walks it BACKWARD: on 2026-08-05 one
@@ -795,12 +797,19 @@ USAGE = <<~USAGE
         pipeline. It lands `fixed` when the repo releases a tracked deployable, and
         straight to `deployed` when it does not (devops, acumen, the shared libs:
         there is no release to wait for, so the merge is the release). Then: flip
-        `fixed` issues to `deployed` once their target app has released past the fix
-        — or, for an issue whose every fix repo releases nothing, once one of its
+        `fixed` issues to `deployed` once the app carrying the fix has released past
+        it — or, for an issue whose every fix repo releases nothing, once one of its
         recorded fix PRs has actually MERGED. `fixed` does not mean merged in this
         fleet (a session records it at PR-ready), so that merge is checked rather
         than assumed; an unmerged fix reports `waiting`, and a PR GitHub cannot be
-        read for stays put. Read-only against GitHub and the deploy registry (same
+        read for stays put.
+
+        WHICH app is derived from the fix urls, not remembered: the url names the
+        repo, the registry names every deployable built from it, and the release has
+        to be newer than the PR's merge. An issue closed out with --app and
+        --baseline-version pins that watch explicitly instead — which is what a fix
+        linked to a document rather than a PR needs, since it names no repo.
+        Read-only against GitHub and the deploy registry (same
         live-version signal as `dev deploy status`) — the release pipeline is
         untouched. Dry-run by default; pass --apply to record the transitions (e.g.
         from a cron).
@@ -3192,13 +3201,15 @@ def issue_plan_closing(category, number)
     CLOSING
   else
     <<~CLOSING.strip
-      - Fixed in a merged PR → `dev issues status #{number} --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>`
-        (--app + --baseline-version let `dev issues reconcile` flip the issue to `deployed`
-        once that app releases past the baseline. `dev deploy status` lists the deployable
-        app names and their live release tags — read the tag BEFORE your fix ships.)
+      - Fixed in a merged PR → `dev issues status #{number} --status fixed --url "<PR URL>"`
+        (the url is all `dev issues reconcile` needs: it names the repo, the registry names
+        what that repo releases, and the PR's merge time is what a release has to be newer
+        than. Nothing to look up and nothing to remember.)
       - Fixed by a document (process/manual fix, e.g. a Google Doc) →
-        `dev issues status #{number} --status fixed --url "<doc URL>"`
-        (no app/baseline: nothing to detect, so `deployed` is set by hand later)
+        `dev issues status #{number} --status fixed --url "<doc URL>" [--app <app> --baseline-version <version>]`
+        (a document names no repo, so this is the case where the pair is worth passing —
+        `dev deploy status` lists the deployable app names and their live release tags.
+        Without it, `deployed` is set by hand later.)
       - A SECOND PR on an issue already fixed/deployed/verified →
         `dev issues fix #{number} --url "<PR URL>" [--app <app> --baseline-version <version>]`
         (never `--status fixed` again: that walks the issue backward out of
@@ -3739,7 +3750,7 @@ def issue_filed_without_session(issue)
   puts "Claimed #{issue_label(issue)} — no session started (--no-spawn)."
   puts ""
   puts "Close it when the fix ships:"
-  puts "  dev issues status #{number} --status fixed --url \"<PR URL>\" --app <app> --baseline-version <live version>"
+  puts "  dev issues status #{number} --status fixed --url \"<PR URL>\""
   puts "Or hand it back to the queue:"
   puts "  dev issues status #{number} --status open"
   issue
@@ -4834,9 +4845,10 @@ def cmd_issues_status(args)
   # Every fix links to how it shipped: a merged PR, or a document describing a
   # manual/process fix.
   problems << "marking fixed requires --url <url> (the merged PR, or a document describing the fix)" if status == "fixed" && (url.nil? || url.empty?)
-  # --app + --baseline-version are the deploy-detection pair: together they let
-  # `dev issues reconcile` flip the issue to `deployed`. One without the other
-  # detects nothing, so it is always a mistake.
+  # --app + --baseline-version are the deploy-detection OVERRIDE: together they pin
+  # what `dev issues reconcile` watches, in place of what it would otherwise derive
+  # from the fix PR's repo. One without the other pins nothing, so it is always a
+  # mistake.
   problems << "--app requires --baseline-version (the app's live release tag at fix time)" if has_app && !has_baseline
   problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
   # Caught here as well as server-side so the mistake reads as a usage error rather than a 422:
@@ -4921,7 +4933,7 @@ def cmd_issues_fix(args)
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   # The whole point of the command: there is no fix to record without one.
   problems << "--url is required (the merged PR, or a document describing the fix)" if url.nil? || url.empty?
-  # Same deploy-detection pair as `issues status`: one without the other detects nothing.
+  # Same deploy-detection override as `issues status`: one without the other pins nothing.
   problems << "--app requires --baseline-version (the app's live release tag at fix time)" if has_app && !has_baseline
   problems << "--baseline-version requires --app (the deployable app the fix ships in)" if has_baseline && !has_app
   report_arg_problems("issues fix", problems, usage_for("issues fix"))
@@ -5173,9 +5185,9 @@ def cmd_issues_snooze(args)
   end
 end
 
-# The deploy-detection info this issue's deploy pass watches: the most recent fix that
-# CARRIES one, or nil when no fix does (a document fix, or an adopted fix whose repo
-# could not be named — see issue_fix_repo).
+# The deploy-detection info this issue's deploy pass watches, when a close-out pinned
+# one explicitly: the most recent fix that CARRIES one, or nil when no fix does — in
+# which case the pass DERIVES the watch from the fix urls instead (ISS-737).
 #
 # The most recent one carrying a deployment, not simply the last fix. Recording an
 # additional fix no longer implies a status change (`dev issues fix`, ISS-536), so an
@@ -5357,8 +5369,14 @@ def issue_fix_pr(url)
   Agent::Github.pr_by_url(url)
 end
 
-# For a `fixed` issue whose repos all release nothing: has the merge that IS the
-# release actually happened?
+# This issue's fix PRs as GitHub sees them, {url => pr-or-nil}, read once per url
+# per run: an issue and the follow-up it spawned routinely name the same PR, and
+# the deploy pass asks for both the merge STATE and the merge TIME.
+def issue_fix_prs(urls, pr_cache)
+  urls.to_h { |url| [url, pr_cache.key?(url) ? pr_cache[url] : (pr_cache[url] = issue_fix_pr(url))] }
+end
+
+# Has the merge this `fixed` issue is waiting on actually happened?
 #
 # `fixed` does not mean merged in this fleet. agent/instructions.md §1 has every
 # session record `fixed` the moment its PR is READY, so a devops issue reaches
@@ -5379,7 +5397,7 @@ end
 #               fix. The cost is a printed skip line on a pass a human reads after
 #               every release, and the next run recovers on its own.
 def issue_merge_is_release_state(urls, pr_cache)
-  prs = urls.to_h { |url| [url, pr_cache.key?(url) ? pr_cache[url] : (pr_cache[url] = issue_fix_pr(url))] }
+  prs = issue_fix_prs(urls, pr_cache)
   unreadable = prs.select { |_url, pr| pr.nil? }.keys
   return [:unknown, issue_fix_pr_label(unreadable.first)] if unreadable.any?
 
@@ -5390,6 +5408,45 @@ def issue_merge_is_release_state(urls, pr_cache)
   return [:merged, merged.map { |url| issue_fix_pr_label(url) }.join(", ")] if merged.any?
 
   [:unmerged, "#{issue_fix_pr_label(prs.keys.first)} was closed without merging"]
+end
+
+# When the last of this issue's fixes merged — the floor a release has to clear
+# for the fix to be live in it — or nil when nothing merged or `gh` did not answer.
+# Reads the same per-run cache the state check populates, so it costs no extra call.
+#
+# The LAST merge, not the first: an issue that shipped across a platform PR and a
+# playbook-admin PR is not live until the release that followed BOTH.
+def issue_fix_merged_at(urls, pr_cache)
+  issue_fix_prs(urls, pr_cache).values.filter_map { |pr| issue_time(Agent::Github.merged_at(pr)) }.max
+end
+
+# Time.parse that answers nil rather than raising, for the timestamps GitHub and a
+# `/_internal_/version` endpoint hand us: a missing or unreadable one must read as
+# "cannot compare", never as an exception out of a release's tail.
+def issue_time(value)
+  return nil if value.nil? || value.to_s.empty?
+  Time.parse(value.to_s)
+rescue ArgumentError
+  nil
+end
+
+# Every deployable built from these repos, deduped by name. More than one can share
+# a repo (platform and playbook-api are the same codebase on different accounts), so
+# all of them have to have released before a fix in that repo is live.
+#
+# Deliberately NOT filtered by ISSUE_APPS the way `issue_app_for_repo` is: that enum
+# constrains what a close-out can RECORD, and reading a live version needs no enum
+# value at all. Which is why acumen and lakeviewsummit-ui — 19 of the 49 issues
+# stranded at `fixed` on 2026-08-06, and unnameable by the tracker — advance here.
+def issue_deployables_for(registry, repos)
+  repos.flat_map { |repo| registry.deploy_tracked.select { |a| a.repo_name == repo } }.uniq(&:name)
+end
+
+# One app's live version, memoized per run. The probe is an HTTP call to production
+# (or a kubectl read), and a release asks about the same handful of apps for every
+# outstanding issue.
+def issue_live_version(registry, version_cache, app)
+  version_cache[app.name] ||= fetch_app_version(registry, app)
 end
 
 # The fix payload for adopting `pr`: always the PR url, plus the (app,
@@ -5506,9 +5563,134 @@ def issue_record_extra_fixes(endpoint:, issue:, prs:)
   end
 end
 
+# What the deploy pass should do with ONE `fixed` issue, decided without writing
+# anything. Split out from the loop so every branch below is reachable from a test
+# that never has to answer a status PUT.
+#
+#   action  :deploy — advance to `deployed`; `comment` is the timeline note.
+#           :wait   — the fix has not shipped yet. Nothing is wrong and nobody has
+#                     to do anything, so it is counted as neither moved nor skipped.
+#           :skip   — a human has to look.
+#   detail  everything printed after the issue link, separator included, because
+#           the app-keyed line reads `ISS-034 (platform: ...)` and the rest read
+#           `ISS-034: ...`.
+IssueDeployOutcome = Struct.new(:action, :detail, :comment, keyword_init: true)
+
+def issue_deploy_outcome(issue, registry:, version_cache:, pr_cache:)
+  deployment = issue_fix_deployment(issue)
+  return issue_recorded_deploy_outcome(issue, deployment, registry, version_cache) if deployment
+  issue_derived_deploy_outcome(issue, registry, version_cache, pr_cache)
+end
+
+# The close-out recorded an (app, baseline_version) pair, so watch exactly what it
+# named. An explicit statement beats an inference — this is also the only path that
+# can work for a fix linked to a document rather than a PR.
+def issue_recorded_deploy_outcome(issue, deployment, registry, version_cache)
+  app_name = deployment["app"]
+  info = version_cache[app_name] ||= begin
+    app = registry.deploy_tracked.find { |a| a.name == app_name }
+    app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
+  end
+  return IssueDeployOutcome.new(action: :skip, detail: " (#{app_name}): #{info[:error]}") if info[:error]
+
+  live = info["version"]
+  unless issue_released_since_fix?(info, issue)
+    return IssueDeployOutcome.new(action: :wait, detail: " (#{app_name}: still #{live})")
+  end
+  IssueDeployOutcome.new(
+    action: :deploy,
+    detail: " (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})",
+    comment: "Deployed in #{app_name} #{live}",
+  )
+end
+
+# No pair was recorded. That used to be the end of the road — the issue sat in
+# `fixed` forever no matter how many releases shipped its fix, and 49 of them had
+# by 2026-08-06 (ISS-737, twelve more hand-walked on 2026-07-30 before that).
+#
+# But the pair is DERIVED data, not remembered data. The fix urls name the repos,
+# the registry names what each repo releases, and the PR's merge time is a strictly
+# better floor than the baseline ever was (`fixed` is recorded when the PR is READY,
+# which can be a day before the code is on main). So derive it, and let the flags be
+# what they are — an override, for the cases inference cannot reach.
+#
+# The one cost is that the merge check now runs for EVERY fixed issue, not just the
+# handful whose repos release nothing: one `gh pr view` per fix url per run, which
+# took a 52-issue backlog from 5s to 20s. It scales with the size of that backlog,
+# which this change is what drains — if it ever stops draining, batch the lookups by
+# repo (`gh pr list --repo <repo>`, one call per repo instead of one per url).
+def issue_derived_deploy_outcome(issue, registry, version_cache, pr_cache)
+  repos = issue_fix_repos(issue)
+  # No PR anywhere: a document fix. Nothing to watch and nothing to infer from.
+  return IssueDeployOutcome.new(action: :skip, detail: ": document fix — advance manually") if repos.empty?
+
+  urls = issue_fix_pr_urls(issue)
+  state, evidence = issue_merge_is_release_state(urls, pr_cache)
+  if state == :unknown
+    return IssueDeployOutcome.new(action: :skip,
+                                  detail: ": could not read #{evidence} from GitHub — leaving it fixed")
+  end
+
+  releasing = repos.reject { |r| issue_repo_releases_nothing?(registry, r) }
+  # EVERY repo the issue shipped from has to release nothing, not just the last
+  # one: an issue fixed across a devops PR and an acumen PR is not live because
+  # devops releases nothing (ISS-536 made multi-PR issues ordinary here).
+  if releasing.empty?
+    phrase = "#{repos.join(' and ')} #{repos.length == 1 ? 'releases' : 'release'} nothing"
+    return IssueDeployOutcome.new(action: :wait, detail: ": #{phrase}, but #{evidence}") if state == :unmerged
+    note = "#{phrase} and #{evidence} merged"
+    return IssueDeployOutcome.new(action: :deploy, detail: ": #{note}",
+                                  comment: "#{note}, so the merge is the release; awaiting verification.")
+  end
+
+  return IssueDeployOutcome.new(action: :wait, detail: ": #{evidence}") if state == :unmerged
+  issue_released_since_merge_outcome(
+    apps: issue_deployables_for(registry, releasing),
+    merged_at: issue_fix_merged_at(urls, pr_cache),
+    evidence: evidence, registry: registry, version_cache: version_cache
+  )
+end
+
+# The merge has landed; has every app built from those repos released since it?
+#
+# Fails closed at each step it cannot read — an unreachable app, a version endpoint
+# with no timestamp, a merge time GitHub did not give us. `deployed` starts the
+# 7-day auto-verify clock, so guessing here would close issues out as verified whose
+# fix is not live, and the cost of not guessing is one skip line on a pass a human
+# reads after every release.
+def issue_released_since_merge_outcome(apps:, merged_at:, evidence:, registry:, version_cache:)
+  if merged_at.nil?
+    return IssueDeployOutcome.new(action: :skip,
+                                  detail: ": #{evidence} merged, but GitHub gave no merge time — leaving it fixed")
+  end
+
+  probes = apps.map { |app| [app.name, issue_live_version(registry, version_cache, app)] }
+  unreachable, error = probes.find { |_name, info| info[:error] }
+  return IssueDeployOutcome.new(action: :skip, detail: " (#{unreachable}): #{error[:error]}") if unreachable
+
+  undated, info = probes.find { |_name, i| issue_time(i["released_at"]).nil? }
+  if undated
+    return IssueDeployOutcome.new(action: :skip,
+                                  detail: ": #{undated} #{info['version']} reports no release time — leaving it fixed")
+  end
+
+  pending = probes.reject { |_name, i| issue_time(i["released_at"]) > merged_at }
+  if pending.any?
+    still = pending.map { |name, i| "#{name} still #{i['version']}" }.join(", ")
+    return IssueDeployOutcome.new(action: :wait, detail: ": #{still}, from before #{evidence} merged")
+  end
+
+  versions = probes.map { |name, i| "#{name} #{i['version']}" }.join(", ")
+  IssueDeployOutcome.new(action: :deploy,
+                         detail: ": #{versions} released after #{evidence} merged",
+                         comment: "Deployed in #{versions}, released after #{evidence} merged; " \
+                                  "awaiting verification.")
+end
+
 # Two passes over the issue tracker, both keyed on facts nobody has to remember:
-# claimed issues whose PR has merged become `fixed`, then `fixed` issues whose
-# target app has released past the fix become `deployed`. Read-only against GitHub
+# claimed issues whose PR has merged become `fixed`, then `fixed` issues whose app
+# has released since the fix merged become `deployed` — with that app derived from
+# the fix urls when no close-out pinned one. Read-only against GitHub
 # and the deploy registry (the same live-version signal `dev deploy status` uses) —
 # the release pipeline is never touched. Dry-run by default; --apply records the
 # transitions.
@@ -5554,84 +5736,24 @@ def cmd_issues_reconcile(args)
     deployed = 0
     skipped = 0
     fixed.each do |c|
-      deployment = issue_fix_deployment(c)
-      if deployment.nil?
-        # No app recorded. Two very different reasons land here, and only the registry
-        # tells them apart — which is exactly why the platform never guesses.
-        # `issue_app` names five apps while the registry tracks about twenty
-        # deployables, so a fix with no app is either a repo that releases
-        # nothing (devops, schema-evolution-manager — the merge IS the release) or a
-        # deployable the tracker has no enum value for (acumen, rallyd, lib-* — which
-        # really do release, so calling the merge "live" would be a claim the
-        # auto-verifier acts on). Promote only the first kind.
-        # EVERY repo the issue shipped from has to release nothing, not just the last
-        # one: an issue fixed across a devops PR and an acumen PR is not live because
-        # devops releases nothing (ISS-536 made multi-PR issues ordinary here).
-        repos = issue_fix_repos(c)
-        releasing = repos.reject { |r| issue_repo_releases_nothing?(registry, r) }
-        phrase = "#{repos.join(' and ')} #{repos.length == 1 ? 'releases' : 'release'} nothing"
-        if repos.any? && releasing.empty?
-          # "The merge is the release" is only true once there IS a merge. Reading
-          # `fixed` as merged is what put five devops issues one reconcile away from
-          # a verified-but-never-merged fix on 2026-08-06 (ISS-652).
-          state, evidence = issue_merge_is_release_state(issue_fix_pr_urls(c), pr_cache)
-          case state
-          when :merged
-            note = "#{phrase} and #{evidence} merged"
-            if apply
-              ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
-                                body: { status: "deployed", visibility: "internal",
-                                        comment: "#{note}, so the merge is the release; awaiting verification." })
-              puts "  deployed #{issue_link(c)}: #{note}"
-            else
-              puts "  would deploy #{issue_link(c)}: #{note}"
-            end
-            deployed += 1
-          when :unmerged
-            # `waiting`, not `skip`, and counted as neither: this is the same state
-            # the app-keyed branch below reports when a release has not shipped yet.
-            # Nothing is wrong and nobody has to do anything.
-            puts "  waiting  #{issue_link(c)}: #{phrase}, but #{evidence}"
-          else
-            puts "  skip #{issue_link(c)}: could not read #{evidence} from GitHub — leaving it fixed"
-            skipped += 1
-          end
-        else
-          reason =
-            if releasing.any?
-              "#{releasing.join(', ')} releases, but no app was recorded — advance once it ships"
-            else
-              "document fix — advance manually"
-            end
-          puts "  skip #{issue_link(c)}: #{reason}"
-          skipped += 1
-        end
-        next
-      end
-      app_name = deployment["app"]
-      info = version_cache[app_name] ||= begin
-        app = registry.deploy_tracked.find { |a| a.name == app_name }
-        app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
-      end
-      if info[:error]
-        puts "  skip #{issue_link(c)} (#{app_name}): #{info[:error]}"
-        skipped += 1
-        next
-      end
-
-      live = info["version"]
-      if issue_released_since_fix?(info, c)
+      outcome = issue_deploy_outcome(c, registry: registry, version_cache: version_cache, pr_cache: pr_cache)
+      case outcome.action
+      when :deploy
         if apply
-          ApiClient.request(endpoint, :put,
-                            issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
-                            body: { status: "deployed", comment: "Deployed in #{app_name} #{live}" })
-          puts "  deployed #{issue_link(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
+          ApiClient.request(endpoint, :put, issues_path("/#{URI.encode_www_form_component(c['number'])}/status"),
+                            body: { status: "deployed", visibility: "internal", comment: outcome.comment })
+          puts "  deployed #{issue_link(c)}#{outcome.detail}"
         else
-          puts "  would deploy #{issue_link(c)} (#{app_name}: #{deployment['baseline_version'] || '?'} -> #{live})"
+          puts "  would deploy #{issue_link(c)}#{outcome.detail}"
         end
         deployed += 1
+      when :wait
+        # Counted as neither moved nor skipped: the fix simply has not shipped yet.
+        # Nothing is wrong and nobody has to do anything.
+        puts "  waiting  #{issue_link(c)}#{outcome.detail}"
       else
-        puts "  waiting  #{issue_link(c)} (#{app_name}: still #{live})"
+        puts "  skip #{issue_link(c)}#{outcome.detail}"
+        skipped += 1
       end
     end
 
@@ -5649,15 +5771,10 @@ end
 # predates the fix). Falls back to "live tag differs from the fix-time baseline" when a
 # timestamp is missing or unparseable.
 def issue_released_since_fix?(info, issue)
-  released_at = info["released_at"]
-  fixed_at = issue["fixed_at"]
-  if released_at && fixed_at
-    begin
-      return Time.parse(released_at) > Time.parse(fixed_at)
-    rescue ArgumentError
-      # fall through to tag comparison
-    end
-  end
+  released_at = issue_time(info["released_at"])
+  fixed_at = issue_time(issue["fixed_at"])
+  return released_at > fixed_at if released_at && fixed_at
+
   baseline = issue_fix_deployment(issue)&.fetch("baseline_version", nil)
   live = info["version"]
   !baseline.nil? && !live.nil? && live != baseline

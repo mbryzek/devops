@@ -400,7 +400,7 @@ class TestDevIssues < Minitest::Test
   # it has to fill in by hand is a placeholder it can get wrong.
   def test_plan_markdown_closing_uses_the_real_issue_number
     md = claim_plan_markdown(graph_issue)
-    assert_includes md, 'dev issues status 034 --status fixed --url "<PR URL>" --app <deployable-app> --baseline-version <live version>'
+    assert_includes md, 'dev issues status 034 --status fixed --url "<PR URL>"'
     assert_includes md, 'dev issues status 034 --status fixed --url "<doc URL>"'
     assert_includes md, "dev issues status 034 --status needs_input"
     refute_includes md, "status <number>"
@@ -1703,15 +1703,30 @@ class TestDevIssues < Minitest::Test
   # unstubbed the assertions would swing on whoever merged what today. A url the
   # map does not mention reads as unreadable-from-GitHub, which is the fail-closed
   # case.
+  #
+  # The value is the state, or [state, merged_at] when the merge TIME matters —
+  # which it does for every repo that releases something, since the deploy pass
+  # compares that app's live release against it (ISS-737).
   def with_fix_pr_states(states, &block)
     with_stubbed_function(:issue_fix_pr, lambda { |url|
-      state = states[url]
-      state && { "url" => url, "state" => state.to_s.upcase, "isDraft" => false }
+      state, merged_at = Array(states[url])
+      state && { "url" => url, "state" => state.to_s.upcase, "isDraft" => false, "mergedAt" => merged_at }
     }, &block)
   end
 
   # The overwhelmingly common shape: one devops PR, merged.
   def with_merged_fix_pr(url, &block) = with_fix_pr_states({ url => "merged" }, &block)
+
+  # Answer the live-version probe from a map of app name => info, so no test
+  # reaches production. An app the map does not mention reads as unreachable,
+  # which is the fail-closed case.
+  def with_app_versions(versions, &block)
+    with_stubbed_function(:fetch_app_version, lambda { |_registry, app|
+      versions[app.name] || { error: "no prod url or docker_k8s config" }
+    }, &block)
+  end
+
+  def live(version, released_at) = { "version" => version, "released_at" => released_at }
 
   # ISS-131's own shape: marked fixed by hand with a devops PR, then stranded,
   # because before ISS-136 this branch skipped everything with no app.
@@ -1751,20 +1766,197 @@ class TestDevIssues < Minitest::Test
     assert_match(/1 deployed, 0 skipped, 1 fixed total\./, out)
   end
 
-  # acumen DOES release. Calling its merge live would be a claim the auto-verifier
-  # then acts on, so it keeps skipping — but says which of the two cases it was.
-  def test_deploy_pass_skips_a_releasing_repo_that_has_no_app_recorded
+  # ---- deploy pass: no pair recorded, so DERIVE it (ISS-737) ----
+  #
+  # This branch used to skip with "acumen releases, but no app was recorded —
+  # advance once it ships", and it never did ship: nothing was watching, so no
+  # release could move it. 49 issues were stranded there on 2026-08-06, twelve
+  # more hand-walked on 2026-07-30. The pair is derivable — the fix url names the
+  # repo, the registry names what that repo releases — so derive it.
+
+  # A releasing repo whose app has released since the fix merged is live. acumen
+  # is the case the enum CANNOT name (ISSUE_APPS has five playbook deployables),
+  # and 19 of the 49 stranded issues were acumen and lakeviewsummit-ui — reading a
+  # live version needs no enum value, which is the whole reason this works.
+  def test_deploy_pass_advances_a_releasing_repo_whose_app_released_after_the_merge
+    url = "https://github.com/mbryzek/acumen/pull/130"
     out, = capture_io do
       with_merged_prs({}) do
-        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
-                         "GET #{issues_list_path(statuses: 'fixed')}" =>
-                           [fixed_via_pr("https://github.com/mbryzek/acumen/pull/130")]) do
-          cmd_issues_reconcile([])
+        with_fix_pr_states(url => ["merged", "2026-08-01T10:00:00Z"]) do
+          with_app_versions("acumen" => live("0.10.24", "2026-08-02T09:00:00Z")) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+              cmd_issues_reconcile([])
+            end
+          end
         end
       end
     end
-    assert_match(/skip ISS-034: acumen releases, but no app was recorded/, out)
+    assert_match(/would deploy ISS-034: acumen 0\.10\.24 released after acumen#130 merged/, out)
+    assert_match(/1 would deploy, 0 skipped, 1 fixed total\./, out)
+    refute_match(/no app was recorded/, out)
+  end
+
+  # Dry-run above wrote nothing. The stub flunks on any request it was not told
+  # about, so the PUT being answered here IS the assertion that it was sent.
+  def test_deploy_pass_apply_records_the_derived_transition
+    url = "https://github.com/mbryzek/acumen/pull/130"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => ["merged", "2026-08-01T10:00:00Z"]) do
+          with_app_versions("acumen" => live("0.10.24", "2026-08-02T09:00:00Z")) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)],
+                             "PUT #{issues_path('/034/status')}" => graph_issue.merge("status" => "deployed")) do
+              cmd_issues_reconcile(["--apply"])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/deployed ISS-034: acumen 0\.10\.24 released after acumen#130 merged/, out)
+    assert_match(/1 deployed, 0 skipped, 1 fixed total\./, out)
+  end
+
+  # The release has to be NEWER than the merge. A release cut before the code
+  # landed does not contain it, and calling it deployed would start the 7-day
+  # auto-verify clock on a fix that is not live.
+  def test_deploy_pass_waits_when_the_app_last_released_before_the_merge
+    url = "https://github.com/mbryzek/acumen/pull/130"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => ["merged", "2026-08-02T10:00:00Z"]) do
+          with_app_versions("acumen" => live("0.10.24", "2026-08-01T09:00:00Z")) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/waiting  ISS-034: acumen still 0\.10\.24, from before acumen#130 merged/, out)
     refute_match(/would deploy/, out)
+  end
+
+  # `fixed` is recorded when the PR is READY, not when it merges (ISS-652), so a
+  # releasing repo needs the same merge gate the merge-is-the-release path has —
+  # and it must not cost a version probe to find that out.
+  def test_deploy_pass_waits_when_the_fix_pr_is_still_open
+    url = "https://github.com/mbryzek/acumen/pull/130"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => "open") do
+          with_app_versions({}) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/waiting  ISS-034: acumen#130 is still open/, out)
+    refute_match(/would deploy/, out)
+  end
+
+  # Fail closed on a GitHub read that did not answer: silence must never advance a
+  # fix, and the next run recovers on its own.
+  def test_deploy_pass_skips_a_releasing_repo_whose_pr_cannot_be_read
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states({}) do
+          with_app_versions({}) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" =>
+                               [fixed_via_pr("https://github.com/mbryzek/acumen/pull/130")]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/skip ISS-034: could not read acumen#130 from GitHub — leaving it fixed/, out)
+  end
+
+  # An issue that shipped across two releasing repos is live only once BOTH have
+  # released — and the floor is the LAST merge, not the first.
+  def test_deploy_pass_waits_until_every_app_of_a_multi_repo_fix_has_released
+    platform = "https://github.com/mbryzek/platform/pull/1"
+    admin = "https://github.com/mbryzek/playbook-admin/pull/2"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(platform => ["merged", "2026-08-01T10:00:00Z"],
+                           admin => ["merged", "2026-08-03T10:00:00Z"]) do
+          with_app_versions("platform" => live("0.19.13", "2026-08-04T09:00:00Z"),
+                            "playbook-admin" => live("0.4.38", "2026-08-02T09:00:00Z")) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [
+                               fixed_via_fixes({ "url" => platform }, { "url" => admin }),
+                             ]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/waiting  ISS-034: playbook-admin still 0\.4\.38, from before platform#1, playbook-admin#2 merged/, out)
+  end
+
+  # An unreachable app is not evidence that the fix shipped.
+  def test_deploy_pass_skips_a_releasing_repo_whose_app_cannot_be_probed
+    url = "https://github.com/mbryzek/acumen/pull/130"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => ["merged", "2026-08-01T10:00:00Z"]) do
+          with_app_versions({}) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/skip ISS-034 \(acumen\): no prod url or docker_k8s config/, out)
+    refute_match(/would deploy/, out)
+  end
+
+  # Without a release timestamp there is nothing to compare the merge against, and
+  # there is no baseline to fall back on — that is what the recorded pair was for.
+  def test_deploy_pass_skips_a_releasing_repo_whose_app_reports_no_release_time
+    url = "https://github.com/mbryzek/acumen/pull/130"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => ["merged", "2026-08-01T10:00:00Z"]) do
+          with_app_versions("acumen" => { "version" => "0.10.24" }) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/skip ISS-034: acumen 0\.10\.24 reports no release time — leaving it fixed/, out)
+  end
+
+  # A merged PR GitHub gave no merge time for. Same fail-closed rule.
+  def test_deploy_pass_skips_a_releasing_repo_with_no_readable_merge_time
+    url = "https://github.com/mbryzek/acumen/pull/130"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => "merged") do
+          with_app_versions("acumen" => live("0.10.24", "2026-08-02T09:00:00Z")) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+              cmd_issues_reconcile([])
+            end
+          end
+        end
+      end
+    end
+    assert_match(/skip ISS-034: acumen#130 merged, but GitHub gave no merge time — leaving it fixed/, out)
   end
 
   # A Google Doc describing a manual fix has no repo and no release to infer. This
@@ -1859,21 +2051,31 @@ class TestDevIssues < Minitest::Test
     )
   end
 
-  def test_deploy_pass_skips_when_one_fix_repo_still_releases
+  # The merge-is-the-release shortcut must not fire when one of the repos DOES
+  # release: devops merging says nothing about whether acumen has shipped. The
+  # issue waits on acumen's release, which is a different answer from both
+  # "deployed" and "there is nothing to watch".
+  def test_deploy_pass_waits_on_the_releasing_repo_when_another_releases_nothing
     out, = capture_io do
       with_merged_prs({}) do
-        with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
-                         "GET #{issues_list_path(statuses: 'fixed')}" => [
-                           fixed_via_fixes(
-                             { "url" => "https://github.com/mbryzek/devops/pull/313" },
-                             { "url" => "https://github.com/mbryzek/acumen/pull/130" },
-                           ),
-                         ]) do
-          cmd_issues_reconcile([])
+        with_fix_pr_states("https://github.com/mbryzek/devops/pull/313" => ["merged", "2026-08-01T10:00:00Z"],
+                           "https://github.com/mbryzek/acumen/pull/130" => ["merged", "2026-08-02T10:00:00Z"]) do
+          with_app_versions("acumen" => live("0.10.24", "2026-08-01T09:00:00Z")) do
+            with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                             "GET #{issues_list_path(statuses: 'fixed')}" => [
+                               fixed_via_fixes(
+                                 { "url" => "https://github.com/mbryzek/devops/pull/313" },
+                                 { "url" => "https://github.com/mbryzek/acumen/pull/130" },
+                               ),
+                             ]) do
+              cmd_issues_reconcile([])
+            end
+          end
         end
       end
     end
-    assert_match(/skip ISS-034: acumen releases, but no app was recorded/, out)
+    assert_match(/waiting  ISS-034: acumen still 0\.10\.24, from before devops#313, acumen#130 merged/, out)
+    refute_match(/releases nothing/, out)
     refute_match(/would deploy/, out)
   end
 
@@ -2010,6 +2212,71 @@ class TestDevIssues < Minitest::Test
     )
     assert_equal ["https://github.com/mbryzek/devops/pull/314"], issue_fix_pr_urls(issue)
     assert_equal %w[devops], issue_fix_repos(issue)
+  end
+
+  # ---- issue_fix_merged_at (the floor a release has to clear) ----
+
+  def test_fix_merged_at_takes_the_last_merge
+    first = "https://github.com/mbryzek/platform/pull/1"
+    last = "https://github.com/mbryzek/playbook-admin/pull/2"
+    with_fix_pr_states(first => ["merged", "2026-08-01T10:00:00Z"],
+                       last => ["merged", "2026-08-03T10:00:00Z"]) do
+      assert_equal Time.parse("2026-08-03T10:00:00Z"), issue_fix_merged_at([first, last], {})
+    end
+  end
+
+  # An unmerged PR has no merge time, and neither has one `gh` could not read.
+  def test_fix_merged_at_is_nil_without_a_merge
+    url = "https://github.com/mbryzek/platform/pull/1"
+    with_fix_pr_states(url => "open") { assert_nil issue_fix_merged_at([url], {}) }
+    with_fix_pr_states({}) { assert_nil issue_fix_merged_at([url], {}) }
+  end
+
+  # Same per-run cache the state check fills, so asking for both costs one call.
+  def test_fix_merged_at_reuses_the_state_check_lookup
+    url = "https://github.com/mbryzek/platform/pull/1"
+    calls = 0
+    cache = {}
+    with_stubbed_function(:issue_fix_pr, lambda { |u|
+      calls += 1
+      { "url" => u, "state" => "MERGED", "isDraft" => false, "mergedAt" => "2026-08-01T10:00:00Z" }
+    }) do
+      issue_merge_is_release_state([url], cache)
+      assert_equal Time.parse("2026-08-01T10:00:00Z"), issue_fix_merged_at([url], cache)
+    end
+    assert_equal 1, calls
+  end
+
+  # ---- issue_time ----
+
+  def test_issue_time_answers_nil_rather_than_raising
+    assert_nil issue_time(nil)
+    assert_nil issue_time("")
+    assert_nil issue_time("whenever")
+    assert_equal Time.parse("2026-08-01T10:00:00Z"), issue_time("2026-08-01T10:00:00Z")
+  end
+
+  # ---- issue_deployables_for ----
+
+  # The enum limits what a close-out can RECORD; reading a live version does not
+  # need one, which is why acumen advances at all.
+  def test_deployables_for_is_not_filtered_by_the_issue_app_enum
+    registry = registry_with(Deployable.new("acumen", "acumen"), Deployable.new("platform", "platform"))
+    assert_equal %w[acumen], issue_deployables_for(registry, %w[acumen]).map(&:name)
+  end
+
+  # More than one deployable can be built from one repo, and every one of them has
+  # to have released before a fix in that repo is live everywhere.
+  def test_deployables_for_finds_every_deployable_built_from_a_repo
+    registry = registry_with(Deployable.new("platform", "platform"),
+                             Deployable.new("playbook-api", "platform"),
+                             Deployable.new("acumen", "acumen"))
+    assert_equal %w[platform playbook-api], issue_deployables_for(registry, %w[platform]).map(&:name)
+  end
+
+  def test_deployables_for_dedupes_repeated_repos
+    registry = registry_with(Deployable.new("platform", "platform"))
+    assert_equal %w[platform], issue_deployables_for(registry, %w[platform platform]).map(&:name)
   end
 
   # ---- playbook tenant login wiring ----

@@ -46,7 +46,7 @@ module Agent
       end.uniq
     end
 
-    PR_FIELDS = "url,isDraft,number,title,state,headRefName".freeze
+    PR_FIELDS = "url,isDraft,number,title,state,headRefName,mergedAt".freeze
 
     # The same fields MINUS the head branch, because `gh search prs` does not
     # have it: asking anyway is "Unknown JSON field" on stderr, a non-zero exit,
@@ -88,6 +88,15 @@ module Agent
     # an UNKNOWN, and every caller here reads an unknown as fail-open rather than
     # as a negative answer.
     def closed?(pr) = !!(pr && pr["state"].to_s.casecmp?("closed"))
+
+    # When this PR merged, as the ISO-8601 UTC string `gh` returns, or nil for one
+    # that has not merged (or a lookup that did not ask for the field).
+    #
+    # The floor `dev issues reconcile` compares a release against: an issue reaches
+    # `fixed` when its PR is READY, which can be a day before the code is on main,
+    # so "released since the fix" is only honest when it means "released since the
+    # fix MERGED" (ISS-737).
+    def merged_at(pr) = merged?(pr) ? pr["mergedAt"] : nil
 
     # Ready for review: open and not a draft.
     def ready?(pr) = open?(pr) && !pr["isDraft"]
