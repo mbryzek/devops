@@ -84,6 +84,27 @@ class TestAgentDevopsMergeRule < Minitest::Test
                         "the exception is the ledger's answer, not the loop's judgment — say so")
   end
 
+  # ---- the rule, enforced in code -------------------------------------------
+
+  # The third home, added with the merge lane (ISS-754). Until it existed the
+  # rule had nowhere to live but prose, and prose reaches whoever reads it: the
+  # `pr-auto-merge` playbook accumulated its skip list one near-miss at a time
+  # (ISS-660, ISS-663) precisely because nothing could enforce one.
+  #
+  # Asserted from THIS file rather than only from test_agent_merge_lane.rb so
+  # that the rule and its enforcement are guarded as a pair, exactly as the rule
+  # and its justification are below. A lane that quietly dropped devops from
+  # SELF_DEPLOYING_REPOS would still pass its own suite's other 45 tests.
+  def test_the_lane_refuses_the_repo_the_rule_names
+    require "agent/merge_lane"
+    assert_includes Agent::MergeLane::SELF_DEPLOYING_REPOS, "devops",
+                    "agent/instructions.md §3 forbids merging a devops PR under any workflow. " \
+                    "Agent::MergeLane is the workflow that merges, so it has to know."
+    assert_raises(ArgumentError, "the lane must refuse a devops merge even when asked directly") do
+      Agent::MergeLane.merge!("mbryzek/devops", 1, head_sha: "a" * 40)
+    end
+  end
+
   # ---- the fact the rule rests on -------------------------------------------
 
   def test_the_fleet_still_fast_forwards_itself_on_every_tick
