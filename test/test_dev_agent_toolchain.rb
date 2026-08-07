@@ -352,10 +352,15 @@ class TestDevAgentToolchain < Minitest::Test
     assert_equal ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"], chrome.paths
   end
 
-  # Chrome's install must not be `npx playwright install`. On this fleet the
-  # egress gateway 400s cdn.playwright.dev, so that command cannot fetch a browser
-  # — and it exits 0 anyway when a half-extracted one is already on disk, which is
-  # how ISS-608 lost twenty minutes to a SIGABRT about a missing dylib.
+  # Chrome's install must not be `npx playwright install`, and the reason is NOT
+  # the one this comment used to give. It claimed the egress gateway 400s
+  # cdn.playwright.dev; ISS-780 disproved that by downloading a browser from it.
+  # The reason that survives is that Playwright's Chromium is pinned per
+  # playwright-core version, so naming it here would put a version in the doctor
+  # that goes stale the day any repo bumps Playwright — which is the 1194-vs-1217
+  # mismatch ISS-780 was filed for. The cask is version-free and every repo's
+  # `channel: "chrome"` resolves to it. (The half-extract-then-exit-0 trap that
+  # cost ISS-608 twenty minutes is real and still documented on the tool.)
   def test_chrome_is_installed_from_the_cask_not_from_the_playwright_cdn
     chrome = T::TOOLS.find { |t| t.name == "google-chrome" }
     assert_includes chrome.install, "--cask google-chrome"

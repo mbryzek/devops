@@ -140,15 +140,34 @@ module Agent
       # `channel: "chrome"` to on darwin, copied from playwright-core's registry
       # rather than guessed, so this cannot pass while browse still fails.
       #
-      # NOT Playwright's bundled Chromium, and that is a fleet fact rather than a
-      # preference: the egress gateway returns HTTP 400 for cdn.playwright.dev, so
-      # `npx playwright install chromium` cannot fetch a browser on these machines
-      # at all. It also does not admit that — a half-extracted browser leaves the
-      # version directory behind, the installer treats an existing directory as
-      # satisfied and exits 0, and the launch then dies with SIGABRT on a missing
-      # `Chromium Framework` dylib. ISS-608 proposed exactly that reinstall as its
-      # own fix; it could never have worked, and the cask below is why this needs
-      # no CDN.
+      # NOT Playwright's bundled Chromium — but for a narrower reason than this
+      # comment used to give, and the difference mattered enough to cost coverage.
+      #
+      # What it used to say: "the egress gateway returns HTTP 400 for
+      # cdn.playwright.dev, so `npx playwright install chromium` cannot fetch a
+      # browser on these machines at all." That is FALSE, verified on a runner on
+      # 2026-08-07 by downloading one: macOS chromium comes from Chrome for
+      # Testing at `cdn.playwright.dev/builds/cft/<version>/mac-arm64/…` and
+      # serves 206, as do firefox and webkit over the dbazure mirror. The 400 is
+      # real on two paths Playwright never requests on macOS — the dbazure mirror
+      # does not carry `builds/cft/*`, and the legacy
+      # `builds/chromium/<rev>/chromium-mac-arm64.zip` is unpublished past rev
+      # ~1205 — and somebody generalised one of those into a fleet fact. It then
+      # sat in agent/instructions.md telling every session not to try, which is
+      # why ISS-779 shipped two playbook-www PRs with the e2e suite unrun
+      # (ISS-780).
+      #
+      # The real reason `browse` drives the cask instead is ordinary: a cask
+      # Chrome is one install that every repo's `channel: "chrome"` resolves to,
+      # whereas Playwright's Chromium is pinned per playwright-core version, so a
+      # doctor entry for it would go stale the day any repo bumps Playwright —
+      # exactly the 1194-vs-1217 mismatch ISS-780 was filed for. Sessions that
+      # need the pinned browsers install them per repo; see agent/instructions.md.
+      #
+      # The half-extraction trap in the old comment IS real and is kept: an
+      # interrupted install leaves the version directory behind, the next run
+      # treats it as satisfied and exits 0, and the launch dies with SIGABRT on a
+      # missing `Chromium Framework` dylib. `rm -rf` the version directory first.
       Tool.new(
         name: "google-chrome",
         paths: ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],

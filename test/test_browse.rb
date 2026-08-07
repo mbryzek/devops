@@ -95,17 +95,24 @@ class TestBrowse < Minitest::Test
   end
 
   # THE ONE THAT MATTERS. A session that reaches this message must not go and try
-  # `npx playwright install`, because on this fleet that cannot work and does not
-  # say so — the CDN 400s, a half-extracted browser reads as installed, and the
-  # launch dies on a missing dylib. ISS-608 proposed exactly that reinstall as its
-  # own remedy, so the message has to close the door explicitly.
+  # `npx playwright install`: it downloads version-pinned Chromium into
+  # ~/Library/Caches/ms-playwright and never the /Applications cask this message
+  # is about, so it cannot clear `:no_chrome` however long it runs. ISS-608
+  # proposed exactly that reinstall as its own remedy, so the message has to close
+  # the door explicitly.
+  #
+  # It must close it on the RIGHT ground. This assertion used to require the
+  # string "400", from a since-disproved claim that the egress gateway blocks
+  # cdn.playwright.dev (ISS-780) — so the test actively held a false statement in
+  # place in operator-facing output. Assert the reason that is true instead.
   def test_a_machine_without_chrome_is_told_why_playwrights_chromium_is_not_the_answer
     with_machine(chrome: false) do |path:, env:|
       assert_equal :no_chrome, Browse.blocking_reason(path: path, env: env)
       message = Browse.message(reason: :no_chrome)
       assert_includes message, "brew install --cask google-chrome"
-      assert_includes message, "400"
+      assert_includes message, "ms-playwright"
       assert_includes message, "playwright install"
+      refute_includes message, "400"
     end
   end
 
