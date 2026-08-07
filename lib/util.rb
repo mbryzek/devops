@@ -385,4 +385,24 @@ module Util
     def Util.assert_sem_installed
       Util.assert_installed("sem-info", "https://github.com/mbryzek/schema-evolution-manager")
     end
+
+    # A span of seconds, compactly: 45s / 2m31s / 1h04m / 3d04h.
+    #
+    # Each tier drops the unit below it once that unit stops carrying information -- nobody
+    # reads the seconds off a three-day span. Was DeployProgress's, which is where it grew
+    # its first three tiers; `dev queries` renders sample spans with it too, and a span there
+    # is routinely days, which is what the fourth tier is for.
+    def Util.duration(seconds)
+      s = seconds.round
+      return "#{s}s" if s < 60
+
+      m, s = s.divmod(60)
+      return format("%dm%02ds", m, s) if m < 60
+
+      h, m = m.divmod(60)
+      return format("%dh%02dm", h, m) if h < 24
+
+      d, h = h.divmod(24)
+      format("%dd%02dh", d, h)
+    end
 end

@@ -376,6 +376,9 @@ class TestDeployProgress < Minitest::Test
 
   # --- durations -----------------------------------------------------------
 
+  # The formatter moved to Util once `dev queries` needed it too; the delegate stays because
+  # every stage renderer here reads `duration(elapsed)`. These assert the delegate still
+  # answers what a deploy has always printed.
   def test_duration_formatting
     assert_equal "0s", DeployProgress.duration(0)
     assert_equal "45s", DeployProgress.duration(45)

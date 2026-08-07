@@ -282,19 +282,14 @@ class DeployProgress
     @terminal_width = DEFAULT_WIDTH
   end
 
-  # 45s / 2m31s / 1h04m
+  # 45s / 2m31s / 1h04m. Lives on Util now that a second caller needs it (`dev queries`
+  # renders sample spans with it); kept here as a delegate so every stage renderer below
+  # still reads `duration(elapsed)`.
   def duration(seconds)
     self.class.duration(seconds)
   end
 
   def self.duration(seconds)
-    s = seconds.round
-    return "#{s}s" if s < 60
-
-    m, s = s.divmod(60)
-    return format("%dm%02ds", m, s) if m < 60
-
-    h, m = m.divmod(60)
-    format("%dh%02dm", h, m)
+    Util.duration(seconds)
   end
 end
