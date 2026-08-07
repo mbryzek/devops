@@ -644,6 +644,93 @@ class TestDevIssues < Minitest::Test
     refute_includes path, "categories="
   end
 
+  # ---- ISS-889: one request is a PAGE, so every read of the list pages ----
+  # The contract caps `limit` at 101 and the response is a bare array with no
+  # total, so a single call returns the newest 100 rows and cannot say there are
+  # more. Every caller goes through issues_list_all; with_stubbed_api flunks on
+  # any path it was not given, so "does not ask for a page it does not need" and
+  # "asks for the page it does" are both assertions here.
+
+  # `n` rows numbered from `range`, shaped like the list endpoint's summaries.
+  def issue_rows(range)
+    range.map do |n|
+      { "number" => format("%03d", n), "status" => "claimed", "category" => "bug", "title" => "row #{n}" }
+    end
+  end
+
+  # One stub per page, at the offsets issues_list_all will actually request.
+  def paged_issues_api(pages, **filters)
+    pages.each_with_index.to_h do |page, i|
+      ["GET #{issues_list_path(offset: i * ISSUES_PAGE_LIMIT, **filters)}", page]
+    end
+  end
+
+  def test_issues_list_path_pages_with_an_offset
+    assert_includes issues_list_path(statuses: "open"), "offset=0"
+    assert_includes issues_list_path(statuses: "open", offset: 100), "offset=100"
+  end
+
+  # A short page is the last page. Asking for another would be a wasted round trip
+  # on every small filter, which is most of them.
+  def test_issues_list_all_stops_on_a_short_page
+    issues = nil
+    with_stubbed_api(paged_issues_api([issue_rows(1..3)], statuses: "open")) do
+      issues = issues_list_all("https://example.test", statuses: "open")
+    end
+    assert_equal %w[001 002 003], issues.map { |i| i["number"] }
+  end
+
+  # The defect itself: the 101st issue. A single request could never return it.
+  def test_issues_list_all_reads_past_the_first_page
+    pages = [issue_rows(1..ISSUES_PAGE_LIMIT), issue_rows(101..137)]
+    issues = nil
+    with_stubbed_api(paged_issues_api(pages, statuses: "open")) do
+      issues = issues_list_all("https://example.test", statuses: "open")
+    end
+    assert_equal 137, issues.length
+    assert_includes issues.map { |i| i["number"] }, "137"
+  end
+
+  # A full page followed by an empty one is a tracker holding exactly a multiple
+  # of the page size — the boundary that turns a `< limit` test into an infinite
+  # loop if it is written as `page.empty?` only, or the other way around.
+  def test_issues_list_all_handles_an_exact_page_boundary
+    pages = [issue_rows(1..ISSUES_PAGE_LIMIT), []]
+    issues = nil
+    with_stubbed_api(paged_issues_api(pages, statuses: "open")) do
+      issues = issues_list_all("https://example.test", statuses: "open")
+    end
+    assert_equal ISSUES_PAGE_LIMIT, issues.length
+  end
+
+  # Offset paging over a newest-first ordering is not stable: an issue filed
+  # between two requests pushes every later row down one, so the row on the
+  # boundary comes back on both pages. Counted once, and once only.
+  def test_issues_list_all_dedupes_a_row_that_two_pages_both_return
+    pages = [issue_rows(1..ISSUES_PAGE_LIMIT), issue_rows(ISSUES_PAGE_LIMIT..104)]
+    issues = nil
+    with_stubbed_api(paged_issues_api(pages, statuses: "open")) do
+      issues = issues_list_all("https://example.test", statuses: "open")
+    end
+    assert_equal 104, issues.length
+    assert_equal issues.map { |i| i["number"] }.uniq.length, issues.length
+  end
+
+  # The runaway guard. A server that never returns a short page is a broken
+  # filter, not a big tracker — so this stops and SAYS it stopped, rather than
+  # looping forever or truncating silently all over again, which is the bug.
+  def test_issues_list_all_stops_at_the_page_ceiling_and_says_so
+    pages = (0...ISSUES_MAX_PAGES).map { |p| issue_rows(((p * ISSUES_PAGE_LIMIT) + 1)..((p + 1) * ISSUES_PAGE_LIMIT)) }
+    issues = nil
+    _, err = capture_io do
+      with_stubbed_api(paged_issues_api(pages, statuses: "open")) do
+        issues = issues_list_all("https://example.test", statuses: "open")
+      end
+    end
+    assert_equal ISSUES_MAX_PAGES * ISSUES_PAGE_LIMIT, issues.length
+    assert_match(/stopped after #{ISSUES_MAX_PAGES} pages/, err)
+  end
+
   # ---- ISS-244: the claim preview must not offer snoozed issues ----
   # A snoozed issue is still `open`, and `is_snoozed` omitted returns BOTH snoozed
   # and awake issues — so an unfiltered preview listed work that POST /claims
@@ -1635,6 +1722,27 @@ class TestDevIssues < Minitest::Test
     assert_match(/would fix ISS-034 <- acumen#173 merged/, out)
     assert_match(/1 would adopt from merged PRs\./, out)
     assert_match(/Re-run with --apply/, out)
+  end
+
+  # What the silent cap actually cost (ISS-889). In `issues list` a truncated page
+  # costs output lines; here it costs WORK. The sweep exists to rescue a claimed
+  # issue whose PR already merged, and one sitting past the first page was never
+  # read — so it stayed `claimed` forever, invisible to the very pass that would
+  # have moved it.
+  def test_reconcile_adopts_a_claimed_issue_past_the_first_page
+    filler = issue_rows(200...(200 + ISSUES_PAGE_LIMIT))   # a full page, nothing adoptable on it
+    page_two = [graph_issue.merge("claimed_at" => "2026-07-19T00:00:00Z")]
+    out, = capture_io do
+      with_merged_prs("034" => [merged_pr]) do
+        with_stubbed_api(
+          paged_issues_api([filler, page_two], statuses: "claimed")
+            .merge("GET #{issues_list_path(statuses: 'fixed')}" => [])
+        ) do
+          cmd_issues_reconcile([])
+        end
+      end
+    end
+    assert_match(/would fix ISS-034 <- acumen#173 merged/, out)
   end
 
   # ISS-127's shape: devops merges, releases nothing, and its issue would otherwise
@@ -2994,6 +3102,30 @@ class TestDevIssues < Minitest::Test
       end
     end
     assert_match(/ISS-020/, out)
+  end
+
+  # ISS-889: the listing is the whole filter, and it says how big it is. A reader
+  # filtering this output client-side could not tell a 100-issue tracker from the
+  # newest 100 of 900, because nothing in the output distinguished them.
+  def test_list_prints_every_issue_past_the_first_page_and_states_the_total
+    pages = [issue_rows(1..ISSUES_PAGE_LIMIT), issue_rows(101..137)]
+    out, = capture_io do
+      with_stubbed_api(paged_issues_api(pages, statuses: [])) do
+        cmd_issues_list([])
+      end
+    end
+    assert_match(/ISS-137/, out)                 # the row a single request could never reach
+    assert_match(/137 issues — the complete list/, out)
+  end
+
+  def test_list_counts_one_issue_in_the_singular
+    issues = [{ "number" => "010", "status" => "open", "category" => "bug", "title" => "Chart empty" }]
+    out, = capture_io do
+      with_stubbed_api("GET #{issues_list_path(statuses: [])}" => issues) do
+        cmd_issues_list([])
+      end
+    end
+    assert_match(/1 issue — the complete list/, out)
   end
 
   def test_list_rejects_an_invalid_status
