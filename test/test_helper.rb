@@ -178,7 +178,11 @@ module DevTestSupport
       @saved = Agent::Toolchain.method(:check)
       Agent::Toolchain.define_singleton_method(:check) do |tools: Agent::Toolchain::TOOLS, now: Time.now, **_opts|
         found = tools.map do |tool|
-          Agent::Toolchain::Found.new(tool: tool, path: "/stubbed/bin/#{tool.name}", version: nil)
+          # `unsupported_reason: nil` stated rather than defaulted: a healthy
+          # machine is one where nothing is absent AND nothing is present at an
+          # unusable version (ISS-781), and the stand-in should say both.
+          Agent::Toolchain::Found.new(tool: tool, path: "/stubbed/bin/#{tool.name}",
+                                      version: nil, unsupported_reason: nil)
         end
         Agent::Toolchain::Result.new(at: now, path: "/stubbed/bin", found: found)
       end

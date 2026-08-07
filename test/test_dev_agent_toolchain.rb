@@ -59,6 +59,26 @@ class TestDevAgentToolchain < Minitest::Test
                 install: "brew install #{name}", required: required)
   end
 
+  # A PATH holding one executable that answers `--version` with a string of the
+  # caller's choosing. The version-dependent half of `check` (ISS-781) cannot be
+  # exercised by `with_path`, whose stubs all report "1.0", and installing five
+  # node majors on whatever machine runs this suite is not an option.
+  def with_version(name, version_string)
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, name)
+      File.write(path, "#!/bin/sh\necho '#{version_string}'\n")
+      File.chmod(0755, path)
+      yield dir
+    end
+  end
+
+  # Carries the REAL guard rather than a stand-in, so these assertions are about
+  # the version boundary the fleet actually ships.
+  def node_tool(producers: %w[browserslist-update])
+    T::Tool.new(name: "node", required_by: "node things", producers: producers,
+                install: "brew install node@24", unsupported: T::NODE_EXTRACT_DEADLOCK)
+  end
+
   # ---- resolution ------------------------------------------------------------
 
   def test_a_binary_on_the_given_path_is_found
@@ -208,6 +228,165 @@ class TestDevAgentToolchain < Minitest::Test
       assert_equal %w[openclaw], result.missing_optional.map(&:name)
       assert_empty result.missing_required
     end
+  end
+
+  # ---- present, and the wrong version anyway (ISS-781) -----------------------
+  #
+  # The third state. Everything above this asks "is it installed"; node 26 is
+  # installed, runs, answers `--version`, and deadlocks `playwright install`
+  # while unpacking a browser — download fine, extraction wedged at 0% CPU
+  # forever. Two sessions lost about an hour each to waiting it out before anyone
+  # realised the installer was never going to return, and the doctor said
+  # `node ok` on that machine throughout. Same silence as `depsguard`, one level
+  # in: not a tool that is absent, a tool that is there and cannot do the job.
+
+  # THE MEASUREMENT, as a test. The first five were run against the real
+  # chromium archive on a runner on 2026-08-07 — same archive, same machine, same
+  # minute: v22.14.0, v24.9.0 and v25.9.0 all extract it; v26.6.0 and v26.7.0
+  # both wedge at the identical byte, so this is a Node >=26 regression and not a
+  # Playwright bug. v24.19.0 is what `brew install node@24` actually gives today
+  # and v27.0.0 is the boundary going the other way (a later major is refused
+  # until somebody measures it, which is the safe direction).
+  def test_the_node_versions_that_extract_a_browser_pass_and_the_ones_that_hang_do_not
+    { "v22.14.0" => true, "v24.9.0" => true, "v25.9.0" => true, "v24.19.0" => true,
+      "v26.6.0" => false, "v26.7.0" => false, "v27.0.0" => false }.each do |version, usable|
+      with_version("node", version) do |dir|
+        result = T.check(tools: [node_tool], path: dir)
+        assert_equal usable, result.ok?, "node #{version} should#{usable ? '' : ' not'} be usable"
+      end
+    end
+  end
+
+  # The distinction that decides where an operator looks. `node` resolves on this
+  # machine — reporting it MISSING would send someone to install a node they
+  # already have, conclude the report is broken, and stop reading it.
+  def test_an_unusable_tool_is_never_reported_as_missing
+    with_version("node", "v26.6.0") do |dir|
+      result = T.check(tools: [node_tool], path: dir)
+      refute result.ok?
+      assert_empty result.missing_required
+      assert_equal %w[node], result.unsupported.map { |f| f.tool.name }
+      assert result.found.first.present?, "an unsupported tool is still present"
+
+      refute_includes T.issue_title(result, "mac-1"), "missing"
+      body = T.issue_body(result, "mac-1")
+      refute_includes body, "is missing"
+      assert_includes body, "v26.6.0"
+      assert_includes body, "brew install node@24"
+    end
+  end
+
+  # The reason has to travel to the operator, because "wrong version" alone does
+  # not tell anyone whether they can ignore it. It names what breaks, and bounds
+  # it: node 26 runs everything else here, Playwright included once browsers are
+  # on disk (playbook-www's suite is 34 passed on 26.6.0) — only the installer
+  # hangs. A reason that overclaimed would be one an operator correctly ignores.
+  def test_the_reason_names_what_breaks_and_does_not_overclaim
+    with_version("node", "v26.6.0") do |dir|
+      reason = T.check(tools: [node_tool], path: dir).unsupported.first.unsupported_reason
+      assert_includes reason, "playwright install"
+      assert_includes reason, "ISS-781"
+      assert_includes reason, "24"
+    end
+  end
+
+  # A version this cannot read is NOT a condemnation. The rest of this module is
+  # emphatic that a tool refusing `--version` is still installed, and guessing
+  # here would file an issue about a working machine.
+  def test_a_tool_whose_version_cannot_be_read_stays_usable
+    with_path("node") do |dir| # stub answers "node 1.0", not a node version at all
+      assert T.check(tools: [node_tool], path: dir).ok?
+    end
+    assert_nil T.major("not a version")
+    assert_nil node_tool.unsupported_reason(nil)
+  end
+
+  # `versions: false` is resolution-only, so it has nothing to judge a version
+  # from. It must not therefore report the tool BROKEN — every caller passing it
+  # is testing resolution, and a false positive there would fail them all.
+  def test_resolution_only_mode_cannot_condemn_a_version
+    with_version("node", "v26.6.0") do |dir|
+      assert T.check(tools: [node_tool], path: dir, versions: false).ok?
+    end
+  end
+
+  # `browserslist-update` shells out through node; it does not care whether node
+  # is absent or wedged. Leaving unsupported tools out of this would report a
+  # producer as fine on a machine where it cannot run.
+  def test_an_unusable_tool_blocks_its_producers_exactly_as_an_absent_one_does
+    with_version("node", "v26.6.0") do |dir|
+      result = T.check(tools: [node_tool], path: dir)
+      assert_equal %w[browserslist-update], result.blocked_producers
+    end
+  end
+
+  # Node 26.6.0 and 26.7.0 are one finding, not two. Keying on the exact version
+  # would file a fresh issue on every patch bump of a node broken for the same
+  # reason, and re-filing four times while nobody has fixed it once is how a
+  # queue stops being read.
+  def test_a_patch_bump_of_a_broken_node_does_not_file_a_second_issue
+    with_version("node", "v26.6.0") do |a|
+      with_version("node", "v26.7.0") do |b|
+        first = T.check(tools: [node_tool], path: a)
+        second = T.check(tools: [node_tool], path: b)
+        assert_equal T.issue_fingerprint(first, "mac-1"), T.issue_fingerprint(second, "mac-1")
+      end
+    end
+  end
+
+  # An absent node and an unusable node are different problems with different
+  # fixes. One fingerprint across both would leave the second invisible behind
+  # the first one's non-terminal issue.
+  def test_missing_and_unusable_are_different_fingerprints
+    with_path do |absent|
+      with_version("node", "v26.6.0") do |wrong|
+        gone = T.check(tools: [node_tool], path: absent)
+        unusable = T.check(tools: [node_tool], path: wrong)
+        refute_equal T.issue_fingerprint(gone, "mac-1"), T.issue_fingerprint(unusable, "mac-1")
+      end
+    end
+  end
+
+  # What the tick logs. A summary built only from `missing_required` printed
+  # "MISSING " with nothing after it on a machine whose sole problem was a
+  # version — an operator reading that line learns nothing at all.
+  def test_the_logged_summary_names_the_unusable_version
+    with_version("node", "v26.6.0") do |dir|
+      summary = T.check(tools: [node_tool], path: dir).summary
+      assert_includes summary, "node"
+      assert_includes summary, "v26.6.0"
+      refute_includes summary, "MISSING"
+    end
+    with_path("node") do |dir|
+      assert_equal "all required tools present", T.check(tools: [node_tool], path: dir).summary
+    end
+  end
+
+  def test_the_marker_records_an_unusable_tool
+    with_agent_home do
+      with_version("node", "v26.6.0") do |dir|
+        T.record(T.check(tools: [node_tool], path: dir))
+        assert_equal %w[node], T.state["unsupported"]
+        assert_equal [], T.state["missing"]
+      end
+    end
+  end
+
+  # THE FLEET ENTRY, not a stand-in. Plain `brew install node` is what put a
+  # Current release on these runners, and Current is the broken one — so the
+  # shipped install command has to name the LTS, and the shipped node entry has
+  # to carry the guard at all.
+  def test_the_fleets_node_is_pinned_to_the_lts_and_guarded
+    node = T::TOOLS.find { |t| t.name == "node" }
+    assert_equal T::NODE_EXTRACT_DEADLOCK, node.unsupported, "node ships without the version guard"
+    assert_includes node.install, "node@24"
+    refute_match(/brew install node(\s|$)/, node.install,
+                 "installs Current, which is the version that deadlocks")
+    assert_includes node.install, "link", "node@24 is keg-only; without a link it never reaches the login PATH"
+
+    # npx deliberately carries no guard: `npx --version` prints NPM's version, so
+    # the node check would be reading the wrong number off it.
+    assert_nil T::TOOLS.find { |t| t.name == "npx" }.unsupported
   end
 
   # ---- what the operator and the issue are told ------------------------------

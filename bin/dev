@@ -12468,8 +12468,12 @@ end
 # cannot run records `check_failed` and a `check_failed` is deliberately
 # indistinguishable from a clean run. Provisioning gets a command it can fail on.
 #
-# The exit code is the contract: 0 every required tool resolves, 1 something
-# does not. Optional tools are reported and never affect it.
+# The exit code is the contract: 0 every required tool resolves AND is usable at
+# the version it reports, 1 otherwise. Optional tools are reported and never
+# affect it. "Usable" is the ISS-781 half — a resolved tool can still be the
+# wrong version (node 26 deadlocks `playwright install`), and provisioning needs
+# to fail on that too or the machine looks healthy while no frontend session on
+# it can obtain a browser.
 def cmd_agent_doctor(args)
   reject_unknown_args("agent doctor", args)
 
@@ -12480,11 +12484,16 @@ def cmd_agent_doctor(args)
 
   width = result.found.map { |f| f.tool.name.length }.max
   result.found.each do |f|
-    status = if f.present? then "ok  "
+    # `BAD ` before `ok  `: an unsupported tool IS present, so an ordering that
+    # asked `present?` first would print it healthy (ISS-781).
+    status = if f.unsupported? then "BAD "
+             elsif f.present? then "ok  "
              elsif f.tool.optional? then "--  "
              else "MISS"
              end
-    detail = if f.present?
+    detail = if f.unsupported?
+               "#{f.version} — #{f.unsupported_reason}"
+             elsif f.present?
                f.version || f.path
              elsif f.tool.absolute?
                # Chrome is not a PATH binary, so "not on the agent's PATH" would
@@ -12498,6 +12507,7 @@ def cmd_agent_doctor(args)
   end
 
   missing = result.missing_required
+  unsupported = result.unsupported
   optional = result.missing_optional
   unless optional.empty?
     puts
@@ -12515,15 +12525,29 @@ def cmd_agent_doctor(args)
       puts "  install: #{tool.install}"
       puts "  blocks producer(s): #{tool.producers.join(', ')}" unless tool.producers.empty?
     end
-    blocked = result.blocked_producers
-    unless blocked.empty?
-      puts
-      puts "Producer(s) that cannot run on this machine: #{blocked.join(', ')}"
-      puts "They record `check_failed`, file nothing, and look exactly like a quiet week."
+  end
+
+  # Its own block, and it says "installed" out loud. The operator is looking at a
+  # machine where `node --version` answers perfectly well, so a report that filed
+  # this under MISSING reads as a broken report and gets ignored (ISS-781).
+  unless unsupported.empty?
+    puts
+    unsupported.each do |f|
+      puts "UNSUPPORTED #{f.tool.name} #{f.version} — installed at #{f.path}, and unusable here"
+      puts "  #{f.unsupported_reason}"
+      puts "  install: #{f.tool.install}"
+      puts "  blocks producer(s): #{f.tool.producers.join(', ')}" unless f.tool.producers.empty?
     end
   end
 
-  if missing.empty? && claude_config.ok?
+  blocked = result.blocked_producers
+  unless blocked.empty?
+    puts
+    puts "Producer(s) that cannot run on this machine: #{blocked.join(', ')}"
+    puts "They record `check_failed`, file nothing, and look exactly like a quiet week."
+  end
+
+  if result.ok? && claude_config.ok?
     puts
     puts "All #{result.found.count { |f| f.tool.required? }} required tool(s) present, " \
          "and #{Agent::ClaudeConfig.link} resolves."
