@@ -157,9 +157,48 @@ module Agent
     # different tool on every machine and it is silent on all of them. Orphaned
     # node deps left behind are harmless and a later deliberate `brew autoremove`
     # collects them; silently unlinking a VPN client is not.
+    # THE OPT LINK IS PUT BACK BY HAND, AND IT IS NOT TIDINESS EITHER (ISS-897).
+    #
+    # `--ignore-dependencies` above is what lets the uninstall run at all, and it
+    # does precisely what it says: other formulae DO depend on `node`
+    # (`brew uses --installed node` answers `mongosh` on a Mac here), and brew
+    # removes the keg and leaves them in place believing they still have a node.
+    # They do not. A formula built against `node` is shebanged at the ABSOLUTE
+    # opt path,
+    #
+    #   $ head -1 .../mongosh/2.8.3/libexec/.../bin/mongosh.js
+    #   #!/opt/homebrew/opt/node/bin/node
+    #
+    # and `brew uninstall node` deletes <prefix>/opt/node along with the keg. So
+    # running this line on a Mac on 2026-08-07 left every mongosh invocation
+    # answering `bad interpreter: /opt/homebrew/opt/node/bin/node: no such file
+    # or directory`, and `dev agent doctor` called that machine all-green,
+    # because mongosh is not one of the tools it checks. Which formulae break is
+    # whatever `brew uses --installed node` returns on that box, so it is a
+    # different tool on every machine and silent on all of them — the same shape
+    # as ISS-852 directly above, one dependency edge further out.
+    #
+    # It points at the opt NAME `node@24`, not at a Cellar path, so brew's own
+    # <prefix>/opt/node@24 stays the single place the keg version is written down
+    # and this link survives every node@24 patch bump untouched.
+    #
+    # It only ever FILLS A HOLE. `[ -e ]` follows the symlink, so an absent
+    # opt/node and a dangling one both qualify while a live one — an uninstall
+    # that failed, or a `node` formula somebody wants — is left exactly alone;
+    # repointing that would leave brew's own view of an installed formula lying.
+    # And brew's `Keg#optlink` unlinks whatever is there before relinking, so if
+    # the `node` formula is ever installed again this disappears, which is right.
+    #
+    # REINSTALLING THE DEPENDENTS was the other way to fix it and is worse:
+    # `brew reinstall mongosh` pulls the `node` formula back in as a dependency,
+    # `node` is Current, and Current is the release NODE_EXTRACT_DEADLOCK exists
+    # to keep off this fleet. The remediation would reintroduce what it remediates.
+    NODE_OPT_RELINK =
+      '[ -e "$(brew --prefix)/opt/node" ] || ln -sfn node@24 "$(brew --prefix)/opt/node"'
+
     NODE_INSTALL =
       "brew install node@24 && HOMEBREW_NO_AUTOREMOVE=1 brew uninstall --ignore-dependencies node " \
-      "; brew link --overwrite --force node@24"
+      "; brew link --overwrite --force node@24 ; #{NODE_OPT_RELINK}"
 
     # Everything the dispatcher, its producers and its claimed sessions shell out
     # to. Homebrew throughout, deliberately: /opt/homebrew/bin is on the login
