@@ -94,6 +94,14 @@ module Agent
     # comment is what a human reads anyway.
     DEPENDENCY_DEFER_MARKER = "Blocked on a dependency that has not merged".freeze
 
+    # What `self_runner` answers when the fleet read FAILED, as distinct from the
+    # nil it answers when the read succeeded and this machine was simply not in
+    # the list. A sentinel rather than nil because the two demand opposite
+    # responses: not-in-the-list is an unregistered runner, whose claim 422s into
+    # `handle_claim_error` and re-registers itself; could-not-read is a machine
+    # whose `paused` flag we cannot see, and pausing is a safety control.
+    FLEET_UNREADABLE = :fleet_unreadable
+
     attr_reader :decisions
 
     def initialize(use_localhost:, claude_argv:, dry_run: false, now: Time.now, verbose: false)
@@ -606,8 +614,8 @@ module Agent
       runners = Agent::Api.runners(token: identity.token, use_localhost: @use_localhost)
       runners.find { |r| r["id"] == identity.runner_id }
     rescue ApiError => e
-      log("could not read the fleet (#{e.message}) — assuming this runner is unchanged")
-      nil
+      log("could not read the fleet (#{e.message}) — claiming nothing this tick")
+      FLEET_UNREADABLE
     end
 
     # ---- reap ----
@@ -828,6 +836,21 @@ module Agent
     # ---- claim ----
 
     def claim(identity, runner)
+      # `paused` is the ONLY control an operator has to stop one machine from
+      # taking new work — the thing you reach for at 3am on the runner producing
+      # bad PRs. So the one state it must never be confused with is "we could not
+      # find out". This used to rescue the fleet read to nil and fall straight
+      # through `runner && runner["paused"]`, which is falsy for nil: a runner
+      # paused thirty seconds ago claimed and spawned anyway the moment
+      # GET /agent/runners had a blip, because the lease POST is a different
+      # endpoint and stays up independently of it.
+      #
+      # Unknown fails CLOSED, and costs nothing when it is wrong: the next tick is
+      # 30 seconds away and the queue keeps.
+      if runner == FLEET_UNREADABLE
+        log("fleet state unknown — claiming nothing")
+        return
+      end
       if runner && runner["paused"]
         log("runner is paused — claiming nothing")
         return

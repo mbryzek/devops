@@ -369,6 +369,23 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # Pausing is the only control that stops ONE machine from taking new work, so
+  # the state it must never be confused with is "we could not find out". The
+  # fleet read is a different endpoint from the lease POST and fails
+  # independently of it: this used to rescue to nil, fall through the `runner &&`
+  # guard, and claim on a runner that had been paused thirty seconds earlier.
+  def test_an_unreadable_fleet_claims_nothing_rather_than_assuming_unpaused
+    with_agent_home do
+      register_identity
+      responses = fleet_responses.merge(
+        "GET /agent/runners" => ->(_body) { raise ApiError, "503 Service Unavailable" },
+      )
+      out = with_stubbed_api(responses) { capture_stdout { tick.run } }
+      assert_match(/fleet state unknown/, out)
+      refute_match(/would POST \/playbook\/issue\/leases/, out)
+    end
+  end
+
   # ---- the job census (ISS-454) ----
   #
   # The platform knows what it LEASED; only this side knows whether the process working that lease
