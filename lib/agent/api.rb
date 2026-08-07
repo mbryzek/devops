@@ -167,9 +167,9 @@ module Agent
       request(:get, "/agent/producers", token: token, use_localhost: use_localhost) || []
     end
 
-    def producer_runs(token:, use_localhost:, producer_key: nil, limit: 100, offset: 0)
+    def producer_runs(token:, use_localhost:, producer_id: nil, limit: 100, offset: 0)
       params = { "limit" => limit, "offset" => offset }
-      params["producer_key"] = producer_key if producer_key
+      params["producer_id"] = producer_id if producer_id
       request(:get, "/agent/producers/runs?#{URI.encode_www_form(params)}",
               token: token, use_localhost: use_localhost) || []
     end
