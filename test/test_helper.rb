@@ -27,6 +27,10 @@ module DevTestSupport
   # so a test that WANTS to prove a command cannot escape can assert on it.
   class NetworkBlocked < StandardError; end
 
+  # Raised when a test reads the REAL apps registry instead of naming a fleet.
+  # See RegistryGuard.
+  class RegistryBlocked < StandardError; end
+
   # The test process is credential-bearing by construction: this box holds a
   # human session, and inside a Claude session `dev` presents the AI's API token
   # (ApiClient.auth_header_for). So a test that calls a `cmd_*` function is one
@@ -224,6 +228,50 @@ module DevTestSupport
     end
   end
 
+  # The same reasoning once more, for the apps registry every deploy path
+  # resolves a deployable through (Work::Registry, ISS-795).
+  #
+  # This one is leaked state as well as machine state, because `cached_registry`
+  # memoizes it in a GLOBAL (`$cached_registry ||= Work::Registry.load`). So it
+  # crosses test boundaries in both directions: a test that loads the registry
+  # hands its fleet to every later test in the process, and a test that stubs
+  # `Work::Registry.load` has NO effect at all once an earlier one has already
+  # filled the global. Left real, `load` shells out to `pkl eval` once per app
+  # under ~/code/env/apps, so the fleet a test asserts on is whatever this
+  # machine happens to have checked out — and how long that takes depends on what
+  # else is running on the box, which is why the failure it produced showed up
+  # only under load.
+  #
+  # A raise rather than a benign stand-in, unlike MaintenanceGuard: a test that
+  # reaches the registry is not one that incidentally touched the machine, it is
+  # one whose subject IS the fleet, and there is no honest default fleet to hand
+  # it. A test that needs one names it (`DeployRegistryFake#with_registry`, or
+  # `DeployReleaseStubs#stub_release_seams` for the release path).
+  #
+  # Resetting the global is the half that cannot be opted out of: install and
+  # uninstall both clear it, so no memoized registry survives a test either way.
+  module RegistryGuard
+    def self.install
+      $cached_registry = nil
+      return unless defined?(Work::Registry)
+      @saved = Work::Registry.method(:load)
+      Work::Registry.define_singleton_method(:load) do |**_opts|
+        raise DevTestSupport::RegistryBlocked,
+              "test read the REAL apps registry: Work::Registry.load shells out to `pkl eval` over " \
+              "~/code/env/apps, so the fleet it returns is whatever this machine has checked out - " \
+              "name a fleet instead (include DeployRegistryFake and use with_registry, or " \
+              "DeployReleaseStubs#stub_release_seams)"
+      end
+    end
+
+    def self.uninstall
+      $cached_registry = nil
+      return unless defined?(Work::Registry) && @saved
+      Work::Registry.define_singleton_method(:load, @saved)
+      @saved = nil
+    end
+  end
+
   # Wraps every test in every class that loads this helper. `before_setup` /
   # `after_teardown` rather than `setup` / `teardown` so a test class defining
   # its own setup cannot silently drop the guard.
@@ -235,11 +283,13 @@ module DevTestSupport
       DevTestSupport::MaintenanceGuard.install
       DevTestSupport::ToolchainGuard.install
       DevTestSupport::CredentialsGuard.install
+      DevTestSupport::RegistryGuard.install
     end
 
     def after_teardown
       DevTestSupport.restore_stubbed_globals(@dev_test_stubbed_globals)
       @dev_test_stubbed_globals = nil
+      DevTestSupport::RegistryGuard.uninstall
       DevTestSupport::CredentialsGuard.uninstall
       DevTestSupport::ToolchainGuard.uninstall
       DevTestSupport::MaintenanceGuard.uninstall
@@ -247,6 +297,20 @@ module DevTestSupport
       DevTestSupport::NetworkGuard.uninstall
       super
     end
+  end
+
+  # Name the fleet the commands under test resolve deployables against, for the
+  # rest of the test. This is how a test opts out of RegistryGuard's raise: the
+  # guard saved the real `load` before installing, so it restores that afterwards
+  # however many times a test replaces it. Clearing the memo is the other half —
+  # `cached_registry` would otherwise keep handing back a fleet named earlier.
+  #
+  # Block-scoped instead when the fleet is the subject rather than the setting:
+  # DeployRegistryFake#with_registry.
+  def registry_fleet(registry)
+    Work::Registry.define_singleton_method(:load) { |**_opts| registry }
+    $cached_registry = nil
+    registry
   end
 
   # Run a block on a box that IS logged in — the normal state of every machine and

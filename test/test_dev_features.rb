@@ -16,6 +16,15 @@ class TestDevFeatures < Minitest::Test
 
   RECORDED_AT = "2026-07-01T12:00:00Z".freeze
 
+  # `features reconcile` loads the apps registry itself, and left real that is
+  # `pkl eval` over ~/code/env/apps (RegistryGuard, ISS-795). An EMPTY fleet is
+  # the honest stand-in here rather than an under-specified one: the removals
+  # these tests feed it name no apps, so the registry is carried through to a
+  # version probe that is never reached.
+  def setup
+    registry_fleet(Struct.new(:deploy_tracked).new([]))
+  end
+
   def pair(app: "platform", baseline: "1.0.0")
     { "app" => app, "baseline_version" => baseline }
   end
