@@ -124,13 +124,27 @@ module DevTestSupport
     def self.install
       return unless defined?(Agent::Maintenance)
       @saved = { :run_shell => Agent::Maintenance.method(:run_shell),
-                 :run_gc => Agent::Maintenance.method(:run_gc) }
+                 :run_gc => Agent::Maintenance.method(:run_gc),
+                 :run_processes => Agent::Maintenance.method(:run_processes) }
       Agent::Maintenance.define_singleton_method(:run_shell) do |source, _trigger|
         Agent::Maintenance::Outcome.new(source: source, label: source.tr("_", " "), ok: true, message: STUBBED)
       end
       Agent::Maintenance.define_singleton_method(:run_gc) do |_now, _trigger|
         Agent::Maintenance::Outcome.new(source: Agent::Maintenance::GC_SOURCE, label: "agent gc",
                                         ok: true, message: STUBBED)
+      end
+      # The third chore SIGKILLs, so leaving it real is worse than leaving the
+      # other two real — those delete files under a tmpdir the test already
+      # overrode, while this one reads the WHOLE MACHINE and cannot be scoped by
+      # any DEV_AGENT_* env var. Unstubbed it does exactly that: running this
+      # suite while writing ISS-782 reaped twenty real orphaned processes off the
+      # box, correctly by its own predicate and entirely without being asked.
+      # A developer running `rake` must never have their machine's processes
+      # killed as a side effect, and the blast radius of a predicate bug found
+      # this way is every session on the runner.
+      Agent::Maintenance.define_singleton_method(:run_processes) do
+        Agent::Maintenance::Outcome.new(source: Agent::Maintenance::PROCESSES_SOURCE,
+                                        label: "process reap", ok: true, message: STUBBED)
       end
     end
 

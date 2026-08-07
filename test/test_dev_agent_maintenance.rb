@@ -222,6 +222,59 @@ class TestDevAgentMaintenance < Minitest::Test
     end
   end
 
+  # ---- the process reap (ISS-782) --------------------------------------------
+  #
+  # The hourly pass is the only thing on a runner that reclaims CPU. Nothing else
+  # would ever notice a leak: `reap` only looks at jobs whose leader is already
+  # dead and signals nothing, so a session that exits normally leaves everything
+  # its Bash tool calls started running, with no job record left pointing at it.
+
+  def test_a_leak_is_reaped_and_reported_with_what_it_was_holding
+    with_agent_home do
+      killed = []
+      stub_singleton(Agent::Processes, :leaked, lambda { |*_args|
+        [[Agent::Processes::Entry.new(pid: 32_683, ppid: 1, pgid: 32_496, command: "zsh",
+                                      elapsed_seconds: 48_000.0, cpu_seconds: 21_600.0),
+          Agent::Processes::Entry.new(pid: 32_684, ppid: 1, pgid: 32_496, command: "zsh",
+                                      elapsed_seconds: 48_000.0, cpu_seconds: 21_600.0)]]
+      }) do
+        stub_singleton(Agent::Processes, :terminate, ->(pids, **_o) { killed.concat(pids) }) do
+          outcome = DevTestSupport::MaintenanceGuard.real(:run_processes).call
+          assert outcome.ok
+          assert_equal [32_683, 32_684], killed
+          assert_match(/reaped 2 process\(es\) in 1 abandoned session group\(s\)/, outcome.message)
+          assert_match(/12\.0 CPU-hour/, outcome.message)
+        end
+      end
+    end
+  end
+
+  def test_a_clean_machine_reaps_nothing_and_says_so
+    with_agent_home do
+      stub_singleton(Agent::Processes, :leaked, ->(*_args) { [] }) do
+        stub_singleton(Agent::Processes, :terminate, ->(*_a, **_o) { flunk("must not signal anything") }) do
+          outcome = DevTestSupport::MaintenanceGuard.real(:run_processes).call
+          assert outcome.ok
+          assert_match(/no leaked session processes/, outcome.message)
+        end
+      end
+    end
+  end
+
+  # A `ps` that will not answer must be one failed chore, never the exception
+  # that takes the whole pass — and with it this machine's log collection and its
+  # disk pruning — down with it.
+  def test_a_broken_ps_is_one_failed_chore
+    with_agent_home do
+      stub_singleton(Agent::Processes, :leaked, ->(*_args) { raise "ps: command not found" }) do
+        outcome = DevTestSupport::MaintenanceGuard.real(:run_processes).call
+        refute outcome.ok
+        assert_equal Agent::Maintenance::PROCESSES_SOURCE, outcome.source
+        assert_match(/ps: command not found/, outcome.message)
+      end
+    end
+  end
+
   def test_one_broken_chore_does_not_stop_the_others
     with_agent_home do
       stub_singleton(Agent::Maintenance, :run_shell, lambda { |source, _trigger|
@@ -236,9 +289,15 @@ class TestDevAgentMaintenance < Minitest::Test
 
       recording_shell(ok: false) do |_ran|
         result = Agent::Maintenance.run(trigger: :cadence)
-        assert_equal 1 + Agent::Maintenance::SHELL_SOURCES.length, result.outcomes.length
+        # Every chore reports, named, whatever the others did — which is what
+        # lets Agent::Errors count a streak per chore rather than per pass.
+        assert_equal [Agent::Maintenance::GC_SOURCE, Agent::Maintenance::PROCESSES_SOURCE,
+                      *Agent::Maintenance::SHELL_SOURCES].sort,
+                     result.outcomes.map(&:source).sort
         assert result.outcomes.find { |o| o.source == Agent::Maintenance::GC_SOURCE }.ok,
                "a failing shell chore must not stop the in-process collection"
+        assert result.outcomes.find { |o| o.source == Agent::Maintenance::PROCESSES_SOURCE }.ok,
+               "a failing shell chore must not stop the process reap"
       end
     end
   end
