@@ -74,6 +74,16 @@ module Agent
     # failure and records nothing.
     CLAUDE_CONFIG_ERROR_SOURCE = "claude_config".freeze
 
+    # Agent::Errors source name for a claim that raised after its lease was
+    # granted, and for a work phase that died on something other than the two
+    # platform errors. Separate sources because they are separate blast radii —
+    # a crashing claim costs one issue's dispatch, a crashing phase costs the
+    # reap and every claim behind it — and the streak that escalates is derived
+    # per source.
+    CLAIM_ERROR_SOURCE = "claim".freeze
+
+    WORK_PHASE_ERROR_SOURCE = "work_phase".freeze
+
     # File an issue the moment consecutive failures for ANY source CROSS this
     # threshold, not on every tick once past it — see `record_failure`.
     #
@@ -495,6 +505,40 @@ module Agent
       claim(identity, self_runner(identity))
     rescue SessionExpired, ApiError => e
       log("work phase: platform error (#{e.message})")
+    rescue StandardError => e
+      # The backstop (ISS-743). Anything the phase raises that is NOT one of the
+      # two platform errors used to travel out of `Tick#run`, past `handle_errors`
+      # — which catches only those same two — and kill the process, leaving a
+      # backtrace on launchd's stderr as the sole evidence. Phase A has already
+      # run by then, so the vitals are fine and nothing looks wrong anywhere a
+      # human is looking.
+      #
+      # A crashing CLAIM is handled closer in, where the lease is in scope
+      # (`abandon_crashed_claim`); this catches the rest of the phase — reap,
+      # maintenance, the toolchain check — and it records rather than logs so
+      # that three in a row files an issue.
+      record_work_phase_crash(e)
+    end
+
+    def record_work_phase_crash(error)
+      decide("work_phase", "work phase CRASHED (#{error.class}: #{error.message}) — vitals are unaffected, " \
+                           "and the next tick retries in 30 seconds")
+      record_failure(
+        WORK_PHASE_ERROR_SOURCE, "#{error.class}: #{error.message}",
+        title: ->(host) { "dev-agent: the work phase is crashing on #{host}" },
+        explain: "Phase B raised something that is neither `ApiError` nor `SessionExpired`, which before " \
+                 "ISS-743 killed the tick outright. It is now contained, but a source that keeps crashing " \
+                 "means this machine is doing NO work — no reap, no claim, no maintenance — while its " \
+                 "heartbeat stays green, because Phase A runs first and is unaffected.\n\n" \
+                 "Backtrace head:\n\n```\n#{Array(error.backtrace).first(5).join("\n")}\n```",
+      )
+    rescue StandardError => e
+      # An exception raised inside a rescue clause PROPAGATES, so a recorder that
+      # can itself fail — Agent::Errors writes a file, and the disk this all
+      # exists to defend can be full — would reintroduce the exact crash above it
+      # is here to contain. A log line is what is left, and it is still strictly
+      # more than the tick had before.
+      log("work phase: crashed (#{error.class}: #{error.message}) and the crash could not be recorded (#{e.message})")
     end
 
     # ---- maintenance (ISS-520) ----
@@ -938,8 +982,60 @@ module Agent
         # ordinary idle case, and the ONLY quiet one. The 422 above is not
         # emptiness and never reaches here.
         break if lease.nil?
-        start_job(lease, identity)
+        # A lease is GRANTED at this point, so nothing below may be allowed to
+        # leave the method by raising: an exception here used to travel out of
+        # phase_b and out of the tick, leaving the issue `claimed` with no
+        # session behind it until the lease expired (ISS-743). Stop claiming
+        # after one — whatever broke is very unlikely to be issue-specific, and
+        # a loop that keeps claiming would burn the queue one lease at a time.
+        begin
+          start_job(lease, identity)
+        rescue StandardError => e
+          abandon_crashed_claim(lease, identity, e)
+          break
+        end
         live += 1
+      end
+    end
+
+    # THE thing that must not happen: a claim that dies with the lease already
+    # taken (ISS-743). The reachable case is `lease["branch"]` — a value the
+    # PLATFORM supplies — reaching Agent::Workspace, which raises a plain
+    # RuntimeError on anything it could not itself have minted; `start_job`
+    # screens that one now, and this is the backstop for every failure nobody
+    # has thought of, including the two API errors it is worth releasing for.
+    #
+    # RELEASE ONLY IF NOTHING IS RUNNING. `start_job` spawns the session BEFORE
+    # it writes the claim comment, so a failure in that last call has a live
+    # child holding the lease legitimately — releasing it there would expire a
+    # session that is working, which is the "machine competes with itself"
+    # failure this file's header exists to prevent. The job record is the
+    # authority on that, because it is written in the same breath as the spawn.
+    #
+    # Durably recorded rather than logged, so three of these in a row file an
+    # issue instead of scrolling past on launchd's stderr — which was the whole
+    # evidence trail the crash used to leave.
+    def abandon_crashed_claim(lease, identity, error)
+      number = lease["issue_number"]
+      running = Agent::Jobs.all.any? { |r| r["lease_id"] == lease["id"] }
+      decide("claim", "ISS-#{number} claim FAILED (#{error.class}: #{error.message}) — " \
+                      "#{running ? 'a session is already running under this lease, so it stays held' : 'releasing the lease'}")
+      record_failure(
+        CLAIM_ERROR_SOURCE, "ISS-#{number}: #{error.class}: #{error.message}",
+        title: ->(host) { "dev-agent: claims are crashing on #{host}" },
+        explain: "`Tick#start_job` raised after the lease was granted. The lease was released (unless a " \
+                 "session had already started under it), so the issue returns to the queue rather than " \
+                 "sitting `claimed` with nothing running until the lease expires.\n\n" \
+                 "Backtrace head:\n\n```\n#{Array(error.backtrace).first(5).join("\n")}\n```",
+      )
+      return if running || @dry_run
+
+      begin
+        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
+      rescue SessionExpired, ApiError => e
+        # Nothing left to try, and it is not worth losing the record above: an
+        # unreleased lease expires on its own and the issue returns to `open`.
+        log("claim: could not release lease #{lease['id']} (#{e.message}) — it expires on its own")
       end
     end
 
@@ -997,9 +1093,9 @@ module Agent
       # second one (§4.4.1). A recorded branch whose PR is closed falls through
       # to a fresh branch — pushing to a branch nobody is reviewing is worse than
       # starting over.
-      resume_branch = lease["branch"]
-      slug = resume_branch && !resume_branch.empty? ? resume_branch : Agent::Workspace.slug(number)
-      resume_repo = resume_branch && !resume_branch.empty? ? Agent::Workspace.resume(slug, resume_branch) : nil
+      resume_branch = usable_resume_branch(lease["branch"])
+      slug = resume_branch || Agent::Workspace.slug(number)
+      resume_repo = resume_branch ? Agent::Workspace.resume(slug, resume_branch) : nil
       slug = Agent::Workspace.slug(number) if resume_branch && resume_repo.nil?
       workspace = Agent::Workspace.create(slug)
       # The repos the issue names, cloned with the branch already created, so the
@@ -1027,6 +1123,29 @@ module Agent
       Agent::Api.comment(number, claim_comment(identity, slug, playbook), use_localhost: @use_localhost)
       decide("claim", "ISS-#{number} claimed → #{workspace} (branch #{slug}, pid #{pid})" \
                       "#{playbook ? " playbook #{playbook.label}" : ''}")
+    end
+
+    # The recorded branch, screened before it is handed to Agent::Workspace —
+    # or nil, meaning "no resume, start a fresh attempt on a fresh slug".
+    #
+    # `lease["branch"]` is a value the PLATFORM supplies, and Agent::Workspace
+    # deliberately REFUSES anything it could not itself have minted, because the
+    # unchecked path mkdir_p's — and later rm_rf's — a caller-controlled path
+    # under ~/code/ai. That guard is right; what was missing was any answer on
+    # this side to it firing (ISS-743). Letting it raise cost the whole tick,
+    # with the lease already granted, every ten minutes until the lease expired.
+    #
+    # Falling back to a fresh slug is the same thing already done for a recorded
+    # branch whose PR is closed: the worst case is a second PR on an issue,
+    # which the close-out contract handles (`dev issues fix`), against a runner
+    # that dispatches nothing at all.
+    def usable_resume_branch(branch)
+      return nil if branch.to_s.empty?
+      return branch if Agent::Workspace.valid_slug?(branch)
+
+      decide("claim", "recorded branch #{branch.inspect} is not a slug this executor could have minted — " \
+                      "ignoring it and starting a fresh attempt")
+      nil
     end
 
     # The first timeline comment, and the audit trail ISS-505 turns on: WHICH
@@ -1127,6 +1246,13 @@ module Agent
     # clear it is a human. Deferring it forever would be the silent-aging outcome
     # the whole close-out contract exists to prevent: a snoozed issue is out of the
     # queue AND out of the daily nudge, so nothing would ever say it was stuck.
+    #
+    # `undeferrable` also says the lease is ALREADY RELEASED: that path reaches
+    # here from inside `defer_for_dependency`, after its own release and a snooze
+    # that did not take. A second DELETE on a closed lease answers 404/409, which
+    # is an ApiError, which unwound the rest of the claim loop — the status write
+    # had already landed, so the issue was fine and only the tick's account of
+    # what it did was wrong.
     def escalate_stalled_dependency(lease, identity, number, reasons, attempt, undeferrable: false)
       why = undeferrable ? "this runner could not record the deferral" : "#{attempt} daily checks have not cleared it"
       text = "Waiting on a dependency that has not merged, and #{why}.\n\n" \
@@ -1137,7 +1263,7 @@ module Agent
       push("dependency_stalled", "dev-agent: ISS-#{number} is still waiting on an unmerged dependency (#{reasons.first})")
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
-        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
+        Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost) unless undeferrable
       end
       decide("claim", "ISS-#{number}: #{reasons.join('; ')} — no session started, moved to needs_input")
     end

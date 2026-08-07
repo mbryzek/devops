@@ -1034,8 +1034,9 @@ class TestDevAgentTick < Minitest::Test
   # flunks on an unstubbed request, so an issue with no blockers reaching for a
   # blocker or for GitHub would fail every claim test in this file.
   def claim_one(body:, number: 707, errors: [], playbooks: nil, links: nil, blocker_issues: {}, prs: {},
-                comments: [])
-    seen = { comments: [], statuses: [], released: [], snoozed: [], calls: [], prompt: nil, spawned: false }
+                comments: [], branch: nil, extra_stubs: nil, max_concurrency: 1)
+    seen = { comments: [], statuses: [], released: [], snoozed: [], calls: [], prompt: nil, spawned: false,
+             claims: 0 }
     with_agent_home do
       register_identity
       Agent::Errors.write(errors) unless errors.empty?
@@ -1044,7 +1045,12 @@ class TestDevAgentTick < Minitest::Test
                   "body" => body }
         issue["links"] = links if links
         stubs = {
-          "POST /playbook/issue/leases" => { "lease" => { "id" => "lse-1", "issue_number" => number } },
+          "POST /playbook/issue/leases" => lambda { |_b|
+            seen[:claims] += 1
+            lease = { "id" => "lse-1", "issue_number" => number }
+            lease["branch"] = branch if branch
+            { "lease" => lease }
+          },
           "GET /playbook/issues/#{number}" => issue,
           "GET /playbook/issues/#{number}/comments?limit=101&offset=0" => comments,
           "POST /playbook/issues/#{number}/comments" => ->(b) { seen[:comments] << b[:body]; {} },
@@ -1057,6 +1063,7 @@ class TestDevAgentTick < Minitest::Test
           },
         }
         blocker_issues.each { |n, row| stubs["GET /playbook/issues/#{n}"] = row }
+        stubs.merge!(extra_stubs.call(seen)) if extra_stubs.respond_to?(:call)
         # The playbook store, as this claim will see it. nil for a key means the
         # platform has never heard of it — a 404, which Agent::Api turns into nil.
         (playbooks || { PLAYBOOK_KEY => { "key" => PLAYBOOK_KEY, "body" => PLAYBOOK_BODY,
@@ -1076,8 +1083,12 @@ class TestDevAgentTick < Minitest::Test
           stub_singleton(Agent::Jobs, :spawn_session, spawn) do
             with_stubbed_api(stubs) do
               seen[:out] = capture_stdout do
-                tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: 1))
+                tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: max_concurrency))
               end
+              # Read INSIDE with_agent_home: the state dir is a tmpdir that is
+              # gone, and DEV_AGENT_STATE_DIR restored, by the time `seen` is
+              # returned.
+              seen[:errors] = Agent::Errors.list
             end
           end
         end
@@ -1258,6 +1269,125 @@ class TestDevAgentTick < Minitest::Test
     assert_equal ["needs_input"], seen[:statuses].map { |s| s[:status] }
     assert_includes seen[:statuses].first[:comment], BLOCKER_PR
     assert_equal ["lse-1"], seen[:released]
+  end
+
+  # The undeferrable path arrives at the escalation with the lease ALREADY
+  # released by `defer_for_dependency`. A second DELETE answers 404/409, which is
+  # an ApiError, and it unwound the rest of the claim loop — the status write had
+  # already landed, so the issue was fine and only the tick's account of what it
+  # did was wrong (ISS-743).
+  def test_a_deferral_that_will_not_record_escalates_and_releases_the_lease_exactly_once
+    undeferrable = ->(_seen) { { "PUT /playbook/issues/707/snooze" => ->(_b) { { "number" => 707 } } } }
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"), extra_stubs: undeferrable)
+    refute seen[:spawned]
+    assert_equal ["needs_input"], seen[:statuses].map { |s| s[:status] },
+                 "a deferral that cannot be recorded escalates — leaving it open and undeferred spins"
+    assert_includes seen[:statuses].first[:comment], "could not record the deferral"
+    assert_equal ["lse-1"], seen[:released], "the lease is released once, by defer_for_dependency"
+    assert_equal 1, seen[:calls].count(:release)
+  end
+
+  # ---- a claim that raises must not take the tick with it (ISS-743) ----
+  #
+  # `start_job` runs with the lease ALREADY GRANTED. Anything it raises that is
+  # not one of the two platform errors used to travel out of phase_b, out of
+  # Tick#run and past `handle_errors` — killing the process and leaving the issue
+  # `claimed` with no session until the lease expired, roughly every ten minutes,
+  # with a launchd stderr backtrace as the only evidence.
+
+  # The REACHABLE case. `lease["branch"]` is supplied by the platform, and
+  # Agent::Workspace refuses (RuntimeError) anything it could not have minted
+  # itself, because the unchecked path mkdir_p's and later rm_rf's a
+  # caller-controlled path under ~/code/ai. That guard is right; the caller now
+  # answers it instead of dying on it.
+  # Drives a claim whose lease carries `branch`, recording every branch that
+  # reached the resume path. Stubbed rather than left live because the resume is
+  # a `gh` call, and what these assert is precisely whether it happens at all.
+  def claim_resuming(branch)
+    asked = []
+    seen = nil
+    stub_singleton(Agent::Github, :search_open_pr, ->(b) { asked << b; nil }) do
+      seen = claim_one(body: "Mike wrote this one by hand.", branch: branch)
+    end
+    [seen, asked]
+  end
+
+  def test_a_recorded_branch_the_workspace_would_refuse_starts_a_fresh_attempt
+    seen, asked = claim_resuming("../../../etc/passwd")
+    assert_empty asked, "a branch this executor could not have minted must never reach the resume path"
+    assert seen[:spawned], "the issue still gets a session — on a fresh slug, as a closed prior PR already does"
+    assert_match(/on branch `i707_[a-z0-9]{3}`/, seen[:comments].first)
+    assert_match(/is not a slug this executor could have minted/, seen[:out])
+    assert_empty seen[:released], "nothing failed — this is an ordinary fresh attempt"
+  end
+
+  # An over-long branch is refused the same way and for the same reason: it
+  # matches the pattern but is past the 19-char ceiling sbt's socket path
+  # imposes, which does not fail loudly — sbt simply cannot start.
+  def test_an_over_long_recorded_branch_is_refused_the_same_way
+    seen, asked = claim_resuming("i707_#{'a' * 40}")
+    assert_empty asked
+    assert seen[:spawned]
+    assert_match(/on branch `i707_[a-z0-9]{3}`/, seen[:comments].first)
+  end
+
+  # A recorded branch that IS one of ours is untouched — the resume path is the
+  # whole point of recording it (§4.4.1) and must keep working.
+  def test_a_recorded_branch_that_is_one_of_ours_still_resumes
+    seen, asked = claim_resuming("i707_abc")
+    assert_equal ["i707_abc"], asked, "the recorded branch is still looked up"
+    assert seen[:spawned]
+  end
+
+  # The backstop, for every failure nobody has thought of. Before the session is
+  # spawned the lease is worth nothing to anyone, so it goes back rather than
+  # sitting held until it expires.
+  def test_a_claim_that_crashes_before_the_spawn_releases_the_lease
+    boom = ->(_seen) { { "GET /playbook/issues/707" => ->(_b) { raise "the platform sent something unparseable" } } }
+    seen = claim_one(body: "unused", extra_stubs: boom, max_concurrency: 2)
+    refute seen[:spawned]
+    assert_equal ["lse-1"], seen[:released], "a lease nothing is running under must go back to the queue"
+    assert_match(/claim FAILED \(RuntimeError: the platform sent something unparseable\)/, seen[:out])
+    assert_equal 1, seen[:claims], "and claiming stops — whatever broke is not issue-specific"
+  end
+
+  # ...but NOT once a session exists. `start_job` spawns before it writes the
+  # claim comment, so a failure in that last call has a live child holding the
+  # lease legitimately: releasing it would expire a session that is working,
+  # which is the "machine competes with itself" failure the two-phase split
+  # exists to prevent.
+  def test_a_claim_that_crashes_after_the_spawn_leaves_the_lease_held
+    boom = ->(_seen) { { "POST /playbook/issues/707/comments" => ->(_b) { raise "500 from the comment write" } } }
+    seen = claim_one(body: "Mike wrote this one by hand.", extra_stubs: boom)
+    assert seen[:spawned]
+    assert_empty seen[:released], "a lease with a live session under it is held, not released"
+    assert_match(/a session is already running under this lease/, seen[:out])
+  end
+
+  # Three in a row files an issue rather than scrolling past on stderr, which is
+  # what `record_failure` buys over a log line — and the streak is what made the
+  # original failure invisible for as long as it was.
+  def test_a_crashing_claim_is_recorded_durably
+    boom = ->(_seen) { { "GET /playbook/issues/707" => ->(_b) { raise "unparseable" } } }
+    seen = claim_one(body: "unused", extra_stubs: boom)
+    assert_equal [Agent::Tick::CLAIM_ERROR_SOURCE], seen[:errors].map { |e| e["source"] }
+    assert_includes seen[:errors].first["message"], "ISS-707: RuntimeError: unparseable"
+  end
+
+  # And the whole-phase backstop: a crash anywhere ELSE in Phase B — the reap,
+  # the toolchain check — used to kill the process just as dead. Phase A has
+  # already run by then, so the heartbeat stays green and the machine looks
+  # healthy while doing no work at all.
+  def test_a_work_phase_crash_is_contained_and_recorded_rather_than_killing_the_tick
+    with_agent_home do
+      register_identity
+      subject = tick(dry_run: false)
+      subject.define_singleton_method(:reap) { |_identity| raise IOError, "the reap fell over" }
+      out = capture_stdout { subject.phase_b }
+      assert_match(/work phase CRASHED \(IOError: the reap fell over\)/, out)
+      assert_equal [Agent::Tick::WORK_PHASE_ERROR_SOURCE], Agent::Errors.list.map { |e| e["source"] }
+    end
   end
 
   # ---- runner staleness is the PLATFORM's alert, not a runner's ----
