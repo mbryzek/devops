@@ -36,31 +36,40 @@ module Agent
     # issues instead of shipping PRs for a week, with nothing anywhere saying so.
     class MissingError < StandardError; end
 
-    # Substituted into a shared playbook so ONE row can carry the exact command
-    # each child of an epic runs (`--app {child}`). The platform writes the child
-    # name onto the pointer as `(target: ...)`; this is what it gets substituted
-    # into.
-    CHILD_TOKEN = "{child}".freeze
-
     # THE contract line between the platform that writes an issue body and the
     # runner that later reads it back — the same shape it has always had, with a
     # playbook key where the repo path used to be. Deliberately strict: anchored
     # to the start of a line and backticked, so prose that merely mentions a
     # playbook — including an issue describing this very mechanism — cannot be
     # mistaken for a pointer.
+    #
+    # WHAT CHANGED IN ISS-843. The suffix used to be a single unnamed value,
+    # `(target: platform)`, substituted for a hardcoded `{child}`. A producer's
+    # parameter BINDINGS are now carried by name — `(app: platform)`,
+    # `(app: platform, child: acumen)` — and each one substitutes `{name}` in the
+    # playbook body. Same mechanism, no longer limited to one value and no longer
+    # requiring the playbook to call every subject `{child}` whatever it is.
+    #
+    # The platform refuses a binding value containing `,` `(` `)` or a backtick
+    # precisely so this line stays parseable (InternalAgentProducersDao), which is
+    # what lets the value pattern below stay this simple.
     MARKER = "Playbook:".freeze
-    MARKER_RE = /^#{MARKER} `([^`\n]+)`(?: \(target: ([^)\n]+)\))?[ \t]*$/.freeze
+    MARKER_RE = /^#{MARKER} `([^`\n]+)`(?: \(([^)\n]*)\))?[ \t]*$/.freeze
+
+    # One `name: value` pair inside that suffix. The name is url-safe-lower, which
+    # is what the platform validates a parameter name to be.
+    BINDING_RE = /([a-z0-9][a-z0-9_-]*): ([^,)\n]+)/.freeze
 
     # The pointer is read back out of an issue body, which is human-editable, so
     # the key is treated as untrusted input before it becomes a path segment: the
     # same url-safe-lower shape the platform validates on write, and nothing else.
     SAFE_KEY_RE = /\A[a-z0-9][a-z0-9._-]*\z/.freeze
 
-    Pointer = Struct.new(:key, :target, keyword_init: true)
+    Pointer = Struct.new(:key, :bindings, keyword_init: true)
 
     # A playbook this runner actually READ: the text it got, and the version it
     # got it at.
-    Resolved = Struct.new(:key, :target, :text, :version, keyword_init: true) do
+    Resolved = Struct.new(:key, :bindings, :text, :version, keyword_init: true) do
       # The exact shape ISS-505 asks the session to record, with the version in
       # place of the sha:
       #   Playbook: dependency-upgrade-app @ 2026-08-05T14:04:20Z
@@ -69,8 +78,12 @@ module Agent
 
     module_function
 
-    def pointer_line(key, target: nil)
-      suffix = target.to_s.empty? ? "" : " (target: #{target})"
+    # Bindings render in NAME ORDER, matching what the platform writes
+    # (ProducerIssueBody): a pointer that reordered itself would show up as a diff
+    # in every issue body for no reason.
+    def pointer_line(key, bindings: {})
+      pairs = bindings.to_h.reject { |_, value| value.to_s.empty? }.sort_by { |name, _| name.to_s }
+      suffix = pairs.empty? ? "" : " (#{pairs.map { |name, value| "#{name}: #{value}" }.join(', ')})"
       "#{MARKER} `#{key}`#{suffix}"
     end
 
@@ -80,7 +93,13 @@ module Agent
     def pointer_in(body)
       match = MARKER_RE.match(body.to_s)
       return nil unless match
-      Pointer.new(key: match[1], target: match[2])
+      Pointer.new(key: match[1], bindings: bindings_in(match[2]))
+    end
+
+    # Values are stripped, so `(app: platform, child: acumen)` round-trips whether
+    # or not the writer padded them.
+    def bindings_in(suffix)
+      suffix.to_s.scan(BINDING_RE).to_h { |name, value| [name, value.strip] }
     end
 
     # nil (no pointer) or a Resolved. Raises MissingError when a pointer IS
@@ -103,8 +122,8 @@ module Agent
 
       Resolved.new(
         key: key,
-        target: pointer.target,
-        text: pointer.target.to_s.empty? ? text : text.gsub(CHILD_TOKEN, pointer.target.to_s),
+        bindings: pointer.bindings,
+        text: substitute(text, pointer.bindings),
         version: row["created_at"],
       )
     rescue ApiError, SessionExpired => e
@@ -113,6 +132,15 @@ module Agent
       # start a session that would do the wrong job. The message says which it
       # was so the issue's comment sends an investigation the right way.
       raise MissingError, "playbook `#{pointer.key}` could not be read from the platform (#{e.class}: #{e.message})"
+    end
+
+    # `{name}` -> its binding, for every binding on the pointer. A token with no
+    # binding is LEFT ALONE rather than blanked, for the same reason the platform
+    # leaves it: an unsubstituted `{app}` in a command is visible to the session
+    # reading it, where a blank silently produces a command that runs against the
+    # wrong thing.
+    def substitute(text, bindings)
+      bindings.to_h.reduce(text) { |acc, (name, value)| acc.gsub("{#{name}}", value.to_s) }
     end
 
     def validated_key(key)

@@ -4593,7 +4593,7 @@ end
 # clone, and the session picked its own branch name and its PR stopped being
 # findable (ISS-365, the exact failure --repo exists to prevent).
 #
-# Not sent, and deliberately: `fingerprint`, `producer_key`, `occurrence_count`
+# Not sent, and deliberately: `fingerprint`, `producer_id`, `occurrence_count`
 # and every status timestamp are server-owned and never rewritten by an update
 # (IssuesService.update), so adopting a producer-filed issue onto an epic cannot
 # cost it the dedup key its producer files against.
@@ -4750,8 +4750,8 @@ end
 # work rather than to a container. The epic takes its title: the run is what the
 # epic is, and the children are what the run found.
 #
-# The epic carries NO fingerprint and NO producer_key, and the second omission is
-# the load-bearing one. `producer_key` would be inherited by every child (ISS-515),
+# The epic carries NO fingerprint and NO producer_id, and the second omission is
+# the load-bearing one. `producer_id` would be inherited by every child (ISS-515),
 # which reads better on the producer page — but an epic sits `open` until its last
 # child ships, and ProducerIssueEmitter's `{datetime}` guard suppresses a producer
 # that has any issue of its own in `open` or `claimed`. Attributing the epic would
@@ -12763,7 +12763,7 @@ def cmd_agent_producers(args)
     # (ISS-526); this just prints them.
     producers = Agent::Api.producers(token: identity.token, use_localhost: use_localhost)
     runs = Agent::Api.producer_runs(token: identity.token, use_localhost: use_localhost)
-    latest = runs.group_by { |r| r["producer_key"] }
+    latest = runs.group_by { |r| r["producer_id"] }
     now = Time.now
     if producers.empty?
       puts "No producers in the registry. Add one at /admin/agents."
@@ -12771,11 +12771,16 @@ def cmd_agent_producers(args)
     end
     puts "Registry: #{producers.length} producer(s), managed at /admin/agents"
     producers.each do |producer|
-      last = (latest[producer["key"]] || []).max_by { |r| r["started_at"].to_s }
+      last = (latest[producer["id"]] || []).max_by { |r| r["started_at"].to_s }
       due = Time.parse(producer["next_due_at"]) rescue nil
       action = producer.dig("action", "file_when")
       check = producer.dig("action", "check")
-      puts "#{producer['key']}"
+      # The label is RENDERED server-side from the definition's template and this
+      # schedule's bindings (ISS-843); the id is what runs join on. Both are
+      # printed because they answer different questions.
+      bindings = (producer["parameters"] || {}).sort.map { |name, value| "#{name}=#{value}" }.join(" ")
+      puts "#{producer['label']}"
+      puts "  #{producer['definition_key']}#{bindings.empty? ? '' : "   #{bindings}"}"
       puts "  #{producer['schedule']} (#{producer['timezone']})   file_when: #{action}#{check ? "   check: #{check}" : ''}"
       puts "  last run: #{last ? "#{last['started_at']} → #{last['result']}" : 'never'}"
       puts "  next due: #{due.nil? ? producer['next_due_at'] : (due <= now ? 'now' : due)}"
@@ -12822,11 +12827,20 @@ def cmd_agent_runs(args)
       end
       puts ""
     end
+    # `dev agent runs <name>` still takes the NAME a human knows the producer by;
+    # the server filters by id, so the name is resolved through the registry first.
+    # A name nothing matches filters to nothing rather than to everything.
+    producer_id = nil
+    if key
+      producers = Agent::Api.producers(token: identity.token, use_localhost: use_localhost)
+      match = producers.find { |p| p["label"] == key || p["id"] == key }
+      producer_id = match ? match["id"] : key
+    end
     runs = Agent::Api.producer_runs(token: identity.token, use_localhost: use_localhost,
-                                    producer_key: key, limit: limit)
+                                    producer_id: producer_id, limit: limit)
     puts "#{runs.length} producer run(s)#{key ? " for #{key}" : ''}"
     runs.each do |r|
-      puts "  #{r['started_at']}  #{r['producer_key']}  #{r['result']}#{r['issue_number'] ? "  ISS-#{r['issue_number']}" : ''}"
+      puts "  #{r['started_at']}  #{r['producer_label']}  #{r['result']}#{r['issue_number'] ? "  ISS-#{r['issue_number']}" : ''}"
     end
   end
 end

@@ -62,14 +62,22 @@ class TestDevAgentPlaybook < Minitest::Test
     line = Agent::Playbook.pointer_line("slow-query-review")
     pointer = Agent::Playbook.pointer_in("some evidence\n\n#{line}\n\nmore prose")
     assert_equal "slow-query-review", pointer.key
-    assert_nil pointer.target
+    assert_empty pointer.bindings
   end
 
-  def test_a_child_pointer_carries_its_target_through_the_round_trip
-    line = Agent::Playbook.pointer_line("dependency-upgrade-app", target: "platform")
+  def test_a_child_pointer_carries_its_binding_through_the_round_trip
+    line = Agent::Playbook.pointer_line("dependency-upgrade-app", bindings: { "child" => "platform" })
     pointer = Agent::Playbook.pointer_in("evidence\n\n#{line}")
     assert_equal "dependency-upgrade-app", pointer.key
-    assert_equal "platform", pointer.target
+    assert_equal({ "child" => "platform" }, pointer.bindings)
+  end
+
+  # ISS-843: a producer's bindings ride on the pointer BY NAME, which is what lets
+  # thirteen weekly reviews share one playbook row. Several of them, in name order.
+  def test_several_bindings_round_trip_in_name_order
+    line = Agent::Playbook.pointer_line("weekly-review", bindings: { "depth" => "deep", "app" => "platform" })
+    assert_equal "Playbook: `weekly-review` (app: platform, depth: deep)", line
+    assert_equal({ "app" => "platform", "depth" => "deep" }, Agent::Playbook.pointer_in(line).bindings)
   end
 
   # The exact line the platform actually emits, copied from ProducerIssueBody. If
@@ -77,26 +85,47 @@ class TestDevAgentPlaybook < Minitest::Test
   # is arriving with a runbook nothing resolves.
   def test_the_line_the_platform_actually_writes_parses
     body = "Filed automatically by the `dependency-upgrade` producer.\n\n---\n\n" \
-           "Playbook: `dependency-upgrade-app` (target: acumen)\n\n" \
+           "Playbook: `dependency-upgrade-app` (child: acumen)\n\n" \
            "The procedure itself is deliberately NOT copied here."
     pointer = Agent::Playbook.pointer_in(body)
     assert_equal "dependency-upgrade-app", pointer.key
-    assert_equal "acumen", pointer.target
+    assert_equal({ "child" => "acumen" }, pointer.bindings)
   end
 
   # One row serves every child of an epic and says `--app {child}` where the
   # command differs, so the substitution is what makes a shared playbook possible
   # at all. Without it the session is told to run a command with a literal
   # `{child}` in it.
-  def test_the_target_substitutes_the_child_token_at_resolve_time
-    body = "evidence\n\n#{Agent::Playbook.pointer_line('dependency-upgrade-app', target: 'acumen')}"
+  def test_a_binding_substitutes_its_token_at_resolve_time
+    body = "evidence\n\n#{Agent::Playbook.pointer_line('dependency-upgrade-app', bindings: { 'child' => 'acumen' })}"
     resolved = resolve(body, { "dependency-upgrade-app" => row(body: CHILD_BODY, key: "dependency-upgrade-app") })
 
     assert_includes resolved.text, "--app acumen"
     refute_includes resolved.text, "{child}"
   end
 
-  def test_a_targetless_playbook_is_handed_over_exactly_as_written
+  # The weekly-review shape: the parameter is named `app`, not `child`, and the
+  # playbook says so. That is the half `(target: ...)` could never express.
+  def test_a_named_parameter_substitutes_its_own_token
+    body = "evidence\n\n#{Agent::Playbook.pointer_line('weekly-review', bindings: { 'app' => 'rallyd' })}"
+    playbook = row(body: "Review the `{app}` repo. Clone mbryzek/{app}.", key: "weekly-review")
+    resolved = resolve(body, { "weekly-review" => playbook })
+
+    assert_includes resolved.text, "Review the `rallyd` repo. Clone mbryzek/rallyd."
+    refute_includes resolved.text, "{app}"
+  end
+
+  # A token nothing binds is LEFT ALONE rather than blanked: an unsubstituted
+  # `{app}` in a command is visible to the session reading it, where a blank
+  # silently produces a command that runs against the wrong thing.
+  def test_an_unbound_token_is_left_visible_rather_than_blanked
+    body = "evidence\n\n#{Agent::Playbook.pointer_line('weekly-review', bindings: { 'app' => 'rallyd' })}"
+    playbook = row(body: "Review {app} at depth {depth}.", key: "weekly-review")
+
+    assert_includes resolve(body, { "weekly-review" => playbook }).text, "Review rallyd at depth {depth}."
+  end
+
+  def test_a_playbook_with_no_bindings_is_handed_over_exactly_as_written
     body = "evidence\n\n#{Agent::Playbook.pointer_line('slow-query-review')}"
     assert_equal BODY, resolve(body, { "slow-query-review" => row }).text
   end
