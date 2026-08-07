@@ -25,10 +25,16 @@ class PostRelease
 
   # Does this checkout own apibuilder specs? A frontend's .api config references
   # registry apps only, and has no local spec file to publish.
+  #
+  # `base_dir: dir` is not optional. A `spec_glob` block resolves its pattern
+  # against ApiConfig's base_dir, which defaults to Dir.pwd — and this is asked
+  # about a repo that is NOT the cwd every time `dev deploy` asks it, from
+  # wherever the human typed the deploy. platform's "dao/spec/*.json" then
+  # matched nothing and aborted a deploy that had already succeeded (ISS-867).
   def self.owns_specs?(dir = Dir.pwd)
     config_path = File.join(dir, ".api", "config.pkl")
     return false unless File.exist?(config_path)
-    ApiConfig.new(config_path).blocks.any? do |block|
+    ApiConfig.new(config_path, base_dir: dir).blocks.any? do |block|
       block.applications.any? { |app| File.exist?(File.join(dir, app.file_path)) }
     end
   end
@@ -63,19 +69,36 @@ class PostRelease
     return if PostDeployWork.deferred?
 
     work = @work || PostDeployWork.new(apps: [PostDeployWork::App.new(name: @app, dir: @dir)])
-    return unless work.any?
+
+    # What an operator would have to run by hand, captured as the work works out
+    # what it owes and never re-derived in the rescue below. `manual_commands` IS
+    # `tasks`, and `tasks` is the thing most likely to have failed here — it
+    # reads the released checkout's `.api` config, which aborts on a broken one —
+    # so a handler that asked `tasks` what to print would die inside itself.
+    commands = PostDeployWork::MANUAL_COMMANDS_FALLBACK
 
     filed = Util.step("Filing post-deploy work") do
       begin
-        work.file!
-      rescue StandardError => e
+        if work.any?
+          commands = work.manual_commands
+          work.file!
+        end
+      rescue SystemExit, StandardError => e
+        # SystemExit is deliberately in that list and is NOT redundant: it is not
+        # a StandardError, so the plain `rescue StandardError` this replaces
+        # caught nothing at all when the failure came from Util.exit_with_error —
+        # which is how EVERY abort under `work.any?` arrives (ISS-867).
         Util.exit_with_error(
-          "Could not file the post-deploy work for #{@app} (#{e.message}).\n" \
+          "Could not file the post-deploy work for #{@app} (#{Util.abort_reason(e)}).\n" \
           "The release itself is DONE — the app is live — but nothing is tracking what is left.\n" \
-          "Run these by hand:\n#{work.manual_commands.map { |c| "  #{c}" }.join("\n")}",
+          "Run these by hand:\n#{commands.map { |c| "  #{c}" }.join("\n")}",
         )
       end
     end
+    # `work.any?` was false: this release owes nothing, so there is nothing to
+    # name below. The stage itself has already run and closed.
+    return if filed.nil?
+
     # Work moving off the critical path must not also move out of sight, so the
     # release names what it filed. Printed AFTER the stage has closed its line
     # and as whole lines: what the deploy display cannot tolerate is output

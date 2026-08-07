@@ -301,6 +301,18 @@ module Util
         exit 1
     end
 
+    # Why an operation aborted, for a caller that narrates its own failure.
+    #
+    # Any such caller has to `rescue SystemExit, StandardError` rather than the
+    # bare `rescue => e` that reads like a catch-all: exit_with_error is how
+    # most of this codebase fails, and the SystemExit it raises is not a
+    # StandardError, so the bare form silently narrates nothing (ISS-867). Once
+    # caught, that SystemExit carries only "exit" — the real reason is already
+    # on stderr — so repeating `e.message` would say less than nothing.
+    def Util.abort_reason(e)
+      e.is_a?(SystemExit) ? "aborted (the ERROR above says why)" : "#{e.class}: #{e.message}"
+    end
+
     def Util.indent(text, size = 2)
       indent = ' ' * size
       text.split("\n").map { |line| indent + line }.join("\n")
