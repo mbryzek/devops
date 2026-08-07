@@ -75,11 +75,12 @@ files.each do |file|
 end
 
 # Everything from here down runs AFTER the rollout the release script waited
-# for, and used to narrate nothing at all: `dev deploy` showed the app sitting
-# on a ticking clock with no stage under it for the minute or more that the
-# spec publish and the reconcilers take, which reads as a hung release. Narrate
-# them as stages instead — same "label... done (12s)" protocol every other stage
-# uses, which the live phase display already parses (lib/deploy_progress.rb).
+# for. It used to be the post-deploy work itself — the spec publish, the
+# changelog and the two global reconcilers, a minute or more of bookkeeping on
+# the clock of whoever was watching. That work is filed for the fleet now
+# (PostDeployWork, ISS-814); what is left is one narrated stage, in the same
+# "label... done (12s)" protocol the live phase display parses
+# (lib/deploy_progress.rb).
 #
 # Quiet mode can only be turned on HERE, not at the top of the script: while the
 # release-* child above was running it had to keep the terminal (it manages its
@@ -89,4 +90,4 @@ end
 Util.quiet!("/tmp/devops-release/#{args.app}-post-release.log") unless args.verbose
 puts "Post-release log: #{Util.log_file}" if Util.quiet?
 
-PostRelease.new(app: args.app, bin_dir: dir, skip_regenerate_flag: Config::SKIP_REGENERATE_FLAG).run
+PostRelease.new(app: args.app).run

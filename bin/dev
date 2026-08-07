@@ -387,12 +387,15 @@ USAGE = <<~USAGE
           5. devops, alone and last, as a plain `git pull` — its update
              rewrites the very scripts the phases above shell out to, so it
              must not run while anything else is mid-release.
-        Then, once and only if an app released, `features reconcile
-        --apply` and `issues reconcile --apply`. Neither is app-scoped —
-        both evaluate everything outstanding — so they belong to the
-        deploy, not to each app's release, which used to run them once
-        per app and all at the same time (ISS-810). A standalone
-        `release` still runs them itself.
+        Then, once and only if an app released, the post-deploy work is
+        FILED rather than run: one `infrastructure` epic for the whole
+        deploy, with a child per spec-publish, one for the changelog and
+        one for the two global reconcilers, all reported here by number.
+        The fleet picks them up; the deploy ends when the rollout is
+        verified (ISS-814). One epic per invocation, not per app, and
+        one reconciler child however many apps released — neither
+        reconciler is app-scoped (ISS-810). A standalone `release` files
+        for the single app it released.
         If an expanding DB release fails, the matching app (foo for
         foo-postgresql) is skipped to avoid deploying an app against an
         unmigrated schema. Skips repos not on `main` or with a dirty tree.
@@ -8503,11 +8506,12 @@ def release_one(name, progress)
     env = { "RELEASE_AUTO_TAG" => "1", "RELEASE_DB_AUTO_CONFIRM" => "1" }
   else
     release_bin = File.expand_path(File.join(__dir__, "release"))
-    # Reconcilers.defer_env: this deploy runs the two global reconcilers itself,
-    # once, after every phase (run_post_deploy_reconcile). Without it a five-app
-    # deploy ran each of them five times, concurrently, all re-evaluating the
-    # same outstanding set (ISS-810).
-    env = { "RELEASE_AUTO_TAG" => "1" }.merge(Reconcilers.defer_env)
+    # PostDeployWork.defer_env: this deploy files the post-deploy work itself,
+    # ONCE for every app it released, after every phase (run_post_deploy_filing).
+    # Without it a five-app deploy filed five epics for one deploy — and, before
+    # any of it was filed at all, ran the two global reconcilers five times
+    # concurrently over the same outstanding set (ISS-810).
+    env = { "RELEASE_AUTO_TAG" => "1" }.merge(PostDeployWork.defer_env)
   end
   # release-db accepts either `foo` or `foo-postgresql` as --app; pass the full
   # name so the script doesn't have to guess.
@@ -8795,32 +8799,60 @@ def deploy_app_phase_message(phase, to_run, concurrency)
   end
 end
 
-# The two global reconcilers, ONCE for the whole deploy, after every phase has
-# finished. They are hoisted out of each app's post-release because neither is
-# app-scoped: both evaluate everything outstanding, so a five-app deploy ran
-# each of them five times over, concurrently, and only the first run of each had
-# anything left to apply. At ~7s apiece that redundancy was pure wall clock on
-# every multi-app deploy, and the concurrent `--apply` was five unsynchronised
-# writers against one feature-flag and issue state (ISS-810). The releases this
-# command spawns carry Reconcilers.defer_env so they skip their own run; a
-# standalone `release` still does it, because there the release IS the deploy.
+# The post-deploy work, filed ONCE for the whole deploy after every phase has
+# finished (ISS-814, ISS-816). `api publish`, the changelog and the two global
+# reconcilers used to run inline at the end of each app's release, on the clock
+# of whoever typed `dev deploy`, after the rollout it had already waited for.
+# They are issues now: filing is dispatching, the fleet picks them up on its own,
+# and the release ends when the rollout is verified.
+#
+# ONE epic for the deploy, not one per app. A deploy releases at concurrency 10,
+# so an epic per app would mint five containers for one deploy and bury the queue
+# `dev issues claim` reads. The releases this command spawns carry
+# PostDeployWork.defer_env so they file nothing of their own; a standalone
+# `release` still files for its one app, because there the release IS the deploy.
 #
 # Gated on an APP having released, which is exactly the set that used to trigger
-# it: a database, a library or a devops pull runs no post-release at all, and a
-# deploy where every app failed has changed nothing for either reconciler to
-# find. Last, after Phase 5, so the answer to "what is production running" is
-# final before anything asks it.
+# the inline steps: a database, a library or a devops pull runs no post-release
+# at all, and a deploy where every app failed has changed nothing for any of this
+# work to be about. Last, after Phase 5, so the answer to "what is production
+# running" is final before anything asks it.
 #
-# The reconciler object comes from a seam so tests can drive `run_deploys`
-# without an `--apply` against real feature-flag and issue state.
-def post_deploy_reconciler
-  Reconcilers.new(bin_dir: __dir__, skip_regenerate_flag: Config::SKIP_REGENERATE_FLAG)
+# The work object comes from a seam so tests can drive `run_deploys` without
+# filing issues against the real tracker.
+def post_deploy_work(names)
+  PostDeployWork.new(apps: names.map { |n| PostDeployWork::App.new(name: n, dir: deploy_item_dir(n)) })
 end
 
-def run_post_deploy_reconcile(app_pending, results)
-  return unless app_pending.any? { |n| results[n] && results[n][:ok] }
+# Files it and says what it filed — work moving off the critical path must not
+# also move out of sight.
+#
+# Returns false when the filing FAILED, which fails the deploy. That severity is
+# inherited, not invented: `api publish` was deliberately not best-effort inline,
+# because a deployed API whose specs did not publish is the drift the hermetic
+# design exists to prevent. An unfiled publish is exactly as silent as an unrun
+# one, so this prints the commands to run by hand and the deploy exits non-zero.
+def run_post_deploy_filing(app_pending, results)
+  released = app_pending.select { |n| results[n] && results[n][:ok] }
+  return true if released.empty?
+
+  work = nil
+  work = post_deploy_work(released)
+  return true unless work.any?
+
+  filed = work.file!
   puts ""
-  post_deploy_reconciler.run
+  puts Util.underline("Post-deploy work")
+  filed.report_lines.each { |line| puts "  #{line}" }
+  true
+rescue => e
+  puts ""
+  puts Util.underline("Post-deploy work NOT FILED")
+  puts "  #{e.class}: #{e.message}"
+  puts "  The apps above ARE live. Nothing is tracking what is left — run these by hand:"
+  (work ? work.manual_commands : ["api publish (in each released app)", "dev features reconcile --apply",
+                                  "dev issues reconcile --apply"]).each { |cmd| puts "    #{cmd}" }
+  false
 end
 
 # Releases `names` and prints the summary. Shared by `deploy all` and the
@@ -8957,7 +8989,7 @@ def run_deploys(pending, concurrency:, errors: [])
     release_serial(devops_pending, results, results_mutex, DeployProgress::Disabled.new)
   end
 
-  run_post_deploy_reconcile(app_pending, results)
+  post_deploy_filed = run_post_deploy_filing(app_pending, results)
 
   pending.each do |n|
     next if skipped.key?(n)
@@ -8996,6 +9028,11 @@ def run_deploys(pending, concurrency:, errors: [])
     end
     exit 1
   end
+
+  # Every app released and the post-deploy work could not be filed: the deploy
+  # succeeded and its bookkeeping is now tracked by nothing. Non-zero, for the
+  # same reason a failed `api publish` used to fail the release.
+  exit 1 unless post_deploy_filed
 
   # A skip means pending work was not released — a failed DB (which already
   # exits 1 above), or a library skipped for want of a terminal. Either way the
