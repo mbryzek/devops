@@ -1,4 +1,5 @@
 require 'util'
+require 'reconcilers'
 
 # The part of a release that runs AFTER the deploy: the app is already live
 # (the release script waited for the rollout), but the release is not over.
@@ -15,19 +16,6 @@ require 'util'
 class PostRelease
   # Only these apps feed the changelog pipeline.
   CHANGELOG_TRACKED = %w[playbook-admin playbook-app playbook-www].freeze
-
-  # The two reconcilers that gate on "what is production running". A release is
-  # the only event that can change either answer, which is why they hang off
-  # this rather than a cron nobody would remember to install.
-  #
-  # Deliberately NOT scoped to the app just released. A feature removal (or a
-  # fixed issue) usually waits on more than one app, so releasing platform can
-  # be what clears one that was also waiting on playbook-app. Both commands
-  # evaluate everything outstanding, so one call per release covers all of it.
-  RECONCILERS = [
-    ["features", "feature-flag cleanup"],
-    ["issues", "fixed -> deployed transitions"],
-  ].freeze
 
   # Publishing specs is the release's job and nobody else's: dev `api` runs are
   # hermetic and never write the registry, so `latest` means "what is released"
@@ -50,9 +38,7 @@ class PostRelease
     Util.run(publish_cmd(bin_dir), quiet: true) if owns_specs?
   end
 
-  DEFAULT_RUN = ->(cmd, ignore_error:) { Util.run(cmd, quiet: true, ignore_error: ignore_error) }
-
-  def initialize(app:, bin_dir:, skip_regenerate_flag:, owns_specs: self.class.owns_specs?, run: DEFAULT_RUN)
+  def initialize(app:, bin_dir:, skip_regenerate_flag:, owns_specs: self.class.owns_specs?, run: Util::STEP_RUN)
     @app = app
     @bin_dir = bin_dir
     @skip_regenerate_flag = skip_regenerate_flag
@@ -88,31 +74,18 @@ class PostRelease
   # to a manual run.
   def record_changelog
     return unless CHANGELOG_TRACKED.include?(@app)
-    best_effort("Recording changelog",
-                dev_cmd("changelog", "--app", @app),
-                "run `dev changelog --app #{@app}` later")
+    Util.best_effort_step("Recording changelog", "run `dev changelog --app #{@app}` later") do
+      @run.call(dev_cmd("changelog", "--app", @app), ignore_error: true)
+    end
   end
 
+  # The global reconcilers, but only when this release IS the whole deploy.
+  # Under `dev deploy` they are hoisted out to one run after every app has
+  # released — see Reconcilers, which owns both the commands and that reasoning.
   def reconcile
-    RECONCILERS.each do |command, description|
-      best_effort("Reconciling #{description}",
-                  dev_cmd(command, "reconcile", "--apply"),
-                  "run `dev #{command} reconcile --apply` later")
-    end
+    return if Reconcilers.deferred?
+    Reconcilers.new(bin_dir: @bin_dir, skip_regenerate_flag: @skip_regenerate_flag, run: @run).run
   end
 
   def dev_cmd(*parts) = [File.join(@bin_dir, "dev"), *parts, @skip_regenerate_flag].join(" ")
-
-  # A hook whose failure must never fail a release that has already succeeded —
-  # both reconcilers are fail-closed, so skipping a run only defers work, and
-  # feature_removals_must_be_processed_within_a_week catches one that has stopped
-  # running entirely. step_failed! only changes how the stage RENDERS ("failed
-  # (4s)" rather than a done that hides it); it does not abort.
-  def best_effort(label, cmd, recovery)
-    Util.step(label) do
-      next if @run.call(cmd, ignore_error: true)
-      Util.detail("#{label} failed (ignored) — #{recovery}")
-      Util.step_failed!
-    end
-  end
 end

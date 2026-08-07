@@ -96,6 +96,26 @@ module Util
         end
       end
     end
+
+    # The production `run` seam for the narrated release steps (PostRelease,
+    # Reconcilers): shell out with the command line suppressed, because the
+    # stage label already says what is happening. Injectable at the call site so
+    # the narration is testable without releasing anything.
+    STEP_RUN = ->(cmd, ignore_error:) { Util.run(cmd, quiet: true, ignore_error: ignore_error) }
+
+    # A stage whose failure must never abort the caller — the post-deploy
+    # changelog and reconcile hooks, which run after a release has already
+    # changed production. The block returns truthy on success; a falsy return
+    # logs `recovery` (the command to run by hand later) and renders the stage
+    # as "failed (4s)" rather than as a done that hides it.
+    def Util.best_effort_step(label, recovery)
+      Util.step(label) do
+        next if yield
+        Util.detail("#{label} failed (ignored) — #{recovery}")
+        Util.step_failed!
+      end
+    end
+
     # Sync <app>-config + <app>-secrets from the git-crypt env repo to the
     # cluster via bin/k8s-secrets (which requires env/apps/<app>/env files).
     # Aborts the caller on failure (Util.run semantics) — never release
