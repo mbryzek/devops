@@ -73,6 +73,12 @@ module Agent
 
     def open?(pr) = !!(pr && pr["state"].to_s.casecmp?("open"))
 
+    # Closed WITHOUT merging — rejected, abandoned, or superseded. Deliberately
+    # not "everything that is not open": a state this file does not recognise is
+    # an UNKNOWN, and every caller here reads an unknown as fail-open rather than
+    # as a negative answer.
+    def closed?(pr) = !!(pr && pr["state"].to_s.casecmp?("closed"))
+
     # Ready for review: open and not a draft.
     def ready?(pr) = open?(pr) && !pr["isDraft"]
 
