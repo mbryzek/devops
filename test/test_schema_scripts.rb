@@ -40,6 +40,33 @@ class TestSchemaScripts < Minitest::Test
     assert_equal 1, contracting("alter table playbook.clubs drop legacy_name;").length
   end
 
+  # The lookahead that recognizes the bare form by what it is NOT matched a
+  # PREFIX, so every one of these ordinary column names read as expanding and got
+  # applied BEFORE the app that still selected it -- ISS-317's outage, from the
+  # classifier written to prevent it. `legacy_name` above shares no prefix with a
+  # keyword, which is why it passed throughout.
+  def test_a_bare_column_drop_is_contracting_when_the_column_name_begins_with_a_keyword
+    %w[
+      type_id trigger_source default_locale not_before indexed_at
+      owned_by_id constraint_type policy_id table_name schema_version
+      view_count function_name sequence_number column_name
+    ].each do |column|
+      sql = "alter table playbook.clubs drop #{column};"
+      assert_equal [sql.chomp(";")], contracting(sql), "#{column} must be read as contracting"
+    end
+  end
+
+  # The other side of the same boundary: these really are the keyword, and the
+  # ones in SAFE_DROPS remove no name a query mentions, so they must stay
+  # expanding. A `\b` that over-matched would sweep them in and defer every
+  # additive release that reindexes.
+  def test_the_safe_drop_keywords_themselves_are_still_expanding
+    assert_empty contracting("alter table playbook.clubs drop constraint clubs_pkey;")
+    assert_empty contracting("alter table playbook.clubs drop index clubs_name_idx;")
+    assert_empty contracting("alter table playbook.clubs alter column nick drop not null;")
+    assert_empty contracting("alter table playbook.clubs alter column nick drop default;")
+  end
+
   def test_renames_are_contracting
     assert_equal 1, contracting("alter table playbook.clubs rename column nick to nickname;").length
     assert_equal 1, contracting("alter table playbook.clubs rename to organizations;").length

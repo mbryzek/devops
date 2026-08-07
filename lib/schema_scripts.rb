@@ -58,7 +58,18 @@ module SchemaScripts
 
   # `ALTER TABLE t DROP c` - Postgres makes the COLUMN keyword optional, so the
   # bare form has to be recognized by what it is NOT.
-  BARE_COLUMN_DROP = /\bdrop\s+(?:if\s+exists\s+)?(?!#{(DROPPED_OBJECTS + SAFE_DROPS + %w[not if]).join('|')})[a-z_"][\w"]*/
+  #
+  # The `\b` closing the lookahead is load-bearing. Alternation matches a PREFIX,
+  # so without it any column whose name merely STARTS with one of these keywords
+  # satisfied the lookahead and the whole statement fell through as expanding:
+  # `drop type_id`, `drop trigger_source`, `drop default_locale`, `drop
+  # not_before`, `drop indexed_at` are all ordinary column names and all read as
+  # additive. That is not a cosmetic misclassification - `SchemaScripts
+  # .contracting` is what sorts a release into deploy Phase 1 (before the app) or
+  # Phase 3 (after it), so a `DROP type_id` was applied while the running code
+  # still selected the column, which is the `column ... does not exist` outage
+  # this module was written for (ISS-317).
+  BARE_COLUMN_DROP = /\bdrop\s+(?:if\s+exists\s+)?(?!(?:#{(DROPPED_OBJECTS + SAFE_DROPS + %w[not if]).join('|')})\b)[a-z_"][\w"]*/
 
   DROP_OBJECT = /\bdrop\s+(?:materialized\s+view|#{DROPPED_OBJECTS.join('|')})\b/
 
