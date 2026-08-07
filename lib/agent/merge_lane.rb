@@ -114,8 +114,9 @@ module Agent
     # This is the playbook's §4 verify table minus the self-deploying repos, and
     # it is a CEILING rather than a work list: a repo is only a candidate if it is
     # here AND its PRs carry a `ci` check (see NO_CI). Adding a repo here is a
-    # deliberate act; adding a `.github/workflows/ci.yml` is what actually enrols
-    # it.
+    # deliberate act; landing `ci/build.sh` is what actually enrols it. This list
+    # is also the work list the fleet verify job walks (Agent::Verify.repos), so a
+    # repo added here starts being BUILT as well as being mergeable.
     LANE_REPOS = %w[
       playbook-admin
       playbook-app
@@ -134,10 +135,10 @@ module Agent
     # THE ENROLMENT RULE, and it is deliberately not a list.
     #
     # A repo is in the lane exactly when its PRs carry a `ci` check. There is no
-    # second registry of "repos that have CI" to drift out of step with the
-    # `.github/workflows` that actually exist: adding a workflow enrols the repo,
-    # deleting one withdraws it, and a repo that never had CI reports
-    # `:no_ci_verdict` on every PR and merges nothing.
+    # second registry of "repos that have CI" to drift out of step with what
+    # actually produces one: landing `ci/build.sh` enrols the repo (Agent::Verify,
+    # ISS-848), deleting it withdraws the repo, and a repo that never had CI
+    # reports `:no_ci_verdict` on every PR and merges nothing.
     #
     # That is a real narrowing versus the playbook loop this replaces, which ran
     # the suite in-session and could therefore act on any repo. It is the correct
@@ -311,11 +312,30 @@ module Agent
     # looked for `context` would never see its own CI.
     def check_name(entry) = (entry["name"] || entry["context"]).to_s
 
-    # nil while a CheckRun is still queued or running: a check with no conclusion
+    # nil while a check is still queued or running: a check with no conclusion
     # has not answered yet, and "no conclusion" must never collapse into the same
     # bucket as "concluded, not success".
+    #
+    # BOTH SHAPES EXPRESS "not yet", DIFFERENTLY, and normalising only one of them
+    # is a silent failure that ISS-848 surfaced. A CheckRun says it by having no
+    # `conclusion` while `status` is queued or in-progress. A StatusContext says it
+    # with the literal state `pending` — GitHub's commit-status states are exactly
+    # `pending`, `success`, `failure` and `error`, and `pending` is the only one of
+    # the four that is not an answer.
+    #
+    # Reading that as a concluded non-success made the lane verdict `:ci_failed`
+    # and PARK every pull request a fleet verify job was still building, telling a
+    # session to go establish whose fault a red suite is for a build that had not
+    # finished. It could not bite while Actions produced every check, because
+    # Actions posts CheckRuns; it bites the moment anything posts a commit status,
+    # which is what the fleet verify job does (Agent::Verify).
+    PENDING_STATE = "PENDING".freeze
+
     def check_state(entry)
-      return entry["state"].to_s.upcase if entry["state"]
+      if entry["state"]
+        state = entry["state"].to_s.upcase
+        return state == PENDING_STATE ? nil : state
+      end
       return nil unless entry["status"].to_s.casecmp?("completed")
       entry["conclusion"].to_s.upcase
     end

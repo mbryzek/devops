@@ -6,7 +6,8 @@ require 'agent/escalation'
 require 'agent/paths'
 require 'agent/shell'
 
-# The runner-local half of CI (ISS-763), for the merge lane ISS-754 shipped.
+# The machine-side half of CI: is this runner fit to produce a verdict, and may
+# it trust what it has cached.
 #
 # The lane reads ONE fact off a PR: did the `ci` check pass on the exact commit
 # about to be squashed. Everything here exists so that fact is worth reading —
@@ -14,60 +15,39 @@ require 'agent/shell'
 # machine that is also running agent sessions, that also prunes its own disk,
 # and whose registry credential expires on its own schedule.
 #
-# THREE THINGS, and they are three because each is a different way the check
-# lies rather than three features of one feature:
+# WHAT USED TO BE HERE AND IS GONE (ISS-848). ISS-763 also carried a slot
+# semaphore, a `~/.platform/ci.json` reservation and a subtraction inside
+# `Agent::Tick#session_capacity`. All three existed because GitHub Actions was a
+# SECOND SCHEDULER on hardware the tick already schedules, and neither could see
+# the other. The `ci` check is produced by a fleet job now (Agent::Verify), which
+# claims through the same tick against the same `max_concurrency` — so there is
+# one scheduler, one number, and nothing left to arbitrate. Do not reintroduce a
+# reservation without reintroducing the second scheduler that made it necessary.
 #
-#   slots       The box has one capacity, and two schedulers want it. The tick
-#               claims agent sessions; GitHub pushes CI jobs at whatever runner
-#               listeners are installed. Neither can see the other, so without
-#               an agreed split they oversubscribe and the machine swaps —
-#               making no progress on either while looking busy on both.
+# TWO THINGS, and they are two because each is a different way the check lies
+# rather than two features of one feature:
+#
 #   preflight   A runner that cannot pull the DB image, or has no disk, cannot
 #               tell you anything about your code. That must not render as
 #               "your tests failed" — it is the runner, and the response to it
 #               is to page someone, not to park the PR and go read the diff.
-#   clean       Warm incremental state is the whole reason to self-host, and
-#               stale incremental state is the one failure with no human
-#               downstream: a FALSE GREEN the lane will merge. So the warm path
-#               is the PR path only, and `main` and the nightly are cold.
-#
-# WHY NOTHING HERE IS A DAEMON. Agent::Tick's header is emphatic that the
-# dispatcher keeps no local state beyond "is this pid alive", and a slot manager
-# with leases and expiry would be exactly the thing it refuses to be. So the
-# semaphore below is N lock files held by `flock` for as long as the build
-# process lives: liveness is the kernel's problem, a killed job releases its slot
-# because the fd closes, and there is no record to leak, expire, or reconcile.
+#   clean       Warm incremental state is the whole reason to build on our own
+#               hardware, and stale incremental state is the one failure with no
+#               human downstream: a FALSE GREEN the lane will merge. So the warm
+#               path is the PR path only, and `main` and anything unlisted are
+#               cold.
 module Agent
   module Ci
     # EX_TEMPFAIL. The exit status every infrastructure fault leaves, and the one
-    # number a workflow step has to know: `dev ci preflight` and `dev ci run`
-    # both use it, and the reusable workflow branches on it to label the failure
-    # as the runner's rather than the branch's.
+    # number a build script has to know: `dev ci preflight` uses it, and
+    # `dev ci verify` branches on it to label the failure as the runner's rather
+    # than the branch's — which is what makes the status description say "fix the
+    # machine" instead of "read the diff".
     #
     # 75 rather than a number of our own because sysexits.h already means this
     # ("temporary failure; the user is invited to retry"), and a CI step that
     # exits 1 is indistinguishable from the suite it wrapped.
     INFRA_EXIT_CODE = 75
-
-    # How long a CI job waits for a slot before giving up.
-    #
-    # Long, because the thing it is queueing behind is another CI job of the same
-    # kind — minutes, not the hours an agent session runs (which is why agent
-    # sessions do not share these slots dynamically; see `reserved`). Bounded,
-    # because a wait with no end is a check that never answers, and the lane
-    # cannot tell "still queueing" from "this runner is wedged".
-    #
-    # Timing out is an INFRASTRUCTURE fault, not a test failure: a box so
-    # oversubscribed that a job waited half an hour is a capacity problem, and
-    # saying so is what makes the buy-a-mini trigger in the design measurable
-    # rather than a feeling.
-    SLOT_WAIT_SECONDS = 30 * 60
-
-    # Poll interval while waiting. `flock` has no portable "wait with a
-    # deadline", so the wait is a poll — coarse on purpose, because the thing
-    # being waited on takes minutes and a tight loop would spend the CPU the wait
-    # exists to protect.
-    SLOT_POLL_SECONDS = 5
 
     # Free space below which the box is not fit to run a build.
     #
@@ -89,129 +69,19 @@ module Agent
     # reads as `:ci_pending` and waits on forever.
     PROBE_TIMEOUT_SECONDS = 60
 
-    # The caches that make a self-hosted runner worth having. Free minutes are
-    # why hosted is unaffordable; PRESERVED INCREMENTAL STATE is why self-hosted
+    # The caches that make building on our own hardware worth it. Hosted minutes
+    # are why hosted CI is unaffordable; PRESERVED INCREMENTAL STATE is why this
     # is fast, and it is the larger effect — a cold platform `Test/compile` is
     # ~8 minutes of which almost none is compilation nobody has done before.
     #
-    # These live in $HOME, outside any workspace, so they survive `actions/
-    # checkout` regardless of what it does to the tree. `target/` does not — it
-    # is inside the checkout, which is why the workflow needs `clean: false` and
-    # why `clean_build?` below exists to take it away again when it is not safe.
+    # These live in $HOME, outside any checkout, so nothing a build does to a
+    # tree can take them away. `target/` and `node_modules/` do NOT — they are
+    # inside the checkout, which is why `Agent::Verify.checkout` cleans with `-fd`
+    # (keeping ignored files) on the warm path and `-xfd` on the cold one, and why
+    # `clean_build?` below decides which.
     WARM_CACHE_DIRS = %w[~/.cache/coursier ~/.ivy2 ~/.sbt ~/.npm].freeze
 
     module_function
-
-    # ---------------- provisioning ----------------
-
-    # This machine's CI configuration, written by `dev ci install` and read by
-    # everything else — including Agent::Tick, which is why it is a file on the
-    # box rather than a field on the platform's runner row.
-    #
-    # The registry derives `max_concurrency` from reported hardware, which is
-    # right for a fact about the hardware. How that capacity is SPLIT is not a
-    # fact about the hardware: it is an operator's decision about this box, made
-    # when the runner is installed on it, and it has to be readable by a tick
-    # running while the platform is unreachable.
-    #
-    # Absent is the normal state. Most machines run no CI, and on them every
-    # entry point here is a no-op.
-    def config
-      Agent::Paths.read_json(Agent::Paths.ci_config_file) || {}
-    end
-
-    # Slots reserved on this box for CI, and therefore both the ceiling on
-    # concurrent CI jobs here and the amount Agent::Tick subtracts from
-    # max_concurrency before it claims.
-    #
-    # RESERVED, not borrowed, and that asymmetry is the whole design. An agent
-    # session runs for hours and its work is deferrable — the queue keeps. A CI
-    # job runs for minutes and something is already waiting on it: a PR, and a
-    # merge lane that cannot distinguish a check queued behind a four-hour
-    # session from a check on a dead runner. So CI gets a fixed floor it never
-    # has to wait hours for, and the tick — the elastic side — gives it up.
-    #
-    # The cost is honest and small: when no PR is open, `slots` cores sit idle
-    # rather than running one more session. See docs/ci.md for the arithmetic
-    # this was chosen against.
-    def reserved
-      value = config["slots"]
-      return 0 unless value.is_a?(Integer) || value.to_s.match?(/\A\d+\z/)
-      [value.to_i, 0].max
-    end
-
-    def enabled? = reserved.positive?
-
-    # ---------------- the slot semaphore ----------------
-
-    def slot_file(index) = File.join(Agent::Paths.ci_slots_dir, "slot-#{index}.lock")
-
-    # Run `block` holding one of this machine's CI slots, waiting up to
-    # `wait_seconds` for one. Returns the block's value, or `:timed_out` if none
-    # came free — the caller turns that into INFRA_EXIT_CODE rather than a test
-    # failure.
-    #
-    # The lock is held by THIS process for the duration of the block, which is
-    # why the whole build runs inside one `dev ci run` rather than the workflow
-    # acquiring in one step and releasing in another. A lease spanning steps
-    # would need an owner, an expiry and a reaper; an fd needs none of them, and
-    # a job killed mid-build releases its slot the instant the kernel closes it.
-    def with_slot(wait_seconds: SLOT_WAIT_SECONDS, poll_seconds: SLOT_POLL_SECONDS, clock: -> { Time.now })
-      count = reserved
-      raise "CI is not provisioned on this machine (#{Agent::Paths.ci_config_file} has no slots). Run `dev ci install`." if count.zero?
-
-      Agent::Paths.mkdir_p(Agent::Paths.ci_slots_dir)
-      deadline = clock.call + wait_seconds
-      loop do
-        # The success path leaves through the `return` inside the block, with
-        # try_slot's `ensure` unlocking behind it. Every other path here means
-        # every slot was busy.
-        count.times { |index| try_slot(index) { return yield(index) } }
-        # The remaining time bounds the sleep, so `--wait 60` waits 60 seconds
-        # rather than the next multiple of the poll interval. A wait that
-        # silently rounds up to the poll granularity would make the deadline a
-        # suggestion, and the whole value of the deadline is that it is the one
-        # thing distinguishing a busy machine from a wedged one.
-        remaining = deadline - clock.call
-        return :timed_out if remaining <= 0
-        sleep([poll_seconds, remaining].min)
-      end
-    end
-
-    # Take slot `index` if it is free, yield, and release. Returns `:busy`
-    # without yielding when another process holds it.
-    def try_slot(index)
-      file = File.open(slot_file(index), File::RDWR | File::CREAT, 0600)
-      begin
-        return :busy unless file.flock(File::LOCK_EX | File::LOCK_NB)
-        begin
-          file.truncate(0)
-          file.write("#{Process.pid} #{Time.now.utc.iso8601}\n")
-          file.flush
-          yield
-        ensure
-          file.flock(File::LOCK_UN)
-        end
-      ensure
-        file.close
-      end
-    end
-
-    # How many CI slots are busy right now — for `dev ci status` and nothing
-    # else. It is NOT what the tick subtracts: the tick subtracts the whole
-    # reservation, so that a CI job arriving on an idle box does not have to wait
-    # for a session to finish (see `reserved`).
-    #
-    # Probing is a non-blocking take-and-release, so a slot this very process
-    # holds reads as free — `dev ci status` run from inside `dev ci run` will
-    # undercount by one. That is the only caller it is wrong for and it is not
-    # worth an ownership record to fix.
-    def slots_held
-      (0...reserved).count do |index|
-        next false unless File.exist?(slot_file(index))
-        try_slot(index) { false } == :busy
-      end
-    end
 
     # ---------------- the false-green rule ----------------
 
@@ -222,19 +92,20 @@ module Agent
     # merges greens without asking. So warmth is spent only where a human still
     # sees the result:
     #
-    #   pull_request  warm. The fast path, and the point of self-hosting. A false
-    #                 green here is bounded by the cold build on `main`, which
-    #                 runs before anything is built on top of it.
-    #   push (main)   cold. The tree every PR is measured against.
-    #   schedule      cold. The nightly, which is what notices that the warm path
-    #                 has been lying all day.
+    #   pull_request  warm. The fast path, and the whole point of building on our
+    #                 own hardware. A false green here is bounded by the cold
+    #                 build on `main`, which runs before anything is built on top
+    #                 of it.
+    #   push (main)   cold. The tree every PR is measured against, rebuilt on
+    #                 every new tip and at least daily — which is what notices
+    #                 that the warm path has been lying (Agent::Verify).
     #   anything else cold. An event nobody listed is an event nobody reasoned
     #                 about, and the safe answer to "should I trust this cache"
     #                 has to be no.
     #
     # Stated as one comparison rather than a list of cold events on purpose:
-    # warmth is an allowlist of exactly one entry, so a new trigger added to a
-    # workflow a year from now is cold until somebody decides otherwise.
+    # warmth is an allowlist of exactly one entry, so a trigger somebody adds a
+    # year from now is cold until it is deliberately made warm.
     def clean_build?(event:) = event.to_s != "pull_request"
 
     # ---------------- preflight ----------------
@@ -370,12 +241,14 @@ module Agent
       Agent::Escalation.record(
         ERROR_SOURCE, report.summary, host: hostname, now: now,
         title: ->(host) { "CI runner #{host} cannot produce a verdict" },
-        explain: "`dev ci preflight` has failed on this runner three times in a row, so every CI job " \
-                 "it accepts is red for a reason that has nothing to do with the branch — and the " \
+        explain: "`dev ci preflight` has failed on this runner three times in a row, so every verify " \
+                 "job it takes is red for a reason that has nothing to do with the branch — and the " \
                  "merge lane is parking those PRs.\n\n" \
                  "Each fault above names the command that fixes it. Until one of them does, take the " \
-                 "machine out of the pool rather than leaving it to fail every job it is handed:\n\n" \
-                 "```\ndev ci install --slots 0\n```\n",
+                 "machine out of the pool rather than leaving it to fail every job it claims. Pausing " \
+                 "covers both kinds of work, because a verify job claims through the same tick an " \
+                 "agent session does (ISS-848):\n\n" \
+                 "```\ndev agent pause\n```\n",
       )
     rescue StandardError
       # Recording is decoration on a report that has already been computed. A

@@ -272,6 +272,45 @@ module DevTestSupport
     end
   end
 
+  # The same reasoning once more, for the lane walk the tick does looking for
+  # commits to verify (Agent::Verify, ISS-848).
+  #
+  # `scan` is `gh pr list` against every repo in the lane — a dozen live GitHub
+  # calls, whose answer is whatever pull requests happen to be open on the account
+  # while the suite runs. Left real, `test_dry_run_walks_every_phase_and_executes_
+  # nothing` made every one of them, on every run: slow, flaky by construction,
+  # and reaching the network from a test — which is the thing NetworkGuard exists
+  # to make impossible for the platform API and could not cover here, because this
+  # one shells out to `gh` rather than going through ApiClient.
+  #
+  # An empty scan rather than a raise, matching MaintenanceGuard: reaching this is
+  # not a test whose subject is the fleet, it is a test that walked the tick and
+  # incidentally passed through it. A test that IS about the scan stubs it itself
+  # (see test_agent_verify.rb), which overrides this.
+  #
+  # `claim` is stubbed too and is the one that would MUTATE: it posts a `pending`
+  # commit status to a real repository.
+  module VerifyGuard
+    def self.install
+      return unless defined?(Agent::Verify)
+      @saved = { scan: Agent::Verify.method(:scan), claim: Agent::Verify.method(:claim) }
+      Agent::Verify.define_singleton_method(:scan) do |**_opts|
+        Agent::Verify::Scan.new(candidates: [], dropped: 0, included_main: false)
+      end
+      Agent::Verify.define_singleton_method(:claim) { |_candidate, **_opts| nil }
+    end
+
+    def self.uninstall
+      return unless defined?(Agent::Verify) && @saved
+      @saved.each { |name, original| Agent::Verify.define_singleton_method(name, original) }
+      @saved = nil
+    end
+
+    # The real methods, for the one file that is ABOUT them. See
+    # `with_real_verify`, which is the only supported way to ask.
+    def self.real(name) = @saved.fetch(name)
+  end
+
   # Wraps every test in every class that loads this helper. `before_setup` /
   # `after_teardown` rather than `setup` / `teardown` so a test class defining
   # its own setup cannot silently drop the guard.
@@ -284,11 +323,13 @@ module DevTestSupport
       DevTestSupport::ToolchainGuard.install
       DevTestSupport::CredentialsGuard.install
       DevTestSupport::RegistryGuard.install
+      DevTestSupport::VerifyGuard.install
     end
 
     def after_teardown
       DevTestSupport.restore_stubbed_globals(@dev_test_stubbed_globals)
       @dev_test_stubbed_globals = nil
+      DevTestSupport::VerifyGuard.uninstall
       DevTestSupport::RegistryGuard.uninstall
       DevTestSupport::CredentialsGuard.uninstall
       DevTestSupport::ToolchainGuard.uninstall
@@ -421,6 +462,18 @@ module DevTestSupport
   # passed as well as on what came back.
   def stub_shell(impl, &block)
     stub_singleton(Agent::Shell, :capture, ->(*cmd, **opts) { impl.call(cmd, opts) }, &block)
+  end
+
+  # The REAL Agent::Verify.scan / .claim, for the one file whose subject they are.
+  #
+  # VerifyGuard neuters both for every other test in the suite, so a test about
+  # the scan has to ask for them back — and gets them only together with whatever
+  # stub the caller then installs over `Agent::Shell.capture` or
+  # `Agent::MergeLane.open_prs`, which is what keeps the network out.
+  def with_real_verify(&block)
+    stub_singleton(Agent::Verify, :scan, DevTestSupport::VerifyGuard.real(:scan)) do
+      stub_singleton(Agent::Verify, :claim, DevTestSupport::VerifyGuard.real(:claim), &block)
+    end
   end
 
   # The REAL Agent::Maintenance.run_shell, for a test about run_shell itself.

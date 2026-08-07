@@ -20,6 +20,7 @@ require 'agent/playbook'
 require 'agent/prompt'
 require 'agent/shell'
 require 'agent/toolchain'
+require 'agent/verify'
 require 'agent/workspace'
 
 # `dev agent tick` — one shot, run by launchd every 30 seconds. THERE IS NO
@@ -459,6 +460,27 @@ module Agent
         next unless Agent::Jobs.alive?(record["pid"])
         kill_if_timed_out(record)
       end
+      enforce_verify_timeouts
+    end
+
+    # The same, for verify jobs, and it is the BACKSTOP rather than the mechanism:
+    # `dev ci verify` has its own watchdog and posts `failure` from it, so this
+    # only fires for a worker that never reached its own deadline — one wedged in
+    # a syscall, or one whose deadline was overtaken by a machine that slept.
+    #
+    # It is on the VITALS path deliberately. A hung verify job holds a slot AND
+    # holds the lane on `:ci_pending`, and the work phase is exactly what a
+    # wedged runner is not running.
+    def enforce_verify_timeouts
+      Agent::Verify.all.each do |record|
+        next unless Agent::Verify.alive?(record["pid"])
+        next unless Agent::Verify.timed_out?(record, now: @now)
+        decide("verify", "#{Agent::MergeLane.bare(record['repo'])} #{Agent::Verify.short(record['sha'])} exceeded its " \
+                         "#{Agent::Verify::JOB_TIMEOUT_SECONDS / 60}m hard timeout — killing pid #{record['pid']}")
+        Agent::Verify.kill(record["pid"]) unless @dry_run
+      end
+    rescue StandardError => e
+      log("vitals: verify timeout sweep failed (#{e.class}: #{e.message})")
     end
 
     def kill_if_timed_out(record)
@@ -968,16 +990,29 @@ module Agent
         log("runner is paused — claiming nothing")
         return
       end
-      max = session_capacity(runner)
-      live = Agent::Jobs.all.count { |r| Agent::Jobs.alive?(r["pid"]) }
+      # BEFORE the sessions, and that ordering is what the ISS-763 reservation
+      # bought, expressed as priority rather than as arithmetic. A session's work
+      # is deferrable — the queue keeps. A pull request is already waiting on a
+      # check, and the lane cannot distinguish a check queued behind a four-hour
+      # session from a check on a dead runner: it reads `:ci_pending` and waits
+      # forever on both.
+      #
+      # ONE POOL, ONE NUMBER (ISS-848). Both kinds of work claim against the same
+      # `max_concurrency`, which is the whole simplification: there is no second
+      # scheduler on this box any more, so there is nothing to reserve, nothing to
+      # subtract and no way for the two to oversubscribe the machine.
+      verify(runner)
+
+      max = capacity(runner)
+      live = live_jobs
       if live >= max
-        log("at capacity (#{live}/#{max}#{ci_reservation_note}) — claiming nothing")
+        log("at capacity (#{live}/#{max}) — claiming nothing")
         return
       end
 
       (max - live).times do
         if @dry_run
-          decide("claim", "would POST /playbook/issue/leases (#{live}/#{max}#{ci_reservation_note} slots used)")
+          decide("claim", "would POST /playbook/issue/leases (#{live}/#{max} slots used)")
           break
         end
         lease = begin
@@ -1006,30 +1041,92 @@ module Agent
       end
     end
 
-    # How many sessions this machine may run at once: its registry-derived
-    # capacity, LESS whatever CI is reserved here (Agent::Ci, ISS-763).
+    # How much work this machine may run at once, of BOTH kinds.
     #
-    # The registry derives max_concurrency from reported hardware, and that is
-    # the whole box — cores and RAM, with no knowledge that a GitHub Actions
-    # runner is also installed on it. GitHub, for its part, pushes jobs at that
-    # runner with no knowledge of this. Two schedulers each sizing themselves to
-    # the same machine is how it ends up swapping at 100% CPU making progress on
-    # neither, so exactly one of them has to give, and it is this one: an agent
-    # session's work is deferrable (the queue keeps) and a CI job's is not (a PR
-    # is already waiting on it, and the merge lane cannot tell a check queued
-    # behind a four-hour session from a check on a dead runner).
+    # The registry derives `max_concurrency` from reported hardware, and that is
+    # the whole box — cores and RAM. Until ISS-848 this number had a reservation
+    # subtracted from it, because GitHub Actions was a second scheduler pushing CI
+    # jobs at the same hardware with no knowledge of this one, and two schedulers
+    # each sizing themselves to the same machine is how it ends up swapping at
+    # 100% CPU making progress on neither.
     #
-    # Zero is a legitimate answer — a box provisioned entirely for CI claims
-    # nothing — which is why the reservation is named in the capacity log line
-    # rather than left to be inferred from a suspicious `0/0`.
-    def session_capacity(runner)
-      capacity = (runner && runner["max_concurrency"]) || 1
-      [capacity - Agent::Ci.reserved, 0].max
+    # There is one scheduler now. Verify jobs are claimed by this tick, counted by
+    # `live_jobs`, and bounded by this same number — so the subtraction is not
+    # merely unnecessary, it would be double-counting.
+    def capacity(runner)
+      value = (runner && runner["max_concurrency"]) || 1
+      [value.to_i, 0].max
     end
 
-    def ci_reservation_note
-      reserved = Agent::Ci.reserved
-      reserved.zero? ? "" : ", #{reserved} reserved for CI"
+    # Everything this box is running: agent sessions AND verify jobs. One number,
+    # because they compete for one machine.
+    def live_jobs
+      Agent::Jobs.all.count { |r| Agent::Jobs.alive?(r["pid"]) } + Agent::Verify.live.length
+    end
+
+    # ---- verify jobs (ISS-848) ----
+    #
+    # The second unit of work the tick schedules, and deliberately NOT a Claude
+    # session: a checkout, a script, an exit code and a commit status. Putting a
+    # model in this loop would make the one path that has to be deterministic
+    # nondeterministic, and would bill tokens per re-verification — of which there
+    # are many, because every merge invalidates every sibling PR's check.
+    #
+    # Three steps, in this order for a reason each:
+    #   reap     first, so a job that finished frees its slot in the same pass
+    #            rather than a tick later — and so the lane is handed the result
+    #            of a worker that died rather than being left on `:ci_pending`.
+    #   scan     throttled well below the tick's own 30 seconds; the walk is an
+    #            API call per repo and the thing being waited on takes minutes.
+    #   claim    posts `pending` and reads it back, so two boxes scanning the same
+    #            repo cannot both build the same sha (fleet-wide dedup, on GitHub
+    #            rather than in a file on this runner).
+    def verify(runner)
+      reap_verify_jobs
+      free = capacity(runner) - live_jobs
+      return if free <= 0
+      return unless Agent::Verify.scan_due?(now: @now)
+
+      scan = Agent::Verify.scan(limit: [free, Agent::Verify::ENQUEUE_CAP].min, now: @now)
+      if @dry_run
+        decide("verify", "would enqueue #{scan.candidates.map(&:label).join(', ')}") if scan.candidates.any?
+        return
+      end
+      Agent::Verify.mark_scanned(now: @now)
+      Agent::Verify.mark_main_scanned(now: @now) if scan.included_main
+      # NAMED rather than silently truncated. A cap nobody can see reads as "the
+      # fleet is keeping up" when the truth is that N pull requests are waiting on
+      # a check; the next pass takes the next batch.
+      decide("verify", "#{scan.dropped} more candidate(s) deferred to the next pass (cap #{Agent::Verify::ENQUEUE_CAP})") if scan.dropped.positive?
+      scan.candidates.each { |candidate| start_verify_job(candidate) }
+    end
+
+    def start_verify_job(candidate)
+      token = Agent::Verify.claim(candidate)
+      if token.nil?
+        # Another box got there first, or the POST failed. Either way this runner
+        # does nothing: the sha is somebody else's to answer, or it still has no
+        # `ci` entry and the next pass sees it again.
+        decide("verify", "#{candidate.label} #{Agent::Verify.short(candidate.sha)} — not claimed here (another runner, or GitHub refused the status)")
+        return
+      end
+      pid = Agent::Verify.spawn(candidate, now: @now)
+      decide("verify", "#{candidate.label} building #{Agent::Verify.short(candidate.sha)} " \
+                       "(#{candidate.clean? ? 'cold' : 'warm'}, pid #{pid})")
+    rescue StandardError => e
+      # A verify job that could not be started must not cost the session claims
+      # behind it, and must not leave a `pending` status with nothing running: the
+      # abandoned-pending rule re-enqueues it, and this says so out loud.
+      decide("verify", "#{candidate.label} could not start (#{e.class}: #{e.message}) — the pending status expires into a re-enqueue")
+    end
+
+    def reap_verify_jobs
+      Agent::Verify.reap(now: @now) do |record, outcome, message|
+        decide("verify", "#{Agent::MergeLane.bare(record['repo'])}#{record['pr'] ? "##{record['pr']}" : ''} " \
+                         "#{Agent::Verify.short(record['sha'])} #{outcome}: #{message}")
+      end
+    rescue StandardError => e
+      log("verify: reap failed (#{e.class}: #{e.message}) — records are retried on the next tick")
     end
 
     # THE thing that must not happen: a claim that dies with the lease already
