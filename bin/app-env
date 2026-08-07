@@ -1,0 +1,45 @@
+#!/usr/bin/env ruby
+
+# Generates environment variables for running scala applications locally.
+# Used with eval to set environment variables for sbt.
+#
+# Usage:
+#   eval "$(~/code/devops/bin/app-env --app platform --env development --format sh)"
+#   sbt run
+#
+# Or combined:
+#   eval "$(~/code/devops/bin/app-env --app platform --env development --format sh) sbt run"
+#
+# NAMED `app-env`, NOT `env`, AND IT MAY NEVER GO BACK. This directory is
+# PREPENDED to PATH (lib/agent/toolchain.rb tells you to do exactly that), so a
+# file named `env` here shadows /usr/bin/env for the whole login shell — and this
+# script prints every resolved secret for the app to stdout, with no flag asked
+# for. That turned the most ordinary line in POSIX shell,
+#
+#   env CONF_DB_DEV_URL=... SBT_OPTS=-Xmx12G sbt 'core/testOnly ...'
+#
+# into a full secret dump: prod DB URL with password, SendGrid, Stripe, Twilio,
+# DO Spaces, NewRelic, Claude keys, the Play crypto secret — one line, into
+# whatever log the command was redirected to (ISS-893, hit for real on 2026-08-07).
+# `test/test_bin_shadows_no_system_command.rb` fails the suite if any name in
+# bin/ ever shadows a system command again.
+
+load File.join(File.dirname(__FILE__), '../lib/common.rb')
+
+args = Args.parse(ARGV, ["app"])
+format = args.format || 'sh'
+
+# Load environment variables from files
+vars = EnvironmentVariables.load(args.app, args.env)
+
+# Load config to get port for deployment nodes
+config = Config.load(args.app)
+if config.scala
+  port = config.port
+  # For local development, single node on localhost (as job server, index 0)
+  vars = vars.with_variable("DEPLOYMENT_NODES", "localhost:#{port}")
+  vars = vars.with_variable("DEPLOYMENT_NODE_INDEX", "0")
+  vars = vars.with_variable("DEPLOYMENT_JOB_SERVER", "true")
+end
+
+puts vars.serialize(format)

@@ -4,7 +4,7 @@ require_relative 'test_helper'
 require 'open3'
 require_relative '../lib/environment_variables'
 
-# `bin/env`'s output is EVAL'D by the caller — `eval "$(bin/env --app platform
+# `bin/app-env`'s output is EVAL'D by the caller — `eval "$(bin/app-env --app platform
 # --env development --format sh)"` in bin/run — and the values are the
 # git-crypt'd app secrets: passwords, tokens, connection strings.
 #

@@ -110,7 +110,7 @@ module Config
     # somewhere other than the checkout you are editing.
     #
     # stderr, for the reason Util.run gives: stdout is a data channel here
-    # (bin/env emits shell the caller evals, bin/db emits a URL).
+    # (bin/app-env emits shell the caller evals, bin/db emits a URL).
     def Config.announce_dist_fallback(dir)
         return if @announced_dist_fallback
         @announced_dist_fallback = true

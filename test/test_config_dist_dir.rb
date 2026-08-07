@@ -117,7 +117,7 @@ class TestConfigDistDir < Minitest::Test
     Config.instance_variable_set(:@announced_dist_fallback, false)
   end
 
-  # The same failure test/env-stdout-is-evalable.sh guards: `bin/env --format sh`
+  # The same failure test/app-env-stdout-is-evalable.sh guards: `bin/app-env --format sh`
   # has its stdout eval'd by the caller, and bin/db emits a bare URL. A banner on
   # stdout there fails with "==: command not found".
   def test_the_fallback_notice_goes_to_stderr_not_stdout

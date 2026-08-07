@@ -23,16 +23,16 @@ Rake::TestTask.new(:test) do |t|
   t.warning = false
 end
 
-# The shell guard for `bin/env --format sh`, kept OUT of `rake test` on purpose.
+# The shell guard for `bin/app-env --format sh`, kept OUT of `rake test` on purpose.
 # It shells into the sibling `env` checkout, so what it reports depends on
 # whether this machine has one and whether it is unlocked — it skips, passes or
 # fails on ambient state rather than on the code under test. That confound is
 # exactly what made the credentials test read green on laptops and red on the
 # runners (ISS-613), and a merge decision must not be made from a signal that
 # moves with the machine. Run it deliberately, on a machine you know.
-desc "Shell guard: bin/env --format sh writes nothing but assignments to stdout"
-task "test:env_stdout" do
-  sh File.expand_path("test/env-stdout-is-evalable.sh", __dir__)
+desc "Shell guard: bin/app-env --format sh writes nothing but assignments to stdout"
+task "test:app_env_stdout" do
+  sh File.expand_path("test/app-env-stdout-is-evalable.sh", __dir__)
 end
 
 task default: :test
