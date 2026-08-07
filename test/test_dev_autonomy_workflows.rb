@@ -129,17 +129,26 @@ class TestDevAutonomyWorkflows < Minitest::Test
     assert_match(/^  last run:   2026-08-06T06:45:00Z$/, out)
   end
 
-  # ISS-756: with the daily budget gone, blocked is the early-warning signal that
-  # the envelope is too tight or the loop has gone wrong. A bare count is a number
+  # ISS-756: with the daily budget gone, blocked is the remaining signal that a
+  # released loop and its envelope have stopped agreeing. A bare count is a number
   # you have to already care about, so the view says what it means and how to read
   # the decisions behind it.
   def test_blocked_decisions_are_called_out_with_the_command_that_reads_them
     out = show_stats(stats(decisions_today: 5, blocked_today: 3))
     assert_match(/^  blocked:    3 today$/, out)
     assert_match(/3 decision\(s\) BLOCKED today/, out)
-    assert_match(/envelope is too tight or the loop has gone/, out)
     assert_includes out,
                     "dev autonomy decisions --workflow pr_auto_merge --disposition blocked"
+  end
+
+  # ...and says which blocked decisions are NOT news. Every one pr_auto_merge had
+  # on the day this shipped was a classification above its reversibility ceiling,
+  # which is the ceiling working; calling those an alarm makes the call-out noise
+  # on its first run.
+  def test_the_call_out_separates_the_designed_hold_from_the_anomaly
+    out = show_stats(stats(blocked_today: 8))
+    assert_match(/above max_reversibility lands here BY DESIGN/, out)
+    assert_match(/other reason means the envelope and the work no longer agree/, out)
   end
 
   # The quiet case is the common one, and a warning printed every day is a warning

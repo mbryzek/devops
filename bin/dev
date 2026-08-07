@@ -11000,18 +11000,24 @@ def autonomy_field_value(value, field)
   field[:show] ? field[:show].call(value) : value.to_s
 end
 
-# A count on a line is a number somebody has to know to care about. Blocked
-# decisions are the signal that a released loop is being held back by its own
-# envelope, or has started asking for things it should not, so when there are
-# any, say what they mean and give the command that reads them.
+# A count on a line is a number somebody has to know to care about, so say what
+# a blocked decision is and what would make this count worth acting on.
+#
+# Being precise about that matters more than it looks. `blocked` is BOTH the
+# designed hold path -- a decision above `max_reversibility` is refused, which is
+# the ceiling doing its job -- and the anomaly signal. All 8 of pr_auto_merge's
+# blocked decisions on the day this shipped were the former. A call-out that read
+# them all as an alarm would be noise from its first run, and a count nobody can
+# interpret is the thing this was added to fix.
 def autonomy_blocked_lines(workflow)
   count = (workflow["stats"] || {})["blocked_today"].to_i
   return [] unless count.positive?
 
   ["",
-   "  #{count} decision(s) BLOCKED today: outside the declared envelope, or over a daily budget.",
-   "  That is the early-warning signal that the envelope is too tight or the loop has gone",
-   "  wrong. Read them before widening anything:",
+   "  #{count} decision(s) BLOCKED today: the ledger refused permission and is holding them.",
+   "  A classification above max_reversibility lands here BY DESIGN. A refusal for any",
+   "  other reason means the envelope and the work no longer agree -- read the reasons,",
+   "  and never re-submit a blocked decision under a softer classification:",
    "    dev autonomy decisions --workflow #{workflow['key']} --disposition blocked"]
 end
 
@@ -11263,6 +11269,11 @@ def cmd_autonomy_decisions(args)
       rows.each do |d|
         puts format("%-14s %-12s %-24s %s",
                     d["disposition"], d["status"], d["workflow"]["key"], d["subject"]["label"])
+        # Why it was held is the whole content of a non-approved row, and this
+        # feed is where `autonomy workflows` sends you to read it. Printed
+        # underneath rather than appended, because both are already long.
+        reason = d["disposition_reason"]
+        puts "  ↳ #{reason}" if reason && !reason.empty?
       end
     end
   end
