@@ -102,6 +102,11 @@ module Agent
     def issue_dir(number)   = File.join(issues_dir, "ISS-#{number}")
     def claude_log(number)  = File.join(issue_dir(number), "claude.log")
     def meta_file(number)   = File.join(issue_dir(number), "meta.json")
+    # One record per operation `dev agent run-op` executed for this issue
+    # (Agent::Ops, ISS-815). Beside claude.log rather than under the workspace
+    # for the reason `exit_code` is: the reap DELETES the workspace, and an
+    # artifact classification reads must outlive the thing it classifies.
+    def ops_dir(number)     = File.join(issue_dir(number), "ops")
 
     def job_file(number) = File.join(jobs_dir, "#{number}.json")
 

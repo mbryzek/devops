@@ -205,6 +205,55 @@ class TestDevFeatures < Minitest::Test
     assert_equal "", out
   end
 
+  # ---------- the ops close-out contract (ISS-815) ----------
+
+  # The two silences mean opposite things, and this is the pair that pins it.
+  #
+  # In a RELEASE, "nothing to do" is the normal state and a section saying so is
+  # noise — the test above. To an ops SESSION, whose entire deliverable is having
+  # run this, "0 processed" is the answer and no line at all is indistinguishable
+  # from a reconcile that never ran — which on a producer-filed issue is an
+  # outcome of `dismissed` (ISS-809's failure mode, one level up).
+  def test_under_an_ops_run_the_reconciler_reports_its_counts_even_when_nothing_moved
+    out, = capture_io do
+      with_ops_run do
+        with_stubbed_api("GET /dev/feature-removals?processed=false&limit=100" => [],
+                         "GET /dev/feature-removals?processed=true&limit=100" => []) do
+          cmd_features_reconcile([])
+        end
+      end
+    end
+    report, visible = Agent::Ops.extract(out)
+    assert_equal "nothing to process or purge; 0 outstanding.", report["summary"]
+    assert_equal 0, report["effects"]["processed"]
+    assert_equal "", visible, "the release log is unchanged; the marker is addressed to `run-op`"
+  end
+
+  def test_under_an_ops_run_the_reconciler_reports_what_it_moved
+    purgeable = removal(apps: []).merge("processed_at" => "2026-01-01T12:00:00Z")
+    out, = capture_io do
+      with_ops_run do
+        with_stubbed_api("GET /dev/feature-removals?processed=false&limit=100" => [],
+                         "GET /dev/feature-removals?processed=true&limit=100" => [purgeable],
+                         "POST /dev/feature-removals/playbook/revenue_business_line/purge" => {}) do
+          cmd_features_reconcile(["--apply"])
+        end
+      end
+    end
+    report, = Agent::Ops.extract(out)
+    assert_equal 1, report["effects"]["purged"]
+    assert_equal true, report["effects"]["applied"]
+    assert_match(/1 purged/, report["summary"])
+  end
+
+  def with_ops_run
+    original = ENV[Agent::Ops::LISTENER_ENV]
+    ENV[Agent::Ops::LISTENER_ENV] = "1"
+    yield
+  ensure
+    ENV[Agent::Ops::LISTENER_ENV] = original
+  end
+
   # ---------- features_reconcile_summary ----------
 
   def test_summary_is_omitted_when_nothing_moved

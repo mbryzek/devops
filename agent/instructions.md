@@ -23,6 +23,7 @@ Exactly one of these, always:
 |---|---|---|
 | Working code | Draft PR → mark it ready → close the issue out | `fixed` |
 | A design/investigation, no code | Commit the document to `~/code/claude/plans/` and put its path in a comment | `needs_review` |
+| An operation to RUN, not code to change | Run it through `dev agent run-op` (see below) | `deployed` |
 | A blocker only a human can clear | `dev issues status <n> --status needs_input --comment "<the specific question>"` | `needs_input` |
 | Genuinely nothing to do | Say what you checked and why you found nothing | see §5 |
 
@@ -33,6 +34,50 @@ leave one command behind that no session can run — that is not a fifth row, it
 **Never exit having done none of these.** An issue that silently ages in the
 queue is the worst outcome in this system — worse than a wrong answer, because
 nobody learns anything from it.
+
+### When the assignment is to RUN something, not to change code
+
+Some issues are chores: run `dev features reconcile --apply`, run `api publish`,
+run the thing and be done. They produce no PR and no plan document, so they close
+out through a different artifact — and it is not your report of having run it.
+
+**Run the operation through `dev agent run-op` and nothing closes out by hand:**
+
+    dev agent run-op <short-name> -- <the command, exactly as you would type it>
+
+    dev agent run-op issues-reconcile -- dev issues reconcile --apply
+    dev agent run-op api-publish -- api publish
+
+It executes the command, prints what the command printed, exits with the
+command's own status, and files a record the executor reads when it classifies
+you. Every operation succeeding plus a clean exit closes the issue as `deployed`,
+with what each one DID on the timeline. Any operation failing returns the issue
+to the queue to be run again.
+
+Three things follow from that, and each has already cost a run somewhere:
+
+- **Run every operation through it, including ones you expect to be a no-op.**
+  A reconcile that moved nothing still has to be recorded as having run: without
+  a record you look identical to a session that did nothing, which on a
+  producer-filed issue means the issue is DISMISSED with the chore never done.
+- **Do not close the issue out yourself afterwards.** No `dev issues status`, no
+  `--status fixed`. The record is the close-out; a status you set by hand is
+  believed (a status the session set wins over the reap's classification), so
+  setting the wrong one sticks.
+- **`run-op` exits with the operation's status**, so `&&` between two of them
+  stops at the first failure — which is usually what you want, since the second
+  operation's result would be recorded against a run that already failed.
+- **A slow operation outruns your own Bash call.** `run-op` prints nothing until
+  the operation finishes, and `api publish` uploads 100+ apibuilder applications;
+  your tool call's timeout will fire first and kill it, leaving a half-run
+  operation and no record. Start anything you expect to take minutes detached
+  (`nohup … > /tmp/<op>.log 2>&1 &`) and poll the log, exactly as §7 says for
+  `playwright install`. `run-op` has its own hour-long deadline underneath
+  (`--timeout SECONDS` to change it), so a genuinely hung operation is still
+  recorded as a timeout rather than hanging your session.
+
+If the command genuinely cannot be run on this machine, that is `dev issues
+workaround` or `dev issues handoff`, exactly as it would be for anything else.
 
 ### The PR sequence, exactly
 

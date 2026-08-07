@@ -86,6 +86,97 @@ class TestDevAgentOutcome < Minitest::Test
     assert_equal "nothing_to_do", classify(producer_filed: false).name
   end
 
+  # ---- the ops arm (ISS-815) ----
+  #
+  # A session whose job is to RUN something — `dev features reconcile --apply`,
+  # `api publish` — changes no code, so it produced neither of the artifacts the
+  # arms above look for and fell all the way through to `nothing_to_do`. On a
+  # producer-filed issue that means DISMISSED: a reconcile that moved twelve
+  # issues and a reconcile that never ran classified identically.
+
+  def ops(operation: "features-reconcile", status: 0, timed_out: false, summary: "2 processed, 1 purged.")
+    Agent::Ops::Record.new(operation: operation, status: status, timed_out: timed_out, summary: summary,
+                           argv: %w[dev features reconcile --apply], effects: {},
+                           started_at: "2026-08-07T15:00:00Z", finished_at: "2026-08-07T15:00:12Z")
+  end
+
+  # `deployed`, not `fixed`. An ops run has no PR to give a deploy watch, and a
+  # `fixed` with nothing to watch is how 49 issues came to sit in `fixed` forever
+  # (ISS-737). `deployed` is the platform's own word for "live, or needed no
+  # release", it stamps deployed_at so the 7-day auto-verify applies unchanged,
+  # and it is a RolledUpStatus so a child filed this way releases its epic.
+  def test_a_completed_operation_closes_the_issue_as_deployed
+    result = classify(operations: [ops], producer_filed: true)
+    assert_equal "operation_completed", result.name
+    assert_equal "deployed", result.status
+    assert_equal "completed", result.lease_outcome
+    assert Agent::Outcome.success?(result), "a completed operation must release the workspace"
+  end
+
+  # The whole value of having run it. A contract that recorded only "the process
+  # exited 0" would reproduce ISS-809's failure mode — silence indistinguishable
+  # from success — one level up, so the counts have to reach the timeline.
+  def test_the_arm_carries_what_the_operation_did_not_merely_that_it_ran
+    reason = classify(operations: [ops, ops(operation: "issues-reconcile", summary: "3 deployed.")]).reason
+    assert_match(/2 operations/, reason)
+    assert_match(/features-reconcile — 2 processed, 1 purged./, reason)
+    assert_match(/issues-reconcile — 3 deployed./, reason)
+  end
+
+  # THE DANGEROUS ONE. The wrapper's `echo $?` reports on CLAUDE, and Claude
+  # exiting tidily says nothing about whether the thing it was sent to run
+  # worked. Without this arm, a session that watched `dev issues reconcile
+  # --apply` exit 1 and then finished cleanly classified as `nothing_to_do` and,
+  # on a producer-filed issue, dismissed itself.
+  def test_an_operation_that_failed_beats_the_sessions_own_clean_exit
+    result = classify(operations: [ops(status: 1)], exit_code: 0, producer_filed: true)
+    assert_equal "failed", result.name
+    assert_equal "open", result.status
+    assert_match(/Operation failed: features-reconcile — exited 1/, result.reason)
+  end
+
+  def test_one_failed_operation_condemns_the_run_even_beside_a_successful_one
+    result = classify(operations: [ops, ops(operation: "issues-reconcile", status: 2)], exit_code: 0)
+    assert_equal "failed", result.name
+    assert_match(/issues-reconcile — exited 2/, result.reason)
+    refute_match(/features-reconcile/, result.reason, "only the failures are the diagnosis")
+  end
+
+  def test_a_timed_out_operation_is_a_failure_not_a_result
+    result = classify(operations: [ops(status: nil, timed_out: true)], exit_code: 0)
+    assert_equal "failed", result.name
+    assert_match(/timed out/, result.reason)
+  end
+
+  # The ops arm requires a CLEAN EXIT, and this is why: nothing here knows how
+  # many operations the issue meant to run, so a session that ran the first of
+  # three and then died must not read as done. The exit code is what supplies
+  # "and there was nothing left to do"; retrying is free because every operation
+  # reached this way is idempotent.
+  def test_a_successful_operation_does_not_rescue_a_session_that_crashed_after_it
+    assert_equal "failed", classify(operations: [ops], exit_code: 1).name
+    assert_equal "failed", classify(operations: [ops], exit_code: nil).name
+    assert_match(/KILLED/, classify(operations: [ops], killed: { "reason" => "timeout" }).reason)
+    assert_match(/never marked ready/, classify(operations: [ops], pr: DRAFT_PR).reason)
+  end
+
+  # Delivered code still outranks a chore. A session that found the reconciler
+  # broken, fixed it, and left a ready PR delivered the more valuable artifact;
+  # the chore is re-filed by the next release either way. Stated as a test
+  # because the order is a judgement call, not an accident.
+  def test_delivered_code_still_outranks_a_completed_operation
+    assert_equal "merged_pr", classify(operations: [ops], pr: MERGED_PR).name
+    assert_equal "ready_pr", classify(operations: [ops], pr: READY_PR).name
+    assert_equal "design_document", classify(operations: [ops], plans_committed: true).name
+  end
+
+  # No operations is exactly the old behaviour: this arm may only ever ADD a
+  # positive outcome, never reinterpret a run that recorded nothing.
+  def test_a_run_with_no_operations_classifies_exactly_as_before
+    assert_equal "dismissed", classify(operations: [], producer_filed: true).status
+    assert_equal "needs_input", classify(operations: [], producer_filed: false).status
+  end
+
   def test_crash_is_retryable_until_three_failures_in_a_row
     assert_equal "open", classify(exit_code: 2).status
     assert_equal "failed", classify(exit_code: 2).name
