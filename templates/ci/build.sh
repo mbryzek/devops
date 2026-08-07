@@ -59,3 +59,18 @@ echo "building ${CI_REPO:-?} @ ${CI_SHA:-?} (${CI_EVENT:-?}, clean=${CI_CLEAN_BU
 npm ci
 npm run check
 npm run test:unit
+
+# THE BUILD IS A VERDICT `npm run check` CANNOT GIVE, and it is why this line is
+# in the template rather than left to each repo to remember (ISS-868, ISS-870).
+# SvelteKit's "$lib/server imported into browser code" guard is a vite BUILD
+# plugin, so svelte-check is blind to it — as it is to a bad adapter config and
+# every other build-only vite failure. A repo that never builds in CI is a repo
+# whose RELEASE is the first thing that ever builds it, and `release-sveltekit`
+# stamps the version before the build step: the leak surfaces from a `dev deploy`
+# that has already tagged and pushed. playbook-admin 0.4.42 is what that looks
+# like — tag pushed, nothing deployed.
+#
+# Build ONE mode even where a repo has several (`build:plybk` and friends). They
+# differ in committed VITE_* values, and every failure this catches is a property
+# of the module graph rather than of the mode.
+npm run build
