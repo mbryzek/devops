@@ -70,6 +70,34 @@ def confirm_contracting_release!(repo_dir, tag)
   Util.exit_with_error("Aborted: deploy the app first, then re-run release-db (or use `dev deploy all`)")
 end
 
+# Say, out loud and every time, when this release contains a statement no
+# ordering makes safe — a rename or a column type change against an object
+# released code still names (SchemaCompat, ISS-864).
+#
+# WARNS RATHER THAN REFUSING, and that asymmetry is the point. `dev schema lint`
+# and `claude-db sync` refuse, because before the merge splitting it into three
+# releases costs a commit. By the time it reaches here the migration AND the code
+# that needs it are both on main: refusing would leave the new code live against
+# a schema it cannot use, which is the same outage with no way out of it. The
+# only decision left is when to open the window, so this describes the window.
+#
+# Printed under RELEASE_DB_AUTO_CONFIRM too. The auto-confirm caller is
+# `dev deploy all`, whose Phase 3 ordering is exactly the thing that does not
+# help here, and a warning suppressed for the unattended path is a warning
+# nobody ever sees — the deploy log is where this incident would have been
+# visible on 2026-08-07 and was not.
+def warn_incompatible_release!(repo_dir, tag)
+  previous = SchemaScripts.previous_tag(repo_dir, tag)
+  return if previous.nil?
+
+  findings = SchemaCompat.scan_scripts(repo_dir, SchemaCompat.added_scripts(repo_dir, previous))
+  return if findings.empty?
+
+  puts ""
+  puts Util.underline("INCOMPATIBLE MIGRATION")
+  puts SchemaCompat.release_warning(tag, findings)
+end
+
 # Refuse to ship scripts that cannot be applied to a database built from scratch.
 #
 # Without this, a collision is discovered by sem-apply ON THE BASTION, against a
@@ -141,6 +169,11 @@ Dir.chdir(repo_dir) do
     end
     released_tag = current_tag
 
+    # Before the ordering prompt, not after: "have the apps already been
+    # deployed?" is the wrong question for an incompatible release — both
+    # answers open a window — and the operator has to know that before they
+    # answer it.
+    warn_incompatible_release!(repo_dir, current_tag)
     confirm_contracting_release!(repo_dir, current_tag)
 
     tarball = File.join(repo_dir, "dist", "#{db_name}-#{current_tag}.tar.gz")

@@ -555,6 +555,23 @@ def do_sync(app)
   # of the pair of PRs that actually has to be reconciled.
   SchemaCollisions.assert_none!(app.repo_dir)
 
+  # And can what this branch adds ship in one release at all? A session writing
+  # a migration comes here next — this is the first command in the system that
+  # reads the script the session just wrote — and it is the last point at which
+  # splitting a rename into three releases costs a commit instead of a
+  # production window (ISS-864).
+  #
+  # Scoped to what THIS BRANCH adds (origin/main, freshly fetched above), never
+  # the whole unreleased set: a session must not be refused a database over
+  # somebody else's merged migration, which it cannot fix and is not answerable
+  # for. With no local schema clone, app.repo_dir is the tooling mirror pinned to
+  # origin/main and this is empty by construction.
+  SchemaCompat.assert_none!(
+    SchemaCompat.added_scripts(app.repo_dir),
+    app.repo_dir,
+    :epilogue => "The database is untouched. Fix the script (or assert the opt-out) and re-run claude-db sync."
+  )
+
   # 127.0.0.1, not the HOST constant: `localhost` resolves to ::1 first on this
   # box, and sem-apply follows that resolution to a refused connection where
   # plain psql happens to fall back to IPv4.
