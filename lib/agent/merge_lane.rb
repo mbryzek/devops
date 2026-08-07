@@ -1,4 +1,5 @@
 require 'json'
+require 'tmpdir'
 require 'agent/github'
 require 'agent/shell'
 
@@ -419,19 +420,24 @@ module Agent
     # Reversibility, from the paths a PR actually changes — never from what the
     # PR says about itself.
     #
-    # Deliberately CONSERVATIVE at the spec boundary: every apibuilder spec change
-    # is `costly` here, including a purely additive one that is not breaking at
-    # all. Classifying those precisely is ISS-757's job and it needs apibuilder's
-    # own `diff_breaking` / `diff_non_breaking`; guessing at it from a path grep
-    # is exactly the imprecision that issue exists to remove. Over-classifying
-    # costs a merge that waits for a human. Under-classifying ships a broken
-    # client to a consumer that regenerates tomorrow.
-    def reversibility(changed_paths, repo:)
+    # `spec_diff` is the ONE input here that is not a path, and it is apibuilder's
+    # own answer rather than this module's: `:non_breaking` means nothing generated
+    # against the old contract stops working, so the spec change is as reversible as
+    # any other undeployed code. Anything else — `:breaking`, or `:unknown` because
+    # the check could not be run — is `costly` and waits for a human (ISS-757).
+    #
+    # It defaults to `:unknown`, which is the path-grep behaviour this replaces: a
+    # caller that does not compute the diff gets every spec change classified
+    # `costly`, exactly as before. Over-classifying costs a merge that waits.
+    # Under-classifying ships a broken client to a consumer that regenerates
+    # tomorrow — so the default is the safe one, and `spec_diff` must be COMPUTED
+    # (see `.spec_diff`), never taken from the session asking for the merge.
+    def reversibility(changed_paths, repo:, spec_diff: :unknown)
       paths = Array(changed_paths).map(&:to_s)
       repo_name = repo.to_s.split("/").last
       return "irreversible" if SELF_DEPLOYING_REPOS.include?(repo_name)
       return "irreversible" if paths.any? { |p| migration?(p) }
-      return "costly" if paths.any? { |p| spec?(p) }
+      return "costly" if paths.any? { |p| spec?(p) } && spec_diff != :non_breaking
       return "trivial" if !paths.empty? && paths.all? { |p| documentation?(p) }
       "reversible"
     end
@@ -446,6 +452,14 @@ module Agent
     end
 
     def spec?(path) = path.match?(%r{(\A|/)spec/[^/]+\.json\z})
+
+    # Whether asking apibuilder about this PR is worth a clone at all. A DAO spec
+    # lives under `dao/spec/` and so matches `spec?` too, but it regenerates
+    # schema and is `irreversible` whatever the diff says — asking about one is a
+    # clone spent on an answer that cannot change the classification.
+    def spec_touched?(changed_paths)
+      Array(changed_paths).map(&:to_s).any? { |p| spec?(p) && !migration?(p) }
+    end
 
     def documentation?(path)
       path.match?(/\.(md|txt)\z/i) || path.match?(%r{(\A|/)docs/})
@@ -469,13 +483,17 @@ module Agent
     # PR author's "tests pass" would be exactly that loop. `suite_passed` here is
     # not a session's word for it — it is the `ci` check, run by GitHub Actions
     # on the sha named beside it.
-    def assertions(candidate, base_sha: nil)
+    def assertions(candidate, base_sha: nil, spec_diff: nil)
       paths = Array(candidate.changed_paths)
+      touches_spec = paths.any? { |p| spec?(p) }
       {
         "repo" => bare(candidate.repo),
         "diff_lines" => candidate.diff_lines,
         "touches_migration" => paths.any? { |p| migration?(p) },
-        "touches_spec" => paths.any? { |p| spec?(p) },
+        "touches_spec" => touches_spec,
+        # Recorded only when there is a spec to have an opinion about, so a feed
+        # reader never sees "non_breaking" beside a PR that changed no contract.
+        "spec_diff" => (touches_spec ? (spec_diff || :unknown).to_s : nil),
         "touches_secrets" => paths.any? { |p| secrets?(p) },
         "suite_passed_post_rebase" => true,
         "verified_by" => "github_actions:#{CI_CHECK}",
@@ -555,6 +573,64 @@ module Agent
     # `--squash --delete-branch` matches how every one of these repos is merged
     # by hand, which is what makes the reversibility argument hold: one revert
     # commit undoes one PR.
+    # Exit codes of `api diff`, which is the whole contract with it: 0 nothing
+    # breaking, 1 at least one breaking difference, 2 could not answer.
+    SPEC_DIFF_EXIT = { 0 => :non_breaking, 1 => :breaking, 2 => :unknown }.freeze
+
+    # A blobless clone of a large repo plus one hermetic diff. Generous, because
+    # the alternative to waiting is `:unknown`, and `:unknown` holds a PR that was
+    # probably fine — the cost of this timeout is paid once per spec PR, not per
+    # candidate.
+    SPEC_DIFF_TIMEOUT_SECONDS = 300
+
+    # Does this PR's spec change break anything generated against main?
+    #
+    # COMPUTED, never believed. The lane's trust model is that the party asking
+    # for the merge asserts nothing: it would cost one flag to let a session pass
+    # `--spec-diff non_breaking`, and that flag would be the whole guarantee gone.
+    # So this checks the PR out itself and runs `api diff`, which asks apibuilder
+    # for its own `diff_breaking` / `diff_non_breaking` classification of every
+    # difference (ISS-757).
+    #
+    # `origin/main` is the right base BECAUSE OF THE LANE'S AHEAD INVARIANT: a
+    # candidate only reaches a merge decision when its head already contains the
+    # current tip of main, so main is an ancestor and the diff is exactly this
+    # PR's own contribution. Run against a PR that is BEHIND main, the same
+    # command would also report main's other spec changes, backwards.
+    #
+    # Every failure — no `api` on this machine, a clone that timed out, an
+    # unreachable registry — returns `:unknown`, which `reversibility` treats as
+    # `costly`. A check that broke must never read as a check that passed.
+    def spec_diff(repo, number, workdir: nil)
+      return :unknown if number.to_s.empty?
+
+      with_pr_checkout(repo, number, workdir: workdir) do |dir|
+        result = Agent::Shell.capture("api", "diff", "--base", "origin/main",
+                                      chdir: dir, timeout: SPEC_DIFF_TIMEOUT_SECONDS)
+        SPEC_DIFF_EXIT.fetch(result.exitstatus, :unknown)
+      end
+    rescue SystemCallError, StandardError
+      :unknown
+    end
+
+    # Checks the PR head out into a throwaway blobless clone and yields its path.
+    # Blobless because the diff reads a few dozen spec files out of a repo whose
+    # history is gigabytes; the objects it actually needs are fetched on demand.
+    def with_pr_checkout(repo, number, workdir: nil)
+      Dir.mktmpdir("spec-diff", workdir) do |dir|
+        clone = File.join(dir, "repo")
+        steps = [
+          ["git", "clone", "--filter=blob:none", "--quiet", "https://github.com/#{repo}.git", clone],
+          ["git", "-C", clone, "fetch", "--quiet", "origin", "pull/#{number}/head:pr-#{number}"],
+          ["git", "-C", clone, "checkout", "--quiet", "pr-#{number}"],
+        ]
+        steps.each do |cmd|
+          return :unknown unless Agent::Shell.capture(*cmd, timeout: SPEC_DIFF_TIMEOUT_SECONDS).ok?
+        end
+        yield clone
+      end
+    end
+
     def merge!(repo, number, head_sha:)
       repo_name = repo.to_s.split("/").last
       if SELF_DEPLOYING_REPOS.include?(repo_name)

@@ -12316,8 +12316,12 @@ def cmd_agent_merge(args)
   end
 
   base = Agent::MergeLane.base_sha(repo, "main")
-  asserts = Agent::MergeLane.assertions(candidate, base_sha: base)
-  reversibility = Agent::MergeLane.reversibility(candidate.changed_paths, repo: repo)
+  # Asked ONLY when a spec actually changed: it is a clone plus a hermetic diff,
+  # and 43 of the 49 open PRs on 2026-08-06 touched no spec at all.
+  spec_diff = Agent::MergeLane.spec_touched?(candidate.changed_paths) ? Agent::MergeLane.spec_diff(repo, candidate.number) : nil
+  asserts = Agent::MergeLane.assertions(candidate, base_sha: base, spec_diff: spec_diff)
+  reversibility = Agent::MergeLane.reversibility(candidate.changed_paths, repo: repo,
+                                                 spec_diff: spec_diff || :unknown)
   puts "  reversibility: #{reversibility}"
   asserts.each { |k, v| puts "  assert #{k}=#{v}" }
 
@@ -12335,8 +12339,9 @@ def cmd_agent_merge(args)
 end
 
 def agent_merge_rationale(candidate, reversibility, asserts)
+  spec = asserts["spec_diff"] ? "apibuilder classified the spec change #{asserts['spec_diff']}. " : ""
   "Lane merge: classified #{reversibility} from #{Array(candidate.changed_paths).length} changed path(s), " \
-    "#{asserts['diff_lines']} changed line(s). `#{Agent::MergeLane::CI_CHECK}` passed on " \
+    "#{asserts['diff_lines']} changed line(s). #{spec}`#{Agent::MergeLane::CI_CHECK}` passed on " \
     "#{Agent::MergeLane.short(candidate.head_sha)}, which is the exact commit that will be squashed, and " \
     "that commit contains the current tip of main (#{Agent::MergeLane.short(asserts['base_sha'])}). " \
     "Verified by GitHub Actions rather than asserted by this session."
