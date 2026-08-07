@@ -547,19 +547,36 @@ Enough to start without a survey. `~/code` holds independent repos; the
       rev ~1205 because mac chromium moved to Chrome for Testing. Hitting either
       by hand and generalising it to "the CDN is blocked" is the mistake that
       produced the old note.
-  Two practical traps, both of which have already burned a session:
-    - **It takes far longer than one Bash call.** chromium + WebKit is ~500 MiB
-      and the unpack is thousands of small files; on a loaded runner that is
-      15–30 minutes, well past a 10-minute tool timeout. Start it detached
-      (`nohup … &`) and poll, or you will SIGTERM it mid-extract.
+  Three practical traps, all of which have already burned a session:
+    - **It outruns one Bash call.** ~340 MiB across three browsers, so start it
+      detached (`nohup … &`) and poll rather than SIGTERMing it at the timeout.
+    - **Its extractor hangs on this fleet.** Downloading is fine; unpacking is
+      not. `playwright install` wedged twice, at the same entry inside the
+      Chrome-for-Testing `.app` bundle, at 0% CPU, indefinitely. Nothing is wrong
+      with the archive — `unzip` of the very same file took **5 seconds** (663
+      files, 345 MiB). So if it stalls, do not wait it out: kill it, `rm -rf` the
+      half-written version directory, and place the browser by hand. That is how
+      playbook-www's suite was finally run on 2026-08-07:
+
+          C=~/Library/Caches/ms-playwright
+          # URLs come from `playwright install --dry-run`, which prints them per browser
+          curl -sSL -o /tmp/b.zip "<download url>"
+          rm -rf "$C/<version-dir>" && mkdir -p "$C/<version-dir>"
+          unzip -q /tmp/b.zip -d "$C/<version-dir>"
+          touch "$C/<version-dir>"/{INSTALLATION_COMPLETE,DEPENDENCIES_VALIDATED}
+
+      The two marker files are what Playwright checks; without them it re-downloads.
     - **A killed install leaves a half-extracted version directory, and the next
       run treats that directory as satisfied and exits 0** — then the launch dies
-      on a missing dylib. If a browser misbehaves after an interrupted install,
-      `rm -rf ~/Library/Caches/ms-playwright/<version-dir>` and reinstall.
+      on a missing dylib. Always `rm -rf` the version directory before retrying.
   Install from the repo's own Playwright (`./node_modules/.bin/playwright install`
   after `npm ci`), never a global one: the browser build is pinned per
   `playwright-core` version, and a mismatch is the original ISS-780 symptom
   (`Executable doesn't exist at …/chromium_headless_shell-1217`).
+
+  End to end this works. `npm run test:e2e` in playbook-www on a runner:
+  **34 passed (23.4s)**, chromium and mobile-safari/WebKit both — the suite
+  ISS-779 was told could not run here.
 - **Playbooks** — the standing procedures producer-filed issues point at — are
   append-only rows in the platform, not files in any repo. Read one with `dev
   agent playbook <key>` and list them with `dev agent playbooks`. If your
