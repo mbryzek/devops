@@ -29,17 +29,16 @@ class TestDevAgentNotify < Minitest::Test
   end
 
   # Stubs the ONE line that shells out, so every outcome below is the real
-  # `event` deciding, not a re-implementation of it. Restores rather than
-  # removes: `capture2e` is used elsewhere in the process.
-  def with_openclaw(result)
-    original = Open3.method(:capture2e)
-    Open3.define_singleton_method(:capture2e) do |*args|
-      raise Errno::ENOENT, args.first if result == :absent
-      ["", Struct.new(:success?).new(result == :ok)]
-    end
-    yield
-  ensure
-    Open3.define_singleton_method(:capture2e, original)
+  # `event` deciding, not a re-implementation of it. `:hung` is a push that
+  # outlived its deadline (ISS-740) — a nudge channel is the last thing worth
+  # wedging a runner for, and every push has a durable backstop precisely
+  # because it may not arrive.
+  def with_openclaw(result, &block)
+    stub_shell(lambda { |cmd, _opts|
+      raise Errno::ENOENT, cmd.first if result == :absent
+      next shell_result(timed_out: true, timeout: Agent::Notify::TIMEOUT_SECONDS) if result == :hung
+      shell_result(exitstatus: result == :ok ? 0 : 1)
+    }, &block)
   end
 
   # ---- the three outcomes are three different things ----
@@ -61,6 +60,14 @@ class TestDevAgentNotify < Minitest::Test
   def test_a_working_binary_is_delivered
     with_state_dir do
       with_openclaw(:ok) { assert_equal Agent::Notify::DELIVERED, Agent::Notify.event("pr_ready", "hi") }
+    end
+  end
+
+  # A push that never returns is a push that did not arrive, which is FAILED —
+  # and, before ISS-740, was a tick that never returned either.
+  def test_a_hanging_binary_is_failed_rather_than_holding_the_tick
+    with_state_dir do
+      with_openclaw(:hung) { assert_equal Agent::Notify::FAILED, Agent::Notify.event("pr_ready", "hi") }
     end
   end
 

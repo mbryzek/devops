@@ -243,6 +243,74 @@ class TestDevAgentMaintenance < Minitest::Test
     end
   end
 
+  # ---- a chore that never returns (ISS-740) ----------------------------------
+  #
+  # The chores are where this failure was most likely and least visible. They run
+  # in Phase B under the work lock, ahead of reap and claim, and `docker prune`
+  # is loudest exactly when the daemon is wedged — it exists to relieve the disk
+  # pressure that wedges it. Unbounded, one hung prune stopped the machine
+  # claiming anything on every later tick, permanently, with nothing logged,
+  # because a hang raises nothing.
+
+  def test_a_chore_that_hangs_is_killed_and_recorded_as_a_failure
+    with_agent_home do
+      with_real_run_shell(->(*) { shell_result(timed_out: true, timeout: Agent::Maintenance::CHORE_TIMEOUT_SECONDS) }) do
+        outcome = Agent::Maintenance.run_shell(Agent::Maintenance::DOCKER_SOURCE, :cadence)
+        refute outcome.ok, "a chore that never returned did not succeed"
+        assert_match(/timed out after 300s/, outcome.message)
+      end
+    end
+  end
+
+  def test_every_chore_is_given_the_deadline
+    with_agent_home do
+      seen = []
+      with_real_run_shell(lambda { |_cmd, opts|
+        seen << opts[:timeout]
+        shell_result
+      }) do
+        Agent::Maintenance::SHELL_SOURCES.each { |source| Agent::Maintenance.run_shell(source, :cadence) }
+      end
+      assert_equal [Agent::Maintenance::CHORE_TIMEOUT_SECONDS] * 3, seen
+    end
+  end
+
+  # ENOENT was the only start failure ever caught, and it is only the most
+  # LIKELY one: a `bin/dev` or `bin/claude-db` that lost its +x bit raises
+  # EACCES, which propagated out of the pass, out of the tick's work phase, and
+  # killed the tick every hour. A chore that cannot start is a recorded chore
+  # failure like any other — never the reason the machine stops claiming.
+  def test_a_chore_binary_that_cannot_be_executed_is_a_failure_not_a_dead_tick
+    with_agent_home do
+      with_real_run_shell(->(cmd, _opts) { raise Errno::EACCES, cmd.first }) do
+        outcome = Agent::Maintenance.run_shell(Agent::Maintenance::AIDIRS_SOURCE, :cadence)
+        refute outcome.ok
+        assert_match(/could not run/, outcome.message)
+      end
+    end
+  end
+
+  def test_a_missing_chore_binary_is_still_a_failure_not_a_dead_tick
+    with_agent_home do
+      with_real_run_shell(->(cmd, _opts) { raise Errno::ENOENT, cmd.first }) do
+        outcome = Agent::Maintenance.run_shell(Agent::Maintenance::CLAUDE_DB_SOURCE, :cadence)
+        refute outcome.ok
+        assert_match(/could not run/, outcome.message)
+      end
+    end
+  end
+
+  # `exited 1: ` with nothing after the colon reads like truncated output rather
+  # than a command that said nothing.
+  def test_a_silent_failure_does_not_report_an_empty_tail
+    with_agent_home do
+      with_real_run_shell(->(*) { shell_result(exitstatus: 1) }) do
+        outcome = Agent::Maintenance.run_shell(Agent::Maintenance::DOCKER_SOURCE, :cadence)
+        assert outcome.message.end_with?("exited 1"), "got #{outcome.message.inspect}"
+      end
+    end
+  end
+
   # ---- what the platform is told ---------------------------------------------
 
   # The half an error channel structurally cannot cover. Errors report runs that
@@ -306,9 +374,9 @@ class TestDevAgentMaintenance < Minitest::Test
       out = "Filesystem 1024-blocks      Used Available Capacity Mounted on\n" \
             "/dev/disk3s5  1000000000 400000000 600000000      40% /System/Volumes/Data\n"
       seen = []
-      stub_singleton(Open3, :capture2, lambda { |*args|
-        seen.concat(args)
-        [out, Struct.new(:success?).new(true)]
+      stub_shell(lambda { |cmd, _opts|
+        seen.concat(cmd)
+        shell_result(output: out)
       }) do
         free, total = Agent::Maintenance.disk
         assert_includes seen, "-Pk", "without POSIX output a long device name wraps onto a second line"

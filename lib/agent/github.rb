@@ -1,6 +1,6 @@
 require 'json'
-require 'open3'
 require 'agent/paths'
+require 'agent/shell'
 
 # The `gh` and `git` reads outcome classification and resume depend on.
 #
@@ -11,10 +11,20 @@ module Agent
   module Github
     module_function
 
+    # Every read here is a `gh` call to GitHub, on the reap path of a phase that
+    # holds the work lock — so an unbounded one against a stalled connection
+    # stops this runner claiming anything on every later tick, silently
+    # (ISS-740). A deadline turns that into the answer every caller here already
+    # handles: nil, read as UNKNOWN and never as "no PR", so a timeout leaves an
+    # issue unclassified for one tick rather than misclassifying it.
+    #
+    # 60 seconds is far longer than a healthy `gh pr list` and short enough that
+    # the reap of one repo cannot outlast the lease heartbeats.
+    TIMEOUT_SECONDS = 60
+
     def capture(cmd, chdir: nil)
-      opts = chdir ? { chdir: chdir } : {}
-      out, status = Open3.capture2(*cmd, **opts)
-      status.success? ? out : nil
+      result = Agent::Shell.capture(*cmd, timeout: TIMEOUT_SECONDS, chdir: chdir, stderr: :inherit)
+      result.ok? ? result.output : nil
     rescue Errno::ENOENT
       nil
     end

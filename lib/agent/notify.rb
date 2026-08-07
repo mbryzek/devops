@@ -1,6 +1,6 @@
-require 'open3'
 require 'time'
 require 'agent/paths'
+require 'agent/shell'
 
 # Push notifications (design §4.7): openclaw system events on PR ready, gave up,
 # and a session that could not start.
@@ -34,6 +34,9 @@ require 'agent/paths'
 module Agent
   module Notify
     BINARY = "openclaw".freeze
+
+    # Hard deadline for one push. See `event`.
+    TIMEOUT_SECONDS = 30
 
     # What this push is, and — the load-bearing half — where the same fact lives
     # when the push does not arrive. A kind with no durable backstop is a kind
@@ -99,8 +102,13 @@ module Agent
     # away.
     def event(kind, text)
       return DISABLED unless enabled?
-      _out, status = Open3.capture2e(BINARY, "system", "event", "--text", text, "--mode", "now")
-      status.success? ? DELIVERED : FAILED
+      # Bounded (ISS-740): this is a push over a network the tick does not
+      # control, and a notification is the least important thing on that path —
+      # nothing here is worth wedging a runner for, and every push has a durable
+      # backstop (BACKSTOPS) precisely because it may not arrive. A push that
+      # times out is FAILED, which is what a push that did not arrive is.
+      Agent::Shell.capture(BINARY, "system", "event", "--text", text, "--mode", "now",
+                           timeout: TIMEOUT_SECONDS).ok? ? DELIVERED : FAILED
     rescue Errno::ENOENT
       UNAVAILABLE
     end

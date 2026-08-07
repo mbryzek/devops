@@ -279,6 +279,34 @@ and, worse, letting leases lapse so `expire_issue_leases` requeues work that is
 still running. Locking is Ruby's `File#flock`; `flock(1)` does not exist on
 macOS.
 
+## Every subprocess has a deadline
+
+A lock that is skipped when held is the right design for work that can be slow,
+and it is a trap for work that can HANG. Phase B holds the work lock across
+maintenance, the toolchain check, reap and claim; a subprocess in there that
+never returns holds that lock forever, so every later tick finds it held and
+skips — the machine keeps heartbeating, keeps looking healthy, and never claims
+another issue. Nothing is logged, because a hang is not an exception. The
+candidates are ordinary: `docker --version` against a wedged daemon, `sbt
+--script-version` on a launcher that wants the network, `docker prune` under
+exactly the disk pressure it exists to relieve, a stalled `gh pr list`.
+
+So `Agent::Shell.capture` (`lib/agent/shell.rb`) is the ONLY thing under
+`lib/agent` that may call `Open3`, every call names its own timeout in seconds,
+and `test_dev_agent_shell.rb` enforces both by scanning the directory (ISS-740).
+A timeout that has to be remembered is one that gets forgotten once and wedges a
+runner for a week — which is the literal history here: `Agent::Checkout` bounded
+its `git pull` in ISS-511 and wrote down why, and every module added afterwards
+shelled out unbounded anyway.
+
+Three properties are load-bearing rather than incidental: output is drained on
+its own thread (a command that outruns the ~64KB pipe buffer blocks on write, so
+a join-then-read helper would kill every chatty command — `docker prune` listing
+what it removed is precisely one), the process GROUP is what gets killed (`dev
+docker prune` is Ruby shelling out to `docker`; killing only the Ruby leaves the
+wedged docker), and the signal is `KILL` (a process wedged on an
+uninterruptible read is the one that ignores `TERM`).
+
 ## Notifications are a nudge, and the platform is the record
 
 `Agent::Notify` shells out to `openclaw`, which **is not installed on the
