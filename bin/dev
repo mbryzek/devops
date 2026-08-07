@@ -39,6 +39,7 @@ require 'depsguard'
 # The autonomous dispatcher (`dev agent`). Split into lib/agent/* rather than
 # inlined here because the pieces that decide anything — schedule due-ness,
 # outcome classification, retention — are pure functions that get real tests.
+require 'agent/ci'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/maintenance'
@@ -140,6 +141,11 @@ INVOCATIONS = {
   "agent merge"         => 'agent merge <repo> <pr> [--run-id ID] [--dry-run] [--localhost]',
   "agent update-branch" => 'agent update-branch <repo> <pr> [--dry-run]',
   "prs group"           => 'prs [group] [--branch NAME] [--repo NAME]... [--all] [--json]',
+  "ci status"           => 'ci [status]',
+  "ci install"          => 'ci install --slots N [--dry-run]',
+  "ci preflight"        => 'ci preflight [--needs docker,registry,database]',
+  "ci run"              => 'ci run [--wait SECONDS] -- <command> [args]...',
+  "ci clean-build"      => 'ci clean-build --event EVENT',
 }.freeze
 
 # The full `dev ...` form passed as `example:` to usage_exit on an arg error.
@@ -1161,6 +1167,46 @@ USAGE = <<~USAGE
         Does NOT ask the autonomy ledger: this lands nothing on `main`, and the
         merge that follows re-reads and re-asks from scratch.
 
+  CI (self-hosted runners — ISS-763):
+
+    #{INVOCATIONS["ci status"]}
+        This machine's CI provisioning: slots reserved, slots busy, and what is
+        left for agent sessions. Prints nothing to configure on a box with no
+        runner — which is most of them.
+
+    #{INVOCATIONS["ci install"]}
+        Reserve N of this machine's concurrency slots for CI and create the warm
+        cache directories. The registry derives max_concurrency from the
+        hardware; this decides how it is SPLIT, so the tick claims that many
+        fewer sessions from the moment it lands.
+        Reserved rather than borrowed: an agent session's work is deferrable and
+        a CI job's is not, so CI never queues behind a four-hour session.
+        Installing the GitHub runner itself is `bin/ci-runner-install` — it needs
+        a registration token, so a human runs it.
+
+    #{INVOCATIONS["ci preflight"]}
+        Is this runner fit to produce a verdict at all? Disk headroom, the Docker
+        daemon, doctl's DigitalOcean auth (what actually expires, and what a
+        registry pull needs), and a free session-database port.
+        Exits #{Agent::Ci::INFRA_EXIT_CODE} on a fault — NOT 1 — and says so as a
+        GitHub annotation, because "could not pull the DB image" must never read
+        as "your tests failed". Records the fault on this machine too, so three
+        in a row files an issue by the same path a dead Docker already does.
+
+    #{INVOCATIONS["ci run"]}
+        Run a build holding one of this machine's CI slots, waiting for one to
+        come free. Exits with the command's own status, so a test failure stays a
+        test failure — except when no slot came free inside --wait, which is a
+        capacity fault and exits #{Agent::Ci::INFRA_EXIT_CODE}.
+
+    #{INVOCATIONS["ci clean-build"]}
+        Prints `true` or `false`: should this run throw away the incremental
+        state before building? Warm on a pull request and cold on everything
+        else, so a false green from stale zinc analysis cannot outlive a day.
+        A workflow feeds it to `actions/checkout`'s `clean:` rather than writing
+        the comparison itself, so the rule lives in one tested place instead of
+        being copy-pasted into every repo.
+
   Common options:
     --app APP       Limit to a single app (acumen, platform)
     --localhost     Hit local development servers instead of production
@@ -1185,7 +1231,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent prs].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent prs ci].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -1210,6 +1256,7 @@ SUBCOMMANDS = {
   "claude-usage" => %w[top],
   "agent"        => %w[tick status logs pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
+  "ci"           => %w[status install preflight run clean-build],
 }.freeze
 
 def levenshtein(a, b)
@@ -1242,7 +1289,12 @@ def suggest(input, candidates)
   return prefix_matches.first if prefix_matches.length == 1 && s.length >= 2
 
   best, dist = candidates.map { |c| [c, levenshtein(s, c.downcase)] }.min_by { |_, d| d }
-  best if dist <= [2, s.length / 3].max
+  # `dist < s.length` on top of the threshold, because the threshold alone is
+  # wrong for SHORT inputs: at two characters it permits a distance of two, which
+  # is every other two-character candidate — a "suggestion" sharing not one
+  # letter with what was typed. Harmless while every command was long; the moment
+  # `ci` was added (ISS-763), `dev lo` started answering "did you mean 'ci'?".
+  best if dist <= [2, s.length / 3].max && dist < s.length
 end
 
 def unknown(kind, value, candidates)
@@ -13048,6 +13100,201 @@ def cmd_prs_group(args)
   puts "#{groups.length} group(s): #{eligible} member(s) eligible to merge now, #{blocked} held."
 end
 
+# ---------- ci ----------
+#
+# The runner-local half of CI (ISS-763). Agent::Ci holds the reasoning; these
+# four commands are the surfaces a workflow step and an operator touch.
+
+def cmd_ci_status(args)
+  reject_unknown_args("ci status", args)
+
+  reserved = Agent::Ci.reserved
+  if reserved.zero?
+    puts "CI is not provisioned on this machine."
+    puts "  #{Agent::Paths.ci_config_file} reserves no slots, so nothing here changes:"
+    puts "  the tick claims against its full max_concurrency and no CI job can start."
+    puts
+    puts "  Reserve capacity with:  dev ci install --slots N"
+    puts "  Install a runner with:  bin/ci-runner-install <owner/repo>"
+    return
+  end
+
+  puts "CI slots reserved on this machine: #{reserved} (#{Agent::Ci.slots_held} busy)"
+  puts "  config: #{Agent::Paths.ci_config_file}"
+  puts "  slots:  #{Agent::Paths.ci_slots_dir}"
+  puts
+  puts "The tick subtracts all #{reserved} from this machine's max_concurrency before it claims,"
+  puts "whether or not a CI job is running — a reservation, so a PR never queues behind a"
+  puts "four-hour session (Agent::Ci.reserved)."
+end
+
+def cmd_ci_install(args)
+  slots = nil
+  dry_run = false
+  rest = args.dup
+  until rest.empty?
+    arg = rest.shift
+    case arg
+    when "--slots"
+      value = rest.shift
+      usage_exit("--slots requires a value", example: usage_for("ci install")) if value.nil?
+      usage_exit("--slots must be a non-negative integer", example: usage_for("ci install")) unless value.match?(/\A\d+\z/)
+      slots = value.to_i
+    when "--dry-run" then dry_run = true
+    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci install"))
+    end
+  end
+  usage_exit("--slots is required", example: usage_for("ci install")) if slots.nil?
+
+  caches = Agent::Ci::WARM_CACHE_DIRS.map { |d| File.expand_path(d) }
+  if dry_run
+    puts "would write #{Agent::Paths.ci_config_file}: {\"slots\": #{slots}}"
+    puts "would create #{Agent::Paths.ci_slots_dir}"
+    caches.each { |dir| puts "would create #{dir}" }
+    return
+  end
+
+  Agent::Paths.write_json(Agent::Paths.ci_config_file, { "slots" => slots })
+  Agent::Paths.mkdir_p(Agent::Paths.ci_slots_dir)
+  # Created rather than assumed, because the workflow does not create them: a
+  # cache directory that does not exist is not an error anywhere, it is just a
+  # cache that is cold every single run, which reads as "self-hosting bought us
+  # nothing" rather than as a missing directory.
+  caches.each { |dir| Agent::Paths.mkdir_p(dir) }
+
+  puts "Reserved #{slots} CI slot#{'s' unless slots == 1} on this machine."
+  puts "  #{Agent::Paths.ci_config_file}"
+  puts
+  puts "The tick subtracts this from max_concurrency on its next pass, so this machine now"
+  puts "claims #{slots} fewer session#{'s' unless slots == 1}. Check the split with `dev agent runners`"
+  puts "and `dev ci status`."
+  puts
+  puts "Next, install a GitHub runner per repo (needs a registration token, so this is a"
+  puts "human step):"
+  puts "  bin/ci-runner-install <owner/repo>"
+end
+
+def cmd_ci_preflight(args)
+  needs = []
+  rest = args.dup
+  until rest.empty?
+    arg = rest.shift
+    case arg
+    when "--needs"
+      value = rest.shift
+      usage_exit("--needs requires a value", example: usage_for("ci preflight")) if value.nil?
+      needs.concat(value.split(",").map(&:strip).reject(&:empty?))
+    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci preflight"))
+    end
+  end
+
+  report = Agent::Ci.preflight(needs: needs)
+  report.checks.each { |c| puts "  #{c.ok? ? 'ok  ' : 'FAULT'} #{c.name.ljust(9)} #{c.detail}" }
+  return if report.ok?
+
+  ci_infra_fault(
+    "preflight",
+    report.faults.map { |c| "#{c.name}: #{c.detail} — fix: #{c.remedy}" },
+  )
+end
+
+def cmd_ci_clean_build(args)
+  event = nil
+  rest = args.dup
+  until rest.empty?
+    arg = rest.shift
+    case arg
+    when "--event"
+      event = rest.shift
+      usage_exit("--event requires a value", example: usage_for("ci clean-build")) if event.nil?
+    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci clean-build"))
+    end
+  end
+  usage_exit("--event is required", example: usage_for("ci clean-build")) if event.nil?
+
+  puts Agent::Ci.clean_build?(event: event)
+end
+
+def cmd_ci_run(args)
+  wait = Agent::Ci::SLOT_WAIT_SECONDS
+  rest = args.dup
+  until rest.empty?
+    break if rest.first == "--"
+    arg = rest.shift
+    case arg
+    when "--wait"
+      value = rest.shift
+      usage_exit("--wait requires a value", example: usage_for("ci run")) if value.nil?
+      usage_exit("--wait must be a positive integer", example: usage_for("ci run")) unless value.match?(/\A\d+\z/)
+      wait = value.to_i
+    else usage_exit("Unknown argument: #{arg}", example: usage_for("ci run"))
+    end
+  end
+  rest.shift if rest.first == "--"
+  usage_exit("ci run needs a command after `--`", example: usage_for("ci run")) if rest.empty?
+
+  outcome =
+    begin
+      Agent::Ci.with_slot(wait_seconds: wait) do |index|
+        warn "dev ci run: holding CI slot #{index} of #{Agent::Ci.reserved}"
+        # `system`, not Agent::Shell.capture: this is a BUILD, and its output has
+        # to stream to the job log as it happens rather than arrive in one lump
+        # at the end — a CI log nobody can watch is a CI log nobody uses. The
+        # deadline that would otherwise be missing is GitHub's own job timeout.
+        system(*rest)
+        $?&.exitstatus || 1
+      end
+    rescue RuntimeError => e
+      # An unprovisioned box running a CI job is a provisioning mistake, and it
+      # is emphatically not evidence about the branch.
+      ci_infra_fault("slot", [e.message])
+    end
+
+  # The ONE outcome here that is not the command's own answer, and the whole
+  # reason `dev ci run` exists rather than the workflow running the build
+  # directly: a box so oversubscribed that nothing came free is a capacity fault,
+  # and reporting it as a test failure would send somebody reading a diff that is
+  # fine.
+  if outcome == :timed_out
+    ci_infra_fault("slot", ["no CI slot came free within #{wait}s on this machine " \
+                            "(#{Agent::Ci.reserved} reserved, all busy)"])
+  end
+  exit(outcome)
+end
+
+# Report an infrastructure fault and exit INFRA_EXIT_CODE.
+#
+# THE POINT OF THIS FUNCTION is that "the runner is broken" and "your tests
+# failed" must not look the same. The lane parks a red PR either way and that is
+# correct — a machine that just proved it cannot be trusted is not a machine
+# whose self-classification should be believed — so the distinguishing is done
+# where it changes what a person does: a GitHub annotation with a title that says
+# so, a step summary they see without opening the log, and an exit status
+# (75, EX_TEMPFAIL) a wrapper can branch on.
+#
+# Paging is separate and already exists: Agent::Ci.preflight has recorded the
+# fault in Agent::Errors, so three in a row on one box files an issue by the same
+# path a dead Docker daemon already does.
+def ci_infra_fault(stage, lines)
+  detail = lines.join("; ")
+  # GitHub's workflow-command syntax. Harmless noise anywhere else, which is why
+  # it is not conditional on being inside Actions — a human running `dev ci
+  # preflight` by hand wants the same words.
+  puts "::error title=CI INFRASTRUCTURE FAULT (#{stage})::#{detail}"
+  summary = ENV["GITHUB_STEP_SUMMARY"]
+  if summary && !summary.empty?
+    File.open(summary, "a") do |f|
+      f.puts "### CI infrastructure fault — this is the runner, not the branch"
+      f.puts
+      lines.each { |line| f.puts "- #{line}" }
+      f.puts
+      f.puts "Nothing here is evidence about the code under test. Do not re-read the diff."
+    end
+  end
+  warn "CI infrastructure fault (#{stage}): #{detail}"
+  exit(Agent::Ci::INFRA_EXIT_CODE)
+end
+
 # ---------- dispatch ----------
 
 if __FILE__ == $PROGRAM_NAME
@@ -13226,6 +13473,16 @@ when "features"
   when "reconcile" then cmd_features_reconcile(argv)
   when "cancel"    then cmd_features_cancel(argv)
   else                  unknown("features subcommand", sub, SUBCOMMANDS["features"])
+  end
+when "ci"
+  sub = resolve_subcommand(argv, default: "status")
+  case sub
+  when "status"    then cmd_ci_status(argv)
+  when "install"   then cmd_ci_install(argv)
+  when "preflight"   then cmd_ci_preflight(argv)
+  when "run"         then cmd_ci_run(argv)
+  when "clean-build" then cmd_ci_clean_build(argv)
+  else                  unknown("ci subcommand", sub, SUBCOMMANDS["ci"])
   end
 when "agent"
   sub = resolve_subcommand(argv, default: "status")

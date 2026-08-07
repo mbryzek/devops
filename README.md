@@ -25,6 +25,13 @@ Two things it deliberately does not do:
 running within seconds — there is no separate deploy step to catch a mistake
 between. Nothing autonomous merges into this repo; see `agent/README.md`.
 
+## CI
+
+[`docs/ci.md`](docs/ci.md) — how the self-hosted runners the merge lane depends
+on are provisioned (capacity, warm caches, the slot semaphore) and the three ways
+a correctly-written workflow still produces a wrong answer. `dev ci` is the
+runner-local half; `templates/ci/` holds the workflow every repo copies.
+
 ## Deploying Scala applications to Kubernetes
 
 ```

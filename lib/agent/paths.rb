@@ -77,6 +77,26 @@ module Agent
     # a shortened streak.
     def errors_lock    = File.join(state_dir, "agent-errors.lock")
 
+    # How this box's capacity is split between agent sessions and CI jobs
+    # (Agent::Ci, ISS-763). Written by `dev ci install`, read by `dev ci run` and
+    # by the tick's admission control.
+    #
+    # LOCAL rather than a field on the platform's runner row, and the distinction
+    # is the same one state_dir draws everywhere else: the registry derives
+    # max_concurrency from reported HARDWARE, which is a fact about the machine.
+    # How that capacity is divided is an operator's decision about this machine,
+    # taken when a runner is installed on it — and the tick has to be able to read
+    # it while the platform is unreachable, because the alternative is a box that
+    # oversubscribes itself for the length of an outage.
+    def ci_config_file = File.join(state_dir, "ci.json")
+
+    # The CI slot semaphore: one lock file per reserved slot, held by `flock` for
+    # as long as the build process lives. Nothing is ever read out of them — the
+    # pid inside is for a human running `lsof` — so there is no state here to
+    # leak or expire, which is the property that keeps this off Agent::Tick's
+    # "there is no daemon" ledger.
+    def ci_slots_dir = File.join(state_dir, "ci-slots")
+
     def tick_log(date)      = File.join(log_root, "tick", "#{date.strftime('%Y-%m-%d')}.log")
     def issues_dir          = File.join(log_root, "issues")
     def issue_dir(number)   = File.join(issues_dir, "ISS-#{number}")

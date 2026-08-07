@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# Install a GitHub Actions self-hosted runner on THIS machine for ONE repo.
+#
+# ── Why this is a human step ─────────────────────────────────────────────────
+#
+# Registering a runner mints a repo-scoped registration token and installs a
+# launchd service that will execute anything anybody can merge into that repo's
+# workflows. No autonomous session does that on Mike's account; `dev issues
+# handoff` hands it over instead. Everything an agent CAN do is `dev ci install`,
+# which only reserves capacity on the box.
+#
+# ── Why it is per repo ───────────────────────────────────────────────────────
+#
+# GitHub supports self-hosted runners at repository, organization and enterprise
+# level. `mbryzek` is a personal account, not an organization, so REPOSITORY
+# LEVEL IS THE ONLY OPTION — there is no shared pool to register once and point
+# every repo at. Each repo therefore gets its own listener process here, and
+# admission control cannot come from GitHub: N idle listeners will each happily
+# accept a job at the same moment. That is what `dev ci run`'s slot semaphore is
+# for, and why every workflow must wrap its build in it.
+#
+# An idle listener is cheap (tens of MB, no CPU); N CONCURRENT JOBS are not.
+#
+# ── What it does ─────────────────────────────────────────────────────────────
+#
+#   bin/ci-runner-install mbryzek/platform
+#
+# Downloads the runner into ~/actions-runner/<repo>, registers it against the
+# repo with the `fleet` label, and installs it as a launchd service that starts
+# at login. Idempotent: --replace re-registers a runner of the same name rather
+# than accumulating ghosts, and an existing directory is reused.
+#
+# ── What it deliberately does NOT do ─────────────────────────────────────────
+#
+# It does not touch DEV_AGENT state beyond reading it, it does not decide the
+# slot count (that is `dev ci install --slots N`, and this refuses to run until
+# it has been), and it never prints the registration token.
+set -euo pipefail
+
+REPO="${1:-}"
+LABEL="${RUNNER_LABEL:-fleet}"
+ROOT="${RUNNER_ROOT:-$HOME/actions-runner}"
+
+if [ -z "$REPO" ] || [ "$REPO" = "--help" ] || [ "$REPO" = "-h" ]; then
+  cat >&2 <<'USAGE'
+Usage: bin/ci-runner-install <owner/repo>
+
+Installs a GitHub Actions self-hosted runner on this machine for one repository,
+labelled `fleet`, as a launchd service.
+
+Reserve capacity first:   dev ci install --slots N
+Check it afterwards:      dev ci status  &&  gh api repos/<owner/repo>/actions/runners
+
+Environment:
+  RUNNER_LABEL   extra label to apply           (default: fleet)
+  RUNNER_ROOT    where runners are installed    (default: ~/actions-runner)
+USAGE
+  exit 1
+fi
+
+case "$REPO" in
+  */*) ;;
+  *) echo "ci-runner-install: expected <owner/repo>, got '$REPO'" >&2; exit 1 ;;
+esac
+
+DEV="$(cd "$(dirname "$0")" && pwd)/dev"
+
+# The reservation has to exist BEFORE a runner does. A machine that accepts CI
+# jobs while the tick still claims against its full max_concurrency is the exact
+# oversubscription this whole mechanism exists to prevent, and it is invisible
+# until the box is swapping.
+if ! "$DEV" ci status | grep -q '^CI slots reserved'; then
+  cat >&2 <<USAGE
+ci-runner-install: this machine reserves no CI slots yet.
+
+Installing a runner first would let GitHub push jobs at a box whose agent
+dispatcher is still claiming sessions against its full capacity — two schedulers
+sizing themselves to the same machine.
+
+  dev ci install --slots N
+
+Pick N against this machine's max_concurrency (\`dev agent runners\`), leaving
+enough for the sessions you still want it to run.
+USAGE
+  exit 1
+fi
+
+command -v gh >/dev/null 2>&1 || { echo "ci-runner-install: gh is not installed" >&2; exit 1; }
+gh auth status >/dev/null 2>&1 || { echo "ci-runner-install: gh is not authenticated (run: gh auth login)" >&2; exit 1; }
+
+DIR="$ROOT/$(basename "$REPO")"
+NAME="$(hostname -s)-$(basename "$REPO")"
+
+mkdir -p "$DIR"
+cd "$DIR"
+
+if [ ! -x ./config.sh ]; then
+  # Resolved from the API rather than pinned, so a provisioning run a year from
+  # now does not install a runner GitHub has stopped accepting connections from.
+  VERSION="$(gh api repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')"
+  case "$(uname -m)" in
+    arm64) ARCH="arm64" ;;
+    x86_64) ARCH="x64" ;;
+    *) echo "ci-runner-install: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+  esac
+  TARBALL="actions-runner-osx-${ARCH}-${VERSION}.tar.gz"
+  echo "==> downloading runner ${VERSION} (${ARCH})"
+  curl -fsSL -o "$TARBALL" \
+    "https://github.com/actions/runner/releases/download/v${VERSION}/${TARBALL}"
+  tar xzf "$TARBALL"
+  rm -f "$TARBALL"
+fi
+
+echo "==> registering $NAME against $REPO"
+# The token is a one-hour repo-scoped credential. Passed on the command line
+# because config.sh takes it that way and read straight out of the API into a
+# shell variable that is never echoed — it is not written to disk, not exported,
+# and not logged.
+TOKEN="$(gh api -X POST "repos/${REPO}/actions/runners/registration-token" --jq .token)"
+./config.sh \
+  --unattended \
+  --replace \
+  --url "https://github.com/${REPO}" \
+  --token "$TOKEN" \
+  --name "$NAME" \
+  --labels "$LABEL" \
+  --work _work
+unset TOKEN
+
+echo "==> installing the launchd service"
+./svc.sh install
+./svc.sh start
+
+cat <<DONE
+
+Runner '$NAME' is registered against $REPO and running.
+
+  status:     (cd $DIR && ./svc.sh status)
+  uninstall:  (cd $DIR && ./svc.sh stop && ./svc.sh uninstall) && gh api -X DELETE repos/${REPO}/actions/runners/<id>
+  fleet view: gh api repos/${REPO}/actions/runners --jq '.runners[] | {name, status, busy}'
+
+Remember: this listener will accept a job the moment one is queued, and so will
+every other repo's listener on this box. What stops them running at once is
+\`dev ci run\` in the workflow — a workflow that shells the build directly
+bypasses the slot semaphore and oversubscribes the machine.
+DONE
