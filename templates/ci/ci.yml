@@ -1,0 +1,127 @@
+# The reference CI workflow (ISS-763). Copy to `.github/workflows/ci.yml` in a
+# repo and change the two marked places.
+#
+# READ docs/ci.md BEFORE COPYING THIS. Three things about it are load-bearing and
+# none of them is obvious from the YAML:
+#
+#   1. THE JOB NAMED `ci` IS THE CONTRACT. The merge lane (ISS-754) reads exactly
+#      one `statusCheckRollup` entry per PR, by that name. Shard however you
+#      like — the gate job below depends on every shard and reports the
+#      aggregate, so the lane stays ignorant of the sharding scheme and adding a
+#      shard never has to be coordinated with the lane. Do not rename it, and do
+#      not give the lane a second check to read.
+#
+#   2. EVERY BUILD RUNS INSIDE `dev ci run`. `mbryzek` is a personal account, so
+#      runners are repository-level: N repos means N idle listeners on this box,
+#      each of which will accept a job the instant one is queued. Nothing at the
+#      GitHub layer limits their sum. `dev ci run` holds one of the machine's
+#      reserved CI slots for the length of the build, and that is the ONLY thing
+#      standing between eight repos and a swapping Mac. A step that shells the
+#      build directly bypasses it.
+#
+#   3. `clean: false` IS A DELIBERATE RISK, BOUNDED HERE. Preserved incremental
+#      state is why self-hosting is fast — dependency resolution stops being a
+#      download and zinc's analysis survives — and stale incremental state is the
+#      one failure that produces a FALSE GREEN, which the lane merges without
+#      asking. So the warm path is the PR path only: `main` and the nightly build
+#      cold, and the nightly is what notices that the warm path has been lying.
+#      `dev ci` decides this (Agent::Ci.clean_build?), not the YAML, so the rule
+#      is in one place with a test on it.
+#
+# Enrolment is the presence of this file: the lane merges a repo exactly when its
+# PRs carry a `ci` check. That cuts both ways — LANDING THIS IN A REPO BEFORE A
+# RUNNER IS ONLINE FOR IT gives every PR a check that queues for 24 hours and
+# then fails. Install the runner first (bin/ci-runner-install), confirm it is
+# listening, then merge this.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly cold build. Not optional: it is the only thing that catches a warm
+    # PR build that has been silently wrong all day.
+    - cron: "0 8 * * *"
+
+# One run per PR. A superseded push cancels the run it superseded, because a
+# green measured on a commit nobody will merge is wasted runner time — and the
+# lane rejects it anyway (`:ci_stale`).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    # `fleet` is the label bin/ci-runner-install applies. `self-hosted` alone
+    # would also match a runner somebody registers by hand for something else.
+    runs-on: [self-hosted, fleet]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # CHANGE ME — one entry per shard. A single-shard repo keeps one entry;
+        # the gate job below does not care how many there are.
+        shard: [all]
+    steps:
+      - name: preflight
+        # Is this runner fit to produce a verdict at all — disk, the Docker
+        # daemon, doctl's DigitalOcean auth (what actually expires, and what a
+        # registry pull needs), a free session-database port. Exits 75 and
+        # annotates the run as an INFRASTRUCTURE fault rather than a test
+        # failure, and records it on the machine so three in a row file an issue.
+        #
+        # CHANGE ME — drop --needs entirely for a repo whose suite touches no
+        # Docker and no database.
+        run: $HOME/code/devops/bin/dev ci preflight --needs docker,registry,database
+
+      - name: checkout policy
+        id: policy
+        # See (3) above. Asked rather than written inline, so the warm/cold rule
+        # lives in one tested place (Agent::Ci.clean_build?) instead of being
+        # copy-pasted into every repo's YAML, where the copies drift and the
+        # failure they produce is a green.
+        run: echo "clean=$($HOME/code/devops/bin/dev ci clean-build --event '${{ github.event_name }}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          clean: ${{ steps.policy.outputs.clean }}
+          # Full history, because the build targets what a PR actually changed
+          # and a shallow clone has no merge base to diff against.
+          fetch-depth: 0
+
+      - name: build
+        # CHANGE ME — this repo's suite. Note there is no `npm test` variant that
+        # runs Playwright: every one of these repos needs a live backend for it,
+        # so browser tests are deliberately out of scope (they cannot be a merge
+        # gate that means anything without one).
+        run: $HOME/code/devops/bin/dev ci run -- ./test.sh ${{ matrix.shard }}
+
+  # THE CHECK THE LANE READS. One per repo, always — never one per shard.
+  ci:
+    name: ci
+    needs: [build]
+    if: always()
+    runs-on: [self-hosted, fleet]
+    timeout-minutes: 5
+    steps:
+      - name: aggregate
+        env:
+          RESULT: ${{ needs.build.result }}
+        run: |
+          echo "shards: $RESULT"
+          if [ "$RESULT" = "success" ]; then
+            exit 0
+          fi
+          cat >> "$GITHUB_STEP_SUMMARY" <<'NOTE'
+          ### `ci` is red
+
+          Check the failing job above for a **CI INFRASTRUCTURE FAULT** annotation
+          before reading the diff. If it is there, this red is the runner — a full
+          disk, a dead Docker daemon, an expired DigitalOcean credential, or a box
+          with no free CI slot — and it is not evidence about the branch. Fix the
+          machine; the fault names the command.
+
+          Otherwise it is the suite, and the diff is where to look.
+          NOTE
+          exit 1

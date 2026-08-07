@@ -52,6 +52,14 @@ The first tick self-registers the machine on its `IOPlatformUUID` and the server
 derives `max_concurrency` from the reported RAM. Nothing else is configured by
 hand.
 
+**If this machine should also run CI**, that capacity has to be taken out of
+`max_concurrency` rather than added on top of it — two schedulers each sizing
+themselves to the same box is how it ends up swapping at 100% CPU making progress
+on neither. `dev ci install --slots N` reserves the split, the tick subtracts it
+before it claims, and `bin/ci-runner-install <owner/repo>` registers the runner
+itself (a human step: it mints a repo-scoped registration token). Order matters
+in both directions — see `docs/ci.md`.
+
 **Host prerequisites.** The toolchain half is `Agent::Toolchain::TOOLS` in
 `lib/agent/toolchain.rb`: every external binary the dispatcher, its producers and
 its claimed sessions shell out to, with what each one blocks and the command that

@@ -1,10 +1,12 @@
 require 'time'
 require 'agent/api'
 require 'agent/checkout'
+require 'agent/ci'
 require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/dependency'
 require 'agent/errors'
+require 'agent/escalation'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/host'
@@ -93,6 +95,11 @@ module Agent
     # it was when ISS-511 introduced it) was the only thing keeping the machine's
     # other recurring failures — its housekeeping chores above all — silent.
     #
+    # Lives on Agent::Escalation since ISS-763, which is where the recording and
+    # the firing both are now that `dev ci preflight` escalates through the same
+    # path. Kept here as the name the rest of this file and the suite already
+    # use, so there is exactly one number and two ways to spell it.
+    #
     # It reads a number Agent::Errors' eviction has to be able to produce, and
     # for two years it could not: that log was capped in TOTAL, so with five
     # sources failing at once no source's count ever reached 3 and this fired on
@@ -100,7 +107,7 @@ module Agent
     # Agent::Errors::PER_SOURCE_CAP > ERROR_ESCALATE_AT is asserted by the suite
     # — strictly greater, because a count that SATURATES at the threshold would
     # match this `==` on every tick forever.
-    ERROR_ESCALATE_AT = 3
+    ERROR_ESCALATE_AT = Agent::Escalation::AT
 
     # An issue waiting on a dependency that has not merged is deferred a day at a
     # time (ISS-649). A day rather than an hour because the thing being waited on
@@ -283,35 +290,14 @@ module Agent
     # first time a source is added without one; passing them in makes it
     # impossible to record a failure nobody can explain.
     def record_failure(source, message, title:, explain:)
-      entries = Agent::Errors.record(source, message, now: @now)
-      count = entries.count { |e| e["source"] == source }
-      # Only fire exactly on the tick that crosses the threshold. A streak that
-      # is already past it must not re-notify or re-file every 30 seconds.
-      escalate_failure(source, message, count, title: title, explain: explain) if count == ERROR_ESCALATE_AT
-    end
-
-    def escalate_failure(source, message, count, title:, explain:)
-      host = hostname
-      Agent::Notify.once("agent_error", source, now: @now) do
-        push("agent_error", "dev-agent: #{source} has failed #{count} times in a row on #{host} (#{message})")
-      end
-      return if @dry_run
-
-      Agent::Api.create_issue(
-        {
-          title: title.call(host),
-          category: "bug",
-          fingerprint: "#{source}:#{@now.utc.strftime('%Y-%m-%d')}",
-          body: "The `#{source}` source has failed #{count} times in a row on #{host}.\n\n" \
-                "Last error:\n\n```\n#{message}\n```\n\n#{explain}",
-          claim_on_create: false,
-        },
-        use_localhost: @use_localhost,
+      Agent::Escalation.record(
+        source, message, title: title, explain: explain, host: hostname, now: @now,
+        dry_run: @dry_run, use_localhost: @use_localhost,
+        # `push` rather than Agent::Notify.event directly: the tick logs what the
+        # notifier did, and that log line is part of what an operator reads off a
+        # tick. The escalation itself has no opinion about either.
+        notifier: method(:push), log: method(:log),
       )
-    rescue SessionExpired, ApiError => e
-      # Escalation must never take down the rest of the phase it runs in — the
-      # same reasoning as phase_a's own top-level rescue.
-      log("#{source} escalation: could not file an issue (#{e.message})")
     end
 
     def ensure_identity
@@ -960,16 +946,16 @@ module Agent
         log("runner is paused — claiming nothing")
         return
       end
-      max = (runner && runner["max_concurrency"]) || 1
+      max = session_capacity(runner)
       live = Agent::Jobs.all.count { |r| Agent::Jobs.alive?(r["pid"]) }
       if live >= max
-        log("at capacity (#{live}/#{max}) — claiming nothing")
+        log("at capacity (#{live}/#{max}#{ci_reservation_note}) — claiming nothing")
         return
       end
 
       (max - live).times do
         if @dry_run
-          decide("claim", "would POST /playbook/issue/leases (#{live}/#{max} slots used)")
+          decide("claim", "would POST /playbook/issue/leases (#{live}/#{max}#{ci_reservation_note} slots used)")
           break
         end
         lease = begin
@@ -996,6 +982,32 @@ module Agent
         end
         live += 1
       end
+    end
+
+    # How many sessions this machine may run at once: its registry-derived
+    # capacity, LESS whatever CI is reserved here (Agent::Ci, ISS-763).
+    #
+    # The registry derives max_concurrency from reported hardware, and that is
+    # the whole box — cores and RAM, with no knowledge that a GitHub Actions
+    # runner is also installed on it. GitHub, for its part, pushes jobs at that
+    # runner with no knowledge of this. Two schedulers each sizing themselves to
+    # the same machine is how it ends up swapping at 100% CPU making progress on
+    # neither, so exactly one of them has to give, and it is this one: an agent
+    # session's work is deferrable (the queue keeps) and a CI job's is not (a PR
+    # is already waiting on it, and the merge lane cannot tell a check queued
+    # behind a four-hour session from a check on a dead runner).
+    #
+    # Zero is a legitimate answer — a box provisioned entirely for CI claims
+    # nothing — which is why the reservation is named in the capacity log line
+    # rather than left to be inferred from a suspicious `0/0`.
+    def session_capacity(runner)
+      capacity = (runner && runner["max_concurrency"]) || 1
+      [capacity - Agent::Ci.reserved, 0].max
+    end
+
+    def ci_reservation_note
+      reserved = Agent::Ci.reserved
+      reserved.zero? ? "" : ", #{reserved} reserved for CI"
     end
 
     # THE thing that must not happen: a claim that dies with the lease already

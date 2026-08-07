@@ -47,6 +47,18 @@ class TestDevSuggest < Minitest::Test
     assert_nil suggest("lo", COMMANDS)
   end
 
+  # A suggestion sharing not one letter with the input is not a suggestion.
+  # The edit-distance threshold alone permits exactly that on SHORT inputs — at
+  # two characters it allows a distance of two, i.e. every other two-character
+  # candidate — which stayed invisible only while every command was long. Adding
+  # `ci` (ISS-763) made `dev lo` answer "did you mean 'ci'?".
+  def test_suggest_does_not_guess_a_candidate_sharing_nothing_with_a_short_input
+    assert_nil suggest("lo", COMMANDS)
+    assert_nil suggest("xy", %w[ci ab])
+    # Still helpful where the input really is a typo of a short candidate.
+    assert_equal "ci", suggest("cy", COMMANDS)
+  end
+
   def test_suggest_no_match_for_unrelated_input
     assert_nil suggest("zzzz", COMMANDS)
     assert_nil suggest("xylophone", COMMANDS)
