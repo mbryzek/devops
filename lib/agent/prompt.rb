@@ -34,19 +34,19 @@ module Agent
       File.read(path)
     end
 
-    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], playbook: nil,
-              credentials: Agent::Credentials.check)
+    def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], continued_repos: [],
+              playbook: nil, credentials: Agent::Credentials.check)
       [
         instructions.strip,
         assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo,
-                   prepared_repos: prepared_repos, credentials: credentials),
+                   prepared_repos: prepared_repos, continued_repos: continued_repos, credentials: credentials),
         issue_section(issue),
         playbook_section(playbook),
         comments_section(comments),
       ].compact.join("\n\n---\n\n") + "\n"
     end
 
-    def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [],
+    def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [], continued_repos: [],
                    credentials: Agent::Credentials.check)
       lines = []
       lines << "# Your assignment"
@@ -63,7 +63,7 @@ module Agent
       # ISS-354 opened its PR on `exp-rpt-notif-inv` and classified as if it had
       # done nothing (ISS-365).
       lines << "**Do not rename the branch.** CLAUDE.md tells interactive sessions to name a branch"
-      lines << "after the feature; that rule does not apply to you. `#{slug}` is recorded on your lease"
+      lines << "after the feature; that rule does not apply to you. `#{slug}` is derived from this issue"
       lines << "and the executor classifies your outcome by looking it up — a descriptively-named"
       lines << "branch is one the executor cannot find, and good work on it reads as no work at all."
       lines << ""
@@ -98,6 +98,7 @@ module Agent
         lines << "a repo that is not listed, clone it into the workspace yourself (`gh repo clone"
         lines << "<owner>/<repo> #{workspace}/<repo>`) and create the same branch in it. Never edit a"
         lines << "checkout under ~/code outside this workspace."
+        lines.concat(continued_section(slug, continued_repos, issue))
       else
         lines << "Your workspace is empty. Clone every repo you need into it (`gh repo clone <owner>/<repo>"
         lines << "#{workspace}/<repo>`), create branch `#{slug}` in each from the latest `origin/main`, and"
@@ -105,6 +106,38 @@ module Agent
       end
       lines << "" << credentials_section(credentials)
       lines.join("\n")
+    end
+
+    # The branch was ALREADY THERE when the executor prepared these checkouts, so
+    # this attempt is standing on somebody's commits (ISS-767).
+    #
+    # Reachable on the ordinary retry path now that the branch is derived from the
+    # issue instead of drawn at random: attempt 2 computes the name attempt 1
+    # pushed. That is the intent — resume by default — but only if the session
+    # KNOWS. Told nothing, it reads the "already cloned, off the latest
+    # origin/main" line above, sees commits it did not write, and its two guesses
+    # are both wrong: open a second PR on work that already has one, or rebase
+    # away a predecessor's diff.
+    #
+    # It deliberately does NOT assert what the earlier commits mean. The executor
+    # knows only that refs exist; whether they are an open PR, a merged one, or a
+    # crashed attempt that never opened anything is one `gh pr list` away for the
+    # session, and guessing here would be a confident wrong answer in the case
+    # that matters most — a diff a human already rejected.
+    def continued_section(slug, continued_repos, issue)
+      repos = Array(continued_repos)
+      return [] if repos.empty?
+
+      ["",
+       "**`#{slug}` ALREADY EXISTED** in #{repos.map { |r| "`#{r}`" }.join(', ')} — it is checked out with an",
+       "earlier attempt's commits on it, NOT freshly branched from `origin/main`. The branch name is",
+       "derived from this issue, so a retry lands here by design. Before you write anything, run",
+       "`gh pr list --head #{slug} --state all` in each of those checkouts and act on what you find:",
+       "an OPEN PR is yours to update in place (never open a second one — see §6); a MERGED one means",
+       "rebase onto latest `origin/main` and the old commits fall away; a CLOSED-unmerged one is work a",
+       "human rejected, so read the review before building on it; no PR at all is an attempt that died",
+       "mid-flight, and continuing it is usually right. Say in your PR description which of these it was.",
+       "Record any additional PR with `dev issues fix #{issue['number']} --url ...`."]
     end
 
     # Which external-API credentials THIS runner holds, stated before the

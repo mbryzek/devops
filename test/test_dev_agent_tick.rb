@@ -1034,9 +1034,10 @@ class TestDevAgentTick < Minitest::Test
   # flunks on an unstubbed request, so an issue with no blockers reaching for a
   # blocker or for GitHub would fail every claim test in this file.
   def claim_one(body:, number: 707, errors: [], playbooks: nil, links: nil, blocker_issues: {}, prs: {},
-                comments: [], branch: nil, extra_stubs: nil, max_concurrency: 1)
+                comments: [], branch: nil, extra_stubs: nil, max_concurrency: 1, parent: nil, children: nil,
+                resume: ->(_branch) { nil })
     seen = { comments: [], statuses: [], released: [], snoozed: [], calls: [], prompt: nil, spawned: false,
-             claims: 0 }
+             claims: 0, resume_lookups: [] }
     with_agent_home do
       register_identity
       Agent::Errors.write(errors) unless errors.empty?
@@ -1044,6 +1045,10 @@ class TestDevAgentTick < Minitest::Test
         issue = { "number" => number, "title" => "Weekly code review: platform", "category" => "infrastructure",
                   "body" => body }
         issue["links"] = links if links
+        # A child of an epic, as the claim reads it: the parent reference rides
+        # the issue itself, and the child ORDER costs the one extra list call
+        # asserted below (ISS-767).
+        issue["parent"] = { "number" => parent.to_s } if parent
         stubs = {
           "POST /playbook/issue/leases" => lambda { |_b|
             seen[:claims] += 1
@@ -1063,6 +1068,10 @@ class TestDevAgentTick < Minitest::Test
           },
         }
         blocker_issues.each { |n, row| stubs["GET /playbook/issues/#{n}"] = row }
+        if children
+          key = "GET /playbook/issues?parent_number=#{parent}&limit=200&offset=0"
+          stubs[key] = children.respond_to?(:call) ? children : children.map { |n| { "number" => n.to_s } }
+        end
         stubs.merge!(extra_stubs.call(seen)) if extra_stubs.respond_to?(:call)
         # The playbook store, as this claim will see it. nil for a key means the
         # platform has never heard of it — a 404, which Agent::Api turns into nil.
@@ -1079,16 +1088,25 @@ class TestDevAgentTick < Minitest::Test
         # (gh missing, rate limited, no such PR), which the gate must read as
         # "dispatch" and never as "not merged".
         pr_view = ->(url) { prs[url] }
+        # Every claim asks whether its branch already carries an open PR
+        # (ISS-767 — the branch is derived, so a retry arrives on its
+        # predecessor's name). That is a `gh search prs` call, and a suite that
+        # made it for real would be both slow and rate-limited, so it is stubbed
+        # here rather than per-test: `resume_lookups` is what the resume
+        # assertions below read.
+        resume_lookup = ->(b) { seen[:resume_lookups] << b; resume.call(b) }
         stub_singleton(Agent::Github, :pr_by_url, pr_view) do
-          stub_singleton(Agent::Jobs, :spawn_session, spawn) do
-            with_stubbed_api(stubs) do
-              seen[:out] = capture_stdout do
-                tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: max_concurrency))
+          stub_singleton(Agent::Workspace, :resume, resume_lookup) do
+            stub_singleton(Agent::Jobs, :spawn_session, spawn) do
+              with_stubbed_api(stubs) do
+                seen[:out] = capture_stdout do
+                  tick(dry_run: false).claim(Agent::Host.cached_identity, runner_row(max_concurrency: max_concurrency))
+                end
+                # Read INSIDE with_agent_home: the state dir is a tmpdir that is
+                # gone, and DEV_AGENT_STATE_DIR restored, by the time `seen` is
+                # returned.
+                seen[:errors] = Agent::Errors.list
               end
-              # Read INSIDE with_agent_home: the state dir is a tmpdir that is
-              # gone, and DEV_AGENT_STATE_DIR restored, by the time `seen` is
-              # returned.
-              seen[:errors] = Agent::Errors.list
             end
           end
         end
@@ -1301,23 +1319,20 @@ class TestDevAgentTick < Minitest::Test
   # itself, because the unchecked path mkdir_p's and later rm_rf's a
   # caller-controlled path under ~/code/ai. That guard is right; the caller now
   # answers it instead of dying on it.
-  # Drives a claim whose lease carries `branch`, recording every branch that
-  # reached the resume path. Stubbed rather than left live because the resume is
-  # a `gh` call, and what these assert is precisely whether it happens at all.
+  # Drives a claim whose lease carries `branch`, and hands back every branch that
+  # reached the resume path — which is what these assert: whether the recorded
+  # branch is looked up at all, and in which order against the derived one.
   def claim_resuming(branch)
-    asked = []
-    seen = nil
-    stub_singleton(Agent::Github, :search_open_pr, ->(b) { asked << b; nil }) do
-      seen = claim_one(body: "Mike wrote this one by hand.", branch: branch)
-    end
-    [seen, asked]
+    seen = claim_one(body: "Mike wrote this one by hand.", branch: branch)
+    [seen, seen[:resume_lookups]]
   end
 
   def test_a_recorded_branch_the_workspace_would_refuse_starts_a_fresh_attempt
     seen, asked = claim_resuming("../../../etc/passwd")
-    assert_empty asked, "a branch this executor could not have minted must never reach the resume path"
-    assert seen[:spawned], "the issue still gets a session — on a fresh slug, as a closed prior PR already does"
-    assert_match(/on branch `i707_[a-z0-9]{3}`/, seen[:comments].first)
+    assert_equal ["i707"], asked,
+                 "a branch this executor could not have minted must never reach the resume path — only the derived one"
+    assert seen[:spawned], "the issue still gets a session — on the derived branch, as a closed prior PR already does"
+    assert_match(/on branch `i707`/, seen[:comments].first)
     assert_match(/is not a slug this executor could have minted/, seen[:out])
     assert_empty seen[:released], "nothing failed — this is an ordinary fresh attempt"
   end
@@ -1327,17 +1342,107 @@ class TestDevAgentTick < Minitest::Test
   # imposes, which does not fail loudly — sbt simply cannot start.
   def test_an_over_long_recorded_branch_is_refused_the_same_way
     seen, asked = claim_resuming("i707_#{'a' * 40}")
-    assert_empty asked
+    assert_equal ["i707"], asked
     assert seen[:spawned]
-    assert_match(/on branch `i707_[a-z0-9]{3}`/, seen[:comments].first)
+    assert_match(/on branch `i707`/, seen[:comments].first)
   end
 
-  # A recorded branch that IS one of ours is untouched — the resume path is the
-  # whole point of recording it (§4.4.1) and must keep working.
-  def test_a_recorded_branch_that_is_one_of_ours_still_resumes
+  # A recorded branch that IS one of ours is still looked up FIRST, and it is the
+  # only thing the lease's `branch` column is good for since ISS-767: an attempt
+  # made under the old random scheme has its PR on `i707_abc`, and that PR is the
+  # one to update rather than duplicate. With no open PR on it the claim falls
+  # through to the derived name, which is where every new attempt lives.
+  def test_a_recorded_branch_that_is_one_of_ours_is_preferred_before_the_derived_one
     seen, asked = claim_resuming("i707_abc")
-    assert_equal ["i707_abc"], asked, "the recorded branch is still looked up"
+    assert_equal %w[i707_abc i707], asked
     assert seen[:spawned]
+    assert_match(/on branch `i707`/, seen[:comments].first)
+  end
+
+  # ...and when it DOES have an open PR it wins outright: the derived name is
+  # never even asked for, because opening a second PR on an issue already under
+  # review is the one thing this ordering exists to prevent.
+  def test_a_recorded_branch_with_an_open_pr_wins_over_the_derived_one
+    seen = claim_one(body: "Mike wrote this one by hand.", branch: "i707_abc",
+                     resume: ->(b) { b == "i707_abc" ? "mbryzek/devops" : nil })
+    assert_equal ["i707_abc"], seen[:resume_lookups], "the derived name is never even asked for"
+    assert seen[:spawned]
+    assert_match(/on branch `i707_abc`/, seen[:comments].first)
+    assert_match(/This is a RESUME/, seen[:prompt])
+  end
+
+  # ---- the derived branch name (ISS-767) ----
+  #
+  # `i<epic>_c<nn>` for a child of an epic, `i<issue>` for a standalone issue,
+  # and NOTHING random. The name is the join key `dev prs group` runs on, so what
+  # matters is that two runs of the same claim agree byte for byte — and that the
+  # epic prefix never becomes a merge order (see below).
+
+  def branch_from(seen) = seen[:comments].first[/on branch `([^`]+)`/, 1]
+
+  def test_a_standalone_issue_gets_the_issue_number_as_its_branch
+    # `children` is absent, which is itself the assertion: `with_stubbed_api`
+    # flunks on an unstubbed request, so an issue with no parent reaching for a
+    # child list would fail here rather than silently costing a call per claim.
+    seen = claim_one(body: "Mike wrote this one by hand.")
+    assert_equal "i707", branch_from(seen)
+  end
+
+  def test_a_child_of_an_epic_gets_the_epic_prefix_and_its_position
+    seen = claim_one(body: "Mike wrote this one by hand.", parent: 682, children: %w[701 707 690])
+    assert_equal "i682_c03", branch_from(seen), "sorted by issue number: 690 is c01, 701 is c02, 707 is c03"
+    assert_match(/Branch to use in every repo you touch: `i682_c03`/, seen[:prompt])
+  end
+
+  # The whole point: a retry has to land on the branch its predecessor pushed, or
+  # review feedback opens a second PR instead of updating the one under review.
+  def test_two_claims_of_the_same_child_compute_the_same_branch
+    branches = 2.times.map do
+      branch_from(claim_one(body: "Mike wrote this one by hand.", parent: 682, children: %w[701 707 690]))
+    end
+    assert_equal 1, branches.uniq.length
+  end
+
+  # A child filed LATER cannot renumber the children that already have branches:
+  # issue numbers are monotonic and the ordering is numeric.
+  def test_a_child_added_later_does_not_move_an_existing_child
+    early = branch_from(claim_one(body: "b", parent: 682, children: %w[690 701 707]))
+    late = branch_from(claim_one(body: "b", parent: 682, children: %w[690 701 707 760 799]))
+    assert_equal early, late
+  end
+
+  # Branch naming must never be able to cost a claim. The list call is one HTTP
+  # request on a path the rest of the claim does not need, and an issue that gets
+  # no session is strictly worse than one whose branch loses its epic prefix.
+  def test_a_child_list_that_will_not_load_falls_back_to_the_standalone_form
+    seen = claim_one(body: "b", parent: 682,
+                     children: ->(_b) { raise ApiError.new("boom", code: 500) })
+    assert seen[:spawned], "the session still starts"
+    assert_equal "i707", branch_from(seen)
+    assert_match(/could not resolve ISS-707's position in epic ISS-682/, seen[:out])
+  end
+
+  # Same fallback for a child list that loads but does not contain this issue —
+  # an epic re-parented mid-claim, or a tracker that disagrees with itself. There
+  # is no position to take, and inventing one would name a branch a later attempt
+  # could not recompute.
+  def test_a_child_missing_from_its_own_epic_falls_back_to_the_standalone_form
+    seen = claim_one(body: "b", parent: 682, children: %w[690 701])
+    assert seen[:spawned]
+    assert_equal "i707", branch_from(seen)
+    assert_match(/is not in epic ISS-682's child list/, seen[:out])
+  end
+
+  # THE constraint this whole scheme is under (ISS-767): `c<nn>` is creation
+  # order and never merge order. A lane that read c01-before-c02 as a dependency
+  # would be right most of the time and silently wrong the moment a child is
+  # filed late. So the session is told, in the
+  # standing instructions it is handed, and nothing in the executor parses the
+  # suffix back out.
+  def test_the_session_is_told_that_the_child_index_is_not_a_merge_order
+    seen = claim_one(body: "b", parent: 682, children: %w[690 701 707])
+    assert_match(/`c<nn>` IS CREATION ORDER\. It is NEVER merge order\./, seen[:prompt])
+    assert_match(/ordering comes only from explicit `blocked_by`\s+edges/, seen[:prompt])
   end
 
   # The backstop, for every failure nobody has thought of. Before the session is

@@ -82,8 +82,8 @@ So the assigned branch is the name of the FIRST PR and the prefix of every other
 
 - the **primary** PR — the most significant one — goes on `<assigned>` exactly;
 - every **additional** PR goes on `<assigned>_<suffix>`: the assigned branch, an
-  underscore, a short suffix naming the fix (`i651_irv` → `i651_irv_sig`,
-  `i651_irv_forms`). Keep the whole name ≤19 chars, for the sbt socket-path
+  underscore, a short suffix naming the fix (`i682_c03` → `i682_c03_sig`,
+  `i682_c03_forms`). Keep the whole name ≤19 chars, for the sbt socket-path
   reason in §4;
 - **every** PR title still starts with `ISS-<n>: `.
 
@@ -304,9 +304,10 @@ assigned by the executor; do not rename either.
 > preference.** CLAUDE.md tells you to name your feature dir and branch after the
 > feature — "`cr-backfill-coord` not `cr-backfill-coordinator`". That rule is for
 > interactive sessions, where a human picks the name. **It does not apply to
-> you.** Your branch name is `i<issue>_<suffix>` and it was chosen before you
-> started, because the executor RECORDED it on your lease and classifies your
-> outcome by looking it up. A descriptive branch name is not a nicer version of
+> you.** Your branch name is DERIVED from the issue — `i<epic>_c<nn>` when the
+> issue is a child of an epic, `i<issue>` when it stands alone — and it was
+> computed before you started, because the executor classifies your outcome by
+> looking it up. A descriptive branch name is not a nicer version of
 > the assigned one; it is a branch the executor cannot find. That has already
 > happened once (ISS-365): the session did the work, opened a good PR, and the
 > issue was classified as if the session had done nothing. The ≤19-char ceiling
@@ -318,6 +319,24 @@ assigned by the executor; do not rename either.
 > opening `<assigned>_<suffix>` siblings when the work is genuinely several
 > independent PRs (§1). A sibling EXTENDS the assigned name; a rename replaces
 > it, and only the second one is invisible.
+
+**`c<nn>` IS CREATION ORDER. It is NEVER merge order.** The number is this
+issue's position among its epic's children, ordered by issue number, and that is
+all it is. Do not infer from `i682_c03` that `i682_c02` merges first, that it is
+already on `main`, or that your work depends on it. That reading is right most of
+the time and silently wrong the moment a child is filed late — the failure mode
+that costs a day to diagnose precisely because the convention appeared to work.
+Grouping comes from the name; **ordering comes only from explicit `blocked_by`
+edges** (`dev issues show <n>`, `--block-on`, and §1's dependency rule). If your
+work genuinely cannot start until a sibling lands, say so with `--block-on`.
+
+**Your branch may already exist**, and your assignment block says so explicitly
+when it does. The name is derived from the issue, so a second attempt lands on
+the branch the first one pushed. That is deliberate — it is how review feedback
+and a pre-merge rebase update one PR instead of opening two — but it means the
+checkout you open into can carry commits you did not write. Follow the
+instructions in that block: check `gh pr list --head <branch> --state all` before
+you write anything, and never force-push to make the branch look fresh.
 
 - Clone every repo you need **into your workspace**:
   `gh repo clone mbryzek/<repo> <workspace>/<repo>`. When the issue named its
@@ -409,6 +428,12 @@ routinely send work back here:
 Do **not** open a second PR and do not create a new branch. Push to the existing
 branch and the PR updates in place, then close the issue out with
 `dev issues status` exactly as in §1.
+
+The same applies when your assignment says only that the branch **already
+existed** (§4). That is the same situation reached the other way: the branch name
+is derived from the issue, so a retry arrives on its predecessor's branch whether
+or not the executor could find an open PR for it. Establish which case you are in
+with `gh pr list --head <branch> --state all` before you write anything.
 
 ## 7. Orientation — where things actually live
 

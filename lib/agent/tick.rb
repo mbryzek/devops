@@ -1088,24 +1088,37 @@ module Agent
         return abandon_unresolvable_playbook(lease, identity, number, e.message)
       end
 
-      # A prior attempt's branch with an OPEN PR is resumed in place, so review
-      # feedback and a pre-merge rebase update the same PR rather than opening a
-      # second one (§4.4.1). A recorded branch whose PR is closed falls through
-      # to a fresh branch — pushing to a branch nobody is reviewing is worse than
-      # starting over.
-      resume_branch = usable_resume_branch(lease["branch"])
-      slug = resume_branch || Agent::Workspace.slug(number)
-      resume_repo = resume_branch ? Agent::Workspace.resume(slug, resume_branch) : nil
-      slug = Agent::Workspace.slug(number) if resume_branch && resume_repo.nil?
+      # THE branch, derived from the issue rather than drawn at random (ISS-767):
+      # `i<epic>_c<nn>` for a child of an epic, `i<issue>` for a standalone one.
+      # Two attempts on one issue therefore compute the SAME name, which makes
+      # resume the default instead of something that has to be recorded.
+      minted = Agent::Workspace.slug(number, **epic_position(issue))
+
+      # A branch a PRIOR attempt recorded still wins when it differs from what
+      # this attempt mints AND its PR is still open — an attempt made before
+      # ISS-767 is on `i<issue>_<rand>`, and that PR is the thing to update
+      # rather than to duplicate (§4.4.1). A recorded branch with no open PR is
+      # finished work and is ignored, exactly as before.
+      recorded = usable_resume_branch(lease["branch"])
+      resume_repo = recorded && recorded != minted ? Agent::Workspace.resume(recorded) : nil
+      slug = resume_repo ? recorded : minted
+      # The derived branch resumes ITSELF: same issue, same name, so an open PR
+      # on it is this issue's own, and the session updates it in place.
+      resume_repo ||= Agent::Workspace.resume(slug)
       workspace = Agent::Workspace.create(slug)
       # The repos the issue names, cloned with the branch already created, so the
       # session opens into a checkout (ISS-562). Best-effort: whatever did not
       # prepare is simply absent from the prompt and the session clones it itself.
       prepared = Agent::Workspace.prepare(slug, issue["repositories"], branch: slug, already_prepared: resume_repo)
+      if prepared.continued.any?
+        decide("claim", "ISS-#{number} branch #{slug} already exists in #{prepared.continued.join(', ')} — " \
+                        "this attempt CONTINUES it rather than starting from origin/main")
+      end
 
       prompt = Agent::Prompt.build(issue: issue, comments: comments, slug: slug,
                                    workspace: workspace, resume_repo: resume_repo,
-                                   prepared_repos: prepared, playbook: playbook)
+                                   prepared_repos: prepared.repos, continued_repos: prepared.continued,
+                                   playbook: playbook)
       pid = Agent::Jobs.spawn_session(argv: @claude_argv, prompt: prompt, workspace: workspace,
                                       number: number, env: child_env(slug))
       Agent::Jobs.write(
@@ -1125,8 +1138,38 @@ module Agent
                       "#{playbook ? " playbook #{playbook.label}" : ''}")
     end
 
+    # The epic this issue belongs to and its position in that epic, as keyword
+    # arguments for `Agent::Workspace.slug` — or `{}`, which mints the standalone
+    # `i<issue>` form (ISS-767).
+    #
+    # The epic is free: the claim already reads the issue, and the issue carries
+    # its `parent` reference. The POSITION costs one list call, and only for a
+    # child — it has to be computed over the epic's whole child set, because
+    # `c<nn>` is a rank within that set and nothing on the child itself knows it.
+    #
+    # `{}` on EVERY failure, and that is the important half. Branch naming must
+    # never be able to cost a claim: the standalone form is a perfectly good
+    # branch that merely loses the epic prefix for this attempt, while an
+    # exception here would land in `abandon_crashed_claim` and burn the dispatch.
+    def epic_position(issue)
+      parent = issue.dig("parent", "number")
+      return {} if parent.to_s.empty?
+
+      numbers = Agent::Api.child_issue_numbers(parent, use_localhost: @use_localhost)
+      index = Agent::Workspace.child_index(numbers, issue["number"])
+      if index.nil?
+        log("claim: ISS-#{issue['number']} is not in epic ISS-#{parent}'s child list — using the standalone branch form")
+        return {}
+      end
+      { parent_number: parent, child_index: index }
+    rescue SessionExpired, ApiError => e
+      log("claim: could not resolve ISS-#{issue['number']}'s position in epic ISS-#{parent} (#{e.message}) — " \
+          "using the standalone branch form")
+      {}
+    end
+
     # The recorded branch, screened before it is handed to Agent::Workspace —
-    # or nil, meaning "no resume, start a fresh attempt on a fresh slug".
+    # or nil, meaning "nothing recorded to prefer, use the derived name".
     #
     # `lease["branch"]` is a value the PLATFORM supplies, and Agent::Workspace
     # deliberately REFUSES anything it could not itself have minted, because the
@@ -1135,10 +1178,11 @@ module Agent
     # this side to it firing (ISS-743). Letting it raise cost the whole tick,
     # with the lease already granted, every ten minutes until the lease expired.
     #
-    # Falling back to a fresh slug is the same thing already done for a recorded
-    # branch whose PR is closed: the worst case is a second PR on an issue,
-    # which the close-out contract handles (`dev issues fix`), against a runner
-    # that dispatches nothing at all.
+    # Falling back to the derived name costs nothing now: since ISS-767 the slug
+    # is computed from the issue, so an unusable recorded branch loses only the
+    # chance to update a PR opened under the old random scheme — and the worst
+    # case of that is a second PR, which the close-out contract handles
+    # (`dev issues fix`), against a runner that dispatches nothing at all.
     def usable_resume_branch(branch)
       return nil if branch.to_s.empty?
       return branch if Agent::Workspace.valid_slug?(branch)

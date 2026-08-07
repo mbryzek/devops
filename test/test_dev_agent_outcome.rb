@@ -303,13 +303,30 @@ class TestDevAgentOutcome < Minitest::Test
   # ---- slug / branch ----
 
   def test_slug_shape_and_length_bound
-    assert_equal "i120_x4q", Agent::Workspace.slug(120, suffix: "x4q")
+    assert_equal "i120", Agent::Workspace.slug(120)
+    assert_equal "i682_c07", Agent::Workspace.slug(700, parent_number: 682, child_index: 7)
+    assert_equal "i682_c17", Agent::Workspace.slug(700, parent_number: 682, child_index: 17)
     # The ceiling exists because macOS caps a unix socket path at 104 bytes and
     # sbt builds <feature>/<repo>/project/.sbtboot/server/<hash>/sock under it.
     (1..99_999).step(7919) do |n|
-      slug = Agent::Workspace.slug(n)
-      assert_operator slug.length, :<=, Agent::Workspace::MAX_SLUG_LENGTH, "slug #{slug} too long"
-      assert_match(/\Ai\d+_[a-z0-9]{3}\z/, slug)
+      standalone = Agent::Workspace.slug(n)
+      child = Agent::Workspace.slug(n, parent_number: n, child_index: 99)
+      [standalone, child].each do |slug|
+        assert_operator slug.length, :<=, Agent::Workspace::MAX_SLUG_LENGTH, "slug #{slug} too long"
+        assert Agent::Workspace.valid_slug?(slug), "#{slug} must be a slug this executor admits"
+      end
+    end
+  end
+
+  # Zero-padded, and it is load-bearing rather than tidy: GitHub's `head:` search
+  # qualifier is a PREFIX match on the whole branch name, so an unpadded
+  # `i682_c1` would match `i682_c10` and the reap of child 1 could adopt child
+  # 10's pull request.
+  def test_a_child_branch_is_never_a_prefix_of_a_sibling_branch
+    names = (1..99).map { |i| Agent::Workspace.slug(700 + i, parent_number: 682, child_index: i) }
+    names.each do |name|
+      others = names - [name]
+      refute others.any? { |o| o.start_with?(name) }, "#{name} is a prefix of a sibling branch"
     end
   end
 
@@ -317,16 +334,62 @@ class TestDevAgentOutcome < Minitest::Test
     assert_raises(RuntimeError) { Agent::Workspace.slug("1234567890123456789") }
   end
 
-  def test_two_attempts_on_one_issue_get_different_slugs
-    slugs = 20.times.map { Agent::Workspace.slug(120) }
-    assert_operator slugs.uniq.length, :>, 1, "a fixed suffix would collide two attempts"
+  # The point of ISS-767, and the exact inverse of what this asserted before: a
+  # second attempt has to arrive at the branch the first one pushed, or review
+  # feedback opens a second PR instead of updating the one under review.
+  def test_two_attempts_on_one_issue_get_the_same_slug
+    assert_equal 1, 20.times.map { Agent::Workspace.slug(120) }.uniq.length
+    assert_equal 1, 20.times.map { Agent::Workspace.slug(700, parent_number: 682, child_index: 7) }.uniq.length
+  end
+
+  # The index is a position in a STABLE ordering: by issue number, over every
+  # child the epic has, so a runner computes the same answer as the runner that
+  # made the last attempt.
+  def test_child_index_is_the_position_by_issue_number
+    numbers = %w[710 682 699]
+    assert_equal 1, Agent::Workspace.child_index(numbers, "682")
+    assert_equal 2, Agent::Workspace.child_index(numbers, "699")
+    assert_equal 3, Agent::Workspace.child_index(numbers, "710")
+    assert_nil Agent::Workspace.child_index(numbers, "800"), "an issue outside the list has no position"
+    assert_nil Agent::Workspace.child_index(numbers, nil)
+    assert_nil Agent::Workspace.child_index(nil, "682")
+    assert_equal 2, Agent::Workspace.child_index(%w[710 x 682 699 682], "699"),
+                 "junk and duplicates must not shift a position"
+  end
+
+  # The tracker stores issue numbers ZERO-PADDED, and `Integer("0767")` is 503 in
+  # Ruby: a leading zero means octal. Read that way the children reorder and a
+  # retry computes a different branch than the attempt it is resuming.
+  def test_a_zero_padded_number_is_read_as_decimal_not_octal
+    assert_equal 3, Agent::Workspace.child_index(%w[0000682 0000699 0000710], "0000710")
+    assert_equal 3, Agent::Workspace.child_index(%w[682 699 710], "0000710")
+  end
+
+  # An issue number is monotonic, so a child filed LATER lands at the end and
+  # cannot renumber the children that already have branches.
+  def test_a_later_child_does_not_renumber_its_predecessors
+    before = %w[682 699 710]
+    after = before + %w[755]
+    before.each do |n|
+      assert_equal Agent::Workspace.child_index(before, n), Agent::Workspace.child_index(after, n)
+    end
+    assert_equal 4, Agent::Workspace.child_index(after, "755")
   end
 
   # The GC pattern must match exactly what the executor creates, and nothing
   # else: ~/code/ai also holds Mike's own feature dirs and gc runs rm -rf.
+  #
+  # `i120` IS an executor slug now (the standalone form), and the legacy
+  # `i120_x4q` still has to be one for as long as a workspace minted before
+  # ISS-767 is on any disk — dropping it would leave those invisible to
+  # `Agent::Gc` and fair game for `dev aidirs prune`, which skips precisely what
+  # this matches.
   def test_gc_slug_pattern_matches_agent_dirs_only
-    assert_match Agent::Gc::AGENT_SLUG, Agent::Workspace.slug(120, suffix: "x4q")
-    ["cr-backfill-coord", "agent-dispatch", "i120", "i120_toolong", "xi120_abc"].each do |name|
+    ["i120", "i120_x4q", "i682_c07", "i682_c100"].each do |name|
+      assert_match Agent::Gc::AGENT_SLUG, name, "#{name} is a workspace the executor owns"
+    end
+    ["cr-backfill-coord", "agent-dispatch", "iss226-rev-src", "i120_toolong", "xi120_abc",
+     "i120_c", "i120_cx", "i682_c07_sig", "i", "120"].each do |name|
       refute_match Agent::Gc::AGENT_SLUG, name, "#{name} must not look like an agent workspace"
     end
   end

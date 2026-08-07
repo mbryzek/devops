@@ -380,11 +380,17 @@ class TestDevAidirs < Minitest::Test
   # The name test is the whole guard, so pin what it does and does not match.
   # It comes from Agent::Workspace::SLUG rather than a local copy — a second copy
   # could drift into matching a hand-made feature dir, which this command deletes.
+  #
+  # `i631` and `i682_c07` are executor slugs since ISS-767 — the standalone and
+  # child-of-an-epic forms — and `i631_lbb` stays one for as long as a workspace
+  # minted before it can be on any disk. The names this must NOT match are the
+  # ones a human types, and a human names a dir after its feature.
   def test_agent_workspace_dir_matches_only_executor_minted_slugs
-    %w[i631_lbb i9_a1b i1234_zzz].each do |name|
+    %w[i631_lbb i9_a1b i1234_zzz i631 i682_c07 i682_c100].each do |name|
       assert agent_workspace_dir?("/code/ai/#{name}"), "#{name} is an executor slug"
     end
-    %w[i631 i631_ i631_lbbx i631_LB1 cr-backfill-coord platform hoa-metrics-be].each do |name|
+    %w[i631_ i631_lbbx i631_LB1 i631_c i682_c07_sig cr-backfill-coord platform
+       hoa-metrics-be iss226-rev-src].each do |name|
       refute agent_workspace_dir?("/code/ai/#{name}"), "#{name} is not an executor slug"
     end
   end

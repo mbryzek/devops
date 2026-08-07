@@ -58,7 +58,8 @@ class TestAgentWorkspaceRepos < Minitest::Test
   def test_each_named_repo_is_cloned_and_branched_off_latest_origin_main
     prepared = Agent::Workspace.prepare("i562_jd8", %w[platform devops], branch: "i562_jd8")
 
-    assert_equal %w[platform devops], prepared
+    assert_equal %w[platform devops], prepared.repos
+    assert_empty prepared.continued, "a branch created off origin/main is not a continuation"
     assert_includes git_calls, "gh repo clone mbryzek/platform #{@tmp}/i562_jd8/platform"
     assert_includes git_calls, "gh repo clone mbryzek/devops #{@tmp}/i562_jd8/devops"
     assert_equal 2, git_calls.count("git fetch origin")
@@ -69,8 +70,10 @@ class TestAgentWorkspaceRepos < Minitest::Test
   # attempt and is in a PR; it is checked out, never reset.
   def test_an_existing_branch_is_checked_out_not_reset
     @existing_branch = true
-    Agent::Workspace.prepare("i562_jd8", %w[platform], branch: "i562_jd8")
+    prepared = Agent::Workspace.prepare("i562_jd8", %w[platform], branch: "i562_jd8")
 
+    assert_equal %w[platform], prepared.continued,
+                 "a derived branch puts this on the ordinary retry path, so it must be REPORTED (ISS-767)"
     assert_includes git_calls, "git checkout i562_jd8"
     refute_includes git_calls, "git checkout -b i562_jd8 origin/main"
     refute(git_calls.any? { |c| c.include?("checkout -B") }, "never reset an existing branch")
@@ -81,7 +84,7 @@ class TestAgentWorkspaceRepos < Minitest::Test
   # checkout that does not exist.
   def test_a_repo_that_will_not_clone_is_skipped_rather_than_failing_the_attempt
     @fail << "clone mbryzek/devops"
-    assert_equal %w[platform], Agent::Workspace.prepare("i562_jd8", %w[platform devops], branch: "i562_jd8")
+    assert_equal %w[platform], Agent::Workspace.prepare("i562_jd8", %w[platform devops], branch: "i562_jd8").repos
   end
 
   # The resume path has already cloned this repo and checked out the EXISTING
@@ -90,22 +93,24 @@ class TestAgentWorkspaceRepos < Minitest::Test
   def test_the_resumed_repo_is_left_alone
     assert_equal %w[devops],
                  Agent::Workspace.prepare("i562_jd8", %w[platform devops], branch: "i562_jd8",
-                                                                          already_prepared: "mbryzek/platform")
+                                                                          already_prepared: "mbryzek/platform").repos
     refute(git_calls.any? { |c| c.include?("mbryzek/platform") })
   end
 
   def test_blank_and_duplicate_names_are_ignored
-    assert_empty Agent::Workspace.prepare("i562_jd8", ["", "  ", nil], branch: "i562_jd8")
-    assert_empty Agent::Workspace.prepare("i562_jd8", nil, branch: "i562_jd8")
-    assert_equal %w[platform], Agent::Workspace.prepare("i562_jd8", ["platform", " platform "], branch: "i562_jd8")
+    assert_empty Agent::Workspace.prepare("i562_jd8", ["", "  ", nil], branch: "i562_jd8").repos
+    assert_empty Agent::Workspace.prepare("i562_jd8", nil, branch: "i562_jd8").repos
+    assert_equal %w[platform],
+                 Agent::Workspace.prepare("i562_jd8", ["platform", " platform "], branch: "i562_jd8").repos
   end
 
   # ---- the prompt ----
 
   def issue = { "number" => "562", "title" => "the flag does not exist", "category" => "bug", "body" => "b" }
 
-  def assignment(prepared)
-    Agent::Prompt.assignment(issue: issue, slug: "i562_jd8", workspace: "/ws/i562_jd8", prepared_repos: prepared)
+  def assignment(prepared, continued: [])
+    Agent::Prompt.assignment(issue: issue, slug: "i562_jd8", workspace: "/ws/i562_jd8", prepared_repos: prepared,
+                             continued_repos: continued)
   end
 
   def test_the_prompt_names_the_prepared_checkouts_instead_of_telling_the_session_to_clone
@@ -119,5 +124,22 @@ class TestAgentWorkspaceRepos < Minitest::Test
     text = assignment([])
     assert_match(/Your workspace is empty/, text)
     refute_match(/already cloned/, text)
+  end
+
+  # ISS-767: the branch is derived from the issue, so a retry opens into a
+  # checkout carrying commits it did not write. Told nothing, the session reads
+  # "off the latest origin/main" above and its two guesses are both wrong — a
+  # second PR on work that already has one, or a rebase over a predecessor's diff.
+  def test_a_branch_that_already_existed_is_named_in_the_prompt
+    text = assignment(%w[platform devops], continued: %w[platform])
+    assert_match(/`i562_jd8` ALREADY EXISTED/, text)
+    assert_match(/gh pr list --head i562_jd8 --state all/, text)
+    refute_match(/`devops`.*ALREADY EXISTED/m, text.lines.grep(/ALREADY EXISTED/).join)
+  end
+
+  # The ordinary first attempt says nothing about it — a warning on every claim
+  # is a warning nobody reads.
+  def test_a_fresh_branch_says_nothing_about_continuing
+    refute_match(/ALREADY EXISTED/, assignment(%w[platform devops]))
   end
 end

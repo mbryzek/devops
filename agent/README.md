@@ -105,7 +105,8 @@ directory 14 days; a failed or gave-up one 30 days — the post-mortem window;
 workspaces deleted on success and after 7 days otherwise.
 
 `dev agent gc` is the **sole** collector of workspaces, and `dev aidirs prune`
-skips every `i<issue>_<suffix>` directory for that reason (ISS-631). Two
+skips every executor-minted directory for that reason (ISS-631) — `i<issue>`,
+`i<epic>_c<nn>`, and the `i<issue>_<rand>` form minted before ISS-767. Two
 collectors sharing `~/code/ai` disagreed in both directions: prune has no notion
 of a running job, so it deleted a live session's workspace during the window
 between the mkdir and the first clone; and its 3-day cutoff was quietly deleting

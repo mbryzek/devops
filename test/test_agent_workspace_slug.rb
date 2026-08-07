@@ -36,6 +36,20 @@ class TestAgentWorkspaceSlug < Minitest::Test
 
   def test_a_generated_slug_is_accepted
     assert Agent::Workspace.valid_slug?(Agent::Workspace.slug(120))
+    assert Agent::Workspace.valid_slug?(Agent::Workspace.slug(700, parent_number: 682, child_index: 7))
+  end
+
+  # Every workspace minted before ISS-767 is on this shape, and a machine can be
+  # holding one for up to WORKSPACE_DAYS. It has to stay admitted or it falls
+  # outside BOTH collectors at once: invisible to `Agent::Gc`, and no longer
+  # skipped by the aggressive `dev aidirs prune`.
+  def test_a_pre_iss767_random_slug_is_still_accepted
+    assert Agent::Workspace.valid_slug?("i120_x4q")
+    with_workspace_root do
+      dir = Agent::Workspace.create("i120_x4q")
+      assert File.directory?(dir)
+      assert Agent::Workspace.delete("i120_x4q")
+    end
   end
 
   def test_a_traversing_slug_is_refused_rather_than_materialized
@@ -56,8 +70,13 @@ class TestAgentWorkspaceSlug < Minitest::Test
     with_workspace_root { assert_raises(RuntimeError) { Agent::Workspace.create(long) } }
   end
 
+  # `i120` is deliberately absent from this list since ISS-767: it is the
+  # standalone form the executor mints, so it MUST read as an executor slug. A
+  # hand-made feature dir is named after its FEATURE — nothing here is a bare `i`
+  # and a number, which is the whole reason that widening is safe.
   def test_a_hand_made_feature_dir_name_is_not_mistaken_for_an_executor_slug
-    ["wk-devops-0805", "iss226-rev-src", "i120", "i120_ABC", "i120_ab", "", nil].each do |name|
+    ["wk-devops-0805", "iss226-rev-src", "i120_ABC", "i120_ab", "i120-c07", "i_c07",
+     "i682_c07_sig", "", nil].each do |name|
       refute Agent::Workspace.valid_slug?(name), "#{name.inspect} must not read as an executor slug"
     end
   end
