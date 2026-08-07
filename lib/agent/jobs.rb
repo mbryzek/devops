@@ -1,9 +1,13 @@
 require 'json'
 require 'shellwords'
 require 'time'
+require 'agent/outcome'
 require 'agent/paths'
 
-# The only local state the executor keeps: "is this pid alive".
+# The only local state the executor keeps: "is this pid alive", plus the two
+# things a later process cannot re-derive once the act of handling them has
+# destroyed the evidence — that the TICK killed this session (`mark_killed`), and
+# what the reap decided about it (`mark_reaped`).
 #
 # ~/.platform/agent-jobs/<issue>.json is a CACHE, not a source of truth. Delete
 # every one of them and the cost is some orphaned Claude processes whose leases
@@ -65,6 +69,27 @@ module Agent
     # signal still leaves the truth behind.
     def mark_killed(record, reason:, now: Time.now)
       write(record.merge("killed" => { "reason" => reason, "at" => now.utc.iso8601 }))
+    end
+
+    # Record the reap's VERDICT, before the reap acts on it (ISS-741).
+    #
+    # The same shape and the same reason as `mark_killed` above: handling an
+    # outcome destroys the evidence for it. The kill destroys the exit code and
+    # the log; the reap deletes the workspace whose clones are where the
+    # session's PRs are found. And the reap's platform write can fail AFTER that
+    # deletion, leaving this job record to be reaped again 30 seconds later with
+    # nothing left to read — which is how a ready PR came to be re-classified as
+    # `nothing_to_do` and its issue dismissed underneath it. Written FIRST, so
+    # the retry applies the verdict rather than inventing a new one.
+    #
+    # It survives into meta.json through `finish`, which is where it earns its
+    # second keep: `reap.at` is when the verdict was reached and `finished_at` is
+    # when it was finally written, and on a reap that had to retry the gap
+    # between them is the post-mortem.
+    def mark_reaped(record, result:, prs:, now: Time.now)
+      write(record.merge("reap" => { "result" => Agent::Outcome.to_h(result),
+                                     "prs" => prs,
+                                     "at" => now.utc.iso8601 }))
     end
 
     def alive?(pid)

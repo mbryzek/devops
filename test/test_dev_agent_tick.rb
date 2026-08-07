@@ -245,6 +245,165 @@ class TestDevAgentTick < Minitest::Test
     stub_singleton(obj, name, impl) { stub_each(pairs.drop(1), &block) }
   end
 
+  # ---- a reap whose outcome write fails (ISS-741) ----
+
+  READY_PR = { "url" => "https://github.com/mbryzek/devops/pull/12", "state" => "OPEN", "isDraft" => false,
+               "number" => 12, "title" => "ISS-707: fix it", "headRefName" => "i707_abc",
+               "repository" => "mbryzek/devops" }.freeze
+
+  # A dead session's job record, with the workspace it left behind. String keys
+  # throughout, because that is what a record read back off disk has.
+  def reaped_job(extra = {}, slug: "i707_abc")
+    Agent::Paths.mkdir_p(Agent::Workspace.path(slug))
+    # A CLEAN exit, which is the shape the bug needs: with no PR left to find,
+    # exit 0 is what classifies as `nothing_to_do` rather than as a failure.
+    Agent::Paths.mkdir_p(Agent::Paths.issue_dir(707))
+    File.write(Agent::Jobs.exit_code_file(707), "0\n")
+    Agent::Jobs.write({ "issue" => 707, "pid" => dead_pid, "slug" => slug, "branch" => slug,
+                        "lease_id" => "lse-1", "producer_filed" => true,
+                        "started_at" => (Time.now - 60).utc.iso8601,
+                        "timeout_at" => (Time.now + 3600).utc.iso8601 }.merge(extra))
+  end
+
+  # THE regression test, run as the two ticks it actually takes.
+  #
+  # Tick 1: the session left a ready PR, classification finds it, `cleanup`
+  # deletes the workspace those PRs were found in, and then the status write
+  # takes a platform 500. The job record survives, so 30 seconds later:
+  #
+  # Tick 2: the workspace is gone, so the real `prs_in_workspace` finds nothing,
+  # and the fallback `gh search prs` is inside its own documented index lag —
+  # both empty. Before ISS-741 that re-classified as `nothing_to_do` and
+  # DISMISSED a producer-filed issue with its fix sitting ready on GitHub. The
+  # verdict is on the job record now, so the retry applies it unchanged.
+  #
+  # Note what tick 2 does NOT stub: `prs_in_workspace` runs for real against the
+  # deleted directory. That is the failure being reproduced, not a premise.
+  def test_a_delivered_pr_is_not_re_classified_when_the_outcome_write_fails
+    with_agent_home do
+      register_identity
+      identity = Agent::Host.cached_identity
+      subject = tick(dry_run: false)
+      record = reaped_job
+      workspace = Agent::Workspace.path(record.fetch("slug"))
+
+      api = { issue_lease_history: ->(*) { [{ "id" => "lse-1" }] },
+              issue: ->(*) { { "status" => "claimed" } },
+              set_status: ->(*) { raise ApiError.new("500 Internal Server Error", code: 500) } }
+      out = with_stubbed_methods(
+        Agent::Github => { prs_in_workspace: ->(*) { [READY_PR] }, plans_committed_since?: ->(*) { false } },
+        Agent::Api => api,
+        subject => { drop_session_databases: ->(*) {} },
+      ) { capture_stdout { subject.send(:reap, identity) } }
+
+      assert_match(/could not be closed out/, out, "one failing outcome write must not abort the reap")
+      refute Dir.exist?(workspace), "cleanup did not run — this test no longer reproduces the bug"
+
+      pending = Agent::Jobs.find(707)
+      refute_nil pending, "the job record must survive so the write is retried"
+      assert_equal "ready_pr", pending.dig("reap", "result", "name"),
+                   "the verdict must be written down BEFORE the evidence for it is deleted"
+
+      # Tick 2 — the platform is healthy again, GitHub still has not indexed the
+      # branch, and the workspace it was found in no longer exists.
+      wrote = nil
+      with_stubbed_methods(
+        Agent::Github => { search_prs: ->(*) { [] }, plans_committed_since?: ->(*) { false } },
+        Agent::Api => api.merge(
+          set_status: ->(number, status, **opts) { wrote = [number, status, opts[:url]]; {} },
+          record_fix: ->(*) { {} },
+          release_lease: ->(*) { {} },
+        ),
+        subject => { drop_session_databases: ->(*) {} },
+      ) { capture_stdout { subject.send(:reap, identity) } }
+
+      assert_equal [707, "fixed", READY_PR["url"]], wrote,
+                   "the retry re-derived an outcome from evidence the first reap deleted"
+      assert_nil Agent::Jobs.find(707), "a job whose outcome was recorded must be finished"
+    end
+  end
+
+  # The same record, reaped twice, with a HUMAN-filed issue: the nothing_to_do
+  # this bug produced lands on `needs_input` rather than `dismissed` there, which
+  # is quieter and no less wrong — the PR is orphaned either way.
+  def test_a_recorded_verdict_is_applied_rather_than_re_classified
+    with_agent_home do
+      register_identity
+      recorded = Agent::Outcome::Result.new(name: "ready_pr", status: "fixed", lease_outcome: "completed",
+                                            reason: "Ready PR #{READY_PR['url']}", url: READY_PR["url"])
+      record = reaped_job({ "producer_filed" => false,
+                            "reap" => { "result" => Agent::Outcome.to_h(recorded), "prs" => [READY_PR] } })
+      subject = tick(dry_run: false)
+
+      result = nil
+      with_stubbed_methods(
+        # Neither lookup may be reached: a recorded verdict is not re-derived,
+        # and `gh` is not asked a question whose answer cannot change it.
+        Agent::Github => { prs_in_workspace: ->(*) { flunk "re-classified a recorded verdict" },
+                           search_prs: ->(*) { flunk "re-classified a recorded verdict" },
+                           plans_committed_since?: ->(*) { flunk "re-classified a recorded verdict" } },
+      ) do
+        capture_stdout { _rec, result, _prs = subject.send(:reap_decision, record, Agent::Host.cached_identity) }
+      end
+
+      assert_equal recorded, result
+    end
+  end
+
+  # A job record written by an executor that predates ISS-741 has no verdict on
+  # it, and a truncated or hand-edited one has half of one. Both re-classify,
+  # which is the old behaviour and never worse than it — what must not happen is
+  # the reap raising on a file it did not write.
+  def test_an_unreadable_recorded_verdict_falls_back_to_classifying
+    with_agent_home do
+      register_identity
+      subject = tick(dry_run: false)
+      [nil, { "url" => "https://x" }, "not a hash"].each do |broken|
+        record = reaped_job({ "reap" => { "result" => broken } })
+        result = nil
+        with_stubbed_methods(
+          Agent::Github => { prs_in_workspace: ->(*) { [READY_PR] }, plans_committed_since?: ->(*) { false } },
+          Agent::Api => { issue_lease_history: ->(*) { [] } },
+        ) do
+          capture_stdout { _rec, result, _prs = subject.send(:reap_decision, record, Agent::Host.cached_identity) }
+        end
+        assert_equal "ready_pr", result.name
+      end
+    end
+  end
+
+  # `dev agent status` on a machine in exactly the state this bug leaves behind.
+  # "FINISHED (unreaped)" reads as "nothing has looked at this yet", which is the
+  # opposite of what a recorded verdict means.
+  def test_status_distinguishes_an_unreaped_job_from_one_awaiting_its_outcome_write
+    with_agent_home do
+      assert_match(/FINISHED \(unreaped\)/, agent_job_line(reaped_job))
+
+      recorded = Agent::Outcome::Result.new(name: "ready_pr", status: "fixed", lease_outcome: "completed",
+                                            reason: "Ready PR #{READY_PR['url']}", url: READY_PR["url"])
+      awaiting = reaped_job({ "reap" => { "result" => Agent::Outcome.to_h(recorded) } })
+      assert_match(/FINISHED \(ready_pr recorded; outcome write pending\)/, agent_job_line(awaiting))
+    end
+  end
+
+  # A dry run must classify and say so without writing the verdict down — the
+  # write is a side effect like every other one, and `--dry-run` is also the
+  # provisioning smoke test.
+  def test_a_dry_run_records_no_verdict
+    with_agent_home do
+      register_identity
+      record = reaped_job
+      out = with_stubbed_methods(
+        Agent::Github => { prs_in_workspace: ->(*) { [READY_PR] }, plans_committed_since?: ->(*) { false } },
+        Agent::Api => { issue_lease_history: ->(*) { [] } },
+      ) { capture_stdout { tick.send(:reap, Agent::Host.cached_identity) } }
+
+      assert_match(/ISS-707 → ready_pr/, out)
+      assert_nil Agent::Jobs.find(707)["reap"], "a dry run wrote the verdict to the job record"
+      assert Dir.exist?(Agent::Workspace.path(record.fetch("slug"))), "a dry run deleted the workspace"
+    end
+  end
+
   # A machine with no Docker running still has an outcome to record and a lease
   # to release, and the hourly `claude-db gc` is the backstop for whatever this
   # could not drop. What must NOT happen is the tick dying here.

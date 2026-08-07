@@ -90,7 +90,9 @@ issues/ISS-<n>/
 ```
 
 Local state, all under `~/.platform/` and all of it a **cache**: `agent.identity`
-(runner id + token), `agent-jobs/<issue>.json` (is this pid alive),
+(runner id + token), `agent-jobs/<issue>.json` (is this pid alive, whether the
+tick killed it, and — written before the reap acts on it — what the reap
+decided),
 `agent-heartbeat`, `agent-notified.json`. Delete all of it and the cost is one
 re-registration plus some orphaned processes whose leases expire within ten
 minutes.
