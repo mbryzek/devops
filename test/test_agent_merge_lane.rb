@@ -290,11 +290,50 @@ class TestAgentMergeLane < Minitest::Test
     assert_equal "irreversible", ML.reversibility(["README.md"], repo: "mbryzek/devops")
   end
 
-  # Conservative on purpose: precise breaking-change classification is ISS-757's
-  # job and needs apibuilder's own diff, not a path grep. Over-classifying costs
-  # a merge that waits; under-classifying ships a broken client.
-  def test_a_spec_change_is_costly
-    assert_equal "costly", ML.reversibility(["spec/club.json", "app/Foo.scala"], repo: "platform")
+  # A spec change is classified by apibuilder's own diff, and the DEFAULT is the
+  # path-grep answer this replaced: a caller that did not compute the diff gets
+  # `costly`, exactly as before (ISS-757). Over-classifying costs a merge that
+  # waits; under-classifying ships a broken client.
+  def test_a_spec_change_is_costly_unless_apibuilder_says_otherwise
+    paths = ["spec/club.json", "app/Foo.scala"]
+    assert_equal "costly", ML.reversibility(paths, repo: "platform")
+    assert_equal "costly", ML.reversibility(paths, repo: "platform", spec_diff: :unknown)
+    assert_equal "costly", ML.reversibility(paths, repo: "platform", spec_diff: :breaking)
+    assert_equal "reversible", ML.reversibility(paths, repo: "platform", spec_diff: :non_breaking)
+  end
+
+  # A non-breaking API spec does not make the migration beside it revertible.
+  def test_a_non_breaking_spec_never_softens_a_migration
+    assert_equal "irreversible",
+                 ML.reversibility(["spec/club.json", "dao/spec/db-club.json"], repo: "platform",
+                                                                              spec_diff: :non_breaking)
+    assert_equal "irreversible",
+                 ML.reversibility(["spec/club.json"], repo: "mbryzek/devops", spec_diff: :non_breaking)
+  end
+
+  # `api diff` reports three states and each one has to survive the trip: an exit
+  # code this does not recognise is `:unknown`, never a pass.
+  def test_the_spec_diff_exit_codes_map_to_the_three_verdicts
+    assert_equal :non_breaking, ML::SPEC_DIFF_EXIT[0]
+    assert_equal :breaking, ML::SPEC_DIFF_EXIT[1]
+    assert_equal :unknown, ML::SPEC_DIFF_EXIT[2]
+    assert_equal :unknown, ML::SPEC_DIFF_EXIT.fetch(127, :unknown)
+  end
+
+  # The clone is only worth doing for a PR that changed a contract.
+  def test_only_a_spec_change_is_worth_a_clone
+    assert ML.spec_touched?(["spec/club.json"])
+    refute ML.spec_touched?(["app/Foo.scala", "dao/spec/db-club.json"])
+    refute ML.spec_touched?(nil)
+  end
+
+  # The lane's trust model in one test: there is no way to TELL it a spec change
+  # is safe. `spec_diff` takes a repo and a PR number and computes the answer
+  # itself, so a session asking for a merge cannot assert its way past the check.
+  def test_the_spec_verdict_cannot_be_asserted_by_the_caller
+    assert_equal %i[repo number], ML.method(:spec_diff).parameters.select { |kind, _| kind == :req }.map(&:last)
+    refute ML.method(:spec_diff).parameters.any? { |kind, name| kind == :key && name == :verdict }
+    assert_equal :unknown, ML.spec_diff("mbryzek/platform", "")
   end
 
   def test_documentation_only_is_trivial
@@ -324,6 +363,17 @@ class TestAgentMergeLane < Minitest::Test
     assert_equal false, a["touches_migration"]
     assert_equal false, a["touches_secrets"]
     assert_equal "c" * 40, a["base_sha"]
+  end
+
+  # The verdict is recorded beside `touches_spec` so the feed says WHY a spec PR
+  # was allowed through — and defaults to `unknown` rather than to a pass.
+  def test_the_spec_verdict_is_recorded_only_when_a_spec_changed
+    spec_pr = ML.candidate("mbryzek/platform", green_pr("files" => [{ "path" => "spec/club.json" }]))
+    assert_equal "non_breaking", ML.assertions(spec_pr, spec_diff: :non_breaking)["spec_diff"]
+    assert_equal "unknown", ML.assertions(spec_pr)["spec_diff"]
+
+    code_pr = ML.candidate("mbryzek/platform", green_pr("files" => [{ "path" => "app/Foo.scala" }]))
+    refute ML.assertions(code_pr).key?("spec_diff")
   end
 
   # `suite_passed_post_rebase` is the ledger's existing field name and it means

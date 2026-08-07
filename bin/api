@@ -27,6 +27,7 @@ USAGE = <<~TEXT
          api [--profile PROFILE] init [--language typescript] [--language scala]
          api [--profile PROFILE] validate <file>
          api [--profile PROFILE] [--app APP ...] [--group GROUP] lint [<file>]
+         api [--profile PROFILE] [--app APP ...] [--group GROUP] diff [--base REF] [--json]
          api [--profile PROFILE] result [--dry-run]
 
   Commands:
@@ -53,6 +54,13 @@ USAGE = <<~TEXT
                       .api/config.pkl; scope it with --app/--group (same as codegen).
                       Exits non-zero if it removed anything or a spec failed to
                       parse — review and commit the changes (git diff to inspect/revert).
+    diff [--base REF]  Ask apibuilder whether this checkout's spec changes break anything
+                      generated against REF (default `origin/main`). Every spec in
+                      .api/config.pkl is sent, the changed ones with the REF version
+                      alongside, and the server returns its own breaking / non-breaking
+                      classification of each difference — the same one it records on
+                      every upload. Hermetic: nothing is published. Exits 0 when nothing
+                      is breaking, 1 when something is, 2 when it could not answer.
     result            Generate a repo-wide ApiResult.scala from the union of all
                       specs whose blocks bind the play_controller generator in
                       .api/config.pkl. Hermetic like codegen: local/sibling spec
@@ -63,6 +71,8 @@ USAGE = <<~TEXT
     --profile PROFILE  Use a named profile from ~/.apibuilder/config
     --app APP          Process only the specified application(s). Can be repeated.
     --group GROUP      Process only blocks with the specified group.
+    --base REF         (diff) The git ref to compare against. Default `origin/main`.
+    --json             (diff) Print the verdict as JSON instead of prose.
 
   Examples:
     api                                              # hermetic codegen
@@ -71,6 +81,8 @@ USAGE = <<~TEXT
     api publish                                       # publish from a clean main checkout
     api validate spec/myapp.json                      # validate a spec file
     api lint                                          # clean unused imports from every spec
+    api diff                                          # breaking-change check against origin/main
+    api diff --base HEAD~1 --json                     # against another ref, machine-readable
     api result                                        # generate ApiResult.scala
     api result --dry-run                              # print request body, skip HTTP
 TEXT
@@ -1209,6 +1221,300 @@ def submit_batch(batch_client, operations, batch)
   end
 end
 
+# --- Diff Command ---
+#
+# "Does this branch's spec change break anything generated against main?"
+#
+# The answer is apibuilder's own: `POST /apibuilder/diffs` runs the same
+# breaking-change diff the registry records on every upload, over the two specs this
+# sends it. Nothing here decides what "breaking" means — a JSON text diff, or a rule
+# about which keys are safe to add, would be a second and weaker opinion about a
+# contract apibuilder already owns the semantics of.
+#
+# The payload is the same hermetic set codegen builds: every configured application
+# rides along so imports resolve against this checkout rather than the registry, and
+# the ones that actually changed carry `previous` (the spec at the base ref) as well.
+# An application without `previous` is context, and gets no verdict.
+#
+# Exit codes are the producer contract, matching `dev codegen`: 0 clean, 1 findings,
+# 2 could-not-answer. `Util.exit_with_error` exits 1, so this command never routes an
+# error through it — an abort from shared code is caught in `run_diff` and re-raised
+# as 2, because "the check broke" must never read as "nothing is breaking".
+
+API_DIFF_EXIT_NON_BREAKING = 0 # nothing breaking; safe for an automated merge to proceed
+API_DIFF_EXIT_BREAKING     = 1 # at least one breaking difference — hold for a human
+API_DIFF_EXIT_UNCHECKABLE  = 2 # could not answer (bad ref, unreachable server, unparseable spec)
+
+API_DIFF_DEFAULT_BASE = "origin/main".freeze
+
+class ApiDiffError < StandardError; end
+
+def parse_diff_args(remaining)
+  base = API_DIFF_DEFAULT_BASE
+  apps = []
+  group = nil
+  json = false
+
+  args = remaining.dup
+  while arg = args.shift
+    case arg
+    when "diff"
+      next
+    when "--base"
+      base = parse_option_value(args, "--base")
+    when "--app"
+      app = parse_option_value(args, "--app")
+      apps << app unless apps.include?(app)
+    when "--group"
+      group = parse_option_value(args, "--group")
+    when "--json"
+      json = true
+    else
+      # Not Util.exit_with_error: that exits 1, which this command reserves for
+      # "breaking changes found".
+      $stderr.puts "ERROR: Unknown argument: #{arg}"
+      $stderr.puts "Usage: api diff [--base REF] [--app APP ...] [--group GROUP] [--json]"
+      exit API_DIFF_EXIT_UNCHECKABLE
+    end
+  end
+
+  { base: base, apps: apps, group: group, json: json }
+end
+
+# The path to hand `git show`: relative to the repository, not to the codegen root
+# that named it (they differ for a nested root).
+def diff_repo_relative_path(git_root, project_root, file_path)
+  Pathname.new(File.join(project_root, file_path)).relative_path_from(Pathname.new(git_root)).to_s
+end
+
+# Two specs are the same change-wise when they parse to the same document —
+# reformatting a spec is not a contract change, and sending it as one would make
+# every whitespace edit look like something to classify.
+def diff_same_spec?(a, b)
+  a == b
+end
+
+def diff_parse_spec(label, contents)
+  JSON.parse(contents)
+rescue JSON::ParserError => e
+  raise ApiDiffError, "#{label}: invalid JSON (#{e.message})"
+end
+
+# One application's place in the diff:
+#   :changed — sent with `previous`, gets a verdict from the server
+#   :added   — no spec at the base ref, so there is no prior contract to break
+#   :context — unchanged; sent so imports resolve here, never given a verdict
+def build_diff_application(org, app_key, file_path, project_root, git_root, base_ref, project_name)
+  full_path = File.join(project_root, file_path)
+  raise ApiDiffError, "Application file not found: #{full_path} (for #{app_key})" unless File.exist?(full_path)
+
+  original = diff_parse_spec(full_path, IO.read(full_path))
+  inject_project_attribute!(original, project_name)
+
+  entry = { "organization_key" => org, "application_key" => app_key, "original" => original }
+
+  repo_path = diff_repo_relative_path(git_root, project_root, file_path)
+  base_contents = ApiProducers.show(git_root, base_ref, repo_path)
+
+  if base_contents.nil?
+    { entry: entry, status: :added, path: repo_path }
+  else
+    previous = diff_parse_spec("#{repo_path}@#{base_ref}", base_contents)
+    inject_project_attribute!(previous, project_name)
+    if diff_same_spec?(previous, original)
+      { entry: entry, status: :context, path: repo_path }
+    else
+      { entry: entry.merge("previous" => previous), status: :changed, path: repo_path }
+    end
+  end
+end
+
+# Spec files that existed at the base ref and are gone from this checkout. Deleting a
+# spec deletes an entire contract, which no per-application diff can report: the
+# application is not in the current config to be asked about. Scoped to the
+# directories the config's own specs live in (`spec/`, `dao/spec/`), so this is a
+# statement about spec files rather than a guess about arbitrary JSON.
+def deleted_spec_paths(git_root, base_ref, spec_dirs, current_paths)
+  return [] if spec_dirs.empty?
+
+  out, status = Open3.capture2(
+    "git", "-C", git_root, "diff", "--name-only", "--diff-filter=D", base_ref, "--", *spec_dirs.to_a.sort,
+    err: File::NULL,
+  )
+  raise ApiDiffError, "git diff against #{base_ref} failed (is #{base_ref} fetched?)" unless status.success?
+
+  out.split("\n").map(&:strip).reject(&:empty?).select { |p| p.end_with?(".json") } - current_paths
+end
+
+# Every application the server should see, plus what this side already knows about
+# each one. Mirrors build_batch_form's resolution: config apps first, then the import
+# closure through the same source chain, so a spec that imports one this repo does
+# not own still resolves against a real source rather than the registry.
+def build_diff_request(config, org, app_filter, group_filter, project_root, git_root, base_ref, sources)
+  blocks = config.blocks_for_org(org)
+  blocks = blocks.select { |b| b.group == group_filter } if group_filter
+
+  app_files = {}
+  blocks.each do |block|
+    block.applications.each do |app|
+      next if app_filter && !app_filter.empty? && !app_filter.include?(app.key)
+      app_files[app.key] ||= app.file_path
+    end
+  end
+
+  project_name = read_project_from_build_sbt(project_root)
+  built = app_files.map do |app_key, file_path|
+    build_diff_application(org, app_key, file_path, project_root, git_root, base_ref, project_name)
+  end
+
+  # Only the applications that changed are sent as subjects; the rest of the repo's
+  # specs arrive as the import closure of those, through the same source chain codegen
+  # uses. Sending every configured spec would be correct but brittle: the server
+  # resolves a payload set as a whole, so one unrelated spec that cannot resolve —
+  # a cyclic import pair falling back to a registry that has not seen it — would take
+  # the answer for a change that had nothing to do with it.
+  applications = built.reject { |b| b[:status] == :context }.map { |b| b[:entry] }
+  applications += payload_context_entries(applications, sources) if sources && !applications.empty?
+
+  spec_dirs = built.map { |b| File.dirname(b[:path]) }.uniq
+  deleted = deleted_spec_paths(git_root, base_ref, spec_dirs, built.map { |b| b[:path] })
+
+  {
+    org: org,
+    form: { "applications" => applications },
+    changed: built.select { |b| b[:status] == :changed }.map { |b| b[:entry]["application_key"] },
+    added: built.select { |b| b[:status] == :added }.map { |b| b[:entry]["application_key"] },
+    deleted: deleted,
+  }
+end
+
+def post_diff(client, form)
+  client.request(:post, "/apibuilder/diffs", form)
+end
+
+def diff_breaking?(diff)
+  diff["discriminator"] == "diff_breaking"
+end
+
+# The verdict, from the server's answers plus the two facts only this side can see:
+# a spec that is new (no prior contract, so nothing to break) and a spec that is gone
+# (the whole contract, gone).
+def summarize_diff(request, results)
+  applications = results.map do |result|
+    {
+      "organization_key" => result["organization_key"],
+      "application_key" => result["application_key"],
+      "status" => "changed",
+      "diffs" => (result["diffs"] || []).map do |d|
+        { "breaking" => diff_breaking?(d), "is_material" => d["is_material"], "description" => d["description"] }
+      end,
+    }
+  end
+
+  added = request[:added].map do |key|
+    { "organization_key" => request[:org], "application_key" => key, "status" => "added", "diffs" => [] }
+  end
+
+  deleted = request[:deleted].map do |path|
+    {
+      "organization_key" => request[:org],
+      "application_key" => File.basename(path, ".json"),
+      "status" => "removed",
+      "diffs" => [{ "breaking" => true, "is_material" => true, "description" => "spec removed: #{path}" }],
+    }
+  end
+
+  applications + added + deleted
+end
+
+def print_diff_report(base, applications)
+  changed = applications.reject { |a| a["diffs"].empty? && a["status"] == "changed" }
+
+  if changed.empty?
+    puts "==> No spec changed against #{base}"
+    return
+  end
+
+  changed.each do |app|
+    breaking = app["diffs"].count { |d| d["breaking"] }
+    summary =
+      case app["status"]
+      when "added" then "new application — no prior contract"
+      when "removed" then "REMOVED"
+      else "#{app["diffs"].size} difference(s), #{breaking.zero? ? 'none breaking' : "#{breaking} breaking"}"
+      end
+    puts "  #{app["application_key"]} — #{summary}"
+    app["diffs"].each do |d|
+      label = d["breaking"] ? "breaking    " : "non-breaking"
+      note = d["is_material"] ? "" : " (not material)"
+      puts "    #{label}  #{d["description"]}#{note}"
+    end
+  end
+end
+
+def run_diff(profile, base:, apps_filter:, group_filter:, json:)
+  exit(diff_verdict(profile, base: base, apps_filter: apps_filter, group_filter: group_filter, json: json))
+end
+
+# Returns the exit code rather than exiting, so that the one place an exit status is
+# chosen is `run_diff` — and a `SystemExit` reaching the rescue below is always
+# somebody else's abort, never this command's own verdict.
+def diff_verdict(profile, base:, apps_filter:, group_filter:, json:)
+  roots = resolve_config_roots(Dir.pwd)
+  validate_filters(roots.map { |config, _| config }, apps_filter.empty? ? nil : apps_filter, group_filter)
+
+  sources = build_spec_sources(roots)
+  client = ApibuilderClient.new(profile)
+
+  applications = roots.flat_map do |config, project_root|
+    git_root = diff_git_root(project_root)
+    diff_assert_ref!(git_root, base)
+    config.orgs.flat_map do |org|
+      request = build_diff_request(config, org, apps_filter, group_filter, project_root, git_root, base, sources)
+      subjects = request[:form]["applications"].count { |a| a.key?("previous") }
+      results = subjects.zero? ? [] : post_diff(client, request[:form])
+      summarize_diff(request, results)
+    end
+  end
+
+  breaking = applications.any? { |a| a["diffs"].any? { |d| d["breaking"] } }
+
+  if json
+    puts JSON.pretty_generate({ "base" => base, "breaking" => breaking, "applications" => applications })
+  else
+    puts "==> Diffing against #{base}"
+    sources.announce
+    print_diff_report(base, applications)
+    puts(breaking ? "==> BREAKING: generated code depends on something this change moves" : "==> No breaking changes")
+  end
+
+  breaking ? API_DIFF_EXIT_BREAKING : API_DIFF_EXIT_NON_BREAKING
+rescue ApiDiffError, ApibuilderClient::Error => e
+  $stderr.puts "ERROR: #{e.message}"
+  API_DIFF_EXIT_UNCHECKABLE
+rescue SystemExit => e
+  # Shared helpers abort through Util.exit_with_error, which exits 1 — the code this
+  # command reserves for "breaking changes found". A check that broke must never read
+  # as a check that passed, and must not read as a finding either.
+  $stderr.puts "ERROR: the diff could not be completed (aborted with status #{e.status})"
+  API_DIFF_EXIT_UNCHECKABLE
+end
+
+def diff_git_root(dir)
+  out, status = Open3.capture2("git", "-C", dir, "rev-parse", "--show-toplevel", err: File::NULL)
+  raise ApiDiffError, "#{dir} is not inside a git repository" unless status.success?
+  out.strip
+end
+
+# Checked once, up front: a ref that does not resolve makes every spec look new, which
+# is a verdict ("nothing to break") rather than the error it actually is.
+def diff_assert_ref!(git_root, ref)
+  _, status = Open3.capture2("git", "-C", git_root, "rev-parse", "--verify", "--quiet", "#{ref}^{commit}", err: File::NULL)
+  return if status.success?
+
+  raise ApiDiffError, "#{ref} does not resolve in #{git_root} — fetch it first (git fetch origin)"
+end
+
 # --- Main ---
 
 if __FILE__ == $PROGRAM_NAME
@@ -1223,6 +1529,9 @@ if __FILE__ == $PROGRAM_NAME
   if remaining.include?("lint")
     parsed = parse_lint_args(remaining)
     run_lint(profile, parsed[:file_path], apps_filter: parsed[:apps], group_filter: parsed[:group])
+  elsif remaining.include?("diff")
+    parsed = parse_diff_args(remaining)
+    run_diff(profile, base: parsed[:base], apps_filter: parsed[:apps], group_filter: parsed[:group], json: parsed[:json])
   elsif remaining.include?("publish")
     parsed = parse_batch_args(remaining)
     run_publish(profile, parsed[:apps], parsed[:group])
