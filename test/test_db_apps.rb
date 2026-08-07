@@ -94,6 +94,45 @@ class TestDbApps < Minitest::Test
     end
   end
 
+  # ── per-subproject test databases ─────────────────────────────────────────
+  #
+  # A build may clone its session database once per subproject so their test
+  # suites can run concurrently (platform does; see ISS-813). Those clones are
+  # the same session's state and `end` reclaims them with it.
+
+  def test_lane_owner_reads_the_session_database_out_of_a_clone
+    assert_equal "platformdb_sess_i813", platform.lane_owner("platformdb_sess_i813__core")
+  end
+
+  def test_a_session_database_is_not_a_clone_of_anything
+    assert_nil platform.lane_owner("platformdb_sess_i813")
+  end
+
+  def test_another_apps_database_is_never_ours
+    assert_nil platform.lane_owner("acumendb_sess_i813__core")
+  end
+
+  # THE POINT OF THE DOUBLE UNDERSCORE, and the reason a single one would be a
+  # data-loss bug rather than a style choice. `sanitize_session_id` collapses
+  # runs of underscores, so no session database name can contain `__` — while a
+  # single underscore is ambiguous exactly where the agent executor puts it: an
+  # epic and its children get workspaces `i682` and `i682_c03`, so session
+  # `i682_c03`'s whole database also reads as session `i682`'s `c03` clone.
+  # Reclaiming session `i682` by single-underscore prefix would drop it.
+  def test_a_sibling_sessions_database_is_not_mistaken_for_a_clone
+    sibling = platform.session_db_name("i682_c03")
+
+    assert_equal "platformdb_sess_i682_c03", sibling
+    assert_nil platform.lane_owner(sibling)
+    refute_equal platform.session_db_name("i682"), platform.lane_owner(sibling)
+  end
+
+  def test_a_sanitized_session_id_can_never_contain_the_separator
+    ["i682--c03", "i682__c03", "a - b _ c"].each do |sid|
+      refute_includes platform.session_db_name(sid), DbApp::LANE_SEPARATOR, "sid=#{sid}"
+    end
+  end
+
   # ── app resolution ────────────────────────────────────────────────────────
 
   def test_base_name_accepts_either_form

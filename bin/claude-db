@@ -60,9 +60,22 @@
 #                      Drop this session's database, from whichever container
 #                      holds it. Without --app, every app is checked.
 #
+#                      Also drops the per-subproject clones a build may have made
+#                      beside it — `<session db>__<subproject>`, see below.
+#
 #   claude-db status [--app APP]
 #                      Show every claude container — app, schema tag, port, and
-#                      the session databases inside it.
+#                      the session databases inside it. The per-subproject clones
+#                      are COUNTED against the session database that owns them
+#                      rather than listed: one platform test run makes fifteen.
+#
+# PER-SUBPROJECT TEST DATABASES. A build may clone its session database once per
+# subproject so those subprojects' test suites can run CONCURRENTLY without
+# writing each other's rows — platform does, see its project/TestDatabases.scala
+# and ISS-813/ISS-167. The clones are named `<session db>__<subproject>`, are
+# re-created at the head of every test run, and belong to the session: `end`
+# takes them with it and `gc` reaps them on the same terms as anything else.
+# Nothing here creates them; the build that wants them does.
 #
 #   claude-db gc [--app APP] [--days N] [--apply]
 #                      Drop session databases that have gone N days (default 3)
@@ -126,9 +139,11 @@ def show_usage
                                    Refuses when the checkout it used is itself
                                    missing migrations origin/main has.
 
-      end [--app APP]              Drop this session's database(s).
+      end [--app APP]              Drop this session's database(s), including any
+                                   per-subproject test clones beside them.
 
       status [--app APP]           Show every claude container and its session databases.
+                                   Per-subproject test clones are counted, not listed.
 
       gc [--app APP]               Drop session databases unused for --days
          [--days N] [--apply]      (default #{DEFAULT_GC_DAYS}), then remove containers left
@@ -673,21 +688,27 @@ def do_end(apps)
     # scanning the containers for it. That is what makes `end` work when the
     # schema tag has moved on since `start` and the database is in an older
     # container — the case a fixed port silently got wrong.
-    holders = app.running_containers_with_ports.select { |(_name, port)|
-      DbImages.database_exists?(port, db)
-    }
-    next if holders.empty?
+    #
+    # `session_dbs` rather than the one name, because a build may have cloned
+    # this session's database once per subproject to run their test suites
+    # concurrently (DbApp::LANE_SEPARATOR). Those clones are this session's
+    # state too — dropping only the original left them for the three-day gc,
+    # which is a leak `end` exists to prevent.
+    app.running_containers_with_ports.each do |(name, port)|
+      dbs = app.session_dbs(port, db)
+      next if dbs.empty?
 
-    found = true
-    holders.each do |(name, port)|
-      puts "Found #{db} in #{name} (:#{port})."
-      # Terminate active connections before dropping.
-      DbImages.psql_exec_quiet(
-        port,
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{db}'"
-      )
-      DbImages.psql_exec(port, "DROP DATABASE #{db}")
-      puts "Dropped #{db} from #{name}."
+      found = true
+      dbs.each do |d|
+        puts "Found #{d} in #{name} (:#{port})."
+        # Terminate active connections before dropping.
+        DbImages.psql_exec_quiet(
+          port,
+          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '#{d}'"
+        )
+        DbImages.psql_exec(port, "DROP DATABASE #{d}")
+        puts "Dropped #{d} from #{name}."
+      end
     end
   end
 
@@ -736,20 +757,32 @@ def do_status(apps)
         next
       end
 
-      dbs    = app.list_session_dbs(port)
+      all    = app.list_session_dbs(port)
       active = app.active_session_dbs(port)
       # Observing costs one round trip and is what keeps the ledger current
       # between gc runs — see observe_activity. The number it returns is also
       # the one that decides whether gc may drop each of these, so listing it
       # here is what makes the reap criterion inspectable before the fact.
+      # Given every database, clones included, so gc's criterion stays current
+      # for the things it is allowed to reap.
       idle   = observe_activity(app, port, active)
-      if dbs.empty?
+
+      # Per-subproject clones are counted against the session database that owns
+      # them, not listed. One platform test run makes fifteen, each carrying
+      # nothing worth inspecting (they are re-cloned at the head of every run) —
+      # and each line below costs a `pending_scripts` round trip, so listing
+      # them would make `status` both unreadable and slow.
+      lanes  = all.group_by { |d| app.lane_owner(d) }
+      dbs    = lanes.delete(nil) || []
+      if dbs.empty? && lanes.empty?
         puts "  databases  : none"
       else
         puts "  databases  :"
         dbs.each do |db|
           flags = [active.include?(db) ? "active" : "idle"]
           flags << "THIS SESSION" if db == current_db
+          count = (lanes.delete(db) || []).length
+          flags << "#{count} test database(s)" if count > 0
           flags << "unused #{(idle[db] / 86_400.0).round(1)}d" if idle[db] && idle[db] > 0
           # Drift, stated where the database is listed. Measured against THIS
           # checkout, which is the only schema any of these can be compared to
@@ -758,6 +791,14 @@ def do_status(apps)
           behind = app.sem_tracking?(port, db) ? app.pending_scripts(port, db).length : nil
           flags << "#{behind} MIGRATION(S) BEHIND" if behind && behind > 0
           puts "    #{db}  [#{flags.join(', ')}]"
+        end
+        # Whatever is left owns no session database any more — `end` dropped the
+        # original before this version of it knew to take the clones with it, or
+        # gc reaped it. Shown rather than hidden, because otherwise they are
+        # invisible disk: nothing else names them.
+        lanes.each do |owner, group|
+          puts "    #{owner}#{DbApp::LANE_SEPARATOR}*  " \
+               "[#{group.length} test database(s), session database gone]"
         end
         # The drift count above connected to every one of them. Those are our
         # connections, not a session's — see absorb_own_connections.

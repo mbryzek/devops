@@ -116,10 +116,41 @@ class Report
     @tests.sum { |ms, _, _| ms }
   end
 
-  # Longest single test run == the critical path through testing itself.
-  # Anything in wall clock beyond it is compile + sbt/JVM startup.
+  # Longest single test run. This is the critical path through testing itself
+  # ONLY when the summaries share a start clock -- see shared_start_clock?.
   def slowest_run_ms
     @run_completed.max
+  end
+
+  # Did every subproject's "Run completed in" summary run off the SAME clock?
+  #
+  # This used to be a safe assumption, and everything derived below rests on it:
+  # `done()` is called on the master runner in the sbt JVM, whose clock starts
+  # when that subproject's `executeTests` begins, and while only the forked group
+  # INSIDE `executeTests` carried a concurrency tag, all of them began together.
+  # Every summary then read "start of the test phase -> end of my own turn", so
+  # the largest was the phase and `wall - largest` was compile.
+  #
+  # A build that limits `Tags.Test` as well -- which is what platform does to run
+  # its subprojects' test tasks concurrently, see its build.sbt and ISS-813 --
+  # throttles `executeTests` itself, and the summaries start at staggered times.
+  # The largest is then just the longest-lived subproject, and it UNDERSTATES the
+  # phase by however long the run went on after that subproject finished. Measured
+  # on one such run: largest summary 46.8s against a 136s phase, which turned a
+  # ~25s compile into a reported 1m54s.
+  #
+  # Told apart by whether the summaries are effectively equal, because that is the
+  # observable consequence of sharing a clock and it needs nothing from the build.
+  # A serial run's fifteen summaries landed inside one second of each other; a
+  # concurrent run's spread from 7s to 47s.
+  def shared_start_clock?
+    # Vacuously, and it matters: a one-subproject project's single summary IS
+    # the phase, and suppressing its compile estimate would be a regression for
+    # every project that is not platform.
+    return true if @run_completed.length < 2
+
+    spread = @run_completed.max - @run_completed.min
+    spread <= [@run_completed.max * 0.05, 1000].max
   end
 
   # The sum of the per-subproject "Run completed in" summaries, which measures
@@ -129,8 +160,11 @@ class Report
     @run_completed.sum
   end
 
+  # Nil rather than a guess when the subtraction is not valid: a compile time
+  # that is silently four times the real one is worse than no compile time.
   def compile_ms
     return nil if @wall_ms.nil? || slowest_run_ms.nil?
+    return nil unless shared_start_clock?
 
     [@wall_ms - slowest_run_ms, 0].max
   end
@@ -225,7 +259,14 @@ if report.compile_ms
   puts format('  %-22s %s', 'compile + startup:', "#{fmt(report.compile_ms)}  (approx: wall clock minus the longest test run)")
 end
 if report.slowest_run_ms
-  puts format('  %-22s %s', 'longest test run:', "#{fmt(report.slowest_run_ms)}  (critical path across #{report.run_completed.length} subproject test runs)")
+  note =
+    if report.shared_start_clock?
+      "critical path across #{report.run_completed.length} subproject test runs"
+    else
+      "longest of #{report.run_completed.length} subproject test runs - NOT the critical path: they " \
+        'ran concurrently, so the phase outlasts this by however long it went on afterwards'
+    end
+  puts format('  %-22s %s', 'longest test run:', "#{fmt(report.slowest_run_ms)}  (#{note})")
 end
 
 # ScalaTest's per-subproject "Run completed in" lines are the most misread numbers
@@ -242,9 +283,15 @@ end
 # ISS-800 was filed off exactly that sum. Printing it here, next to the wall clock
 # that refutes it, is cheaper than the investigation it costs otherwise.
 if report.run_completed.length > 1
+  why =
+    if report.shared_start_clock?
+      "they share one start clock, so they overlap almost completely; use 'longest test run'"
+    else
+      'they overlap by however much the subprojects ran concurrently; use the wall clock'
+    end
   puts format('  %-22s %s', 'summed test runs:',
               "#{fmt(report.summed_runs_ms)}  (MEANINGLESS - the #{report.run_completed.length} per-subproject " \
-              "'Run completed in' summaries share one start clock and are not additive; use 'longest test run')")
+              "'Run completed in' summaries are not additive: #{why})")
 end
 
 body = report.body_ms
@@ -304,7 +351,9 @@ end
 
 # Summed body time approaching the critical path means the suites are barely
 # overlapping, so parallelism is the lever rather than any individual test.
-if report.slowest_run_ms && body > report.slowest_run_ms * 0.8
+# Only asked when the summaries really are the critical path: against a
+# concurrent run's longest-subproject number this fires on every healthy run.
+if report.shared_start_clock? && report.slowest_run_ms && body > report.slowest_run_ms * 0.8
   reasons << format('test bodies total %s against a %s critical path, so suites are running ' \
                     'close to serially - parallelism is the lever', fmt(body), fmt(report.slowest_run_ms))
 end
