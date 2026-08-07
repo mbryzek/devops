@@ -98,7 +98,16 @@ module Agent
       request(:get, "/agent/playbooks/#{URI.encode_www_form_component(key)}",
               token: token, use_localhost: use_localhost)
     rescue ApiError => e
-      raise unless e.message.include?("404")
+      # `e.code`, never the message. ApiError carries the status structurally
+      # (lib/api_client.rb sets `code:` on every raise) and everything else in
+      # this subsystem reads it that way — `e.code == 409` on a lease heartbeat,
+      # `case error.code` in handle_claim_error. This one matched the message,
+      # and that message embeds the whole response body: a 502 whose gateway
+      # error page happens to contain "404" was swallowed into nil, which
+      # Agent::Playbook reads as "this playbook does not exist" and turns into a
+      # hard needs_input on an issue whose playbook is perfectly fine. That is
+      # the one outcome here a human has to undo by hand.
+      raise unless e.code == 404
       nil
     end
 

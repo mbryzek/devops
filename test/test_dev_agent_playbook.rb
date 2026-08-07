@@ -136,6 +136,34 @@ class TestDevAgentPlaybook < Minitest::Test
     assert_includes error.message, "no-such-playbook"
   end
 
+  # ...but only a REAL 404 may become "no such playbook". Agent::Api.playbook used
+  # to decide that by substring-matching the exception message, and that message
+  # embeds the whole response body -- so a transport failure whose body merely
+  # CONTAINS "404" (a gateway error page, an error payload quoting an id) was
+  # swallowed to nil and turned into the MissingError above: a hard needs_input,
+  # requiring a human to undo, on an issue whose playbook exists and is fine.
+  def test_a_transport_failure_whose_body_mentions_404_is_not_a_missing_playbook
+    responses = {
+      "GET /agent/playbooks/slow-query-review" =>
+        ->(_body) { raise ApiError.new("HTTP 502 GET /agent/playbooks/slow-query-review: <html>error 404-7 upstream</html>", code: 502) },
+    }
+    assert_raises(ApiError) do
+      with_stubbed_api(responses) do
+        Agent::Api.playbook("slow-query-review", token: TOKEN, use_localhost: false)
+      end
+    end
+  end
+
+  def test_a_real_404_is_a_missing_playbook
+    responses = {
+      "GET /agent/playbooks/nope" =>
+        ->(_body) { raise ApiError.new("HTTP 404 GET /agent/playbooks/nope: not found", code: 404) },
+    }
+    with_stubbed_api(responses) do
+      assert_nil Agent::Api.playbook("nope", token: TOKEN, use_localhost: false)
+    end
+  end
+
   # A row that exists but says nothing is the same failure wearing a 200: the
   # session would get an empty brief and quietly do generic triage.
   def test_an_empty_body_raises_rather_than_handing_over_an_empty_brief
