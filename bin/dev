@@ -3987,6 +3987,23 @@ def issue_filed_without_session(issue)
   issue
 end
 
+# The command that decomposes an epic, printed both when one is filed and when
+# `show` finds one with no children yet — one string so the two cannot drift.
+#
+# `--status open`, NOT claimed (ISS-829). Decomposing an epic is a PLANNING act:
+# you name the pieces up front, you are not starting all of them at once. A child
+# filed `claimed` is one `dev issues claim` will never offer — claim only ever
+# sweeps OPEN issues — so a hardcoded `claimed` here makes every child of every
+# epic unpickupable while looking handled, the exact failure `--status` was added
+# to prevent (devops#254, after ISS-149/ISS-151). Over-claiming costs a human
+# noticing by hand; under-claiming costs one `dev issues claim --number` later.
+def issue_epic_decompose_command(number)
+  "  dev issues create --category <cat> --status open|claimed --parent #{number} --title \"...\" --no-spawn\n" \
+    "\n--status open sends the child to the queue. Use claimed ONLY for the piece you are\n" \
+    "writing RIGHT NOW: the claim sweep only ever offers OPEN issues, so a child filed\n" \
+    "claimed that nobody is working is a child no session will ever pick up."
+end
+
 # The `--status open` tail: the issue belongs to the queue, and the filer is done
 # with it. Nothing is claimed, no session is started, and there is nothing for the
 # filer to close — so print how it gets picked up rather than how it gets closed.
@@ -3998,7 +4015,7 @@ def issue_filed_open(issue)
     puts "Filed #{issue_label(issue)} as an EPIC — it holds no work of its own."
     puts ""
     puts "Decompose it. File each separately verifiable piece as a child:"
-    puts "  dev issues create --category <cat> --status claimed --parent #{number} --title \"...\" --no-spawn"
+    puts issue_epic_decompose_command(number)
     puts ""
     puts "Close each child out individually. Do NOT verify them: this epic advances to"
     puts "deployed on its own once the last child lands, and IT is what gets verified."
@@ -4903,8 +4920,7 @@ def issue_family_section(endpoint, issue)
     children = ApiClient.request(
       endpoint, :get, issues_list_path(statuses: [], parent_number: number, limit: 100)
     ) || []
-    return "\nEPIC with no children yet. Decompose it:\n" \
-           "  dev issues create --category <cat> --status claimed --parent #{number} --title \"...\" --no-spawn\n" if children.empty?
+    return "\nEPIC with no children yet. Decompose it:\n#{issue_epic_decompose_command(number)}\n" if children.empty?
 
     done = children.count { |c| %w[deployed verified dismissed].include?(c["status"]) }
     "\nEPIC — #{done} of #{children.length} children done:\n#{issue_epic_children_lines(children)}\n" \

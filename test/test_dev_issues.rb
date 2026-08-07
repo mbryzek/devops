@@ -3588,6 +3588,21 @@ class TestDevIssues < Minitest::Test
     refute_match(/dev issues claim/, out)
   end
 
+  # ISS-829: decomposing an epic names the pieces up front, so the printed command
+  # must not hardcode `--status claimed` — `dev issues claim` only ever offers OPEN
+  # issues, so a child filed claimed is one no session can ever pick up.
+  def test_epic_decompose_command_does_not_hardcode_claimed
+    command = issue_epic_decompose_command("140")
+    assert_match(/--status open\|claimed/, command)
+    refute_match(/--status claimed/, command)
+    assert_match(/RIGHT NOW/, command)
+  end
+
+  def test_filed_open_epic_offers_the_status_choice
+    out, = capture_io { issue_filed_open(epic_issue) }
+    assert_match(/--status open\|claimed --parent 140/, out)
+  end
+
   def test_filed_open_still_points_a_plain_issue_at_claim
     out, = capture_io { issue_filed_open(crawl_issue) }
     assert_match(/dev issues claim/, out)
