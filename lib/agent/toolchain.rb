@@ -129,6 +129,38 @@ module Agent
         "that hangs. Node 24 is the current Active LTS"
     end
 
+    # The one command that puts a usable node on a runner, written once because
+    # TWO tools below need it (`node` and `npx` come out of the same formula) and
+    # a fleet-wide command that exists in two copies is one a fix lands on half of.
+    #
+    # PINNED TO 24, and the pin is the whole fix for ISS-781: plain
+    # `brew install node` is what put a Current release on this fleet, and
+    # Current is 26, which deadlocks `playwright install`. 24 is the Active LTS
+    # ("Krypton"). See NODE_EXTRACT_DEADLOCK above for the measurements.
+    #
+    # `brew uninstall node` is part of the literal command rather than an
+    # afterthought: node@24 is keg-only, so it only reaches the login PATH via
+    # `brew link --force`, and leaving the unversioned `node` formula installed
+    # alongside means the next `brew upgrade` relinks 26 over the top and the
+    # hang comes back with nothing to show why.
+    #
+    # HOMEBREW_NO_AUTOREMOVE=1 IS LOAD-BEARING AND IS NOT TIDINESS (ISS-852).
+    # `brew uninstall` runs an autoremove pass afterwards, and that pass does not
+    # stop at the tree it just orphaned: it sweeps EVERY formula whose install
+    # receipt says `installed_as_dependency` and which nothing depends on any
+    # more. Running this line on a Mac on 2026-08-07 swept 8 formulae, and
+    # `tailscale` was one of them — brew removed the /opt/homebrew/bin symlinks
+    # and INSTALL_RECEIPT.json, and only root-owned binaries inside the keg
+    # stopped it removing the keg too. Nothing looked broken until the CLI was
+    # invoked, because the already-running `tailscaled` still held its own path.
+    # Which formulae get swept depends entirely on receipt flags, so it is a
+    # different tool on every machine and it is silent on all of them. Orphaned
+    # node deps left behind are harmless and a later deliberate `brew autoremove`
+    # collects them; silently unlinking a VPN client is not.
+    NODE_INSTALL =
+      "brew install node@24 && HOMEBREW_NO_AUTOREMOVE=1 brew uninstall --ignore-dependencies node " \
+      "; brew link --overwrite --force node@24"
+
     # Everything the dispatcher, its producers and its claimed sessions shell out
     # to. Homebrew throughout, deliberately: /opt/homebrew/bin is on the login
     # PATH that launchd hands the tick, which is exactly the property a
@@ -144,22 +176,13 @@ module Agent
       # simply invisible to `/bin/zsh -lc`, which is the only shell the agent ever
       # runs in. See the module comment.
       #
-      # PINNED TO 24, and the pin is the whole fix for ISS-781: plain
-      # `brew install node` is what put a Current release on this fleet, and
-      # Current is 26, which deadlocks `playwright install`. 24 is the Active LTS
-      # ("Krypton"). See NODE_EXTRACT_DEADLOCK above for the measurements.
-      #
-      # `brew uninstall node` is part of the literal command rather than an
-      # afterthought: node@24 is keg-only, so it only reaches the login PATH via
-      # `brew link --force`, and leaving the unversioned `node` formula installed
-      # alongside means the next `brew upgrade` relinks 26 over the top and the
-      # hang comes back with nothing to show why.
+      # The install command is NODE_INSTALL above, where the pin to 24 and the
+      # autoremove suppression are explained.
       Tool.new(
         name: "node",
         required_by: "`dev browserslist update`, and every JS repo a claimed session builds",
         producers: %w[browserslist-update],
-        install: "brew install node@24 && brew uninstall --ignore-dependencies node " \
-                 "; brew link --overwrite --force node@24",
+        install: NODE_INSTALL,
         unsupported: NODE_EXTRACT_DEADLOCK,
       ),
       # No `unsupported:` here even though npx ships with node, and that is
@@ -171,8 +194,7 @@ module Agent
         name: "npx",
         required_by: "`npx --yes update-browserslist-db@latest` in `dev browserslist update`",
         producers: %w[browserslist-update],
-        install: "brew install node@24 && brew uninstall --ignore-dependencies node " \
-                 "; brew link --overwrite --force node@24",
+        install: NODE_INSTALL,
       ),
       # The one tool here devops SHIPS rather than installs: `api` sits in
       # `bin/` next to `dev` itself. It is on this list anyway because the plist

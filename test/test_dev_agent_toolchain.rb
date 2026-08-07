@@ -389,6 +389,31 @@ class TestDevAgentToolchain < Minitest::Test
     assert_nil T::TOOLS.find { |t| t.name == "npx" }.unsupported
   end
 
+  # node and npx come out of one formula, so they are one remediation. Held as
+  # ONE string because the copy that gets missed is what ISS-852 is: the
+  # autoremove suppression below was applied to a line that existed twice.
+  def test_node_and_npx_ship_the_same_remediation
+    node, npx = %w[node npx].map { |n| T::TOOLS.find { |t| t.name == n } }
+    assert_equal node.install, npx.install
+    assert_equal T::NODE_INSTALL, node.install
+  end
+
+  # ISS-852. `brew uninstall` runs an autoremove pass afterwards, and that pass
+  # sweeps every formula flagged `installed_as_dependency` that nothing depends
+  # on any more — not just the tree the uninstall orphaned. On a Mac on
+  # 2026-08-07 this line took `tailscale`'s symlinks and receipt with it, and
+  # nothing looked broken until the CLI was invoked. Which formulae get swept is
+  # a property of the machine's receipt flags, so it is a different tool every
+  # time and silent every time. Asserted over EVERY tool, not just node: the
+  # hazard belongs to `brew uninstall` appearing in a command we ship at all.
+  def test_no_shipped_remediation_lets_brew_autoremove_run
+    T::TOOLS.each do |t|
+      next unless t.install.to_s.include?("brew uninstall")
+      assert_match(/HOMEBREW_NO_AUTOREMOVE=1 brew uninstall/, t.install,
+                   "#{t.name}: `brew uninstall` autoremoves unrelated formulae fleet-wide (ISS-852)")
+    end
+  end
+
   # ---- what the operator and the issue are told ------------------------------
 
   def test_blocked_producers_are_named_and_deduped
