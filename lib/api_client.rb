@@ -118,6 +118,20 @@ class ApiClient
     nil
   end
 
+  # Whether `request` can authenticate as `app` at all — either arm of `auth_header_for`'s fallback:
+  # the AI's token inside a Claude session, or a logged-in human's session id. For callers that gate
+  # optional work on having a credential, rather than letting it 401 mid-way.
+  #
+  # It exists because asking for only the session half is a live bug that reads as correct. A Claude
+  # session never has a session file, so `session_id_for(...).nil?` is TRUE for the identity that is
+  # perfectly well authenticated — which is how `dev changelog build` came to skip ISS enrichment on
+  # every agent-driven release, quietly dropping the issue links from notes it went on to write
+  # anyway (ISS-736).
+  def self.credential_for?(app, use_localhost:)
+    return true unless auth_header_for(app, use_localhost: use_localhost).nil?
+    !session_id_for(app, use_localhost: use_localhost).nil?
+  end
+
   def self.write_session_id_for(app, id, use_localhost:)
     file = session_file(app, use_localhost)
     dir = File.dirname(file)
