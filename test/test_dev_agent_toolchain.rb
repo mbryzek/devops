@@ -414,6 +414,116 @@ class TestDevAgentToolchain < Minitest::Test
     end
   end
 
+  # ISS-897, and it is ISS-852's hazard one dependency edge further out. The
+  # `--ignore-dependencies` that lets the uninstall run at all is exactly what
+  # leaves the dependents behind, and `brew uninstall node` takes
+  # <prefix>/opt/node with the keg — so every formula shebanged at
+  # `#!/opt/homebrew/opt/node/bin/node` (mongosh, on a Mac here) answers `bad
+  # interpreter` from that moment, and this doctor reports the box all-green
+  # because mongosh is not one of the tools it checks. Asserted over EVERY tool
+  # for the same reason as the autoremove one: the hazard belongs to
+  # `brew uninstall <formula>` appearing in anything this fleet ships, not to
+  # node.
+  def test_a_shipped_uninstall_puts_the_formulas_opt_name_back
+    T::TOOLS.each do |t|
+      formula = t.install.to_s[/brew uninstall(?:\s+--\S+)*\s+(\S+)/, 1]
+      next if formula.nil?
+      assert_includes t.install, "opt/#{formula}",
+                      "#{t.name}: `brew uninstall #{formula}` deletes <prefix>/opt/#{formula}, and " \
+                      "every formula shebanged into it breaks silently (ISS-897)"
+    end
+  end
+
+  # ---- the relink, executed --------------------------------------------------
+  #
+  # The four assertions below run the SHIPPED string under /bin/sh against a
+  # throwaway brew prefix. Only `$(brew --prefix)` is substituted — the guard,
+  # the flags and the link target are the characters an operator pastes, because
+  # a test that restated the logic in Ruby would pass on a hint with a typo in it.
+
+  # A prefix laid out the way brew lays one out: a versioned keg, and the opt
+  # name brew itself maintains pointing into it.
+  def with_brew_prefix(keg: "24.19.0")
+    Dir.mktmpdir do |prefix|
+      FileUtils.mkdir_p(File.join(prefix, "Cellar", "node@24", keg, "bin"))
+      File.write(File.join(prefix, "Cellar", "node@24", keg, "bin", "node"), "#!/bin/sh\n")
+      FileUtils.mkdir_p(File.join(prefix, "opt"))
+      File.symlink("../Cellar/node@24/#{keg}", File.join(prefix, "opt", "node@24"))
+      yield prefix
+    end
+  end
+
+  def relink(prefix)
+    script = T::NODE_OPT_RELINK.gsub('$(brew --prefix)', prefix)
+    assert system("/bin/sh", "-c", script, out: File::NULL, err: File::NULL),
+           "the shipped relink exited non-zero: #{script}"
+  end
+
+  # The state `brew uninstall --ignore-dependencies node` leaves behind: opt/node
+  # simply gone. This is the whole bug — the dependents' shebangs point here.
+  def test_the_relink_restores_a_node_removed_by_the_uninstall
+    with_brew_prefix do |prefix|
+      refute File.exist?(File.join(prefix, "opt", "node"))
+      relink(prefix)
+      assert File.exist?(File.join(prefix, "opt", "node", "bin", "node")),
+             "a `#!/opt/homebrew/opt/node/bin/node` shebang still does not resolve"
+    end
+  end
+
+  # It is appended to a command an operator may run more than once — and to one
+  # whose earlier halves are `;`-separated precisely so a partly-provisioned
+  # machine can be re-run.
+  def test_the_relink_is_idempotent
+    with_brew_prefix do |prefix|
+      2.times { relink(prefix) }
+      assert File.exist?(File.join(prefix, "opt", "node", "bin", "node"))
+    end
+  end
+
+  # `[ -e ]` follows the symlink, so a dangling opt/node is not "already there".
+  # A `[ -L ]`/`-h` test would see a link, decide the machine was fine, and leave
+  # the exact broken state ISS-897 reports.
+  def test_the_relink_replaces_a_dangling_opt_node
+    with_brew_prefix do |prefix|
+      File.symlink("../Cellar/node/26.6.0", File.join(prefix, "opt", "node"))
+      relink(prefix)
+      assert File.exist?(File.join(prefix, "opt", "node", "bin", "node"))
+    end
+  end
+
+  # The other direction, and the reason the guard is there at all. A LIVE
+  # opt/node means the `node` formula is installed — the uninstall failed, or
+  # somebody wants it — and repointing it at node@24 would leave brew's own view
+  # of an installed formula lying, with the link deleted again the next time that
+  # formula is removed.
+  def test_the_relink_never_repoints_a_live_opt_node
+    with_brew_prefix do |prefix|
+      FileUtils.mkdir_p(File.join(prefix, "Cellar", "node", "26.6.0", "bin"))
+      File.write(File.join(prefix, "Cellar", "node", "26.6.0", "bin", "node"), "#!/bin/sh\n")
+      File.symlink("../Cellar/node/26.6.0", File.join(prefix, "opt", "node"))
+      relink(prefix)
+      assert_equal "../Cellar/node/26.6.0", File.readlink(File.join(prefix, "opt", "node"))
+    end
+  end
+
+  # Why it links the opt NAME and not the Cellar path. brew rewrites
+  # opt/node@24 on every patch bump; a link to `../Cellar/node@24/24.19.0` would
+  # dangle the first time node@24 moved, which is the same failure this fixes
+  # arriving later and with nobody having run anything.
+  def test_the_relink_survives_a_node_24_patch_bump
+    with_brew_prefix do |prefix|
+      relink(prefix)
+      FileUtils.mkdir_p(File.join(prefix, "Cellar", "node@24", "24.20.0", "bin"))
+      File.write(File.join(prefix, "Cellar", "node@24", "24.20.0", "bin", "node"), "#!/bin/sh\n")
+      File.unlink(File.join(prefix, "opt", "node@24"))
+      File.symlink("../Cellar/node@24/24.20.0", File.join(prefix, "opt", "node@24"))
+      FileUtils.rm_rf(File.join(prefix, "Cellar", "node@24", "24.19.0"))
+
+      assert File.exist?(File.join(prefix, "opt", "node", "bin", "node")),
+             "opt/node dangled after node@24 moved — it is pinned to a Cellar version"
+    end
+  end
+
   # ---- what the operator and the issue are told ------------------------------
 
   def test_blocked_producers_are_named_and_deduped
