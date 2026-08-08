@@ -114,6 +114,46 @@ class TestK8sNewRelic < Minitest::Test
                  "from the variable k8s-secrets actually syncs"
   end
 
+  # --- 4. ...and the guard only fires where it applies ------------------------
+  #
+  # k8s-secrets syncs EVERY k8s app, not just the template-rendered ones. Reading
+  # k8s/apps/<app>.pkl unconditionally therefore aborted the release of the one
+  # app that has never had such a file: `release --app workers` pushed images
+  # 0.1.80 and 0.1.81 to the registry and then died at the secrets step, before a
+  # single manifest was applied.
+
+  def test_docker_k8s_app_is_not_template_rendered
+    workers = App.new("name" => "workers", "docker_k8s" => {
+                        "build_script"   => "bin/build-and-push.sh",
+                        "manifests_dir"  => "k8s/manifests/workers",
+                        "rollout_target" => "statefulset/workers",
+                        "namespace"      => "bryzek-production"
+                      })
+    refute K8sAppConfig.template_rendered?(workers),
+           "an app with hand-written manifests has no k8s/apps/<app>.pkl and never will; " \
+           "demanding one aborts its release outright"
+  end
+
+  def test_every_other_app_is_still_template_rendered
+    assert K8sAppConfig.template_rendered?(App.new("name" => "acumen")),
+           "the exemption must be exactly the docker_k8s apps — widening it to " \
+           "'no pkl on disk' would restore ISS-1070: a scala-play app whose config went " \
+           "missing would sync silently instead of aborting"
+  end
+
+  def test_workers_really_is_the_app_with_no_config
+    refute File.exist?(K8sAppConfig.path("workers")),
+           "if workers ever grows a k8s/apps/workers.pkl this test's premise is gone"
+    assert File.directory?(File.join(K8S, "manifests/workers")),
+           "workers deploys from hand-written manifests, which is why it has no pkl"
+  end
+
+  def test_the_license_key_guard_is_scoped_to_template_rendered_apps
+    assert_match(/if K8sAppConfig\.template_rendered\?\(app_config\)/, SECRETS,
+                 "the K8sAppConfig.load call must sit INSIDE this branch — it aborts when " \
+                 "there is no app config, and a docker_k8s app never has one")
+  end
+
   # --- The tracing setting ---------------------------------------------------
 
   def test_acumen_disables_distributed_tracing

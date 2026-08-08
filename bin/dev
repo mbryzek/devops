@@ -1534,7 +1534,12 @@ USAGE = <<~USAGE
         Records the fault on this machine too, so three in a row files an issue
         by the same path a dead Docker already does.
         A repo declares what its build needs in `#{Agent::Verify::BUILD_SCRIPT}` itself:
-        `# ci-needs: docker, registry, database`.
+        `# ci-needs: docker, registry, database, heap:12G`.
+        `heap:<N>G` is the one entry read BEFORE the claim, not after it: it is
+        what stops a build needing 12G landing on a slot that gives #{Agent::Heap::MIN_GB}G and
+        OOMing, which the lane cannot tell from a red suite. Unlike the names
+        beside it a malformed heap token is an error rather than ignored — a
+        typo there means "no minimum", which is the failure this prevents.
 
     #{INVOCATIONS["ci clean-build"]}
         Prints `true` or `false`: should this run throw away the incremental
@@ -16253,29 +16258,78 @@ def cmd_ci_scan(args)
 
   # Deliberately does NOT mark the scan window. A human asking what the fleet
   # would do must not delay the fleet doing it.
-  scan = Agent::Verify.scan(limit: limit, now: Time.now, include_main: include_main)
+  #
+  # The fleet read is best-effort and its failure is not fatal (ISS-1123): the
+  # tick needs it to tell "another box's job" from "nobody's job", and a human
+  # asking what WOULD be enqueued is better served by an answer with that column
+  # missing than by an error.
+  fleet_heap = ci_scan_fleet_heap(use_localhost: false)
+  heap_here = Agent::Heap.gigabytes_here
+  scan = Agent::Verify.scan(limit: limit, now: Time.now, include_main: include_main,
+                            heap_gb: heap_here, fleet_heap_gb: fleet_heap)
   live = Agent::Verify.live
-  puts Util.underline("ci scan  [#{Agent::Verify.hostname}]")
+  puts Util.underline("ci scan  [#{Agent::Verify.hostname}, heap #{heap_here}G" \
+                      "#{fleet_heap ? ", fleet best #{fleet_heap}G" : ''}]")
   if live.any?
     puts "In flight on this machine:"
     live.each { |r| puts "  #{r['repo']}#{r['pr'] ? "##{r['pr']}" : ''} #{Agent::Verify.short(r['sha'])}  pid #{r['pid']}  since #{r['started_at']}" }
     puts
   end
-  if scan.candidates.empty?
+  if scan.candidates.empty? && scan.deferred.empty? && scan.unsatisfiable.empty?
     puts "Nothing to verify: every open PR in an enrolled repo already carries a `#{Agent::MergeLane::CI_CHECK}` check."
     puts
     puts "A repo is enrolled when `#{Agent::Verify::BUILD_SCRIPT}` exists at the PR's head sha. Nothing else"
     puts "enrols it — there is no registry to keep in step with the repos that have one."
     return
   end
-  puts "Would enqueue #{scan.candidates.length} (cap #{limit}#{scan.dropped.positive? ? ", #{scan.dropped} deferred" : ''}):"
-  scan.candidates.each do |c|
-    puts "  #{c.label.ljust(24)} #{Agent::Verify.short(c.sha)}  #{c.event}  #{c.clean? ? 'cold' : 'warm'}"
+  if scan.candidates.any?
+    puts "Would enqueue #{scan.candidates.length} (cap #{limit}#{scan.dropped.positive? ? ", #{scan.dropped} deferred" : ''}):"
+    scan.candidates.each do |c|
+      puts "  #{c.label.ljust(24)} #{Agent::Verify.short(c.sha)}  #{c.event}  #{c.clean? ? 'cold' : 'warm'}  #{c.heap_text}"
+    end
+    puts
   end
-  puts
+  ci_scan_print_unbuildable(scan, heap_here, fleet_heap)
+  if scan.candidates.empty?
+    puts "Nothing for THIS machine to enqueue."
+    return
+  end
   puts "Confirm one by hand before leaving the lane to depend on it:"
   first = scan.candidates.first
   puts "  dev ci verify --repo #{Agent::MergeLane.qualify(first.repo)} --sha #{first.sha}#{first.pr ? " --pr #{first.pr}" : ''} --no-post"
+end
+
+# The largest heap any registered runner would give a build, or nil (ISS-1123).
+#
+# Every failure is nil rather than an exception, and that is the whole contract:
+# this decorates a scan report, and a `dev ci scan` that died because the
+# registry was slow would be a worse tool than one that prints a column less.
+def ci_scan_fleet_heap(use_localhost:)
+  identity = Agent::Host.cached_identity
+  return nil unless identity
+  Agent::Heap.fleet_gigabytes(Agent::Api.runners(token: identity.token, use_localhost: use_localhost))
+rescue StandardError
+  nil
+end
+
+# The candidates this machine did NOT take, and why — the half of the scan that
+# used to be invisible. A pull request nothing will ever build looks exactly like
+# one whose turn has not come yet, and only this tells them apart.
+def ci_scan_print_unbuildable(scan, heap_here, fleet_heap)
+  if scan.deferred.any?
+    puts "Left for a bigger runner (this machine gives #{heap_here}G):"
+    scan.deferred.each { |c| puts "  #{c.label.ljust(24)} #{Agent::Verify.short(c.sha)}  #{c.heap_text}" }
+    puts
+  end
+  return if scan.unsatisfiable.empty?
+
+  puts "NO RUNNER IN THE FLEET CAN BUILD THESE#{fleet_heap ? " (largest heap any runner gives: #{fleet_heap}G)" : ''}:"
+  scan.unsatisfiable.each { |c| puts "  #{c.label.ljust(24)} #{Agent::Verify.short(c.sha)}  #{c.heap_text}" }
+  puts
+  puts "Nothing will claim them, so these pull requests stay on `no_ci_verdict`. Lower the repo's"
+  puts "`# ci-needs: heap:<N>G` if it is not measured, lower a runner's max_concurrency so its slots"
+  puts "are bigger, or add a machine with more RAM. `dev agent sbt-opts --explain` shows the arithmetic."
+  puts
 end
 
 def cmd_ci_verify(args)
