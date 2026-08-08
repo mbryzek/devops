@@ -46,7 +46,7 @@ module Agent
       end.uniq
     end
 
-    PR_FIELDS = "url,isDraft,number,title,state,headRefName,mergedAt".freeze
+    PR_FIELDS = "url,isDraft,number,title,state,headRefName,mergedAt,mergeCommit".freeze
 
     # The same fields MINUS the head branch, because `gh search prs` does not
     # have it: asking anyway is "Unknown JSON field" on stderr, a non-zero exit,
@@ -104,6 +104,15 @@ module Agent
     # so "released since the fix" is only honest when it means "released since the
     # fix MERGED" (ISS-737).
     def merged_at(pr) = merged?(pr) ? pr["mergedAt"] : nil
+
+    # The commit a merged PR landed as — what a release is asked to CONTAIN, and
+    # the only way to ask "is this fix actually live" of a repo rather than of a
+    # timestamp (ISS-1097).
+    #
+    # nil for a PR that has not merged, and for one found through `gh search prs`,
+    # which does not carry the field (SEARCH_FIELDS). Every caller reads nil as
+    # UNKNOWN, exactly as it reads a `gh` that did not answer.
+    def merge_sha(pr) = pr&.dig("mergeCommit", "oid")
 
     # Ready for review: open and not a draft.
     def ready?(pr) = open?(pr) && !pr["isDraft"]

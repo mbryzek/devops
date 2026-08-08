@@ -227,7 +227,7 @@ retention purges images older than 3 days, and `claude-db` starts on latest.
 
 | Port | What | Who touches it |
 |------|------|----------------|
-| **5432** | Mike's Postgres.app (dev server, manual psql) | Mike only |
+| **5432** | Mike's Postgres.app (dev server, manual psql) | Mike; a session may `SELECT`/`EXPLAIN`, never write |
 | **5500–9999** | Docker containers `<database>-claude-<schema-tag>` | Claude sessions only |
 | ephemeral | scratch build containers, on 127.0.0.1 | `db-image` only |
 

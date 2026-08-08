@@ -15,6 +15,8 @@
 ///   - WEB_REPLICAS: Number of web replicas (default: 2)
 ///   - JOB_REPLICAS: Number of job replicas (default: 1)
 ///   - JAVA_AGENT: Path to Java agent JAR (e.g., /opt/newrelic/newrelic.jar)
+///   - NEWRELIC_DISTRIBUTED_TRACING: "true"/"false"; unset leaves the agent's
+///     own default (enabled). Only read when JAVA_AGENT is set.
 
 module scalaPlayApp
 
@@ -39,7 +41,36 @@ local jobReplicas = (read?("env:JOB_REPLICAS") ?? "1").toInt()
 
 // Optional Java agent (e.g., New Relic APM)
 local javaAgent = read?("env:JAVA_AGENT") ?? ""
-local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-javaagent:\(javaAgent) -Dnewrelic.config.app_name=\(appName)-\(tier) "
+
+// Distributed tracing, only meaningful when the agent is attached. Left unset,
+// the agent uses its own default (enabled), so an app that says nothing about
+// it renders exactly the JAVA_OPTS it rendered before this setting existed —
+// which is why platform's manifest is byte-identical across this change.
+//
+// An app sets it to false when it has nothing to trace INTO. Distributed
+// tracing correlates one request across services; on a single standalone
+// service the spans it ships describe a call graph that never leaves the
+// process, and they are not cheap. Measured on account 7724695 over the 30 days
+// to 2026-08-08: TracingBytes was 30.7 GB of 76.5 GB ingested — 40% of the
+// bill, against a 100 GB/month free-tier ceiling the account already sits at
+// ~82% of. Errors survive it untouched, which is the signal this exists for:
+// TransactionError carries the class, message and stack trace, and cost
+// 0.005 GB across all of platform in the same window.
+//
+// Expressed as a JVM system property rather than a NEW_RELIC_* variable in the
+// git-crypt'd env repo because it is not a secret — it is deployment config,
+// and it belongs in the reviewable, version-controlled file that decides
+// everything else about how the app is launched. Only the license key is a
+// secret. The agent reads `-Dnewrelic.config.<dotted.path>` (verified against
+// SystemPropertyProvider in newrelic-agent 9.1.0, the version
+// templates/Dockerfile.scala-play installs), and these override newrelic.yml's
+// defaults — as app_name on the same line has done in production since platform
+// was instrumented.
+local distributedTracing = read?("env:NEWRELIC_DISTRIBUTED_TRACING") ?? ""
+local distributedTracingFlag =
+  if (distributedTracing == "") "" else "-Dnewrelic.config.distributed_tracing.enabled=\(distributedTracing) "
+
+local function javaAgentFlags(tier: String) = if (javaAgent == "") "" else "-javaagent:\(javaAgent) -Dnewrelic.config.app_name=\(appName)-\(tier) \(distributedTracingFlag)"
 
 // Idle old-gen reclamation for the JOB tier (JEP 346). G1 only evacuates the
 // old generation during mixed-GC cycles, and those only make progress while

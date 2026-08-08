@@ -1438,7 +1438,9 @@ module Agent
       # whose blocker is live work; what it cannot see is a blocker sitting at
       # `fixed` on a PR that is still OPEN, which in this fleet is what `fixed`
       # means most of the day. Starting a session on one hands it a dependency
-      # that is not on main and forces it to invent a merge order.
+      # that is not on main and forces it to invent a merge order — or, since
+      # ISS-1097, one that merged but has not been released, which hands it
+      # nothing it can test against.
       unshipped = Agent::Dependency.unshipped(issue, use_localhost: @use_localhost)
       return defer_for_dependency(lease, identity, number, unshipped, comments) unless unshipped.empty?
 
@@ -1633,10 +1635,11 @@ module Agent
       text = "#{DEPENDENCY_DEFER_MARKER} — not dispatched, deferred #{DEPENDENCY_DEFER_DAYS} day " \
              "(attempt #{attempt} of #{DEPENDENCY_DEFER_LIMIT}).\n\n" \
              "#{reasons.map { |r| "- #{r}" }.join("\n")}\n\n" \
-             "A session started now would be building on code that is not on `origin/main`, and its only " \
-             "options are to re-implement the dependency or to stack on it — both of which ISS-649 exists " \
-             "to stop. Nothing to do here: this returns to the queue on its own, and the check is rerun " \
-             "against GitHub each time."
+             "A session started now would be building on code that is not on `origin/main` — where its only " \
+             "options are to re-implement the dependency or to stack on it, both of which ISS-649 exists to " \
+             "stop — or testing against a fix that has merged but is not running in production, which is a " \
+             "session with nothing it can verify (ISS-1097). Nothing to do here: this returns to the queue " \
+             "on its own, and the check is rerun against GitHub each time."
       unless @dry_run
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
         deferred = Agent::Api.snooze(number, @now + (DEPENDENCY_DEFER_DAYS * 24 * 60 * 60),
@@ -1663,11 +1666,12 @@ module Agent
     # what it did was wrong.
     def escalate_stalled_dependency(lease, identity, number, reasons, attempt, undeferrable: false)
       why = undeferrable ? "this runner could not record the deferral" : "#{attempt} daily checks have not cleared it"
-      text = "Waiting on a dependency that has not merged, and #{why}.\n\n" \
+      text = "Waiting on a dependency that has not landed, and #{why}.\n\n" \
              "#{reasons.map { |r| "- #{r}" }.join("\n")}\n\n" \
-             "Merge the PR (or drop the `blocked_by` edge with `dev issues block #{number} --on <n> --remove` " \
-             "if this issue no longer needs it) and move this back to `open`. No session has been started: " \
-             "the work is not blocked on a decision, only on the code landing on `origin/main`."
+             "Merge the PR — or release the repo it merged into, if the line above says the merge is not in " \
+             "the newest release yet — and move this back to `open`. Dropping the `blocked_by` edge with " \
+             "`dev issues block #{number} --on <n> --remove` works too, if this issue no longer needs it. " \
+             "No session has been started: the work is not blocked on a decision, only on the code landing."
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost) unless undeferrable
@@ -1683,14 +1687,26 @@ module Agent
     # could persist itself. Saying so in the prompt is necessary; it is not
     # sufficient.
     #
-    # The credentials merged in last are the external-API keys a session needs
-    # to VERIFY work whose subject is an external API, rather than designing it
-    # against the documentation (ISS-570). They are read from the env repo at
-    # spawn time and never logged — `Agent::Credentials.resolve` is the only
-    # call in this file that carries a secret, and its result goes straight into
-    # the spawn and nowhere else. What the session is TOLD about them (present
-    # or absent, and why) is `Agent::Credentials.check`, which carries no values
-    # and is rendered into the prompt by Agent::Prompt.
+    # The credentials merged in last are the external-API keys a session needs to
+    # VERIFY work whose subject is an external API, rather than designing it
+    # against the documentation (ISS-570) — and since ISS-1037 what is merged is
+    # their ABSENCE. `Agent::Credentials.withheld` maps every name to nil, which
+    # is how `Process.spawn` is told to remove a variable rather than merely not
+    # to add one; that matters because the runner's own shell may export a key,
+    # and a child inherits what it is not explicitly denied.
+    #
+    # No line in this file carries a secret any more. A session that needs one
+    # runs `dev agent credential exec`, which resolves it into that one command's
+    # process and records the use. The reason is blast radius, not access control
+    # — every session is the same uid and the env repo is readable on disk, so
+    # this can only change how many runs hold a key they were never going to use.
+    # Measured on a runner while ISS-1037 was written: 16 of 604 processes
+    # carried PLAYBOOK_CLAUDE_KEY, and two of seventeen playbooks use a
+    # credential at all. Agent::CredentialUse has the full argument.
+    #
+    # What the session is TOLD about them (present or absent, and why) is
+    # unchanged and is `Agent::Credentials.check`, which carries no values and is
+    # rendered into the prompt by Agent::Prompt.
     # CLAUDE_SESSION_ID is set by the RUNNER, not left to the session, and that is
     # what makes the reclamation in `cleanup` possible: `claude-db` names a
     # session's databases after this variable (falling back to the ~/code/ai
@@ -1723,7 +1739,7 @@ module Agent
         "GIT_CONFIG_KEY_0" => "core.hooksPath",
         "GIT_CONFIG_VALUE_0" => Agent::Paths.githooks_dir,
         "DEV_AGENT_CLAUDE_REPO" => Agent::Paths.claude_repo,
-      }.merge(Agent::Credentials.resolve)
+      }.merge(Agent::Credentials.withheld)
     end
 
     # ---------------- plumbing ----------------

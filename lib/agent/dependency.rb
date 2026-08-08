@@ -1,7 +1,9 @@
 require 'agent/api'
 require 'agent/github'
+require 'prs/deploy'
 
-# Has the code an issue is BLOCKED ON actually landed on main?
+# Has the code an issue is BLOCKED ON actually landed — on main, and then in
+# production?
 #
 # The tracker answers that with a status, and in this fleet the status lies. A
 # `blocked_by` edge stops holding its dependent back the moment the blocker
@@ -25,10 +27,33 @@ require 'agent/github'
 # decision does (`dev issues reconcile`): it needs an external signal the
 # backend has no business reaching for.
 #
+# MERGED IS NOT LIVE, and that is the second half (ISS-1097). A dependent does
+# not always merely BUILD on its blocker — a follow-up on a crawler fix, and the
+# club_backfill retries are a standing source of them, can only be tested once
+# the pod is running the fix. ISS-1024 said so in as many words: "Once workers#207
+# is merged AND the workers deploy is live, retry the held windows. Retrying
+# BEFORE the fix is live only burns four more attempts." The gate read the first
+# half, woke it at 16:09 with #207 merged at 16:08 and the newest workers tag at
+# 0.1.77 (= #206), and the session that claimed it four minutes later could do
+# nothing at all.
+#
+# So a blocker has LANDED only when its fix PR merged AND the merge commit is
+# contained in what its repo has released. Both halves are asked of GitHub, and
+# the second reuses Prs::Deploy — the same "has this actually shipped" the
+# cross-repo merge check runs on (ISS-758) — rather than a second notion of what
+# a release is.
+#
+# NOT the blocker's STATUS, at either half. `fixed -> deployed -> verified` is a
+# one-way ladder a session can walk by hand, and ISS-1012 reached `verified` at
+# 16:03 for a PR that merged at 16:08 — five minutes in the future. Any check
+# reading "is it at deployed-or-better" would have cleared on that. Release
+# evidence is a fact about a commit; a rung is a claim about one.
+#
 # FAIL OPEN, everywhere. `gh` missing, a rate limit, an unreadable blocker, a
-# fix that is a document rather than a PR — every unknown dispatches. A
-# dependency check that stalls the whole queue whenever GitHub is unreachable is
-# a worse failure than the one it exists to prevent, and it would be silent.
+# fix that is a document rather than a PR, a release state that could not be
+# read — every unknown dispatches. A dependency check that stalls the whole
+# queue whenever GitHub is unreachable is a worse failure than the one it exists
+# to prevent, and it would be silent.
 module Agent
   module Dependency
     # The statuses at which a blocker stops holding its dependents back, mirroring
@@ -41,7 +66,23 @@ module Agent
     # deferring on work that will never arrive.
     ABANDONED_STATUS = "dismissed".freeze
 
-    FIX_PR_URL = %r{\Ahttps://github\.com/[^/]+/[^/]+/pull/\d+}
+    # Group 1 is the REPO, which is what the release check asks GitHub about: a
+    # fix url is the only place the repo a blocker shipped in is written down.
+    FIX_PR_URL = %r{\Ahttps://github\.com/[^/]+/([^/]+)/pull/\d+}
+
+    # The release check asks for the newest RELEASE TAG, never a live prod probe.
+    # Two reasons, and the first is decisive: this runs on an agent runner, which
+    # has no kubeconfig — the very repo in the incident above (`workers`) is a
+    # docker_k8s app with no HTTP version endpoint, so the probe that `dev deploy
+    # status` uses answers nothing here (ISS-904). The second is cost: reaching a
+    # prod url means loading the apps registry, which shells out to `pkl eval`,
+    # on a check that runs every five minutes.
+    #
+    # The tag is also what the issue asked for and what `dev issues reconcile`
+    # already gates `fixed -> deployed` on. What it costs is a release that
+    # tagged and then failed to roll out: this would call that shipped. That is a
+    # loud, attended event, and the same trade `fetch_release_info` documents.
+    NO_LIVE_VERSION = ->(_repo) { nil }
 
     # How a deferral this module caused is recognised on a timeline, which is
     # where its attempt count is kept. Deliberately a marker in the comment
@@ -106,35 +147,93 @@ module Agent
         .filter_map { |l| l["issue"] }
     end
 
-    # Every blocker whose code is NOT on main yet, each with the evidence: the
-    # blocker's status, and the open PR that contradicts it when there is one.
-    # Empty — the overwhelmingly common case, since most issues have no blockers
-    # at all — means dispatch.
-    def unshipped(issue, use_localhost:)
+    # Where a merge commit has got to, memoised per (repo, sha) so a sweep over
+    # twenty issues waiting on ONE PR asks GitHub once. Built per pass rather
+    # than held on the module: a cache that outlived a pass would remember
+    # "not released yet" across the release that fixed it.
+    def release_oracle
+      cache = {}
+      lambda do |repo, sha|
+        cache.fetch([repo, sha]) { cache[[repo, sha]] = release_state(repo, sha) }
+      end
+    end
+
+    # :shipped / :unreleased / :unknown for one merge commit.
+    #
+    # A repo that publishes NO releases is :shipped, and that is not a fallback —
+    # it is the correct answer. devops is the case that matters, and it is the
+    # most common blocker repo in this fleet: nothing builds or ships it, every
+    # runner fast-forwards its checkout at the top of every tick, so merging IS
+    # deploying (which is why instructions.md §3 forbids merging one at all).
+    # Waiting for a tag there would park every devops-blocked issue until the
+    # daily expiry — undoing ISS-922 for the majority case in the name of a
+    # release nobody is ever going to cut. Prs::Deploy tells that apart from a
+    # read that failed, which stays :unknown.
+    def release_state(repo, sha)
+      case Prs::Deploy.state(repo, sha, live_version: NO_LIVE_VERSION)
+      when :shipped, :unreleasable then :shipped
+      when :unshipped then :unreleased
+      else :unknown
+      end
+    end
+
+    # Where ONE recorded fix url has got to — `[state, pr]` — in the vocabulary
+    # both gates read:
+    #
+    #   :shipped    — merged, and that merge is in the repo's newest release
+    #   :unreleased — merged, and demonstrably NOT in it yet
+    #   :open       — still open
+    #   :closed     — closed without merging
+    #   :unknown    — every read that did not answer
+    #
+    # (`unshipped` adds :working for a blocker that is not terminal at all, which
+    # is answered from the tracker's status without asking GitHub anything.)
+    #
+    # `pr` is nil only when the lookup itself failed, which is an :unknown like
+    # any other.
+    def fix_state(url, deployed:)
+      pr = Agent::Github.pr_by_url(url)
+      return [:unknown, nil] if pr.nil?
+      return [:open, pr] if Agent::Github.open?(pr)
+      return [:closed, pr] if Agent::Github.closed?(pr)
+      # A state this file does not recognise, and a merged PR whose merge commit
+      # `gh` did not return: both are unknowns, and neither is evidence.
+      return [:unknown, pr] unless Agent::Github.merged?(pr)
+
+      [deployed.call(url[FIX_PR_URL, 1], Agent::Github.merge_sha(pr)), pr]
+    end
+
+    # Every blocker whose code is NOT live yet, each with the evidence: the
+    # blocker's status, how far its fix got, and the PR that says so when there
+    # is one. Empty — the overwhelmingly common case, since most issues have no
+    # blockers at all — means dispatch.
+    def unshipped(issue, use_localhost:, deployed: release_oracle)
       blockers(issue).filter_map do |ref|
         number = ref["number"]
         status = ref["status"]
         # Live work by the tracker's own rule. The server passes these over when it
         # leases, so reaching here means something raced; agreeing with the server
         # costs one branch and cannot false-positive.
-        next { "number" => number, "status" => status, "pr" => nil } unless SHIPPED_STATUSES.include?(status)
+        unless SHIPPED_STATUSES.include?(status)
+          next { "number" => number, "status" => status, "pr" => nil, "state" => :working }
+        end
         next nil if status == ABANDONED_STATUS
 
-        pr = unmerged_fix_pr(number, use_localhost: use_localhost)
-        pr && { "number" => number, "status" => status, "pr" => pr }
+        state, pr = unlanded_fix(number, use_localhost: use_localhost, deployed: deployed)
+        state && { "number" => number, "status" => status, "pr" => pr, "state" => state }
       end
     end
 
-    # The PR that proves a `fixed` blocker has not landed, or nil.
+    # The fix that proves a `fixed` blocker has not landed — `[state, pr]` — or nil.
     #
-    # AN OPEN FIX BLOCKS, whatever else on the list merged (ISS-1105). This used
-    # to read "ANY merged fix clears it", on the grounds that a REOPENED issue
+    # AN OPEN FIX BLOCKS, whatever else on the list shipped (ISS-1105). This used
+    # to read "ANY shipped fix clears it", on the grounds that a REOPENED issue
     # accumulates fixes round after round, so "the newest one is still open" is
     # routinely true of an issue whose code merged rounds ago. That reasoning
     # describes a real case and got the common one backwards, because ISS-759
     # made the fix list CONCURRENT as well as sequential: one change spanning
     # repos is closed out as `--status fixed --url <primary>` plus a `dev issues
-    # fix --url` per sibling, and there every url has to merge before the code a
+    # fix --url` per sibling, and there every url has to land before the code a
     # dependent builds on exists.
     #
     # ISS-998 is the measured case. It shipped as platform#2230 and
@@ -154,29 +253,35 @@ module Agent
     # code that is not there, which is recoverable only by the human who
     # eventually notices. Invert and the choice makes itself.
     #
+    # A MERGED-BUT-UNRELEASED fix blocks for the same reason (ISS-1097), and it is
+    # the state this reads most often: between a merge and the next release, every
+    # fix in a deployable repo is in it. A dependent dispatched there is writing
+    # against code that is on main and on nothing that is running.
+    #
     # A CLOSED-unmerged fix is deliberately NOT promoted the same way, and still
-    # loses to a merge elsewhere on the list. It is the ambiguous one: abandoned,
-    # superseded, or a round that was rewritten under a url that did land. Reading
-    # every one of those as blocking would park dependents on PRs nobody will ever
-    # reopen, with no daily merge to end it. ISS-739 keeps the scope it was
-    # written with — a closed fix blocks when NOTHING on the list merged.
+    # loses to a shipped fix elsewhere on the list. It is the ambiguous one:
+    # abandoned, superseded, or a round that was rewritten under a url that did
+    # land. Reading every one of those as blocking would park dependents on PRs
+    # nobody will ever reopen, with no daily merge to end it. ISS-739 keeps the
+    # scope it was written with — a closed fix blocks when NOTHING on the list
+    # shipped. Note this is not the deliberate FAIL-OPEN policy — that covers
+    # UNKNOWNS (`gh` unreachable, a fix that is a document, a state this file does
+    # not recognise, a release state that could not be read), and all of those
+    # still return nil below. Here the answer is known and verifiable.
     #
-    # Failing an open one, the fix is unshipped, and BOTH ways of being unshipped count
-    # (ISS-739). An OPEN fix is the common one. The other is a fix CLOSED WITHOUT
-    # MERGING — rejected, abandoned, or superseded by a PR opened under a url
-    # nobody recorded with `dev issues fix`. This used to answer nil there, which
-    # every caller reads as "shipped, dispatch is safe": the absence of unmerged
-    # evidence was standing in for positive evidence of a merge, and a closed
-    # PR is neither. The dependent then dispatched against code that never landed
-    # on main, which is exactly what ISS-649 exists to prevent. Note this is not
-    # the deliberate FAIL-OPEN policy — that covers UNKNOWNS (`gh` unreachable,
-    # a fix that is a document, a state this file does not recognise), and all of
-    # those still return nil below. Here the answer is known and verifiable.
+    # Which one is NAMED, when there are several: the open PR first — it is the
+    # one that will actually ship, and the deferral note is only actionable if it
+    # points at that — then the unreleased merge, then the LAST RECORDED closed
+    # one. Last recorded rather than highest number because fixes span repos,
+    # where PR numbers are not comparable, and the recorded order is the only
+    # chronology available without a second API field.
     #
-    # Among several closed fixes it is the LAST RECORDED one, not the highest PR
-    # number: fixes can span repos, where numbers are not comparable, and the
-    # recorded order is the only chronology available without a second API field.
-    def unmerged_fix_pr(number, use_localhost:)
+    # UNKNOWNS still return nil, which is the deliberate FAIL-OPEN policy: `gh`
+    # unreachable, a fix that is a document, a state this file does not
+    # recognise, a release state that could not be read. One unknown among
+    # several is enough — the fix that shipped might be the one that could not be
+    # read.
+    def unlanded_fix(number, use_localhost:, deployed:)
       blocker = begin
         Agent::Api.issue(number, use_localhost: use_localhost)
       rescue StandardError
@@ -187,14 +292,18 @@ module Agent
       urls = fix_pr_urls(blocker)
       return nil if urls.empty?
 
-      prs = urls.map { |url| Agent::Github.pr_by_url(url) }
-      return nil if prs.any?(&:nil?)
-
-      open_fix = prs.find { |pr| Agent::Github.open?(pr) }
+      states = urls.map { |url| fix_state(url, deployed: deployed) }
+      # An OPEN fix is asked FIRST, ahead of the fail-open unknown check, because
+      # it is positive evidence in its own right: this url has demonstrably not
+      # landed, and no unreadable sibling makes that less true. Everything after
+      # it is an inference from the whole list, so one unknown there poisons the
+      # answer and dispatches (ISS-1105 over ISS-739's fail-open policy).
+      open_fix = states.find { |state, _| state == :open }
       return open_fix if open_fix
-      return nil if prs.any? { |pr| Agent::Github.merged?(pr) }
+      return nil if states.any? { |state, _| state == :unknown }
 
-      prs.reverse.find { |pr| Agent::Github.closed?(pr) }
+      states.find { |state, _| state == :unreleased } ||
+        (states.any? { |state, _| state == :shipped } ? nil : states.reverse.find { |state, _| state == :closed })
     end
 
     # The PR urls recorded as fixes on an issue. A fix that is a document (a design
@@ -226,12 +335,12 @@ module Agent
     # An issue with NO blockers is cleared, vacuously and correctly: that is what
     # a human dropping the edge with `dev issues block --remove` leaves behind,
     # and it is exactly the state the escalation note asks them to produce.
-    def cleared?(issue, use_localhost:)
-      blockers(issue).all? { |ref| blocker_landed?(ref, use_localhost: use_localhost) }
+    def cleared?(issue, use_localhost:, deployed: release_oracle)
+      blockers(issue).all? { |ref| blocker_landed?(ref, use_localhost: use_localhost, deployed: deployed) }
     end
 
-    # One blocker: is its code demonstrably on main?
-    def blocker_landed?(ref, use_localhost:)
+    # One blocker: is its code demonstrably on main AND in its repo's release?
+    def blocker_landed?(ref, use_localhost:, deployed: release_oracle)
       status = ref["status"]
       # Live work by the tracker's own reckoning — there is nothing merged to
       # find, whatever GitHub says.
@@ -248,17 +357,20 @@ module Agent
       end
       return false if blocker.nil?
 
-      # EVERY recorded fix merged, mirroring `unmerged_fix_pr` (ISS-1105). This
-      # said `any?` and it is the half of that bug that actually fired: ISS-1009
-      # was deferred CORRECTLY at 07:05 with both of ISS-998's PRs open, and it
-      # was this sweep — not the claim-time gate — that woke it at 16:13 on the
-      # strength of platform#2230 alone, while hoa-frontend#107 was still open.
-      # The wake note it wrote said "there is nothing left to wait for".
+      # EVERY recorded fix SHIPPED, mirroring `unlanded_fix` (ISS-1105, ISS-1097).
+      # This said `any?` and it is the half of that bug that actually fired:
+      # ISS-1009 was deferred CORRECTLY at 07:05 with both of ISS-998's PRs open,
+      # and it was this sweep — not the claim-time gate — that woke it at 16:13 on
+      # the strength of platform#2230 alone, while hoa-frontend#107 was still
+      # open. The wake note it wrote said "there is nothing left to wait for".
+      #
+      # SHIPPED rather than merged, because a merge that has not been released is
+      # code the dependent still cannot build on (ISS-1097).
       #
       # An unreadable url now counts AGAINST waking rather than contributing
       # nothing. Under `any?` it could be ignored, because one positive merge was
       # the whole bar; under `all?` a url `gh` could not read is a fix that has
-      # not been SHOWN to merge, and this side of the module has always required
+      # not been SHOWN to ship, and this side of the module has always required
       # positive evidence. Same fail-safe direction as everything else here: not
       # knowing leaves the deferral standing, the daily expiry still applies, and
       # the claim-time gate re-runs either way.
@@ -271,7 +383,7 @@ module Agent
       urls = fix_pr_urls(blocker)
       return false if urls.empty?
 
-      urls.all? { |url| Agent::Github.merged?(Agent::Github.pr_by_url(url)) }
+      urls.all? { |url| fix_state(url, deployed: deployed).first == :shipped }
     end
 
     # How many CONSECUTIVE dependency deferrals a timeline records — the number
@@ -304,14 +416,6 @@ module Agent
     # One line per blocker for the timeline note, naming what is actually being
     # waited on — the PR when there is one, the status when the blocker has not
     # got that far.
-    #
-    # A CLOSED fix gets its own sentence, because the two cases want different
-    # things from whoever reads the note. An open PR resolves itself: it merges,
-    # and the next attempt of this gate passes. A closed-unmerged one never will
-    # — either the real fix went in under a url nobody recorded (`dev issues
-    # fix`) or the blocker was never actually fixed — so the deferral loop can
-    # only end with a human, and saying "has not merged" would hide that behind
-    # wording that reads as "not yet".
     def describe(unshipped)
       unshipped.map do |b|
         reason = pr_reason(b)
@@ -332,12 +436,31 @@ module Agent
     # underneath it. One source for the wording, so the note a session reads on
     # the timeline and the line a human reads before claiming cannot drift into
     # two different accounts of the same PR.
+    #
+    # A clause per state, because they want different things from whoever reads
+    # it. An OPEN PR resolves itself: it merges, and the next attempt of this gate
+    # passes. A CLOSED-unmerged one never will — either the real fix went in under
+    # a url nobody recorded (`dev issues fix`) or the blocker was never actually
+    # fixed — so that deferral loop can only end with a human, and "has not
+    # merged" would hide it behind wording that reads as "not yet". An UNRELEASED
+    # one waits on a DEPLOY rather than on a review, so it names the repo to
+    # release; calling it unmerged would be flatly false about a commit sitting on
+    # main, which is the confusion ISS-1097 was filed about.
+    #
+    # Driven off the recorded state rather than re-derived from the PR, because
+    # the PR in the unreleased case IS merged — `merged?` can no longer stand in
+    # for "landed".
     def pr_reason(entry)
       pr = entry["pr"]
       return nil if pr.nil?
 
-      if Agent::Github.closed?(pr)
+      case entry["state"]
+      when :closed
         "its fix #{pr['url']} was CLOSED WITHOUT MERGING — nothing shipped, and no open PR will ship it"
+      when :unreleased
+        "its fix #{pr['url']} merged and has NOT been released — that commit is not in the newest " \
+          "`#{pr['url'][FIX_PR_URL, 1]}` release, so the code is on `origin/main` and not in production " \
+          "where a session would have to test against it"
       else
         "its fix #{pr['url']} has not merged"
       end
