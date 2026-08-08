@@ -854,6 +854,34 @@ class TestDevAgentTick < Minitest::Test
     end
   end
 
+  # ISS-783. CPU headroom rides the same heartbeat as disk headroom, and this assertion is load
+  # bearing in a way the platform side cannot cover: AgentInvariants' oversubscription check reads
+  # a column, so if devops ever stopped SENDING these the column would simply go null fleet-wide
+  # and the check would go quiet — which from the platform is indistinguishable from a fleet that
+  # is comfortably idle. Same argument AgentInvariants writes out for the maintenance vitals.
+  def test_the_load_average_rides_the_heartbeat
+    with_agent_home do
+      register_identity
+      sent = nil
+      stub_singleton(Agent::Processes, :load_average, ->(*) { [48.5, 30.0, 12.25] }) { sent = heartbeat_once }
+      assert_equal 48.5, sent[:load_average_1m]
+      assert_equal 12.25, sent[:load_average_15m]
+    end
+  end
+
+  # A machine that will not say reports nothing rather than 0, exactly as an unreadable df does. A
+  # reported 0 is the picture of an idle machine, so it is the one wrong answer that would keep an
+  # oversubscribed box looking healthy forever.
+  def test_a_machine_that_will_not_report_its_load_sends_nothing_rather_than_zero
+    with_agent_home do
+      register_identity
+      sent = nil
+      stub_singleton(Agent::Processes, :load_average, ->(*) { nil }) { sent = heartbeat_once }
+      refute sent.key?(:load_average_1m)
+      refute sent.key?(:load_average_15m)
+    end
+  end
+
   # A machine whose `df` cannot be read reports nothing rather than 0. A reported 0 would read as a
   # full disk on a machine whose only problem is an unreadable df, and the platform would file about
   # headroom that is probably fine.
