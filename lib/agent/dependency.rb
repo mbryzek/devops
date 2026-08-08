@@ -226,20 +226,48 @@ module Agent
 
     # The fix that proves a `fixed` blocker has not landed — `[state, pr]` — or nil.
     #
-    # ANY shipped fix clears it. A reopened issue accumulates fixes and `dev issues
-    # fix` appends more after the fact, so "the newest fix is still open" is
-    # routinely true of an issue whose code merged rounds ago — reading it as
-    # unshipped would defer a dependent on a PR it never needed.
+    # AN OPEN FIX BLOCKS, whatever else on the list shipped (ISS-1105). This used
+    # to read "ANY shipped fix clears it", on the grounds that a REOPENED issue
+    # accumulates fixes round after round, so "the newest one is still open" is
+    # routinely true of an issue whose code merged rounds ago. That reasoning
+    # describes a real case and got the common one backwards, because ISS-759
+    # made the fix list CONCURRENT as well as sequential: one change spanning
+    # repos is closed out as `--status fixed --url <primary>` plus a `dev issues
+    # fix --url` per sibling, and there every url has to land before the code a
+    # dependent builds on exists.
     #
-    # Failing that, the fix is unshipped, and every way of being unshipped counts.
-    # An OPEN fix is the common one. A fix CLOSED WITHOUT MERGING — rejected,
-    # abandoned, or superseded by a PR opened under a url nobody recorded with
-    # `dev issues fix` — used to answer nil, which every caller reads as "shipped,
-    # dispatch is safe": the absence of unmerged evidence was standing in for
-    # positive evidence of a merge, and a closed PR is neither (ISS-739). A fix
-    # that MERGED and has not been released is the third (ISS-1097), and it is
-    # the one this reads most often, since between a merge and the next release
-    # every fix in a deployable repo is in that state.
+    # ISS-998 is the measured case. It shipped as platform#2230 and
+    # hoa-frontend#107, BOTH recorded — the reap found the sibling on its own and
+    # appended it. platform#2230 merged at 16:07 on 2026-08-08 with #107 still
+    # open; `any?(&:merged?)` answered "shipped", the wake sweep lifted ISS-1009's
+    # deferral six minutes later saying "there is nothing left to wait for", and
+    # the session was dispatched onto an Elm module whose contract change was
+    # still sitting in an open PR. That is the ISS-649 failure reached through the
+    # gate built to prevent it.
+    #
+    # The two cases are not distinguishable from the fix list — a url is a url,
+    # and nothing records which ROUND it belongs to — so this picks the safe
+    # reading and takes the cost of the other. Over-blocking a reopened issue's
+    # dependent is a deferral: recoverable, re-checked daily, and escalated to a
+    # human after seven attempts. Under-blocking is a session writing code against
+    # code that is not there, which is recoverable only by the human who
+    # eventually notices. Invert and the choice makes itself.
+    #
+    # A MERGED-BUT-UNRELEASED fix blocks for the same reason (ISS-1097), and it is
+    # the state this reads most often: between a merge and the next release, every
+    # fix in a deployable repo is in it. A dependent dispatched there is writing
+    # against code that is on main and on nothing that is running.
+    #
+    # A CLOSED-unmerged fix is deliberately NOT promoted the same way, and still
+    # loses to a shipped fix elsewhere on the list. It is the ambiguous one:
+    # abandoned, superseded, or a round that was rewritten under a url that did
+    # land. Reading every one of those as blocking would park dependents on PRs
+    # nobody will ever reopen, with no daily merge to end it. ISS-739 keeps the
+    # scope it was written with — a closed fix blocks when NOTHING on the list
+    # shipped. Note this is not the deliberate FAIL-OPEN policy — that covers
+    # UNKNOWNS (`gh` unreachable, a fix that is a document, a state this file does
+    # not recognise, a release state that could not be read), and all of those
+    # still return nil below. Here the answer is known and verifiable.
     #
     # Which one is NAMED, when there are several: the open PR first — it is the
     # one that will actually ship, and the deferral note is only actionable if it
@@ -265,12 +293,13 @@ module Agent
       return nil if urls.empty?
 
       states = urls.map { |url| fix_state(url, deployed: deployed) }
-      return nil if states.any? { |state, _| state == :shipped }
+      # UNKNOWNS first, and they fail OPEN: one url `gh` could not read is not
+      # evidence either way, and not knowing must never stall the queue.
       return nil if states.any? { |state, _| state == :unknown }
 
       states.find { |state, _| state == :open } ||
         states.find { |state, _| state == :unreleased } ||
-        states.reverse.find { |state, _| state == :closed }
+        (states.any? { |state, _| state == :shipped } ? nil : states.reverse.find { |state, _| state == :closed })
     end
 
     # The PR urls recorded as fixes on an issue. A fix that is a document (a design
@@ -324,18 +353,33 @@ module Agent
       end
       return false if blocker.nil?
 
-      # ANY shipped fix, mirroring `unlanded_fix`: a reopened issue accumulates
-      # fixes, so "the newest one is still open" is routinely true of an issue
-      # whose code merged rounds ago. An unreadable url contributes nothing here
-      # rather than poisoning the answer — it is one absent piece of evidence,
-      # and a fix found shipped elsewhere in the list is still shipped.
+      # EVERY recorded fix SHIPPED, mirroring `unlanded_fix` (ISS-1105, ISS-1097).
+      # This said `any?` and it is the half of that bug that actually fired:
+      # ISS-1009 was deferred CORRECTLY at 07:05 with both of ISS-998's PRs open,
+      # and it was this sweep — not the claim-time gate — that woke it at 16:13 on
+      # the strength of platform#2230 alone, while hoa-frontend#107 was still
+      # open. The wake note it wrote said "there is nothing left to wait for".
+      #
+      # SHIPPED rather than merged, because a merge that has not been released is
+      # code the dependent still cannot build on (ISS-1097).
+      #
+      # An unreadable url now counts AGAINST waking rather than contributing
+      # nothing. Under `any?` it could be ignored, because one positive merge was
+      # the whole bar; under `all?` a url `gh` could not read is a fix that has
+      # not been SHOWN to ship, and this side of the module has always required
+      # positive evidence. Same fail-safe direction as everything else here: not
+      # knowing leaves the deferral standing, the daily expiry still applies, and
+      # the claim-time gate re-runs either way.
       #
       # No PR fix recorded at all — a fix that is a design document, or a `fixed`
       # with nothing attached — is NOT evidence: there is no merge to observe.
       # The claim-time gate dispatches on that case and this declines to wake on
       # it, which costs a day at most and only for an issue held by some OTHER
       # blocker, since a document-fixed blocker never causes a deferral itself.
-      fix_pr_urls(blocker).any? { |url| fix_state(url, deployed: deployed).first == :shipped }
+      urls = fix_pr_urls(blocker)
+      return false if urls.empty?
+
+      urls.all? { |url| fix_state(url, deployed: deployed).first == :shipped }
     end
 
     # How many CONSECUTIVE dependency deferrals a timeline records — the number

@@ -465,11 +465,42 @@ action never happens, and no artifact substitutes for not doing it.
   enforces this; a push touching anything else there is refused.
 - **Never unlock the git-crypt'd `env` repo.** Never run bare `env` or otherwise
   dump the environment — it prints production secrets.
+
+  **And never HARVEST a sibling session's secrets, however easy it is.** Every
+  session on this runner is the same uid, so `ps -E`, `ps auxww`, `pgrep -fl` and
+  a read of `~/code/env` all hand you credentials that were issued to somebody
+  else's run — and they hand them to your transcript, which outlives this
+  machine. You were already given every key you are entitled to, by name, in your
+  assignment block. The one you were NOT given is a `dev issues workaround`, never
+  a lookup. §4 has the mechanics and what to poll instead (ISS-1028).
 - **Never touch the production database, and never `:5432`.** `:5432` is Mike's
   local database and parallel sessions clobber it. Use `claude-db` (§4).
+
+  **That is a rule about the DATABASE, not about production data.** Reading a
+  product's own API is a different act with a different blast radius, and it is
+  sanctioned — `dev prod get` (§4) sends one authenticated GET and has no write
+  form. Do not read this bullet as "production is unreachable, infer instead".
+  The ISS-1056 session did: it found no acumen key in its credentials block,
+  concluded there was no way to look, reconstructed the cause from git history,
+  and shipped a migration naming four stale enum values it had never observed
+  plus a delete of rows it had never counted — while the producer's own
+  six-second probe sat one command away (ISS-1062). **When an issue cites an
+  on-screen or per-row observation, go and look at it.**
 - **Never edit outside your workspace** (`~/code/ai/<slug>/`, plus
   `~/code/claude/plans/`). Never edit `~/code/platform`, `~/code/devops`, or any
   other top-level checkout — clone what you need into your workspace.
+
+  The morning briefing's status files are the one thing a playbook routinely
+  sends you outside it for, and they are not an exception to this — they are a
+  **command**: `dev agent status-file <key> --write FILE`. Write the report in
+  your workspace, then hand it over with that. Nothing about
+  `~/code/openclaw/openclaw-workspace/data/` is yours to edit, and cloning it
+  (the remedy above) accomplishes nothing, because the briefing reads the
+  original path and not your copy. Run `dev agent status-file` bare to see the
+  registered keys. If a playbook still tells you to write that path with your own
+  hands, follow the command instead and file the playbook with
+  `dev issues workaround` — that instruction predates the command and cannot be
+  obeyed as written (ISS-1022).
 - **Never disable, weaken, or work around any of the above**, including by
   editing the hook, the plist, or this file.
 
@@ -565,38 +596,170 @@ the one way to bring `main` under a branch like this, and it needs no force.
   credentials on this runner" — **read it while you are still planning**, because
   an absent credential looks exactly like one you have not thought to look for
   yet, and the cost of finding out late is a request shape you designed against
-  the documentation and cannot test (ISS-565). If the one you need is present it
-  is already exported into your environment; pass it explicitly to what you are
-  verifying. If it is absent, say so up front, do the offline work in full, state
-  plainly in the PR which part is unverified, and file it with `dev issues
-  workaround`. Either way a credential is never yours to print, echo, commit, or
-  paste into a PR, an issue comment, a plan or a test fixture.
-- **This runner is SHARED, and a command line is PUBLIC.** Several agent sessions
-  run on one Mac mini as the same user, and `ps -U <uid>` shows every argument of
-  every one of their processes to all the others. Two rules follow, and neither is
-  covered by "never print a credential" — in the incident below the session
-  printed nothing, echoed nothing and pasted nothing:
+  the documentation and cannot test (ISS-565). If it is absent, say so up front,
+  do the offline work in full, state plainly in the PR which part is unverified,
+  and file it with `dev issues workaround`. A credential is never yours to print,
+  echo, commit, or paste into a PR, an issue comment, a plan or a test fixture.
+
+  **A credential you DO have is not in your environment, and that is deliberate**
+  (ISS-1037). `$PLAYBOOK_CLAUDE_KEY` and `$NEWRELIC_USER_KEY` are empty in your
+  shell. Ask for one per command instead, and it exists only inside that
+  command's own process:
+
+      dev agent credential exec --name NEWRELIC_USER_KEY -- \
+        /bin/zsh -c 'curl -sS -X POST https://api.newrelic.com/graphql \
+          -H "Content-Type: application/json" -H "API-Key: $NEWRELIC_USER_KEY" ...'
+
+  **SINGLE quotes around the inner command.** Double quotes make YOUR shell
+  expand the reference before `dev` runs — to nothing — and an unauthenticated
+  NerdGraph query answers an empty result set rather than a 401, which reads
+  exactly like a healthy graph (ISS-635). The command refuses when it cannot see
+  the name in what you gave it, which is precisely what that mistake leaves
+  behind; `--implicit` is the escape for a program that reads the variable itself
+  and never names it on a command line. `dev agent credential list` says which
+  credentials this machine has, and never a value.
+
+  This is not a permission you have to earn and it is not an access control: any
+  session can run it, because every session on this runner is the same uid. What
+  it changes is that a run which never touches an external API no longer carries
+  the keys to two — so nothing can sweep them out of your environment by accident,
+  which is how both of the leaks that have actually happened happened (ISS-961,
+  ISS-1035). Every use is recorded under the issue's log tree.
+- **Reading production:** `dev prod get --app <app> <path>` sends ONE authenticated
+  GET against that product's own production API using the credential this runner
+  already holds, and prints the JSON on stdout — guardrails and the HTTP status go
+  to stderr, so `| jq` works. There is no write form and no `--localhost`. Which
+  apps are readable HERE is in your assignment block under "Production data you can
+  READ on this runner", and it is there for the same reason the credential list is:
+  read it while you are still planning. A non-2xx exits 1 with the body on stderr,
+  which makes a 500 an observation rather than a dead end — so probing a range
+  reports each row honestly:
+
+      for o in 672 673 678; do dev prod get --app acumen "/g/bryzek/duplicate/transactions?status=pending_review&limit=1&offset=$o"; done
+
+  Quote the path: unquoted, the shell splits it on `&` and the command sees a
+  fragment. If the stored session has expired the command says so and hands back
+  the `dev issues handoff` line, because refreshing it is an interactive login no
+  session can run.
+
+  **Acumen is Mike's real household finances.** Read-only, and only the
+  `Bryzek Family` group (`/g/bryzek/...`) — the session can reach other households
+  and `dev prod get` refuses them, because that is the one rule here a typo is
+  enough to break. **Never quote a real merchant name, amount, balance or account identifier**
+  into an issue, PR, comment, plan, commit message or test fixture; cite shapes,
+  counts and percentages ("seven rows in this group fail to decode"), never a
+  transaction. Never initiate or complete a Plaid link or reauthentication flow —
+  that is a bank login and §3 forbids it outright.
+- **This runner is SHARED, and the isolation boundary is the MACHINE, not your
+  session.** Several agent sessions run on one Mac mini AS THE SAME USER, and
+  same-uid means each of them can read everything the others hold. Three routes,
+  all measured on a runner (ISS-1028), all open right now:
+  `ps -U <uid>` prints every argument of every sibling's processes; **`ps -Eax`
+  prints every sibling's whole ENVIRONMENT**, so the keys handed to your session
+  are readable by every other session for as long as you live; and the env repo
+  those keys are read out of sits unlocked on disk under that same uid, so a
+  sibling never had to ask a process at all.
+
+  **And it is precisely YOUR processes that disclose.** macOS withholds the
+  environment of an Apple platform binary — `/bin/sleep` shows nothing — and
+  hands over everything else. Everything else is what a session runs: `claude`
+  itself, `node`, `ruby`, `java`, `vite`, `npm run dev`, every homebrew tool.
+  Counted on this runner while writing this: 770 processes listed, 88 of them
+  disclosing a full environment, and **13 of those carrying `PLAYBOOK_CLAUDE_KEY`
+  in plaintext** — sibling sessions and their dev servers, right then, with
+  nothing wrong with any of them. **That measurement is what ISS-1037 acted on**
+  — the keys are no longer handed to a session's environment at all — but the
+  disclosure route is untouched, and everything else your session runs still
+  carries whatever it was given.
+
+  **`-E` is also not the targeted flag it looks like, and on this fleet `ps` is
+  aliased to `ps -ax`.** `-E` appends the environment only in the DEFAULT output
+  format: it is silently ignored the moment you pass `-o`, and adds nothing to a
+  bare `-p <pid>`. So `ps -Eax` is the disclosing form — and
+  `~/code/misc/env/.alias` turns a session's careful `ps -E -p <pid>` into
+  `ps -ax -E -p <pid>`, i.e. the whole machine rather than the one child you
+  scoped it to. That is why the rule below is "do not run these at all" rather
+  than "scope them properly".
+
+  **So nothing on this box protects your credentials from another session on it,
+  and no rule below is going to.** Do not reason as though the environment were
+  the safe place to keep one. It is the worst of the three on duration: an inlined
+  key is exposed for the seconds a `curl` runs, an inherited one for the hours a
+  session lives — which is exactly why `dev agent credential exec` above hands
+  you one for a single command rather than for your whole run.
+
+  What that leaves is a boundary genuinely worth defending, and it is not on this
+  machine. A transcript, a PR, an issue comment, a plan, a log file, a test
+  fixture, a commit — those OUTLIVE the runner and LEAVE it, and a credential that
+  reaches one is disclosed to everyone who can read it, permanently, until the key
+  is rotated. Every rule below is about keeping secret material out of that
+  durable record. None of them is about hiding it from a sibling, which cannot be
+  done — and in the ISS-961 incident the session printed nothing, echoed nothing
+  and pasted nothing, so none of them is covered by "never print a credential":
+    - **Never run a command that HARVESTS what other sessions are holding.**
+      `ps -E` in any form, `ps auxww`, `ps -eww`, `pgrep -fl`, and a bare `env` or
+      `printenv` all pipe a sibling's credentials into your transcript, and reading
+      `~/code/env` does the same from disk (§3 forbids that repo outright). There
+      is nothing to gain: you were already handed every credential you are
+      entitled to, listed by name in your assignment block. When you poll for a
+      background process, ask for PIDS — `pgrep -f <pattern>` and `pgrep -q
+      <pattern>` answer "is it still running" without printing anybody's command
+      line. Best of all, poll the log you redirected to, which is what §1 and §7
+      already tell you to do.
     - **Never write a resolved credential INTO a command. Always `$NAME`, never
       the value.** Your Bash tool keeps the literal text of your command in its
-      own argv for as long as the call runs, so a key you type out is readable by
-      every sibling session for that whole time. `$NAME` keeps it off THAT line —
-      but the shell still expands it, and a child that receives it as an argument
-      (`curl -H "x-api-key: $PLAYBOOK_CLAUDE_KEY"`) carries the value in its OWN
-      argv while it runs. For a one-second curl that window is acceptable and the
-      usage examples in your assignment block are fine as written. For anything
-      LONG-RUNNING it is not: never let a credential ride on a backgrounded or
-      long-lived command — `npm run dev`, a dev server, a watch loop — where it
-      sits in a listing for hours. Prefer stdin when the tool will take it.
-    - **When you poll for a background process, ask for pids — never command
-      lines.** `pgrep -f <pattern>` and `pgrep -q <pattern>` answer "is it still
-      running". `pgrep -fl` and `ps auxww` answer the same question by printing
-      every OTHER session's command lines into your transcript. Best of all, poll
-      the log you redirected to, which is what §1 and §7 already tell you to do.
+      own argv for as long as the call runs, and every sibling's routine process
+      listing can sweep it up from there into an artifact neither of you controls.
+      `$NAME` keeps it off THAT line — but the shell still expands it, and a child
+      that receives it as an argument (`curl -H "x-api-key: $PLAYBOOK_CLAUDE_KEY"`)
+      carries the value in its OWN argv while it runs. For a one-second curl that
+      window is acceptable and the usage examples in your assignment block are
+      fine as written. For anything LONG-RUNNING it is not: never let a credential
+      ride on a backgrounded or long-lived command — `npm run dev`, a dev server,
+      a watch loop — where it sits in a listing for hours. Prefer stdin when the
+      tool will take it.
+    - **Spell `/bin/ps`, never a bare `ps` — a narrow `ps` on this fleet is not
+      narrow.** `~/.zprofile` here defines `alias ps='ps -ax'`, and zsh expands
+      aliases in NON-interactive shells too, so it is live in your Bash tool and
+      live in `/bin/zsh -lc`. `-ax` is PREPENDED and macOS `ps` will not let a
+      later `-p` narrow it back down — the `-p` is silently ignored:
 
-  That is ISS-961: a session polling its own detached `api publish` with a routine
-  `pgrep -fl api` captured two sibling sessions' `PLAYBOOK_CLAUDE_KEY` and
-  `NEWRELIC_USER_KEY` in plaintext. The pattern matched partly ON the key, because
-  `sk-ant-api03-...` contains the string `api` it was searching for.
+          ps -o command= -p 1566      | wc -l   ->  599
+          ps -o command= -p $$        | wc -l   ->  599   # even about your OWN shell
+          /bin/ps -p 1566 -o command= | wc -l   ->    1
+
+      So asking about ONE process prints all 599, and `ps -p <pid>` — which reads
+      as the careful choice — is identical to `ps auxww`. `dev agent doctor` lists
+      every alias on this machine that shadows a binary.
+
+  That is ISS-961 and ISS-1033: a session polling its own detached `api publish`
+  with a routine `pgrep -fl api` captured two sibling sessions'
+  `PLAYBOOK_CLAUDE_KEY` and `NEWRELIC_USER_KEY` in plaintext. The pattern matched
+  partly ON the key, because `sk-ant-api03-...` contains the string `api` it was
+  searching for. A later session reached the same leak through `ps -o command= -p
+  <pid>`, having followed every word of the rule above — the guidance named the
+  commands that are obviously broad and could not warn about the narrow one,
+  because the narrow one is only broad here.
+
+  **The general rule, and it is bigger than `ps`: a bare command name on this
+  fleet is not reliably the binary you think it is.** Two mechanisms, one fact —
+  an alias the login profile defines (`ps`), and `~/code/devops/bin` preceding
+  `/usr/bin` on the PATH, which is how a `run-op`'s `env` became devops' own
+  script and killed the operation (ISS-893/896, and §1 says so there too). An
+  absolute path is immune to both. Spell one whenever a command's exact behaviour
+  is what you are relying on.
+
+  **And the leak is not the worst shape this takes — silent success is.** The
+  same profile defines `alias rm='rm -i'`, and your shell has no tty, so a bare
+  `rm <file>` prompts, reads EOF, deletes NOTHING and **exits 0** (measured on a
+  runner, 2026-08-08). A cleanup step that checks its status is told it worked.
+  `rm -rf` is unaffected — `-f` and `-i` are last-one-wins and `-f` comes later —
+  which is why §7's `rm -rf` advice has never surfaced this. Use `/bin/rm`, or
+  keep the `-f`, when a delete has to actually happen.
+
+  And if you decide your task needs a credential you were NOT handed: you may not
+  go and get it, however reachable it is from this uid. Say so — `dev issues
+  workaround`, exactly as §1 and the credentials block describe for an absent key.
 - **The sbt heap is THIS MACHINE'S, and you interpolate it — never a number you
   chose.** `dev agent sbt-opts` prints it, derived from this box's RAM and how
   many sessions it runs at once (ISS-753). Assign it in the SAME shell
@@ -616,6 +779,35 @@ the one way to bring `main` under a branch like this, and it needs no force.
   folds `-J` args into the JAVA_OPTS half, so `SBT_OPTS` wins. A session was
   caught running `java ... -Xmx12G ... -Xms40G -Xmx40G` for exactly this reason.
   `dev agent doctor` says so out loud when the profile is fighting you.
+- **Never read this machine's shell startup files. Run `dev agent dotfiles`.**
+  `~/.zshrc`, `~/.zprofile` and the `~/.alias` it sources are symlinks into a
+  human's own dotfiles checkout, and three of the assignments in them are live
+  third-party credentials as plaintext literals — a Jira token, an Artifactory
+  password, a GitHub token. **The credential rules above do not cover these.**
+  Those are about keys the FLEET hands you and how to keep them out of an argv.
+  These are somebody else's, in a file you are positively encouraged to open.
+
+  And you WILL be sent there. Answering anything about shell configuration on
+  this fleet means reading those files: ISS-1033 was "where is `alias ps='ps
+  -ax'` defined?", there is no other way to find out, and finding out put two
+  credentials into a session transcript (ISS-1035). `dev agent doctor` names
+  `~/.alias` as the file to look in, and the bullets above send you to
+  `~/.zprofile` twice. Reading it is the CORRECT investigation step, which is
+  exactly why a rule against it needs somewhere else to send you:
+
+      dev agent dotfiles                    # every startup file, values removed
+      dev agent dotfiles --grep 'alias ps'  # the ISS-1033 question, answered
+
+  Same files, same structure, no values. Aliases, `source` lines, `PATH`,
+  conditionals and comments come through verbatim — everything such a question
+  is ever about. Only ASSIGNMENT VALUES are withheld, and by default: a value is
+  shown only when it is recognisably a path, a `$VAR`, a flag or a number, so a
+  credential is hidden whatever its variable happens to be called.
+
+  If you have already read one, it is in your transcript and stays there. Do not
+  quote it, do not paste it into a PR, an issue or a plan, and file it —
+  `dev issues workaround --key dotfile-credential-read` — naming the FILE and the
+  VARIABLE and never the value, so it can be rotated.
 - platform has no sbt CI and `main` can be red, so before blaming your change on
   a failure, confirm it also fails on an unmodified `origin/main` (use
   `git worktree add`, never stash/checkout).
@@ -793,6 +985,10 @@ error is the most expensive mistake available here.
    `dev queries top` for slow-query symptoms; playbook-admin's invocation and
    worker pages decode a failing pipeline run into its actual exception. Logs do
    not survive the pod, so read the recorded artifact, not a reconstruction.
+   For an acumen symptom there is no APM at all, so the failing request IS the
+   artifact: `dev prod get --app acumen <path>` (§4) reissues it and prints what
+   production actually answers. An issue's "Evidence (checkable in under a
+   minute)" line is usually that request, already written out for you.
 3. **Locate it in the pipeline before editing.** Trace producer → table →
    consumer: which job wrote the row, which DAO reads it, which controller
    serves it. Fix the producer, not the receiver — a receiver-side patch hides

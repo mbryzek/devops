@@ -18,11 +18,19 @@ require 'environment_variables'
 #
 # TWO PUBLIC FACES, AND THE SPLIT IS THE SAFETY PROPERTY. `check` reports
 # WHETHER a credential resolves and never carries its value, so it is safe to
-# print, log, and render into a prompt. `resolve` returns values, is called from
-# exactly one place (the spawn environment), and its result is never printed.
-# Keeping them apart is what stops a doctor listing, a tick log line, or an
-# exception's `inspect` from leaking a live API key into a file a PR might
-# quote.
+# print, log, and render into a prompt. `probe` returns values, and nothing that
+# calls it prints its result. Keeping them apart is what stops a doctor listing,
+# a tick log line, or an exception's `inspect` from leaking a live API key into a
+# file a PR might quote.
+#
+# WHERE THE VALUES GO, SINCE ISS-1037. Not into the session. A spawned session's
+# environment gets `withheld` — every credential name explicitly removed — and a
+# session that needs one runs `dev agent credential exec`, which puts it into one
+# child process for one command (`Agent::CredentialUse`). ISS-570's promise is
+# unchanged and is made by `check`: a session is told up front which credentials
+# this machine holds, before it plans, so an absent one is never discovered
+# halfway through. What changed is that being TOLD about a key and HOLDING it for
+# the life of the run are no longer the same thing.
 #
 # WHY NOT `ANTHROPIC_API_KEY`. That name is exactly the one that must never
 # appear here. The process this environment is handed to IS `claude`, and the
@@ -65,25 +73,6 @@ module Agent
       def read(_name) = EnvRepo.read_secret("api_keys/#{file}")
     end
 
-    # The same directory, for a service whose credential is a TUPLE: one file per
-    # service, KEY=VALUE lines inside it, each `Credential` reading its own name
-    # out of it. Court Reserve is the case — a login is an email AND a password,
-    # and neither half authenticates anything on its own.
-    #
-    # Not two `KeyFile`s, and the difference is provisioning rather than taste.
-    # Two files can be half-written, which produces the one state nobody planned
-    # for: a session told it HAS a Court Reserve credential, holding an email and
-    # no password. One file is either there or it is not.
-    #
-    # Not `AppEnv` either, for the ISS-635 reason stated above: this is what a
-    # TOOL authenticates with, not what an app boots with, and a tooling
-    # credential filed under an app's env is one no application reads and nobody
-    # rotates.
-    KeyVars = Struct.new(:file, keyword_init: true) do
-      def label = "env/api_keys/#{file}"
-      def read(name) = EnvRepo.read_var("api_keys/#{file}", name)
-    end
-
     # One credential, where it is read from, and what stops working without it.
     #
     # `name` is both the key looked up in the env repo AND the environment
@@ -103,37 +92,6 @@ module Agent
     Credential = Struct.new(:name, :source, :required_by, :how_to_provide, :usage_example,
                             keyword_init: true) do
       def source_label = source.label
-    end
-
-    # One half of the Court Reserve login. Everything except the variable name is
-    # shared by CONSTRUCTION rather than by copy: two entries describing one
-    # credential must not be able to drift into telling a session two different
-    # stories about where its login comes from.
-    def self.court_reserve(name)
-      Credential.new(
-        name: name,
-        source: KeyVars.new(file: "court-reserve"),
-        required_by: "logging in to Court Reserve from a crawler harness — `recon-refunds.ts` in the " \
-                     "workers repo, and any live re-crawl — the only way a session can VERIFY a change " \
-                     "to crawler behaviour against the live site rather than arguing it from recorded " \
-                     "production console logs and letting the next scheduled crawl be the test (ISS-1012). " \
-                     "A harness run connects DIRECTLY, where production always crawls through a " \
-                     "residential proxy, so expect a Cloudflare challenge and keep live runs few — a " \
-                     "flagged test account helps nobody",
-        how_to_provide: "put CR_EMAIL and CR_PASSWORD in the env repo at api_keys/court-reserve, as one " \
-                        "KEY=VALUE file (both halves or neither). It MUST be a login scoped to a Court " \
-                        "Reserve TEST org — picklejar-test — never a real club's credential and never an " \
-                        "account with write access: every session on this runner inherits whatever is " \
-                        "put here",
-        # A shell assignment PREFIX, deliberately, rather than a tidier bare
-        # command. The prefix is consumed by the shell — the harness is exec'd
-        # with argv `npx tsx recon-refunds.ts`, and the values reach it only
-        # through its environment — so this satisfies "pass it explicitly"
-        # without putting a secret on a command line that `ps` shows to every
-        # sibling session for the several minutes a crawl takes (ISS-961, §4).
-        usage_example: 'CR_EMAIL="$CR_EMAIL" CR_PASSWORD="$CR_PASSWORD" RECON_OUT=/tmp/recon ' \
-                       'npx tsx recon-refunds.ts',
-      )
     end
 
     CREDENTIALS = [
@@ -171,27 +129,43 @@ module Agent
         usage_example: 'curl -X POST https://api.newrelic.com/graphql ' \
                        '-H "Content-Type: application/json" -H "API-Key: $NEWRELIC_USER_KEY" ...',
       ),
-      # ISS-1023, and it is ISS-565's shape a third time. ISS-1012 changed how the
-      # refunds crawler asks Court Reserve for a date window — behaviour whose
-      # only real test is a live crawl — and the session had no Court Reserve
-      # login, so `recon-refunds.ts` (the repo's own harness, which exists for
-      # exactly this) could not be run at all. workers#207 shipped with its
-      # central behaviour argued from production console logs, and the first
-      # scheduled crawl after deploy became the actual test, on real clubs.
+      # THERE IS DELIBERATELY NO COURT RESERVE CREDENTIAL HERE, and this comment
+      # is load-bearing: ISS-1023 (devops#438) added one, and ISS-1098 removed it
+      # again. Do not re-add it without reading why it went.
       #
-      # THE PAIR IS THE POINT: two entries, one file. See `KeyVars`.
+      # A Court Reserve login is not a credential this registry can hold, because
+      # the safe version of it does not exist. `workers/src/recon/run.ts` and the
+      # README section "Answering a question about Court Reserve's live
+      # behaviour" (workers#202, ISS-884, verified) state it as a design
+      # decision rather than a gap: a CR admin login is NOT read-only — the same
+      # account this worker logs in with can issue credits and change schedules
+      # — and Court Reserve has no read-only scope to hand out. Every credential
+      # `resolve` returns is handed to EVERY spawned session, not only crawler
+      # ones, so registering this would put write access to a club's bookings
+      # and money in the environment of every session on the runner, to answer a
+      # diagnostic question.
       #
-      # WHY THIS IS NOT DEAD WEIGHT WHILE THAT FILE IS ABSENT. Listing a
-      # credential nobody has provisioned yet is the ENTIRE ISS-570 mechanism:
-      # `credentials_section` renders an absent credential as "cannot be closed
-      # out here", names `dev issues workaround`, and says it BEFORE the session
-      # plans. Today a crawler session is told nothing about Court Reserve at
-      # all, so it works the gap out for itself once the code already exists —
-      # which is the failure, not the missing secret. The day the file lands,
-      # every session gets the login with no further change here.
-      court_reserve("CR_EMAIL"),
-      court_reserve("CR_PASSWORD"),
+      # WHAT REPLACES IT is already built and is not a credential. The workers
+      # README's ladder: (1) make the crawl prove the answer for itself — a
+      # discriminating check that runs on every crawl and fails the report when
+      # the answer is wrong (`verifyServerHonorsWindow`), which needs no login
+      # and answers the question forever rather than once; (2) when the question
+      # is exploratory, write the experiment as `npm run recon` flags and hand it
+      # to a credential-holder with `dev issues handoff --command '<the line>'`.
+      # `recon`'s output is redacted by construction so the report is safe to
+      # paste back into an issue.
+      #
+      # WHY devops#438 CONCLUDED OTHERWISE. It rested on a quotation from a file
+      # that has never existed — "the workers repo's own harness is explicit
+      # about needing one: `npx tsx recon-refunds.ts`". There is no
+      # `recon-refunds.ts` anywhere in workers, there is no `RECON_OUT`, and the
+      # real harness's own header comment says the opposite of what it was cited
+      # for. The entry's `how_to_provide` then demanded a login "never with write
+      # access", which Court Reserve cannot issue — so it could not have been
+      # provisioned as specified by anyone who tried. See ISS-1098.
     ].freeze
+
+    NAMES = CREDENTIALS.map(&:name).freeze
 
     # What `check` reports. Carries a STATUS, never a value — see the module
     # comment. `source` is where the answer came from: :process_env when the
@@ -235,23 +209,41 @@ module Agent
       end
     end
 
-    # The values to ADD to a spawned session's environment. The one caller is
-    # `Agent::Tick#child_env`, and its result is never logged.
-    #
-    # Credentials the runner's own environment already carries are deliberately
-    # omitted: `Process.spawn` merges this hash over an inherited ENV, so the
-    # child gets those anyway, and re-listing them would pull a secret through
-    # more code for no effect.
-    def resolve(credentials: CREDENTIALS, env: ENV)
-      credentials.each_with_object({}) do |credential, resolved|
-        status, value, source = probe(credential, env: env)
-        next unless status == :present && source == :env_repo
-        resolved[credential.name] = value
-      end
+    # One credential by the name a session was told, or nil.
+    def find(name, credentials: CREDENTIALS)
+      credentials.find { |c| c.name == name.to_s }
     end
 
-    # [status, value, source]. The single read, so `check` and `resolve` cannot
-    # disagree about what this machine has.
+    # What a spawned session's environment says about credentials: NOTHING
+    # (ISS-1037). Every name mapped to nil, which is how `Process.spawn` is told
+    # to REMOVE a variable from the child rather than merely not to add one.
+    #
+    # Not-adding is not enough, and the difference is the whole reason this is a
+    # method rather than an omission. `spawn` merges its env hash over an
+    # INHERITED environment, so a credential the runner's own shell exports —
+    # which `probe` deliberately lets an operator do, and which one of the two
+    # runners may well be doing — would otherwise ride down into every session
+    # untouched, and the change would be a no-op on exactly the machine nobody
+    # checked. Explicit nils make the grant independent of how the runner was
+    # started.
+    #
+    # WHAT REPLACES IT. `dev agent credential exec` (Agent::CredentialUse) puts
+    # one credential into one child process for one command. That is not an
+    # access control — same uid, and the env repo is readable on disk — and the
+    # module comment there says so. It is a blast-radius change: a run that never
+    # touches an external API no longer holds the keys to two.
+    def withheld(credentials: CREDENTIALS)
+      credentials.each_with_object({}) { |credential, env| env[credential.name] = nil }
+    end
+
+    # [status, value, source]. The single read, so `check` and every caller that
+    # needs a VALUE cannot disagree about what this machine has.
+    #
+    # There used to be a `resolve` beside `check` here, building the whole spawn
+    # environment in one call. ISS-1037 deleted it rather than leaving it unused:
+    # nothing hands a session a hash of credentials any more, and a
+    # value-carrying function with no callers is the one kind of dead code worth
+    # going out of the way to remove.
     #
     # The process environment wins over the env repo so an operator can override
     # one key from `.zprofile` without editing (or unlocking) the secrets repo.

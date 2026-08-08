@@ -171,11 +171,41 @@ module Dependencies
       result
     end
 
+    # ---------- the tracking issue ----------
+
+    # Every PR this pipeline opens is titled `ISS-<n>: Upgrade dependencies`
+    # (ISS-1104). The prefix is not decorative: `dev agent merge-lane` skips a
+    # PR without it (`no_issue_prefix`) and `dev issues reconcile` cannot adopt
+    # one either, so a bare-titled PR is a PR nothing downstream can act on —
+    # which is exactly what acumen#240 was, and what every night re-created.
+    #
+    # The number is the run's own tracking issue, passed in with `--issue`: the
+    # nightly is already one child issue per repo (the `dependency-upgrade`
+    # epic), so the session invoking this HAS a number and there is nothing to
+    # invent. It is not derivable here — this pipeline runs in its own clone
+    # under ~/code/ai/dep-up.<MMDD>/, not in the session's workspace — so it is
+    # required rather than guessed, and a run without one stops before it can
+    # produce an unattributable PR.
+    ISSUE_ARG_RE = /\A(?:ISS-)?(\d+)\z/i.freeze
+
+    # The issue number in `1104`, `ISS-1104` or `iss-1104`, or nil when the value
+    # is not one. Deliberately format-only: verifying the issue EXISTS would put
+    # the platform API on the critical path of a pipeline that otherwise needs
+    # nothing but git and sbt, and a night that cannot reach the platform should
+    # still upgrade dependencies.
+    def parse_issue_number(value)
+      m = ISSUE_ARG_RE.match(value.to_s.strip)
+      n = m && m[1].to_i
+      n&.positive? ? n : nil
+    end
+
+    def pr_title(issue) = "ISS-#{issue}: Upgrade dependencies"
+
     # ---------- Claude prompt ----------
 
     # Bounded like Codegen::Sync.fix_prompt: get the repo to a pushed,
     # review-ready PR and STOP. No review rounds, no rebase, no merge.
-    def upgrade_prompt(app:, branch:, bumps:)
+    def upgrade_prompt(app:, branch:, bumps:, issue:)
       bump_lines = bumps.map { |b| "  - #{b[:group]}:#{b[:artifact]}  #{b[:current]} -> #{b[:target]}" }
       <<~PROMPT
         You are in a fresh clone of #{app} on branch #{branch}. Nightly dependency
@@ -201,7 +231,9 @@ module Dependencies
                reason: "<one line: what broke, date>"
         5. Commit the green tree and push: `git push -u origin #{branch}`.
         6. Open the PR: `gh pr create --draft --head #{branch}` with title
-           "Upgrade dependencies" and a body listing every applied bump
+           "#{pr_title(issue)}" — EXACTLY that, ISS- prefix included, or the
+           merge lane refuses the PR and nothing can tie it back to the issue
+           tracking this run — and a body listing every applied bump
            (old -> new, release-notes link for majors) plus any Deferred
            upgrades section. Then run `gh pr ready` to mark it ready.
         Do NOT run code reviews, do NOT rebase, do NOT merge, and never

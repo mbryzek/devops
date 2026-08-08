@@ -1,5 +1,6 @@
 require 'agent/credentials'
 require 'agent/paths'
+require 'agent/prod_read'
 
 # The prompt fed to a session on stdin (design §4.3.2). Four parts, in this
 # order:
@@ -35,11 +36,12 @@ module Agent
     end
 
     def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], continued_repos: [],
-              playbook: nil, credentials: Agent::Credentials.check)
+              playbook: nil, credentials: Agent::Credentials.check, prod_read: Agent::ProdRead.check)
       [
         instructions.strip,
         assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo,
-                   prepared_repos: prepared_repos, continued_repos: continued_repos, credentials: credentials),
+                   prepared_repos: prepared_repos, continued_repos: continued_repos, credentials: credentials,
+                   prod_read: prod_read),
         issue_section(issue),
         playbook_section(playbook),
         comments_section(comments),
@@ -47,7 +49,7 @@ module Agent
     end
 
     def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [], continued_repos: [],
-                   credentials: Agent::Credentials.check)
+                   credentials: Agent::Credentials.check, prod_read: Agent::ProdRead.check)
       lines = []
       lines << "# Your assignment"
       lines << ""
@@ -114,6 +116,7 @@ module Agent
         lines << "work there. Never edit a checkout under ~/code outside this workspace."
       end
       lines << "" << credentials_section(credentials)
+      lines << "" << prod_read_section(prod_read)
       lines.join("\n")
     end
 
@@ -168,22 +171,44 @@ module Agent
       lines = ["## Live external-API credentials on this runner", ""]
       Array(found).each do |f|
         if f.present?
-          lines << "- `#{f.name}` — **available in your environment** (#{f.explanation}). Needed for " \
-                   "#{f.credential.required_by}."
-          lines << "  Pass it explicitly to whatever you are verifying — e.g. " \
-                   "`#{f.credential.usage_example}`."
+          # ISS-1037. This used to read "available in your environment", and it
+          # was true: every session held every key for its whole life, so a
+          # `ps -Eax`, an inherited dev server, or a stray `pgrep -fl` could
+          # sweep one up without the session doing anything wrong (ISS-961). The
+          # value is no longer there. What the session is told is unchanged in
+          # the part ISS-570 cares about — this machine HAS the key, so work that
+          # needs it can be closed out here — and changed in where it lives.
+          lines << "- `#{f.name}` — **available on this runner, and deliberately NOT in your " \
+                   "environment** (#{f.explanation}). Needed for #{f.credential.required_by}."
+          lines << "  Ask for it per command, and it exists only in that command's own process:"
+          lines << ""
+          lines << "        dev agent credential exec --name #{f.name} -- \\"
+          lines << "          /bin/zsh -c '#{f.credential.usage_example}'"
+          lines << ""
+          # The quoting is the whole failure mode, so it is stated at the point
+          # of use rather than left to §4. Double quotes make the session's own
+          # shell expand the reference to the empty string before `dev` runs, and
+          # an unauthenticated NerdGraph query answers an empty result set rather
+          # than a 401 — a graph that reads as healthy and was never queried
+          # (ISS-635). The command refuses when it cannot see the name in the
+          # argv, which is exactly what that mistake leaves behind.
+          lines << "  **SINGLE quotes around the inner command**, so the shell that expands `$#{f.name}` " \
+                   "is the one that has it. Double quotes expand it to nothing before `dev` starts, and " \
+                   "an unauthenticated request usually answers an empty result rather than an error. The " \
+                   "command refuses when it cannot see `#{f.name}` in what you gave it."
           lines << "  **Never print, echo, commit, or paste it** into a PR, an issue comment, a plan or a " \
                    "test fixture."
           # ISS-961. The line above is what a session obeys and it was not
           # enough, because inlining a value into a command reads as none of
-          # those four verbs — and `usage_example` right above it is a shell
+          # those four verbs — and the `exec` example right above it is a shell
           # command, which is the moment the question actually arises. Stated per
           # credential, with the variable's own name in it, so the correct form
           # is the thing on screen at the point of use.
           lines << "  **And never write the value into a command line — pass `$#{f.name}`, never what it " \
                    "resolves to.** Several sessions share this runner as one user, and `ps` shows every " \
-                   "argument of every one of their processes to all the others; a key you inline is readable " \
-                   "by all of them for as long as the command runs (hours, for anything backgrounded). See §4."
+                   "argument of every one of their processes to all the others — so a sibling's routine " \
+                   "process listing sweeps an inlined key into ITS transcript, which outlives this machine. " \
+                   "`exec` keeps the value in an environment instead, for one command's lifetime. See §4."
         else
           lines << "- `#{f.name}` — **NOT available on this runner** (#{f.explanation})."
           lines << "  Anything in your assignment that asks you to verify behaviour against the live API " \
@@ -193,6 +218,29 @@ module Agent
                    "then report it as verified."
         end
       end
+      # ISS-1028. Stated once, as a footer, because it is a fact about the MACHINE
+      # rather than about any one key — and stated at all because the per-credential
+      # rule above, read alone, implies a protection that does not exist. "Never
+      # write the value into a command line" is true, but a session takes from it
+      # that the ENVIRONMENT is the safe place to keep a credential. It is not:
+      # `ps -Eax` prints a sibling's whole environment to any process with the
+      # same uid, for the whole life of the session, and the env repo these values
+      # are read out of is unlocked on disk under that same uid. Measured on a
+      # runner: 88 of 770 processes disclosing, 13 of them carrying
+      # PLAYBOOK_CLAUDE_KEY. A session that obeys
+      # the argv rule perfectly still holds nothing back from its siblings. So the
+      # honest statement, plus the two rules that survive it: the durable artifact
+      # is the boundary, and harvesting is the way a credential reaches one.
+      lines << ""
+      lines << "This runner is SHARED and the isolation boundary is the MACHINE, not your session: every " \
+               "other session runs as the same user and can already read these keys out of your " \
+               "environment (`ps -Eax`), out of your command lines (`ps -U`), and off disk. macOS " \
+               "withholds only an Apple platform binary's environment, so the processes that DO disclose " \
+               "are `claude`, `node`, `ruby`, `java`, `vite` — every process a session actually runs. " \
+               "Hiding a key from a sibling is not possible and is not the rule. The rule is that it must never " \
+               "reach a DURABLE artifact — a transcript, a PR, an issue comment, a plan, a commit, a test " \
+               "fixture — and that you never run a command that harvests one: no `ps -E`, no `ps auxww`, " \
+               "no `pgrep -fl`, no bare `env`. See §4 (ISS-1028)."
       # A footer rather than a per-credential line: this is a fact about the
       # PROCESS the environment is handed to, not about any one key. `claude`
       # resolves ANTHROPIC_API_KEY as its own credential, so copying anything
@@ -201,6 +249,53 @@ module Agent
       lines << ""
       lines << "Never copy any of these into `ANTHROPIC_API_KEY` — that variable reconfigures the " \
                "`claude` CLI you are running inside."
+      lines.join("\n")
+    end
+
+    # Which production APIs this runner can READ, stated beside the credentials
+    # for the same reason they are (ISS-1062).
+    #
+    # The ISS-1056 session had this exact access and did not know it. It read §3's
+    # "never touch the production database", found no acumen key in the
+    # credentials section above, and concluded — reasonably, from what it was
+    # told — that production was unreachable. So it inferred a list of stale enum
+    # values from git history and shipped a migration naming them, while the
+    # producer's own six-second probe sat one command away.
+    #
+    # That is why this is a section and not a line in the standing instructions.
+    # A capability a session is not told about does not exist, and the shape of
+    # the mistake is identical to ISS-565's: the run did not fail, it quietly
+    # lowered what it claimed to have established.
+    def prod_read_section(found)
+      lines = ["## Production data you can READ on this runner", ""]
+      lines << "An issue that cites an on-screen or per-row observation is CHECKABLE. Check it — do not"
+      lines << "reconstruct it from the repos and ship the inference (ISS-1062)."
+      lines << ""
+      lines << "This is not a relaxation of §3. §3 forbids the production DATABASE and still does;"
+      lines << "`dev prod get` sends one authenticated GET against the product's own API and cannot send"
+      lines << "anything else. There is no write form of this command."
+      lines << ""
+      Array(found).each do |f|
+        t = f.target
+        if f.present?
+          lines << "- **`#{t.app}`** (#{t.host}) — **readable** as #{f.explanation}. Use it for #{t.answers}."
+          lines << ""
+          lines << "        #{t.example}"
+          lines << ""
+          # A stored session EXPIRES, unlike an API key, and `ProdRead.check`
+          # deliberately does not spend a network round-trip finding out (see its
+          # module comment). So the confirming call is named here, at the point
+          # the session decides whether to rely on it.
+          lines << "  Confirm it in one call before you rely on it — `dev prod get --app #{t.app} #{t.confirm_path}`."
+          t.guardrails.each { |g| lines << "  - #{g}" }
+        else
+          lines << "- **`#{t.app}`** (#{t.host}) — **NOT readable on this runner** (#{f.explanation}). To provide it, " \
+                   "#{t.how_to_provide}."
+          lines << "  Anything in your assignment that asks you to confirm an observation against #{t.product} " \
+                   "**cannot be confirmed here**. Say so up front, do the offline work in full, state plainly in " \
+                   "the PR which part is INFERRED rather than observed, and file it with `dev issues workaround`."
+        end
+      end
       lines.join("\n")
     end
 

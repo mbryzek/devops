@@ -213,6 +213,70 @@ class TestDevIssues < Minitest::Test
     refute_includes issue_render_item(graph_issue, 1, comments: [comment(body: "just a note")]), "RE-OPENED"
   end
 
+  # ---- an answer is not a re-open (ISS-989) ----
+
+  # `dev issues review` records the answer and sets `open`, so the natural way to
+  # clear a handoff — paste what happened, send it back to the queue — used to be
+  # read as "the earlier attempt did not hold" about output saying it worked.
+  def answer_comments(body = "Ran both. `patched ...` then `Already applied`.", from: "needs_input")
+    [
+      comment(body: "Waiting on a human: the commands need a scope no session has.",
+              transition: { "from" => "open", "to" => from }),
+      comment(body: body, transition: { "from" => from, "to" => "open" }, at: "2026-07-12T09:00:00Z"),
+    ]
+  end
+
+  def test_an_answer_from_a_blocked_status_is_not_a_reopen
+    refute issue_reopened?(answer_comments), "needs_input → open is a human unblocking it"
+    refute issue_reopened?(answer_comments(from: "needs_review")), "needs_review → open is the same path"
+  end
+
+  def test_render_item_leads_with_the_answer_callout_and_never_the_reopen_one
+    out = issue_render_item(fixed_issue, 1, comments: answer_comments)
+    banner = out.index("**ANSWERED")
+    assert banner, "expected the answer banner"
+    assert banner < out.index("- Issue: `ISS-034`"), "banner must precede the issue fields"
+    refute_includes out, "RE-OPENED"
+    refute_includes out, "did not hold"
+    assert_includes out, "NOT because an attempt failed"
+    assert_includes out, "  > Ran both. `patched ...` then `Already applied`."
+    assert_includes out, "take it at its word"
+  end
+
+  # A cleared handoff's answer is routinely pasted terminal output, so it is quoted
+  # as a block — not collapsed onto one line the way the re-open reason is.
+  def test_the_answer_callout_quotes_a_multiline_answer_in_full
+    out = issue_render_item(fixed_issue, 1, comments: answer_comments("patched cron 0c8a3666\nAlready applied"))
+    assert_includes out, "  > patched cron 0c8a3666\n  > Already applied"
+  end
+
+  def test_the_answer_callout_survives_an_answer_with_no_note
+    out = issue_render_item(fixed_issue, 1, comments: answer_comments(""))
+    assert_includes out, "**ANSWERED"
+    assert_includes out, "the timeline below is all there is"
+  end
+
+  # Both facts are true and both banners render: the two failed attempts are still
+  # worth leading with, and the reason quoted is the FAILURE, not the human's reply.
+  def test_an_answer_after_failed_attempts_shows_both_banners_answer_first
+    comments = reopen_comments + answer_comments("go ahead, the MX record is live")
+    out = issue_render_item(fixed_issue, 1, comments: comments)
+    assert out.index("**ANSWERED") < out.index("**RE-OPENED"), "the answer is the newer of the two"
+    assert_includes out, "**RE-OPENED — the earlier attempt did not hold.**"
+    assert_includes out, "Reason given: still broken on mobile"
+    refute_includes out, "Reason given: go ahead"
+  end
+
+  # An answer only leads while it is the latest thing that moved the issue to
+  # `open`. A failed attempt after it makes it history — still on the timeline.
+  def test_a_failed_attempt_after_an_answer_takes_the_lead_back
+    comments = answer_comments("go ahead") +
+               [comment(transition: { "from" => "claimed", "to" => "open" }, body: "session exited 1", at: "2026-07-14T09:00:00Z")]
+    out = issue_render_item(fixed_issue, 1, comments: comments)
+    refute_includes out, "**ANSWERED"
+    assert_includes out, "Reason given: session exited 1"
+  end
+
   def test_render_item_includes_the_comment_history_oldest_first
     out = issue_render_item(fixed_issue, 1, comments: reopen_comments)
     assert_includes out, "**Comment history (2, oldest first):**"
@@ -603,7 +667,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_categories_match_the_spec_enum
-    assert_equal %w[graphs worker insights club_backfill suggestion feature bug improvement infrastructure], ISSUE_CATEGORIES
+    assert_equal %w[graphs worker insights club_backfill suggestion feature bug improvement product infrastructure], ISSUE_CATEGORIES
   end
 
   def test_graphs_body_orients_to_playbook_app
@@ -2732,8 +2796,10 @@ class TestDevIssues < Minitest::Test
 
   # The hand-filing list is a SUBSET of the full category list: `create` offers
   # only the categories that make sense to type, while `claim` covers them all.
+  # `product` is on it despite being producer-driven, because the product-owner
+  # review files its recommendations THROUGH `create` rather than server-side.
   def test_manual_categories_are_a_subset_of_all_categories
-    assert_equal %w[feature bug improvement], ISSUE_MANUAL_CATEGORIES
+    assert_equal %w[feature bug improvement product], ISSUE_MANUAL_CATEGORIES
     assert_empty(ISSUE_MANUAL_CATEGORIES - ISSUE_CATEGORIES)
   end
 
