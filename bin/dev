@@ -11836,7 +11836,7 @@ def cmd_queries_top(args)
         "%4d  %12d  %10d  %9d  %9d  %7s  %s\n",
         idx + 1, s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
         queries_multi_share(s),
-        s["call_site"] || "(never got hot)"
+        s["call_site"] || QUERIES_NO_CALL_SITE
       )
       puts "#{QUERIES_SQL_INDENT}#{queries_span_line(s, hours: hours, use_localhost: use_localhost)}"
       queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
@@ -11987,7 +11987,7 @@ def cmd_queries_show(args)
 
     samples = history["samples"] || []
     puts ""
-    puts Util.underline("Samples for #{history['call_site'] || '(never got hot)'} (last #{window})")
+    puts Util.underline("Samples for #{history['call_site'] || QUERIES_NO_CALL_SITE} (last #{window})")
     puts ""
     queries_sql_lines(history["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
     puts ""
@@ -12169,7 +12169,7 @@ QUERIES_ISSUE_CATEGORY = "improvement".freeze
 
 # A title that says which query without the session having to open the issue.
 # The call site is the identifying half when there is one; the statement's head
-# is the fallback for a query that never got hot enough to be attributed.
+# is the fallback for a query whose stack walk found no application frame.
 def queries_issue_title(selected)
   return "Expensive queries: #{selected.length} from the query-stats ranking" if selected.length > 1
 
@@ -12219,12 +12219,13 @@ def queries_issue_body(selected, hours:, sort:)
     window. `dev queries top` reads those rows back through `GET /dev/query/stats`,
     grouped by statement and summed across every node and window in the period.
 
-    The call site is resolved by walking the stack ONCE, the first time a query crosses
-    100 calls on a node — far too expensive per call, free amortized over a hot query.
+    The call site is resolved by walking the stack ONCE per statement per window, on
+    that statement's first execution after a drain — far too expensive per call, and
+    bounded by the tracking cap however much traffic the window sees.
 
     ## Where the code lives
 
-    - `~/code/platform/generated/app/util/QueryStats.scala` — the counters, the hot threshold, the 5,000-query tracking cap
+    - `~/code/platform/generated/app/util/QueryStats.scala` — the counters, the once-per-window attribution, the 5,000-query tracking cap
     - `~/code/platform/generated/app/util/PlatformDatabase.scala` — the timing decorator that records each block
     - `~/code/platform/generated/app/util/TimingConnection.scala` — which statement in a block the duration is charged to
     - `~/code/platform/generated/app/util/QuerySqlNormalizer.scala` — how bind lists are collapsed
@@ -12247,10 +12248,12 @@ def queries_issue_body(selected, hours:, sort:)
       flat (`in (?)`) and row-wise (`in ((?))`) alike, so the list may have been two
       elements or two thousand. The width is a prime suspect and is NOT visible here —
       find it at the call site.
-    - **`(never got hot)` means no call site, not no caller**: the query never reached
-      100 calls in a window on any single node, so the stack walk never ran. Find the
-      caller by grepping the statement's head (a distinctive column list or table name)
-      under `~/code/platform`.
+    - **`#{QUERIES_NO_CALL_SITE}` means no call site, not no caller.** Every statement is
+      now attributed on its first execution of a window, so this is either a row recorded
+      before that change shipped (attribution used to need 100 calls in a single window,
+      which a third of the most expensive statements never reached) or a stack whose
+      frames were all plumbing. Find the caller by grepping the statement's head (a
+      distinctive column list or table name) under `~/code/platform`.
     - **`calls`, `total_ms` and `multi-statement` are sums across nodes and windows.**
       Per-node cost is roughly this divided by the number of pods serving; `max_ms` is a
       true single-call worst case, not an average of maxima.
@@ -12307,7 +12310,7 @@ end
 # select does not bury the ranking, but the session needs the whole thing.
 def queries_issue_body_entry(s, position)
   <<~ENTRY.strip
-    ### #{position}. #{s['call_site'].to_s.empty? ? '(never got hot — no call site resolved)' : "`#{s['call_site']}`"}
+    ### #{position}. #{s['call_site'].to_s.empty? ? QUERIES_NO_CALL_SITE : "`#{s['call_site']}`"}
 
     - total: #{s['total_ms']} ms across #{s['calls']} calls
     - mean: #{s['mean_ms']} ms, max: #{s['max_ms']} ms
@@ -12360,6 +12363,13 @@ end
 QUERIES_SQL_CHARS = 440
 
 QUERIES_SQL_INDENT = "              ".freeze
+
+# Shown in place of a call site when there is none. Deliberately says what is missing rather
+# than why: a null `call_site` used to mean one thing (the statement never reached 100
+# calls in a six-hour window, so the stack walk never ran) and now means another (the walk
+# ran on the statement's first execution and found no application frame), and rows of both
+# vintages sit in the same table for 90 days. "(never got hot)" described only the first.
+QUERIES_NO_CALL_SITE = "(no call site)".freeze
 
 # The statement, whitespace-collapsed, capped at QUERIES_SQL_CHARS and wrapped to the
 # terminal so the extra length reads as text instead of one line the terminal folds
