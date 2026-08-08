@@ -169,17 +169,18 @@ end
 class TestDependenciesPrompt < Minitest::Test
   def test_prompt_contains_bumps_and_workflow
     bumps = [{ group: "org.postgresql", artifact: "postgresql", current: "42.7.11", target: "42.7.13" }]
-    p = Dependencies::Updates.upgrade_prompt(app: "acumen", branch: "dep-upgrade-x", bumps: bumps)
+    p = Dependencies::Updates.upgrade_prompt(app: "acumen", branch: "dep-upgrade-x", bumps: bumps, issue: 1104)
     assert_includes p, "org.postgresql:postgresql  42.7.11 -> 42.7.13"
     assert_includes p, "./run.sh test"
     assert_includes p, "gh pr create --draft --head dep-upgrade-x"
     assert_includes p, "gh pr ready"
     assert_includes p, "Deferred upgrades"
+    assert_includes p, %q{"ISS-1104: Upgrade dependencies"}
     assert_includes p, "never\nforce-push"
   end
 
   def test_platform_prompt_uses_session_db_in_one_shell_call
-    p = Dependencies::Updates.upgrade_prompt(app: "platform", branch: "b", bumps: [])
+    p = Dependencies::Updates.upgrade_prompt(app: "platform", branch: "b", bumps: [], issue: 1)
     assert_includes p, "claude-db start"
     assert_includes p, "CONF_DB_DEV_URL"
     assert_includes p, "&& sbt test"
@@ -187,7 +188,7 @@ class TestDependenciesPrompt < Minitest::Test
   end
 
   def test_lib_cipher_prompt_uses_testquick
-    p = Dependencies::Updates.upgrade_prompt(app: "lib-cipher", branch: "b", bumps: [])
+    p = Dependencies::Updates.upgrade_prompt(app: "lib-cipher", branch: "b", bumps: [], issue: 1)
     assert_includes p, "sbt testQuick"
   end
 end
@@ -196,12 +197,12 @@ class TestDependenciesArgs < Minitest::Test
   include DevTestSupport
 
   def test_default_is_all_apps
-    assert_equal Dependencies::Updates::APPS.keys, parse_dependencies_args([], "dependencies check")
+    assert_equal Dependencies::Updates::APPS.keys, parse_dependencies_args([], "dependencies check").apps
   end
 
   def test_app_filter_repeatable_and_deduped
     got = parse_dependencies_args(%w[--app platform --app acumen --app platform], "dependencies check")
-    assert_equal %w[platform acumen], got
+    assert_equal %w[platform acumen], got.apps
   end
 
   def test_rejects_unknown_app
@@ -217,6 +218,83 @@ class TestDependenciesArgs < Minitest::Test
   def test_app_requires_value
     _, status = capture_stderr_and_exit { parse_dependencies_args(%w[--app], "dependencies check") }
     assert_equal 1, status
+  end
+end
+
+# ISS-1104: the nightly opened PRs titled bare "Upgrade dependencies", which
+# `dev agent merge-lane` skips as `no_issue_prefix` and `dev issues reconcile`
+# cannot adopt. The number now comes in on `--issue` and titles the PR.
+class TestDependenciesIssueNumber < Minitest::Test
+  include DevTestSupport
+
+  def test_accepts_bare_and_prefixed_forms
+    assert_equal 1104, Dependencies::Updates.parse_issue_number("1104")
+    assert_equal 1104, Dependencies::Updates.parse_issue_number("ISS-1104")
+    assert_equal 1104, Dependencies::Updates.parse_issue_number(" iss-1104 ")
+  end
+
+  # An unsubstituted placeholder out of a playbook (`--issue <n>`) must fail
+  # loudly rather than title a PR with something the merge lane will refuse.
+  def test_rejects_non_numbers
+    ["", "<n>", "ISS-", "0", "12a", "ISS-1104: Upgrade"].each do |bad|
+      assert_nil Dependencies::Updates.parse_issue_number(bad), "#{bad.inspect} must not parse"
+    end
+  end
+
+  def test_parses_issue_for_upgrade
+    assert_equal 1104, parse_dependencies_args(%w[--issue ISS-1104], "dependencies upgrade").issue
+  end
+
+  def test_issue_is_upgrade_only
+    _, status = capture_stderr_and_exit { parse_dependencies_args(%w[--issue 1104], "dependencies check") }
+    assert_equal 1, status
+  end
+
+  def test_rejects_unparseable_issue
+    _, status = capture_stderr_and_exit { parse_dependencies_args(%w[--issue <n>], "dependencies upgrade") }
+    assert_equal 1, status
+  end
+
+  def test_issue_requires_value
+    _, status = capture_stderr_and_exit { parse_dependencies_args(%w[--issue], "dependencies upgrade") }
+    assert_equal 1, status
+  end
+
+  # The gate the whole issue is about: no issue number, no run — checked before
+  # anything is cloned, so no PR can reach GitHub without the prefix.
+  def test_refuses_when_there_is_no_issue_anywhere
+    out, status = with_agent_issue(nil) { capture_stderr_and_exit { dependencies_issue!(nil) } }
+    assert_equal 1, status
+    assert_includes out, "no issue number"
+  end
+
+  # The case that actually runs: the executor names the child issue this session
+  # was spawned for, so the nightly needs no flag and no playbook change.
+  def test_defaults_to_the_sessions_own_issue
+    assert_equal 1104, with_agent_issue("1104") { dependencies_issue!(nil) }
+  end
+
+  def test_explicit_issue_wins_over_the_environment
+    assert_equal 42, with_agent_issue("1104") { dependencies_issue!(42) }
+  end
+
+  # A DEV_AGENT_ISSUE that is not a number is not an issue number: refuse rather
+  # than title a PR `ISS-0:` or `ISS-nonsense:`.
+  def test_ignores_a_junk_environment_value
+    _out, status = with_agent_issue("nonsense") { capture_stderr_and_exit { dependencies_issue!(nil) } }
+    assert_equal 1, status
+  end
+
+  def with_agent_issue(value)
+    saved = ENV["DEV_AGENT_ISSUE"]
+    ENV["DEV_AGENT_ISSUE"] = value
+    yield
+  ensure
+    ENV["DEV_AGENT_ISSUE"] = saved
+  end
+
+  def test_pr_title_carries_the_prefix
+    assert_equal "ISS-1104: Upgrade dependencies", Dependencies::Updates.pr_title(1104)
   end
 end
 
@@ -411,7 +489,7 @@ class TestDependenciesUpgradeCommand < Minitest::Test
       with_stubbed_run(workdir, result) do
         out = capture_stdout do
           begin
-            cmd_dependencies_upgrade(%w[--app lib-cipher])
+            cmd_dependencies_upgrade(%w[--app lib-cipher --issue 1104])
           rescue SystemExit => e
             status = e.status
           end
@@ -438,5 +516,56 @@ class TestDependenciesUpgradeCommand < Minitest::Test
   def test_in_sync_exits_zero
     _out, status = run_upgrade({ status: :in_sync, held: [] })
     assert_equal DEPS_EXIT_OK, status
+  end
+
+  # ISS-1104: refused before any repo is cloned or any session is spawned, so a
+  # run that could only produce an unprefixed PR never starts.
+  def test_without_issue_refuses_before_doing_anything
+    saved = ENV["DEV_AGENT_ISSUE"]
+    ENV["DEV_AGENT_ISSUE"] = nil
+    ran = false
+    Object.send(:alias_method, :__real_upgrade_one, :dependencies_upgrade_one)
+    Object.send(:define_method, :dependencies_upgrade_one) { |*_args, &_blk| ran = true; { status: :in_sync } }
+    err, status = capture_stderr_and_exit { cmd_dependencies_upgrade(%w[--app lib-cipher]) }
+    assert_equal 1, status
+    assert_includes err, "no issue number"
+    refute ran, "no repo may be processed without an issue number"
+  ensure
+    ENV["DEV_AGENT_ISSUE"] = saved
+    Object.send(:alias_method, :dependencies_upgrade_one, :__real_upgrade_one)
+    Object.send(:remove_method, :__real_upgrade_one)
+  end
+
+  # The wiring, end to end: the number the session was spawned for reaches the
+  # per-repo run, which is what puts it in the prompt and so in the PR title.
+  # Every other test here would still pass if the command resolved the issue and
+  # then dropped it on the floor.
+  def test_resolved_issue_reaches_the_repo_run
+    saved = ENV["DEV_AGENT_ISSUE"]
+    ENV["DEV_AGENT_ISSUE"] = "1104"
+    seen = nil
+    Object.send(:alias_method, :__real_upgrade_one, :dependencies_upgrade_one)
+    Object.send(:alias_method, :__real_deps_workdir, :dependencies_workdir)
+    Dir.mktmpdir do |workdir|
+      Object.send(:define_method, :dependencies_workdir) { workdir }
+      Object.send(:define_method, :dependencies_upgrade_one) do |*_args, issue:, &_blk|
+        seen = issue
+        { status: :in_sync, held: [] }
+      end
+      capture_stdout do
+        begin
+          cmd_dependencies_upgrade(%w[--app lib-cipher])
+        rescue SystemExit
+          nil
+        end
+      end
+    end
+    assert_equal 1104, seen
+  ensure
+    ENV["DEV_AGENT_ISSUE"] = saved
+    Object.send(:alias_method, :dependencies_upgrade_one, :__real_upgrade_one)
+    Object.send(:alias_method, :dependencies_workdir, :__real_deps_workdir)
+    Object.send(:remove_method, :__real_upgrade_one)
+    Object.send(:remove_method, :__real_deps_workdir)
   end
 end

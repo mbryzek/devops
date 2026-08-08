@@ -118,7 +118,7 @@ INVOCATIONS = {
   "scripts run"         => 'scripts run <name> [args...]',
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
-  "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
+  "dependencies upgrade" => 'dependencies upgrade [--issue N] [--app APP]...',
   "issues create"       => 'issues create [--category feature|bug|improvement|product] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--snoozed | --awake] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
@@ -676,7 +676,14 @@ USAGE = <<~USAGE
         against an isolated claude-db session DB), fixes any breakage, reverts
         bumps it cannot make green (listed as "Deferred upgrades" in the PR
         body with a paste-ready denylist entry), and opens a draft PR then
-        marks it ready. One PR per repo. Skips a repo that already has an open
+        marks it ready. Every PR it opens is titled `ISS-<n>: Upgrade
+        dependencies`: a bare title is refused by `dev agent merge-lane`
+        (no_issue_prefix) and cannot be adopted by `dev issues reconcile`
+        (ISS-1104). In an agent session <n> is the issue the session was
+        spawned for (DEV_AGENT_ISSUE — the nightly's epic files one child
+        issue per repo); --issue overrides it, and is required when running
+        by hand outside a session.
+        One PR per repo. Skips a repo that already has an open
         dep-upgrade PR. Lib repo PRs bump the lib's own dependencies only —
         releasing the lib stays manual (release-lib). Scheduled by the
         `dependency-upgrade` producer, which files an epic with one child issue
@@ -9819,10 +9826,19 @@ def dependencies_verdict(results, code)
   "#{failed.length} repo(s) did not complete: #{failed.join(', ')}"
 end
 
+DEPS_CHECK_KEY = "dependencies check".freeze
+DEPS_UPGRADE_KEY = "dependencies upgrade".freeze
+
+# What the two dependencies commands were asked to do: which repos, and (upgrade
+# only) the issue number every PR it opens must be titled with.
+DependenciesArgs = Struct.new(:apps, :issue, keyword_init: true)
+
 # Returns the app names to process: every `--app` given (validated, deduped),
-# or all known apps when none was passed.
+# or all known apps when none was passed. `--issue` belongs to `upgrade` alone —
+# `check` opens no PR, so there is nothing for an issue number to title.
 def parse_dependencies_args(argv, command_key)
   apps = []
+  issue = nil
   args = argv.dup
   until args.empty?
     case (a = args.shift)
@@ -9832,11 +9848,46 @@ def parse_dependencies_args(argv, command_key)
         usage_exit("unknown app '#{v}' (known: #{Dependencies::Updates::APPS.keys.join(', ')})", example: usage_for(command_key))
       end
       apps << v
+    when "--issue"
+      usage_exit("unknown option --issue", example: usage_for(command_key)) unless command_key == DEPS_UPGRADE_KEY
+      v = args.shift or usage_exit("--issue requires a value", example: usage_for(command_key))
+      issue = Dependencies::Updates.parse_issue_number(v) ||
+              usage_exit("--issue must be an issue number, e.g. --issue 1104 or --issue ISS-1104 (got '#{v}')",
+                         example: usage_for(command_key))
     else
       usage_exit("unknown option #{a}", example: usage_for(command_key))
     end
   end
-  apps.empty? ? Dependencies::Updates::APPS.keys : apps.uniq
+  DependenciesArgs.new(apps: apps.empty? ? Dependencies::Updates::APPS.keys : apps.uniq, issue: issue)
+end
+
+# The issue every PR of this run is titled with (ISS-1104): `--issue` when it was
+# given, otherwise the issue the EXECUTOR spawned this session for.
+#
+# The environment is the default and not a fallback of last resort, because it is
+# the case that actually runs: the nightly is one child issue per repo of the
+# `dependency-upgrade` epic, and `DEV_AGENT_ISSUE` is already the executor's
+# contract for naming that issue to a child process (ISS-815, the same variable
+# `dev agent run-op` files its records under). Reading it here is what makes this
+# fix land whole at merge — the `dependency-upgrade-app` playbook does not have to
+# change, so there is no window where the CLI wants a flag the playbook has not
+# started passing yet, or the reverse.
+#
+# No number at all — a run by hand outside a session — stops HERE, before a clone,
+# a suite or a Claude session is spent, rather than ending in a bare-titled PR that
+# `dev agent merge-lane` skips (`no_issue_prefix`) and `dev issues reconcile`
+# cannot adopt. That PR is what acumen#240 was, every night, in every repo.
+def dependencies_issue!(explicit)
+  issue = explicit || Dependencies::Updates.parse_issue_number(agent_issue_number)
+  return issue if issue
+  usage_exit(
+    "no issue number: every PR this opens is titled `ISS-<n>: Upgrade dependencies`, and one without " \
+    "that prefix is refused by `dev agent merge-lane` and invisible to `dev issues reconcile`.\n" \
+    "  An agent session gets it from DEV_AGENT_ISSUE; pass --issue <n> to override or when running by hand.\n" \
+    "  Nothing tracking this run yet? File it first: dev issues create --category improvement \\\n" \
+    "    --status claimed --no-spawn --repo <repo> --title 'Upgrade dependencies' --body '...'",
+    example: usage_for(DEPS_UPGRADE_KEY),
+  )
 end
 
 # Scratch workdir for the DAY, under ~/code/ai so `dev aidirs prune` purges it
@@ -9885,7 +9936,7 @@ def dependencies_detect(app, clone, workdir, denylist)
 end
 
 def cmd_dependencies_check(argv)
-  apps = parse_dependencies_args(argv, "dependencies check")
+  apps = parse_dependencies_args(argv, DEPS_CHECK_KEY).apps
   denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
   workdir = dependencies_workdir
   puts "Working in #{workdir}"
@@ -9933,7 +9984,7 @@ end
 # One repo, end to end: clone, gate on an already-open dep-upgrade PR, branch
 # off freshly-fetched origin/main, detect, and hand allowed bumps to a Claude
 # session that must end with a review-ready PR. Mirrors codegen's run_repo.
-def dependencies_upgrade_one(app, workdir, branch, denylist, &announce)
+def dependencies_upgrade_one(app, workdir, branch, denylist, issue:, &announce)
   note = ->(msg) { announce&.call(msg) }
   clone_log = +""
   clone = clone_repo(github_origin(Dependencies::Updates::APPS.fetch(app)), app, workdir, false, clone_log)
@@ -9957,7 +10008,7 @@ def dependencies_upgrade_one(app, workdir, branch, denylist, &announce)
   end
 
   note.call("#{det[:bumps].length} bump(s) — handing to Claude (#{DEPS_CLAUDE_MODEL}, #{DEPS_CLAUDE_TIMEOUT_SECS / 60}m timeout)")
-  prompt = Dependencies::Updates.upgrade_prompt(app: app, branch: branch, bumps: det[:bumps])
+  prompt = Dependencies::Updates.upgrade_prompt(app: app, branch: branch, bumps: det[:bumps], issue: issue)
   spawn_claude(clone, prompt, model: DEPS_CLAUDE_MODEL, timeout_secs: DEPS_CLAUDE_TIMEOUT_SECS)
     .merge(held: det[:held], bumps: det[:bumps])
 rescue => e
@@ -9965,7 +10016,9 @@ rescue => e
 end
 
 def cmd_dependencies_upgrade(argv)
-  apps = parse_dependencies_args(argv, "dependencies upgrade")
+  args = parse_dependencies_args(argv, DEPS_UPGRADE_KEY)
+  apps = args.apps
+  issue = dependencies_issue!(args.issue)
   denylist = Dependencies::Updates.load_denylist(DEPS_DENYLIST_PATH)
   run_id = Time.now.strftime("%Y%m%d-%H%M%S")
   branch = "#{DEPS_BRANCH_PREFIX}-#{run_id}"
@@ -9977,7 +10030,7 @@ def cmd_dependencies_upgrade(argv)
   results = {}
   apps.each do |app|
     puts "  #{app}:"
-    r = dependencies_upgrade_one(app, workdir, branch, denylist) { |msg| puts "    #{msg}" }
+    r = dependencies_upgrade_one(app, workdir, branch, denylist, issue: issue) { |msg| puts "    #{msg}" }
     results[app] = r
     report_repo_line(app, r[:status], r[:error] || r[:note], false)
   end

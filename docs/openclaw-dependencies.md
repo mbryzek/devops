@@ -7,7 +7,10 @@
 > openclaw cron and the launchd plist are both gone — do not re-add either, or
 > the open-PR gate becomes the only thing standing between you and duplicate
 > runs. What follows describes the retired setup, kept for the flag values and
-> the briefing wiring.
+> the briefing wiring. Note that the bare `dev dependencies upgrade` in the cron
+> command below no longer runs: every PR the pipeline opens is titled
+> `ISS-<n>: Upgrade dependencies` (ISS-1104), and outside an agent session —
+> which is what a cron is — the number has to come from `--issue`.
 
 Two cron jobs on the openclaw gateway: one runs the pipeline overnight, one
 delivers the morning summary. Use EITHER this OR the launchd plist
