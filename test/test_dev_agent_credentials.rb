@@ -318,89 +318,28 @@ class TestDevAgentCredentials < Minitest::Test
     end
   end
 
-  # ---- the tuple layout (ISS-1023) ----
+  # ---- what this registry deliberately does NOT hold (ISS-1098) ----
   #
-  # A Court Reserve login is an email AND a password, so `api_keys/court-reserve`
-  # is a KEY=VALUE file and each credential reads its own name out of it. The
-  # tests below are about the two ways that shape fails rather than about the
-  # parser: half a login reported as a login, and a password containing `=`
-  # truncated on its way out of the file.
-  def test_a_key_vars_credential_reads_its_own_variable_out_of_the_shared_file
-    with_env_repo("api_keys/court-reserve" => "CR_EMAIL=bot@example.com\nCR_PASSWORD=pw\n") do
-      assert_equal [:present, "bot@example.com", :env_repo], C.probe(C.court_reserve("CR_EMAIL"), env: {})
-      assert_equal [:present, "pw", :env_repo], C.probe(C.court_reserve("CR_PASSWORD"), env: {})
-    end
-  end
-
-  # The failure two separate files would have produced, asserted as the state the
-  # session is actually told about: a half-provisioned login must not read as a
-  # login. `resolve` hands over only the half that exists, and `check` says the
-  # other half is absent — which is what makes the prompt print "cannot be closed
-  # out here" rather than a green light backed by an email and no password.
-  def test_half_a_login_reports_as_half_a_login
-    with_env_repo("api_keys/court-reserve" => "CR_EMAIL=bot@example.com\n") do
-      pair = [C.court_reserve("CR_EMAIL"), C.court_reserve("CR_PASSWORD")]
-      assert_equal({ "CR_EMAIL" => "bot@example.com" }, C.resolve(credentials: pair, env: NO_PROCESS_ENV))
-
-      email, password = C.check(credentials: pair, env: NO_PROCESS_ENV)
-      assert email.present?
-      assert password.absent?
-      assert_match(/not set in env\/api_keys\/court-reserve/, password.explanation)
-    end
-  end
-
-  # `split("=", 2)`, not `split("=")`. A password is an arbitrary string and a
-  # generated one routinely ends in `=`; truncating it produces a login_failed
-  # against the live site with nothing anywhere saying why.
-  def test_a_value_containing_an_equals_sign_survives
-    with_env_repo("api_keys/court-reserve" => "CR_PASSWORD=a=b==\n") do
-      assert_equal [:present, "a=b==", :env_repo], C.probe(C.court_reserve("CR_PASSWORD"), env: {})
-    end
-  end
-
-  def test_a_key_vars_file_without_the_variable_is_missing_rather_than_present
-    with_env_repo("api_keys/court-reserve" => "CR_EMAIL=bot@example.com\nCR_PASSWORD=\n") do
-      assert_equal [:missing, nil, nil], C.probe(C.court_reserve("CR_PASSWORD"), env: {})
-    end
-  end
-
-  def test_an_absent_key_vars_file_is_no_file_rather_than_missing
-    with_env_repo({}) do
-      assert_equal [:no_file, nil, nil], C.probe(C.court_reserve("CR_EMAIL"), env: {})
-    end
-  end
-
-  # api_keys/ is git-crypt'd like the rest of the env repo, and a session may not
-  # unlock it — so a locked file is a state to report, never one to fix.
-  def test_a_locked_key_vars_file_reports_locked_and_never_unlocks
-    with_env_repo("api_keys/court-reserve" => "\x00GITCRYPT\x00binary-goo") do
-      assert_equal [:locked, nil, nil], C.probe(C.court_reserve("CR_EMAIL"), env: {})
-    end
-  end
-
-  # The registry itself. Both halves must be handed to sessions, from api_keys/
-  # (what a TOOL authenticates with) rather than from an app's env file — the
-  # ISS-635 mistake — and from the SAME file, since two files can be half-written.
-  def test_the_court_reserve_login_is_registered_as_a_pair_from_one_api_keys_file
-    pair = C::CREDENTIALS.select { |c| %w[CR_EMAIL CR_PASSWORD].include?(c.name) }
-    assert_equal %w[CR_EMAIL CR_PASSWORD], pair.map(&:name),
-                 "a crawler session must be told about BOTH halves of the Court Reserve login"
-    assert_equal ["env/api_keys/court-reserve"], pair.map(&:source_label).uniq
-  end
-
-  # The whole reason the entries exist while the file does not: a session that
-  # changes crawler behaviour has to learn it cannot crawl BEFORE it plans, which
-  # is exactly what ISS-1012's session did not (it found out after the code
-  # existed, and shipped the change argued from production logs).
-  def test_an_unprovisioned_court_reserve_login_tells_the_session_it_cannot_verify
-    section = with_env_repo({}) do
-      Agent::Prompt.credentials_section(
-        C.check(credentials: [C.court_reserve("CR_EMAIL")], env: NO_PROCESS_ENV),
-      )
-    end
-    assert_match(/CR_EMAIL.*NOT available on this runner/, section)
-    assert_match(/cannot be closed out here/, section)
-    assert_match(/dev issues workaround/, section)
+  # devops#438 registered a Court Reserve login here and it was removed again,
+  # because the safe version of that credential does not exist: a CR admin login
+  # can issue credits and change schedules, CR has no read-only scope, and every
+  # credential `resolve` returns is handed to EVERY session on the runner rather
+  # than only to crawler ones (workers#202 / ISS-884, and the workers README
+  # section "Answering a question about Court Reserve's live behaviour").
+  #
+  # An assertion rather than a comment because the pressure to re-add it is
+  # standing and mechanical: `dev agent doctor` prints an ABSENT line for every
+  # registered-but-unprovisioned credential, which reads as a chore somebody
+  # ought to finish. The replacement is `npm run recon` handed to a
+  # credential-holder with `dev issues handoff`, which needs nothing here.
+  def test_no_court_reserve_login_is_registered_as_a_runner_credential
+    registered = C::CREDENTIALS.map(&:name)
+    assert_empty registered & %w[CR_EMAIL CR_PASSWORD],
+                 "a Court Reserve login must not be handed to every session on the runner — it is " \
+                 "write-capable and has no read-only scope. Use the workers recon harness and " \
+                 "`dev issues handoff` instead (ISS-884, ISS-1098)."
+    assert_empty C::CREDENTIALS.select { |c| c.source_label.include?("court-reserve") },
+                 "nothing may be sourced from env/api_keys/court-reserve"
   end
 
   def test_the_prompt_uses_each_credentials_own_usage_example
