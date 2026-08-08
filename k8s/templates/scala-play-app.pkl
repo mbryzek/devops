@@ -44,18 +44,30 @@ local javaAgent = read?("env:JAVA_AGENT") ?? ""
 
 // Distributed tracing, only meaningful when the agent is attached. Left unset,
 // the agent uses its own default (enabled), so an app that says nothing about
-// it renders exactly the JAVA_OPTS it rendered before this setting existed —
-// which is why platform's manifest is byte-identical across this change.
+// it renders exactly the JAVA_OPTS it rendered before this setting existed.
+// As of ISS-1112 every instrumented app sets it, so nothing currently takes
+// that branch; it stays because the next app to be instrumented gets the
+// agent's own default until someone has measured what tracing buys it.
 //
 // An app sets it to false when it has nothing to trace INTO. Distributed
 // tracing correlates one request across services; on a single standalone
 // service the spans it ships describe a call graph that never leaves the
 // process, and they are not cheap. Measured on account 7724695 over the 30 days
-// to 2026-08-08: TracingBytes was 30.7 GB of 76.5 GB ingested — 40% of the
+// to 2026-08-08: TracingBytes was 31.0 GB of 77.0 GB ingested — 40% of the
 // bill, against a 100 GB/month free-tier ceiling the account already sits at
-// ~82% of. Errors survive it untouched, which is the signal this exists for:
+// ~87% of. Errors survive it untouched, which is the signal this exists for:
 // TransactionError carries the class, message and stack trace, and cost
 // 0.005 GB across all of platform in the same window.
+//
+// "Nothing to trace INTO" is CHECKABLE, and the check is one query — run it
+// before setting this either way, rather than reasoning about the topology:
+//
+//     FROM Span SELECT count(*) FACET appName, parent.app SINCE 1 day ago
+//
+// A `parent.app` of null means the span began a trace that no other service
+// handed it. All-null means no trace in the account has ever crossed a service
+// boundary, which is what platform measured (ISS-1112) and what makes tracing
+// there pure cost.
 //
 // Expressed as a JVM system property rather than a NEW_RELIC_* variable in the
 // git-crypt'd env repo because it is not a secret — it is deployment config,
