@@ -603,7 +603,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_categories_match_the_spec_enum
-    assert_equal %w[graphs worker insights club_backfill suggestion feature bug improvement infrastructure], ISSUE_CATEGORIES
+    assert_equal %w[graphs worker insights club_backfill suggestion feature bug improvement product infrastructure], ISSUE_CATEGORIES
   end
 
   def test_graphs_body_orients_to_playbook_app
@@ -2732,8 +2732,10 @@ class TestDevIssues < Minitest::Test
 
   # The hand-filing list is a SUBSET of the full category list: `create` offers
   # only the categories that make sense to type, while `claim` covers them all.
+  # `product` is on it despite being producer-driven, because the product-owner
+  # review files its recommendations THROUGH `create` rather than server-side.
   def test_manual_categories_are_a_subset_of_all_categories
-    assert_equal %w[feature bug improvement], ISSUE_MANUAL_CATEGORIES
+    assert_equal %w[feature bug improvement product], ISSUE_MANUAL_CATEGORIES
     assert_empty(ISSUE_MANUAL_CATEGORIES - ISSUE_CATEGORIES)
   end
 
