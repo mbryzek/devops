@@ -13516,6 +13516,14 @@ def cmd_agent_runners(args)
       # timestamp here — two thresholds that disagree is worse than one.
       flags = [r["is_stale"] ? "OFFLINE" : nil, r["paused"] ? "PAUSED" : nil, r["retired_at"] ? "RETIRED" : nil].compact
       puts "  last seen #{r['last_heartbeat_at']}#{flags.empty? ? '' : "   #{flags.join('  ')}"}"
+      # `is_oversubscribed` is the server's answer too, and for the same reason (ISS-783): it is a
+      # SUSTAINED window, so it cannot be recovered from the single load figure printed beside it.
+      # A machine legitimately runs hot while a session compiles; only the platform, which has seen
+      # every heartbeat since the load went up, can tell that apart from a machine that is stuck.
+      if (load = r["load_average_1m"])
+        hot = r["is_oversubscribed"] ? "   OVERSUBSCRIBED since #{r['oversubscribed_since']}" : ""
+        puts "  load #{format('%.2f', load.to_f)}#{r['cpu_cores'] ? " (#{format('%.2f', load.to_f / r['cpu_cores'])} per core)" : ''}#{hot}"
+      end
     end
   end
 end

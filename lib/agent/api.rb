@@ -67,7 +67,8 @@ module Agent
     # machine did not, which is exactly why the error channel had to be moved off it first.
     #
     # `maintenance` is Agent::Maintenance.report (ISS-528): last_maintenance_at,
-    # maintenance_reclaimed_bytes, disk_free_bytes, disk_total_bytes. Same noun for the same reason
+    # maintenance_reclaimed_bytes, disk_free_bytes, disk_total_bytes, and this machine's CPU
+    # headroom — load_average_1m and load_average_15m (ISS-783). Same noun for the same reason
     # as `errors`, and it started on the since-deleted registry report for the same wrong one. Merged rather than
     # nested so each is a column the staleness invariant can query directly, and OMITTED when
     # unknown — a machine that has never pruned has no last_maintenance_at, and that absence is

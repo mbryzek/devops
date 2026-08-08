@@ -40,7 +40,7 @@ require 'agent/shell'
 #
 # LIVENESS IS REPORTED, NOT INFERRED. Every run stamps a marker file, and the
 # tick's RUNNER HEARTBEAT carries `last_maintenance_at` plus this machine's disk
-# headroom (ISS-528 — on the machine's own heartbeat rather than its registry
+# and CPU headroom (ISS-528/ISS-783 — on the machine's own heartbeat rather than its registry
 # report, because the subject is the machine and the reported registry goes away
 # with server-side scheduling). An error channel can only ever report a run that
 # BROKE; it cannot report one that NEVER HAPPENED (a crashed tick, an unloaded
@@ -384,22 +384,53 @@ module Agent
       )
     end
 
-    # What the tick sends with its runner heartbeat. Disk is re-read here rather
-    # than taken from the marker: headroom is a fact about the machine RIGHT NOW,
-    # and a report that quoted yesterday's number would be at its least accurate
-    # exactly while the disk was filling.
+    # What the tick sends with its runner heartbeat. Disk and load are re-read
+    # here rather than taken from the marker: headroom is a fact about the
+    # machine RIGHT NOW, and a report that quoted yesterday's number would be at
+    # its least accurate exactly while the disk was filling.
     #
     # Keys are omitted rather than sent as null when unknown — a machine that has
     # never run maintenance has no last_maintenance_at, and that absence is the
     # signal the staleness invariant reads.
+    #
+    # CPU HEADROOM (ISS-783), for the same reason disk headroom is here and one
+    # the process reaper directly above cannot cover. `run_processes` reclaims
+    # the leaks IT can prove are leaks; a machine oversubscribed for any other
+    # reason — genuine over-concurrency, a wedged sbt, a human's runaway build —
+    # is left exactly as slow as it was, with nothing off the machine saying so.
+    # ISS-782 was found by a session on an unrelated issue wondering why the box
+    # felt wrong, which is not a monitoring strategy.
+    #
+    # BOTH ENDS OF THE LOAD AVERAGE, deliberately, because they answer different
+    # questions and only one of them can be sampled honestly from here:
+    #
+    #   1m   what an operator means by "right now". The counterpart of
+    #        disk_free_bytes, and what the fleet board shows.
+    #   15m  what the SERVER's sustained-oversubscription check reads. The
+    #        heartbeat floor is ten minutes (Agent::Tick::RUNNER_HEARTBEAT_
+    #        SECONDS), so a 1m figure sampled on it describes one minute in every
+    #        ten and aliases badly — a machine pinned for nine minutes out of
+    #        every ten can report quiet forever, and one that happens to be
+    #        compiling at each sample reports catastrophe. A 15m average already
+    #        summarises the whole gap between two heartbeats, so consecutive
+    #        samples tile the timeline instead of poking holes in it.
+    #
+    # NO cpu_count. `Agent::Processes.cpu_count` and the `cpu_cores` the platform
+    # already stores are the same `sysctl -n hw.ncpu`, sent at registration and
+    # non-null on every row, so the server divides by the count it already has.
+    # A second copy arriving on every heartbeat could only ever agree with the
+    # first or be a bug.
     def report(now: Time.now)
       record = state
       free, total = disk
+      load = Agent::Processes.load_average
       {
         last_maintenance_at: last_run_at(record)&.utc&.iso8601,
         maintenance_reclaimed_bytes: record && record["reclaimed_bytes"],
         disk_free_bytes: free,
         disk_total_bytes: total,
+        load_average_1m: load&.first,
+        load_average_15m: load&.last,
       }.compact
     end
   end
