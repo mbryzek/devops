@@ -42,8 +42,10 @@ Follow `~/code/CLAUDE.md`. The parts that bite most often:
 - Write tests. Read the existing tests in each repo first to match their shape.
 - A shared contract change (apibuilder spec, lib, DB column, config key) is a
   CROSS-REPO change: find and update every consumer on the same branch.
-- When done: commit, push, open a DRAFT PR, then mark it ready. Rebase onto the
-  latest `origin/main` and rerun codegen before the branch is final.
+- When done: commit, push, open a DRAFT PR, then mark it ready. Bring the latest
+  `origin/main` under the branch (`git merge origin/main` — never a rebase, which
+  could only reach the PR through a force-push) and rerun codegen before the
+  branch is final.
 - Report the GitHub PR URL and the working directory. NEVER report a Reviewable
   URL — Mike navigates there from GitHub himself.
 

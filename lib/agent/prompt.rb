@@ -89,7 +89,8 @@ module Agent
       lines << ""
       if resume_repo
         lines << "**This is a RESUME, not a fresh attempt.** `#{resume_repo}` is already cloned in your"
-        lines << "workspace, checked out on `#{slug}` and rebased onto `origin/main`. An open PR exists"
+        lines << "workspace, checked out on `#{slug}` with the latest `origin/main` MERGED in (§6 — never"
+        lines << "rebased, so your push is an ordinary one and needs no force). An open PR exists"
         lines << "on that branch. Do NOT open a second PR and do NOT create a new branch: read the"
         lines << "comments below for what is being asked, address it, rerun codegen, push, and the PR"
         lines << "updates in place. Close the issue out with `dev issues status` as usual. That bars"
@@ -142,7 +143,8 @@ module Agent
        "derived from this issue, so a retry lands here by design. Before you write anything, run",
        "`gh pr list --head #{slug} --state all` in each of those checkouts and act on what you find:",
        "an OPEN PR is yours to update in place (never open a second one — see §6); a MERGED one means",
-       "rebase onto latest `origin/main` and the old commits fall away; a CLOSED-unmerged one is work a",
+       "the work already landed, so merge latest `origin/main` in (§6, never rebase) and the old diff is",
+       "already there; a CLOSED-unmerged one is work a",
        "human rejected, so read the review before building on it; no PR at all is an attempt that died",
        "mid-flight, and continuing it is usually right. Say in your PR description which of these it was.",
        "Record any additional PR with `dev issues fix #{issue['number']} --url ...`."]

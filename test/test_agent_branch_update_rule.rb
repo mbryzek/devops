@@ -1,8 +1,12 @@
 #!/usr/bin/env ruby
 require 'minitest/autorun'
+require 'fileutils'
+require 'tmpdir'
 require_relative 'test_helper'
 require 'agent/paths'
 require 'agent/merge_lane'
+require 'agent/workspace'
+require 'agent/prompt'
 
 # Moving a pull request branch (ISS-769), and the pair that has to move together.
 #
@@ -142,5 +146,121 @@ class TestAgentBranchUpdateRule < Minitest::Test
     refute_includes joined, "push", "a session pushing a PR branch is the act §3 forbids"
     refute_includes joined, "--force"
     refute_includes joined, "git", "there is no local clone in this act, which is why it cannot rewrite"
+  end
+
+  # ---- the session's OWN branch (ISS-771) -----------------------------------
+  #
+  # The other branch the same contradiction lives on, and the one every session
+  # hits rather than only the merge loop. CLAUDE.md's when-work-is-done step 4
+  # says to rebase onto latest `origin/main` and force-push before merge; §3
+  # forbids the force-push flat and outranks it. So the pre-merge update — which
+  # exists for a real reason (platform #617 regenerated against a pre-#615
+  # snapshot) — was work every session was told to do and forbidden to finish,
+  # and both ways out of that were invisible in the artifact.
+  #
+  # The resolution is the same shape as ISS-769's: not a softer rule, a narrower
+  # act. Merging `origin/main` in reaches the identical tree, and squash-merge
+  # discards the merge commit and the linear history a rebase would have made
+  # alike — so nothing step 4 is for is lost, and the push is an ordinary one.
+  #
+  # Same three-way agreement, so the same file guards it: the RULE in §3, the
+  # PROCEDURE in §6, and the ACT in `Agent::Workspace.resume`, which prepares the
+  # checkout a resumed session opens into. That last one is why this cannot be a
+  # prose test alone — the executor rebased the branch before handing it over,
+  # which left `origin/<branch>` unreachable by any push §3 permits, for review
+  # feedback as much as for drift.
+
+  def resuming_section
+    text = instructions[/^## 6\. Resuming.*?^## 7\./m]
+    refute_nil text, "instructions.md no longer has a §6 / §7 to place the pre-merge procedure between"
+    text
+  end
+
+  def test_the_rule_reaches_the_branch_the_session_was_assigned
+    assert_section_says(/includes the branch you were assigned/i,
+                        "§3 no longer says the force-push prohibition covers your OWN branch. Scoping it to " \
+                        "other people's branches is ISS-771 option (a), which was rejected: 'mine' is a " \
+                        "judgment, and §4 says a retry's checkout can carry commits you did not write")
+    assert_section_says(/force-with-lease/,
+                        "§3 has to close --force-with-lease by name — it is the flag a session reaches for " \
+                        "once it decides the branch is its own, and it does not help here")
+  end
+
+  # §6 has to name the act, not merely forbid the other one: a session that is
+  # told what it may not do and not what it may do improvises, which is exactly
+  # how this file came to describe unperformable work.
+  def test_the_pre_merge_update_is_a_merge_and_is_spelled_out
+    assert_match(/git merge origin\/main/, resuming_section,
+                 "§6 no longer spells out the pre-merge update. The command is the artifact — it is what " \
+                 "makes the difference from a rebase concrete rather than a preference (ISS-771)")
+    refute_match(%r{git push[^\n]*--force}, resuming_section,
+                 "§6 asks for a force-push. That contradiction with §3 IS ISS-771 — §6 may NAME the flag " \
+                 "to close it off, but no push it prescribes may carry one")
+    refute_match(%r{rebase (onto|origin/main)}, resuming_section,
+                 "§6 tells a session to rebase its branch, which it can then only push with a force " \
+                 "(ISS-771). Say what to do instead, do not merely forbid it")
+  end
+
+  # The whole point is that §3, §6 and CLAUDE.md step 4 end up saying the same
+  # thing, which is what ISS-765 and ISS-769 were both about. §6 is where the
+  # disagreement with CLAUDE.md is declared, so it has to be declared.
+  def test_section_6_says_it_overrides_claude_md_rather_than_silently_differing
+    assert_match(/CLAUDE\.md/, resuming_section,
+                 "§6 changes what CLAUDE.md step 4 tells a session to do, so it has to say so. An " \
+                 "undeclared difference is the state ISS-771 was filed about")
+  end
+
+  # ---- the act the executor performs on that branch -------------------------
+
+  # THE load-bearing assertion of the ISS-771 half. A rebase here rewrites every
+  # commit on the branch, so the checkout a resumed session opens into has
+  # diverged from `origin/<branch>` and its ONLY route back to the PR is a
+  # force-push — for a one-line review fix as much as for drift. The prose in §6
+  # is true only while this stays a merge.
+  def test_the_resumed_checkout_is_merged_not_rebased
+    calls = resume_calls
+    assert_includes calls, "git merge --no-edit origin/main",
+                    "the executor must MERGE main under a resumed branch. A rebase leaves the session " \
+                    "unable to push at all without the force-push §3 forbids (ISS-771)"
+    refute(calls.any? { |c| c.include?("rebase") },
+           "a rebase of the resumed branch is the act that made §6 unperformable: #{calls.inspect}")
+    refute(calls.any? { |c| c.include?("--force") || c.include?("push") },
+           "the executor never pushes a session's branch: #{calls.inspect}")
+  end
+
+  # The session is told what state its checkout is in, and a wrong answer here is
+  # worse than none: "rebased onto origin/main" is precisely what would send it
+  # looking for a force-push.
+  def test_the_resume_prompt_does_not_tell_the_session_its_branch_was_rebased
+    text = Agent::Prompt.assignment(issue: { "number" => 771, "title" => "t", "category" => "improvement" },
+                                    slug: "i771", workspace: "/ws/i771", resume_repo: "mbryzek/devops")
+    assert_match(/MERGED in/, text,
+                 "the resume block must say the branch was merged, so the session knows an ordinary push " \
+                 "reaches the PR")
+    refute_match(/rebased onto/, text,
+                 "the resume block claimed the branch was rebased, which is both false now and the reason " \
+                 "a session would reach for a force-push (ISS-771)")
+  end
+
+  # Every git/gh call `resume` makes, with the network and the filesystem stubbed
+  # out. Mirrors `test_agent_workspace_repos.rb`, which asserts the sibling path's
+  # command sequence for the same reason: the sequence IS the behaviour here.
+  def resume_calls
+    seen = []
+    tmp = Dir.mktmpdir("i771")
+    Agent::Workspace.singleton_class.send(:alias_method, :run_without_stub, :run)
+    Agent::Workspace.singleton_class.send(:alias_method, :create_without_stub, :create)
+    Agent::Workspace.define_singleton_method(:run) { |cmd, chdir:| seen << cmd.join(" ") && true }
+    Agent::Workspace.define_singleton_method(:create) do |slug|
+      File.join(tmp, slug).tap { |d| FileUtils.mkdir_p(d) }
+    end
+    stub_singleton(Agent::Github, :search_open_pr, ->(_branch) { { "repository" => "mbryzek/devops" } }) do
+      Agent::Workspace.resume("i771")
+    end
+    seen
+  ensure
+    Agent::Workspace.singleton_class.send(:alias_method, :run, :run_without_stub)
+    Agent::Workspace.singleton_class.send(:alias_method, :create, :create_without_stub)
+    FileUtils.remove_entry(tmp) if tmp && File.directory?(tmp)
   end
 end

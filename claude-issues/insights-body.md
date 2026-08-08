@@ -64,5 +64,5 @@ generated, so this routes to the insight-generation improvement session.
    build plus `./review.sh`. Any API Builder spec change needs explicit approval on the exact
    JSON before you implement it.
 5. Commit, push, open a DRAFT PR (`gh pr create --draft`), then mark it ready
-   (`gh pr ready`), then rebase onto latest origin/main + rerun codegen per the standard
+   (`gh pr ready`), then bring latest origin/main under the branch (merge, never rebase — §6) + rerun codegen per the standard
    done-workflow.

@@ -141,8 +141,18 @@ module Agent
     end
 
     # Resume a prior attempt's branch (design §4.4.1): find the repo whose open
-    # PR is on this branch, clone it, check the branch out, and rebase onto
-    # origin/main so the session starts from the same state a human would.
+    # PR is on this branch, clone it, check the branch out, and bring the latest
+    # origin/main under it so the session starts green against what has shipped.
+    #
+    # MERGE, not rebase (ISS-771). A rebase rewrites every commit on the branch,
+    # so the checkout the session opens into has diverged from `origin/<branch>`
+    # and its only way to reach the PR at all — even for a one-line review fix
+    # that has nothing to do with the drift — is a force-push, which
+    # `agent/instructions.md` §3 forbids flat. This path was therefore handing
+    # every resumed session a branch it could not push, and §6's "push to the
+    # existing branch and the PR updates in place" was not achievable. A merge
+    # leaves an ordinary fast-forwardable push and the identical tree; these
+    # repos squash-merge, so the merge commit never reaches main.
     #
     # The branch IS the slug — one executor-assigned name, used for both — so
     # this takes one argument rather than two copies of the same string.
@@ -167,9 +177,12 @@ module Agent
       return nil unless run(["gh", "repo", "clone", repo, checkout], chdir: dir)
       return nil unless run(["git", "fetch", "origin"], chdir: checkout)
       return nil unless run(["git", "checkout", branch], chdir: checkout)
-      # A rebase conflict is normal work, not an executor failure: leave the
-      # branch as-is and let the session resolve it — it has the context.
-      run(["git", "rebase", "origin/main"], chdir: checkout)
+      # A merge conflict is normal work, not an executor failure: leave the
+      # conflicted tree in place and let the session resolve it — it has the
+      # context, the branch is its own, and unlike a half-finished rebase this
+      # is a state a session can read with `git status` and finish with a commit.
+      # `--no-edit` because nothing here can answer an editor.
+      run(["git", "merge", "--no-edit", "origin/main"], chdir: checkout)
       repo
     end
 
