@@ -65,6 +65,13 @@ module Agent
     # immediately, which is what gives a freshly provisioned runner its answer on
     # the first tick instead of a day later.
     def toolchain_file = File.join(state_dir, "agent-toolchain.json")
+    # The last `max_concurrency` the platform told this machine about (ISS-753),
+    # cached so that `Agent::Heap` can size the sbt heap without a network call
+    # on the path to every build. A cache and never an authority: the tick
+    # overwrites it from the registry row on every work phase, and an absent or
+    # unreadable file means "unknown", which Agent::Heap answers with its floor
+    # rather than with a guess.
+    def runner_file    = File.join(state_dir, "agent-runner.json")
     def work_lock      = File.join(state_dir, "agent-tick.lock")
     def vitals_lock    = File.join(state_dir, "agent-vitals.lock")
     # agent-errors.json's own lock, held across Agent::Errors' read-modify-write

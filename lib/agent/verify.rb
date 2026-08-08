@@ -4,6 +4,7 @@ require 'shellwords'
 require 'socket'
 require 'time'
 require 'agent/ci'
+require 'agent/heap'
 require 'agent/merge_lane'
 require 'agent/paths'
 require 'agent/shell'
@@ -755,6 +756,14 @@ module Agent
     # running `dev ci verify` by hand — which is how a repo's first build is
     # confirmed — gets the same isolated database the fleet does, instead of the
     # ~/code/ai fallback or a hard failure.
+    #
+    # `SBT_OPTS` is the same idea for the heap (ISS-753): the build script says
+    # `sbt test` and never a number, so the ceiling is this machine's own — a
+    # share of RAM sized against how many slots it runs — rather than a constant
+    # that was wrong on both fleet machines. Unlike a session, a build script is
+    # spawned directly and NOT through a login shell, so this value is the one
+    # that reaches sbt: it beats the inherited `~/.zprofile` value the tick
+    # itself was started with.
     def build_env(repo:, sha:, pr:, event:, clean:, now: Time.now)
       {
         "CI" => "true",
@@ -764,6 +773,7 @@ module Agent
         "CI_EVENT" => event.to_s,
         "CI_CLEAN_BUILD" => clean.to_s,
         "CLAUDE_SESSION_ID" => session_id(repo, sha, now: now),
+        "SBT_OPTS" => Agent::Heap.sbt_opts,
         "PATH" => "#{File.join(Agent::Paths.devops_repo, 'bin')}:#{ENV.fetch('PATH', '')}",
       }
     end

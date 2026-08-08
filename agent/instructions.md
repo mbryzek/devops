@@ -526,10 +526,28 @@ you write anything, and never force-push to make the branch look fresh.
   plainly in the PR which part is unverified, and file it with `dev issues
   workaround`. Either way a credential is never yours to print, echo, commit, or
   paste into a PR, an issue comment, a plan or a test fixture.
-- `sbt` on platform needs a large heap (`-Xmx12G`); platform has no sbt CI and
-  `main` can be red, so before blaming your change on a failure, confirm it also
-  fails on an unmodified `origin/main` (use `git worktree add`, never
-  stash/checkout).
+- **The sbt heap is THIS MACHINE'S, and you interpolate it — never a number you
+  chose.** `dev agent sbt-opts` prints it, derived from this box's RAM and how
+  many sessions it runs at once (ISS-753). Assign it in the SAME shell
+  invocation as sbt, exactly as you do `CONF_DB_DEV_URL`:
+
+      SBT_OPTS="$(dev agent sbt-opts)" sbt Test/compile
+
+  This is not belt-and-braces over an environment variable that is already set
+  for you. `SBT_OPTS` IS set in your environment, and your Bash tool runs a
+  LOGIN shell, so a `~/.zprofile` that exports its own `SBT_OPTS` overwrites it
+  before every command you run. On the 24G runner that profile value is
+  `-Xms40G -Xmx40G` — a 40G heap, COMMITTED at JVM start, on a 24G machine
+  running three sessions.
+
+  `sbt -J-Xmx8G` does not fix it either, and this is the part that surprises:
+  sbt's launcher builds `java $JAVA_OPTS $SBT_OPTS ... -jar sbt-launch.jar` and
+  folds `-J` args into the JAVA_OPTS half, so `SBT_OPTS` wins. A session was
+  caught running `java ... -Xmx12G ... -Xms40G -Xmx40G` for exactly this reason.
+  `dev agent doctor` says so out loud when the profile is fighting you.
+- platform has no sbt CI and `main` can be red, so before blaming your change on
+  a failure, confirm it also fails on an unmodified `origin/main` (use
+  `git worktree add`, never stash/checkout).
 - Run `./review.sh` for Elm repos and prettier for frontend repos before
   committing.
 
