@@ -27,6 +27,24 @@ class TestAgentDependencyWake < Minitest::Test
   DEFER = Agent::Dependency::DEFER_MARKER
   URL = "https://github.com/mbryzek/platform/pull/2190".freeze
 
+  # A deferral comment as the PLATFORM actually writes it, not as this file used
+  # to abbreviate it. `Agent::Tick#defer_for_dependency` hands its text to
+  # `Agent::Api.snooze`, and the server puts `IssuesService.snoozeComment`'s
+  # sentence in front of it before anything reaches a timeline — so a bare
+  # DEFER_MARKER body is a shape that has never existed in production.
+  #
+  # The fidelity matters now rather than being tidiness: `dependency_deferred?`
+  # reads the snooze sentence to tell WHICH snooze an issue is under (ISS-975),
+  # so a fixture missing it exercises a case the sweep never sees.
+  DEFER_COMMENT = "Snoozed until Aug 9, 2026 at 1:36 AM EDT. #{DEFER} — not dispatched, " \
+                  "deferred 1 day (attempt 1 of 7).".freeze
+
+  # What a human parking an issue leaves behind: the same server sentence, with
+  # a note that has nothing to do with a dependency.
+  def human_snooze(note)
+    "Snoozed until Aug 14, 2026 at 10:23 PM EDT. #{note}"
+  end
+
   def snoozed_row(number, until_at: "2026-08-09T01:36:36.000Z")
     { "number" => number.to_s, "status" => "open", "snoozed_until" => until_at }
   end
@@ -88,7 +106,7 @@ class TestAgentDependencyWake < Minitest::Test
 
   def test_a_deferral_whose_fix_has_merged_is_woken
     result, writes = sweep(rows: [snoozed_row(858)],
-                           timelines: { "858" => ["Snoozed until tomorrow. #{DEFER} — attempt 1 of 7."] },
+                           timelines: { "858" => [DEFER_COMMENT] },
                            issues: { "858" => blocked_issue(858) })
     assert_equal %w[858], result.woken
     assert_equal [:wake, "858"], writes.first
@@ -99,7 +117,7 @@ class TestAgentDependencyWake < Minitest::Test
   # still leaves the issue correctly back in the queue.
   def test_the_wake_precedes_the_note
     _, writes = sweep(rows: [snoozed_row(858)],
-                      timelines: { "858" => [DEFER] },
+                      timelines: { "858" => [DEFER_COMMENT] },
                       issues: { "858" => blocked_issue(858) })
     assert_equal %i[wake comment], writes.map(&:first)
   end
@@ -110,7 +128,7 @@ class TestAgentDependencyWake < Minitest::Test
   # attempt — the exact inflation ISS-922 says a merge-driven wake must not cause.
   def test_the_wake_note_resets_the_attempt_count_rather_than_adding_to_it
     _, writes = sweep(rows: [snoozed_row(858)],
-                      timelines: { "858" => [DEFER] },
+                      timelines: { "858" => [DEFER_COMMENT] },
                       issues: { "858" => blocked_issue(858) })
     note = writes.last[2]
     refute_includes note, DEFER, "the wake note must not read as another deferral"
@@ -130,9 +148,62 @@ class TestAgentDependencyWake < Minitest::Test
     assert_empty result.woken
   end
 
+  # ISS-975, and the reason this sweep is asked about the CURRENT snooze rather
+  # than the whole timeline. ISS-892 was deferred on an unmerged platform#2201,
+  # that PR merged, and from then on every snooze anybody put the issue under was
+  # lifted within minutes as though this sweep had set it — Mike's, then the
+  # seven-day one the session working it set because the issue's own body told it
+  # to, 14 seconds after it was written. Four claims in two hours, each re-running
+  # an identical read-out against identical data.
+  #
+  # The old `comments.any?` reading passes every other test in this file and
+  # fails this one, because it is the only fixture where a deferral and a later
+  # unrelated snooze sit on the SAME timeline.
+  def test_a_later_snooze_is_not_this_sweeps_to_lift_however_the_issue_was_deferred_before
+    result, writes = sweep(
+      rows: [snoozed_row(892)],
+      timelines: { "892" => [DEFER_COMMENT,
+                             "Snooze cleared; back in the queue.",
+                             human_snooze("## No verdict — the pilot is 45 minutes old.")] },
+      issues: { "892" => blocked_issue(892) },
+    )
+    assert_empty writes, "a snooze this sweep did not set must not be lifted"
+    assert_equal %w[892], result.skipped
+    assert_empty result.woken
+  end
+
+  # The other side of the same tense, so the fix cannot be "never wake anything":
+  # an issue deferred, woken, and deferred AGAIN is under a deferral now, and the
+  # older comments do not stop it being lifted.
+  def test_a_reinstated_deferral_is_still_woken
+    result, writes = sweep(
+      rows: [snoozed_row(858)],
+      timelines: { "858" => [DEFER_COMMENT,
+                             "Snooze cleared; back in the queue.",
+                             human_snooze("Parking this until the migration lands."),
+                             "Snooze cleared; back in the queue.",
+                             DEFER_COMMENT] },
+      issues: { "858" => blocked_issue(858) },
+    )
+    assert_equal %w[858], result.woken
+    assert_equal [:wake, "858"], writes.first
+  end
+
+  # A snooze with nothing on the timeline explaining it — the server always
+  # writes the sentence, so this is a shape that means something has changed
+  # underneath. It reads as "not mine", which leaves the issue to the daily
+  # expiry that predates this sweep entirely.
+  def test_a_snooze_with_no_comment_explaining_it_is_left_alone
+    result, writes = sweep(rows: [snoozed_row(858)],
+                           timelines: { "858" => [DEFER] },
+                           issues: { "858" => blocked_issue(858) })
+    assert_empty writes
+    assert_equal %w[858], result.skipped
+  end
+
   def test_a_deferral_whose_fix_is_still_open_is_left_alone
     result, writes = sweep(rows: [snoozed_row(859)],
-                           timelines: { "859" => [DEFER] },
+                           timelines: { "859" => [DEFER_COMMENT] },
                            issues: { "859" => blocked_issue(859) },
                            merged: [])
     assert_empty writes
@@ -144,7 +215,7 @@ class TestAgentDependencyWake < Minitest::Test
   # once, and the claims behind them would re-defer each one seconds later.
   def test_an_unreadable_github_leaves_every_deferral_in_place
     result, writes = sweep(rows: [snoozed_row(858), snoozed_row(859)],
-                           timelines: { "858" => [DEFER], "859" => [DEFER] },
+                           timelines: { "858" => [DEFER_COMMENT], "859" => [DEFER_COMMENT] },
                            issues: { "858" => blocked_issue(858), "859" => blocked_issue(859) },
                            github_readable: false)
     assert_empty writes
@@ -155,14 +226,14 @@ class TestAgentDependencyWake < Minitest::Test
   # human. The wake itself is idempotent server-side; the note beside it is not.
   def test_an_issue_that_is_no_longer_snoozed_is_not_commented_on_again
     _, writes = sweep(rows: [snoozed_row(858)],
-                      timelines: { "858" => [DEFER] },
+                      timelines: { "858" => [DEFER_COMMENT] },
                       issues: { "858" => blocked_issue(858).merge("snoozed_until" => nil) })
     assert_empty writes
   end
 
   def test_nothing_is_written_on_a_dry_run
     result, writes = sweep(rows: [snoozed_row(858)],
-                           timelines: { "858" => [DEFER] },
+                           timelines: { "858" => [DEFER_COMMENT] },
                            issues: { "858" => blocked_issue(858) },
                            dry_run: true)
     assert_empty writes
@@ -173,7 +244,7 @@ class TestAgentDependencyWake < Minitest::Test
   # timeline alone — `cleared?` needs the blockers, and an issue with none reads
   # as vacuously cleared.
   def test_an_unreadable_issue_is_left_alone
-    result, writes = sweep(rows: [snoozed_row(858)], timelines: { "858" => [DEFER] }, issue_error: true)
+    result, writes = sweep(rows: [snoozed_row(858)], timelines: { "858" => [DEFER_COMMENT] }, issue_error: true)
     assert_empty writes
     assert_empty result.woken
   end
@@ -194,7 +265,7 @@ class TestAgentDependencyWake < Minitest::Test
   # as a success — and the next pass five minutes later retries it anyway.
   def test_a_refused_wake_is_reported_rather_than_counted_as_woken
     result, = sweep(rows: [snoozed_row(858), snoozed_row(859)],
-                    timelines: { "858" => [DEFER], "859" => [DEFER] },
+                    timelines: { "858" => [DEFER_COMMENT], "859" => [DEFER_COMMENT] },
                     issues: { "858" => blocked_issue(858), "859" => blocked_issue(859) },
                     wake_error: true)
     assert_empty result.woken
@@ -206,7 +277,7 @@ class TestAgentDependencyWake < Minitest::Test
   # genuinely back in the queue.
   def test_a_wake_whose_note_failed_is_still_a_wake
     result, writes = sweep(rows: [snoozed_row(858)],
-                           timelines: { "858" => [DEFER] },
+                           timelines: { "858" => [DEFER_COMMENT] },
                            issues: { "858" => blocked_issue(858) },
                            comment_error: true)
     assert_equal %w[858], result.woken

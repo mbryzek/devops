@@ -140,19 +140,62 @@ module Agent
       result
     end
 
-    # Has the dispatcher deferred this issue on a dependency? The marker on the
-    # timeline is the record — see Agent::Dependency::DEFER_MARKER for why the
-    # count lives in a comment and not in a field.
+    # Is the snooze this issue is under RIGHT NOW one the dispatcher set on a
+    # dependency? The marker on the timeline is the record — see
+    # Agent::Dependency::DEFER_MARKER for why the count lives in a comment and
+    # not in a field.
     #
-    # A timeline that cannot be read answers false: not knowing why an issue is
-    # snoozed is the case where leaving it snoozed is obviously right.
+    # THE TENSE IS THE WHOLE QUESTION, and getting it wrong is ISS-975. This used
+    # to ask whether the issue had EVER been deferred — `comments.any?` over the
+    # entire timeline. But DEFER_MARKER is written once and never removed, so
+    # that reading is permanent: an issue deferred a single time, whose blocker
+    # then merged, matched forever. Every LATER snooze on it — one a human set,
+    # one a session set because its own instructions told it to — was lifted
+    # within five minutes as though this sweep had set it.
+    #
+    # ISS-892 is the measured case. The dispatcher deferred it on an unmerged
+    # platform#2201; the PR merged; Mike then snoozed it until Aug 11 and the
+    # sweep lifted that, and the session which picked it up snoozed it seven days
+    # and the sweep lifted THAT 14 seconds later. Four claims in two hours, each
+    # re-running an identical read-out against identical data, on an issue that
+    # is waiting on ten days of pilot volume and had no snooze available to it
+    # that would survive.
+    #
+    # So the question is asked of ONE comment: the last one that established a
+    # snooze (Agent::Dependency::PLATFORM_SNOOZE_MARKER — every snooze path in
+    # the system writes it). If that comment carries DEFER_MARKER the snooze is
+    # this sweep's to lift; if something else put the issue to sleep more
+    # recently, it is not, whatever happened earlier on the timeline.
+    #
+    # Both unknowns answer false, which is the same fail-safe the module argues
+    # everywhere else: a timeline that cannot be read, and a snooze with no
+    # comment to explain it, are both cases where leaving the issue alone is
+    # obviously right — the daily expiry brings it back regardless.
     def dependency_deferred?(number, use_localhost:)
       comments = begin
         Agent::Api.issue_comments(number, use_localhost: use_localhost)
       rescue StandardError
         []
       end
-      comments.any? { |c| c["body"].to_s.include?(Agent::Dependency::DEFER_MARKER) }
+      current = current_snooze_comment(comments)
+      return false if current.nil?
+
+      current.include?(Agent::Dependency::DEFER_MARKER)
+    end
+
+    # The body of the comment that established the snooze the issue is under now,
+    # or nil if nothing on the timeline claims to have snoozed it.
+    #
+    # LAST wins, and the timeline arrives oldest-first (`GET /issues/:n/comments`
+    # is ordered by creation, and `dev issues show` renders it in that order), so
+    # this is a reverse scan rather than a sort — there is no timestamp on the
+    # comment shape to sort by.
+    def current_snooze_comment(comments)
+      comments.reverse_each do |c|
+        body = c["body"].to_s
+        return body if body.include?(Agent::Dependency::PLATFORM_SNOOZE_MARKER)
+      end
+      nil
     end
 
     def read_issue(number, use_localhost:)
