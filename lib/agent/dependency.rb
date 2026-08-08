@@ -43,6 +43,35 @@ module Agent
 
     FIX_PR_URL = %r{\Ahttps://github\.com/[^/]+/[^/]+/pull/\d+}
 
+    # How a deferral this module caused is recognised on a timeline, which is
+    # where its attempt count is kept. Deliberately a marker in the comment
+    # rather than a field: the tracker has nowhere to store a per-issue dispatch
+    # counter, and a comment is what a human reads anyway.
+    #
+    # It lives HERE rather than on Agent::Tick — where it was written and where
+    # `DEPENDENCY_DEFER_MARKER` still spells it — because there are two readers
+    # now, and they are in different files. The tick writes it when it defers;
+    # Agent::DependencyWake reads it to tell a dependency deferral apart from a
+    # snooze a human set for some unrelated reason. Same precedent, and same
+    # reason, as ERROR_ESCALATE_AT living on Agent::Escalation: one string, two
+    # ways to spell it.
+    DEFER_MARKER = "Blocked on a dependency that has not merged".freeze
+
+    # What Agent::DependencyWake writes when it lifts a deferral early, and what
+    # the platform itself writes on ANY wake — a `dev issues snooze --wake`, the
+    # "Wake now" button in playbook-admin, or the DELETE the sweep issues.
+    #
+    # Both count, because `defer_attempts` below is asking "has this issue been
+    # blocked CONTINUOUSLY", and a wake of either kind ends the run. Recognising
+    # the platform's string couples this to a sentence the server owns
+    # (IssuesService.WakeComment), and the coupling fails SAFE: if that text ever
+    # changes, an old run stops being reset and the issue reaches the
+    # seven-attempt escalation sooner — which puts it in front of a human, not
+    # past one.
+    WAKE_MARKER = "Dependency cleared — this issue is no longer waiting on unmerged code".freeze
+    PLATFORM_WAKE_MARKER = "Snooze cleared; back in the queue".freeze
+    WAKE_MARKERS = [WAKE_MARKER, PLATFORM_WAKE_MARKER].freeze
+
     module_function
 
     # The issues this one is waiting on, as the server returns them: one entry per
@@ -118,6 +147,92 @@ module Agent
     # doc, a plan) contributes nothing: there is no merge to wait for.
     def fix_pr_urls(issue)
       Array(issue["fixes"]).filter_map { |fix| fix["url"] if fix["url"].to_s.match?(FIX_PR_URL) }
+    end
+
+    # ---- the inverse question, asked of an issue ALREADY deferred (ISS-922) ----
+
+    # Positive evidence that nothing this issue is blocked by is still waiting to
+    # land. Agent::DependencyWake lifts a deferral on it, hours ahead of the
+    # daily expiry that used to be the only way back.
+    #
+    # DELIBERATELY NOT `unshipped(...).empty?`, and the difference is the whole
+    # safety argument. `unshipped` answers `[]` for every UNKNOWN, because the
+    # dispatch gate FAILS OPEN: not knowing must never stall the queue. Inverted
+    # into a wake signal that same `[]` says the opposite of what it means — one
+    # rate-limited `gh` would unsnooze every deferred issue in the fleet at once,
+    # and the claim behind each would re-defer it the moment `gh` answered again,
+    # walking it toward the seven-attempt escalation for nothing.
+    #
+    # So this asks for the MERGE, and every unknown answers false: the deferral
+    # stands and the daily expiry still applies, which is the fail-open policy
+    # pointing the same way it always did — an unreadable GitHub changes nothing
+    # about an issue that is already parked. Failing to wake early costs at most
+    # a day, and the ISS-649 gate re-runs at claim time either way.
+    #
+    # An issue with NO blockers is cleared, vacuously and correctly: that is what
+    # a human dropping the edge with `dev issues block --remove` leaves behind,
+    # and it is exactly the state the escalation note asks them to produce.
+    def cleared?(issue, use_localhost:)
+      blockers(issue).all? { |ref| blocker_landed?(ref, use_localhost: use_localhost) }
+    end
+
+    # One blocker: is its code demonstrably on main?
+    def blocker_landed?(ref, use_localhost:)
+      status = ref["status"]
+      # Live work by the tracker's own reckoning — there is nothing merged to
+      # find, whatever GitHub says.
+      return false unless SHIPPED_STATUSES.include?(status)
+      # Nobody is ever going to ship it, so there is no merge to wait for and the
+      # dependent is on its own. Positive by the same reading `unshipped` gives
+      # it, and the one place this agrees with the tracker's status alone.
+      return true if status == ABANDONED_STATUS
+
+      blocker = begin
+        Agent::Api.issue(ref["number"], use_localhost: use_localhost)
+      rescue StandardError
+        nil
+      end
+      return false if blocker.nil?
+
+      # ANY merged fix, mirroring `unmerged_fix_pr`: a reopened issue accumulates
+      # fixes, so "the newest one is still open" is routinely true of an issue
+      # whose code merged rounds ago. An unreadable url contributes nothing here
+      # rather than poisoning the answer — it is one absent piece of evidence,
+      # and a merge found elsewhere in the list is still a merge.
+      #
+      # No PR fix recorded at all — a fix that is a design document, or a `fixed`
+      # with nothing attached — is NOT evidence: there is no merge to observe.
+      # The claim-time gate dispatches on that case and this declines to wake on
+      # it, which costs a day at most and only for an issue held by some OTHER
+      # blocker, since a document-fixed blocker never causes a deferral itself.
+      fix_pr_urls(blocker).any? { |url| Agent::Github.merged?(Agent::Github.pr_by_url(url)) }
+    end
+
+    # How many CONSECUTIVE dependency deferrals a timeline records — the number
+    # Agent::Tick's seven-attempt escalation counts, plus one for the deferral it
+    # is about to write.
+    #
+    # CONSECUTIVE, not total, and that is the second half of ISS-922. The
+    # escalation exists for a PR that is STUCK: "a week of daily checks has not
+    # cleared it, so this needs a human rather than another day". An issue that
+    # was blocked, cleared, dispatched, and later blocked again on an entirely
+    # different PR is not that — but a running total counts it as though it were,
+    # and a wake/re-defer round trip (which the sweep makes cheap enough to
+    # happen) would push issues into `needs_input` on somebody else's history.
+    #
+    # Reading a wake as the reset point is what makes it consecutive, and it is
+    # the only reset available: comments cannot be deleted, so there is nothing
+    # to un-count.
+    #
+    # ORDER-SENSITIVE — oldest first, which is what `Agent::Api.issue_comments`
+    # returns (`GET /issues/:number/comments`, offset paging from 0). A reversed
+    # list would put the reset at the wrong end and count the deferrals BEFORE
+    # the last wake instead of after it.
+    def defer_attempts(comments)
+      bodies = Array(comments).map { |c| c["body"].to_s }
+      last_wake = bodies.rindex { |body| WAKE_MARKERS.any? { |marker| body.include?(marker) } }
+      since = last_wake.nil? ? bodies : bodies[(last_wake + 1)..]
+      since.count { |body| body.include?(DEFER_MARKER) }
     end
 
     # One line per blocker for the timeline note, naming what is actually being
