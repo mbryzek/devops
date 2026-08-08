@@ -6590,11 +6590,24 @@ def issue_deployables_for(registry, repos)
   repos.flat_map { |repo| registry.deploy_tracked.select { |a| a.repo_name == repo } }.uniq(&:name)
 end
 
-# One app's live version, memoized per run. The probe is an HTTP call to production
-# (or a kubectl read), and a release asks about the same handful of apps for every
-# outstanding issue.
-def issue_live_version(registry, version_cache, app)
-  version_cache[app.name] ||= fetch_app_version(registry, app)
+# One app's released version, memoized per run. The probe is an HTTP call to
+# production (or a GitHub read), and a release asks about the same handful of apps
+# for every outstanding issue.
+def app_release_info(registry, cache, app)
+  cache[app.name] ||= fetch_release_info(registry, app)
+end
+
+# The same, for a caller holding only the app's NAME: a close-out that recorded an
+# (app, baseline_version) pair, or a feature removal. A name the registry does not
+# have is an error and never an empty answer — silence must not advance anything.
+#
+# Shared by `dev issues reconcile` and `dev features reconcile` so both gate on
+# exactly the same signal.
+def named_release_info(registry, cache, app_name)
+  cache[app_name] ||= begin
+    app = registry.deploy_tracked.find { |a| a.name == app_name }
+    app ? fetch_release_info(registry, app) : { error: "unknown app '#{app_name}'" }
+  end
 end
 
 # The fix payload for adopting `pr`: always the PR url, plus the (app,
@@ -6606,7 +6619,7 @@ def issue_adoption_body(registry, version_cache, pr)
   body = { status: "fixed", url: pr["url"] }
   app = issue_app_for_repo(registry, pr["repo"])
   return body if app.nil?
-  info = version_cache[app.name] ||= fetch_app_version(registry, app)
+  info = app_release_info(registry, version_cache, app)
   return body if info[:error] || info["version"].nil?
   body.merge(app: app.name, baseline_version: info["version"])
 end
@@ -6732,10 +6745,7 @@ end
 # can work for a fix linked to a document rather than a PR.
 def issue_recorded_deploy_outcome(issue, deployment, registry, version_cache)
   app_name = deployment["app"]
-  info = version_cache[app_name] ||= begin
-    app = registry.deploy_tracked.find { |a| a.name == app_name }
-    app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
-  end
+  info = named_release_info(registry, version_cache, app_name)
   return IssueDeployOutcome.new(action: :skip, detail: " (#{app_name}): #{info[:error]}") if info[:error]
 
   live = info["version"]
@@ -6809,7 +6819,7 @@ def issue_released_since_merge_outcome(apps:, merged_at:, evidence:, registry:, 
                                   detail: ": #{evidence} merged, but GitHub gave no merge time — leaving it fixed")
   end
 
-  probes = apps.map { |app| [app.name, issue_live_version(registry, version_cache, app)] }
+  probes = apps.map { |app| [app.name, app_release_info(registry, version_cache, app)] }
   unreachable, error = probes.find { |_name, info| info[:error] }
   return IssueDeployOutcome.new(action: :skip, detail: " (#{unreachable}): #{error[:error]}") if unreachable
 
@@ -6835,9 +6845,12 @@ end
 # Two passes over the issue tracker, both keyed on facts nobody has to remember:
 # claimed issues whose PR has merged become `fixed`, then `fixed` issues whose app
 # has released since the fix merged become `deployed` — with that app derived from
-# the fix urls when no close-out pinned one. Read-only against GitHub
-# and the deploy registry (the same live-version signal `dev deploy status` uses) —
-# the release pipeline is never touched. Dry-run by default; --apply records the
+# the fix urls when no close-out pinned one. Read-only against GitHub and the
+# deploy registry, and — deliberately — against nothing else: this is bookkeeping
+# that runs after every release and on every agent runner, so it asks production
+# for a version where there is an endpoint and GitHub for the release tag where
+# there is not, and needs no cluster credentials for either (ISS-904). The
+# release pipeline is never touched. Dry-run by default; --apply records the
 # transitions.
 def cmd_issues_reconcile(args)
   rest, _app, use_localhost = parse_common_flags(args)
@@ -6950,11 +6963,11 @@ end
 # waits here until every app carrying the removal has released past the version
 # production was running when it merged.
 #
-# The readiness decision lives in this CLI, not the backend: it needs the live
-# version signal (/_internal_/version, or the k8s image tag) that `dev deploy
-# status` reads, and the backend has no business reaching for kubectl. The API
-# only records that a cleanup is outstanding and performs the transitions asked
-# of it.
+# The readiness decision lives in this CLI, not the backend: it needs the release
+# signal (/_internal_/version, or the app repo's newest release tag) that
+# fetch_release_info reads, and the backend has no business probing production.
+# The API only records that a cleanup is outstanding and performs the transitions
+# asked of it.
 
 FEATURE_REMOVALS_PATH = "/dev/feature-removals".freeze
 
@@ -6971,15 +6984,6 @@ end
 
 def feature_label(removal)
   "#{removal['subproject']}/#{removal['feature']}"
-end
-
-# Live version per app, memoized for the run. Shares fetch_app_version with
-# `dev issues reconcile`, so both commands gate on exactly the same signal.
-def feature_version_info(registry, cache, app_name)
-  cache[app_name] ||= begin
-    app = registry.deploy_tracked.find { |a| a.name == app_name }
-    app ? fetch_app_version(registry, app) : { error: "unknown app '#{app_name}'" }
-  end
 end
 
 # Whether one (app, baseline_version) pair has cleared. Primary signal is the
@@ -7010,7 +7014,7 @@ end
 def feature_removal_state(registry, cache, removal)
   pairs = removal["apps"] || []
   results = pairs.map do |pair|
-    info = feature_version_info(registry, cache, pair["app"])
+    info = named_release_info(registry, cache, pair["app"])
     confirmed = feature_pair_confirmed?(info, pair, removal["created_at"])
     detail =
       if info && info[:error]
@@ -7097,7 +7101,7 @@ def cmd_features_retire(args)
 
   cache = {}
   pairs = apps.map do |name|
-    info = feature_version_info(registry, cache, name)
+    info = named_release_info(registry, cache, name)
     if info.nil? || info[:error] || info["version"].nil?
       reason = info && info[:error] ? info[:error] : "no live version available"
       Util.exit_with_error("Cannot read the live version for '#{name}': #{reason}. " \
@@ -7860,14 +7864,24 @@ end
 # For docker_k8s apps with no public ingress, read the live image tag straight
 # from the cluster. The image tag is what's *actually* running and avoids
 # requiring an HTTP /_internal_/version on internal-only services.
+#
+# Cluster access is NOT assumed anywhere it is merely convenient: this is the
+# probe for "what is production running right now", which nothing but the cluster
+# can answer, and it is asked only by `dev deploy status` and `dev prs group`.
+# The reconcilers ask fetch_release_info instead — they run on agent runners,
+# which have no kubeconfig at all (ISS-904).
 def fetch_k8s_version(app)
   ns = app.docker_k8s.namespace
   target = app.docker_k8s.rollout_target  # e.g. "statefulset/workers"
-  image, status = Open3.capture2(
+  # capture3, not capture2: with no kubeconfig `kubectl` writes several lines of
+  # memcache/discovery noise to stderr, and inheriting it interleaved that noise
+  # with the report of whatever command was running. The failure belongs in the
+  # error string, where the caller decides how to show it.
+  image, stderr, status = Open3.capture3(
     "kubectl", "-n", ns, "get", target,
     "-o", "jsonpath={.spec.template.spec.containers[0].image}"
   )
-  return { error: "kubectl get #{target}: failed" } unless status.success?
+  return { error: "kubectl get #{target}: #{kubectl_failure_reason(stderr)}" } unless status.success?
   image = image.strip
   return { error: "kubectl returned empty image" } if image.empty?
   # Tag is everything after the LAST ':' in the final path segment — this
@@ -7880,7 +7894,7 @@ def fetch_k8s_version(app)
   # version went live" but advances on any pod restart (OOM kill, liveness
   # failure) — not strictly the deploy time. Good enough for the versions
   # command; we'd need a deploy annotation for a true deploy timestamp.
-  started_at, _ = Open3.capture2(
+  started_at, _stderr, _status = Open3.capture3(
     "kubectl", "-n", ns, "get", "pod",
     "-l", "app=#{app.name}",
     "-o", "jsonpath={.items[0].status.startTime}"
@@ -7898,6 +7912,56 @@ def fetch_app_version(registry, app)
   return fetch_version(url) if url
   return fetch_k8s_version(app) if app.docker_k8s
   { error: "no prod url or docker_k8s config" }
+end
+
+# One line of kubectl's stderr worth showing. The LAST one: a client that cannot
+# reach a cluster prints its discovery retries first (`memcache.go:265] couldn't
+# get current server API group list`) and the reason last, so taking the first
+# line reports the symptom and buries the cause.
+KUBECTL_REASON_LIMIT = 160
+
+def kubectl_failure_reason(stderr)
+  reason = stderr.to_s.lines.map(&:strip).reject(&:empty?).last
+  return "failed" if reason.nil?
+  reason.length > KUBECTL_REASON_LIMIT ? "#{reason[0, KUBECTL_REASON_LIMIT]}…" : reason
+end
+
+# What an app RELEASED, and when — the signal the two reconcilers gate on. Same
+# shape as fetch_app_version ({"version", "released_at"} or {error:}), and the
+# same answer for every app with an HTTP endpoint, because there the running
+# version IS the release.
+#
+# They differ only for a docker_k8s app: fetch_app_version asks the cluster what
+# is running, and this asks GitHub what was last tagged. Reconciling is routine
+# bookkeeping that runs after every release and on every agent runner, and a
+# runner has no kubeconfig — so `workers` was skipped by every reconcile pass on
+# every runner, indefinitely and silently (ISS-904). A release record nobody
+# needs cluster credentials to read removes the dependency rather than
+# provisioning it.
+#
+# The tag is also a BETTER timestamp than the cluster gives: fetch_k8s_version
+# dates a release by the pod's start time, which advances on any restart, while
+# the tag is dated when `release` cut it.
+#
+# The cost is a release that tagged and then failed to roll out: the tag says
+# shipped and the cluster would not have. `dev deploy status` still asks the
+# cluster and still reports that divergence, and a failed release is a loud,
+# attended event — the silent-forever skip this replaces was neither.
+def fetch_release_info(registry, app)
+  url = registry.prod_url(app)
+  return fetch_version(url) if url
+  return fetch_release_tag_info(app) if app.docker_k8s
+  { error: "no prod url or docker_k8s config" }
+end
+
+def fetch_release_tag_info(app)
+  repo = app.repo || app.repo_name
+  tag = ReleaseTag.latest(repo)
+  return { error: "no release tag found for #{repo} on GitHub" } if tag.nil? || tag.empty?
+
+  released_at = ReleaseTag.cut_at(repo, tag)
+  return { error: "could not read when #{repo} #{tag} was tagged" } if released_at.nil?
+  { "version" => tag, "released_at" => released_at }
 end
 
 # ---------- deploy (fleet release state) ----------

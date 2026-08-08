@@ -1830,3 +1830,94 @@ class TestDeployPostDeployFiling < Minitest::Test
     assert_equal %w[acumen acumen-postgresql lib-util devops FILED], @released
   end
 end
+
+# fetch_release_info: what an app RELEASED, and when — the signal both
+# reconcilers gate on, and the one that must not need cluster credentials
+# (ISS-904).
+class TestFetchReleaseInfo < Minitest::Test
+  include DevTestSupport
+
+  FakeApp = Struct.new(:name, :repo, :repo_name, :docker_k8s, keyword_init: true)
+
+  class FakeRegistry
+    def initialize(url) = @url = url
+    def prod_url(_) = @url
+  end
+
+  def workers = FakeApp.new(name: "workers", repo: nil, repo_name: "workers", docker_k8s: Object.new)
+
+  def with_release_tag(tag, cut_at)
+    stub_singleton(ReleaseTag, :latest, ->(_repo, **) { tag }) do
+      stub_singleton(ReleaseTag, :cut_at, ->(_repo, _tag, **) { cut_at }) { yield }
+    end
+  end
+
+  # An app with an endpoint is unchanged: there the running version IS the
+  # release, and asking production is the stronger answer.
+  def test_an_app_with_a_prod_url_is_still_asked_over_http
+    asked = nil
+    stub_global_for_test(:fetch_version) { |url| asked = url; { "version" => "0.9.9" } }
+    info = fetch_release_info(FakeRegistry.new("https://rallyd.com"),
+                              FakeApp.new(name: "rallyd", repo_name: "rallyd", docker_k8s: nil))
+    assert_equal "https://rallyd.com", asked
+    assert_equal "0.9.9", info["version"]
+  end
+
+  # The whole point: no kubectl, no kubeconfig, no cluster. A runner has an
+  # authenticated `gh` and nothing else, and this is all the answer needs.
+  def test_a_docker_k8s_app_is_answered_from_its_newest_release_tag
+    with_release_tag("0.1.9", "2026-07-08T14:55:40Z") do
+      info = fetch_release_info(FakeRegistry.new(nil), workers)
+      assert_equal "0.1.9", info["version"]
+      assert_equal "2026-07-08T14:55:40Z", info["released_at"]
+      refute info[:error]
+    end
+  end
+
+  # Fail closed, both halves: an unreadable tag list and an undateable tag are
+  # errors, which the reconcilers print as a skip rather than acting on.
+  def test_an_unreadable_release_record_is_an_error_and_never_a_version
+    with_release_tag(nil, nil) do
+      assert_match(/no release tag found for workers/, fetch_release_info(FakeRegistry.new(nil), workers)[:error])
+    end
+    with_release_tag("0.1.9", nil) do
+      assert_match(/could not read when workers 0\.1\.9 was tagged/,
+                   fetch_release_info(FakeRegistry.new(nil), workers)[:error])
+    end
+  end
+
+  def test_an_app_with_neither_a_url_nor_a_cluster_target_has_nothing_to_read
+    info = fetch_release_info(FakeRegistry.new(nil),
+                              FakeApp.new(name: "playbook-app", repo_name: "playbook-app", docker_k8s: nil))
+    assert_equal "no prod url or docker_k8s config", info[:error]
+  end
+end
+
+# kubectl's stderr belongs in the error string, not interleaved with the report
+# of whatever command was probing (the other half of ISS-904).
+class TestKubectlFailureReason < Minitest::Test
+  include DevTestSupport
+
+  # The LAST line: a client with no kubeconfig prints its discovery retries
+  # first and the actual reason last.
+  def test_the_reason_is_the_last_line_not_the_first
+    stderr = <<~ERR
+      E0808 00:06:18.408123   memcache.go:265] couldn't get current server API group list
+      E0808 00:06:18.409001   memcache.go:265] couldn't get current server API group list
+      The connection to the server localhost:8080 was refused - did you specify the right host or port?
+    ERR
+    assert_equal "The connection to the server localhost:8080 was refused - did you specify the right host or port?",
+                 kubectl_failure_reason(stderr)
+  end
+
+  def test_a_silent_failure_still_reads_as_one
+    assert_equal "failed", kubectl_failure_reason("")
+    assert_equal "failed", kubectl_failure_reason(nil)
+  end
+
+  def test_a_runaway_line_is_truncated_rather_than_flooding_the_report
+    reason = kubectl_failure_reason("x" * 500)
+    assert_equal KUBECTL_REASON_LIMIT + 1, reason.length
+    assert reason.end_with?("…")
+  end
+end

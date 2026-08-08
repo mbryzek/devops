@@ -1,4 +1,5 @@
 require 'json'
+require 'release_tag'
 
 # "Has this merge commit actually shipped?" — the one question a single-PR merge
 # check cannot answer, and the whole reason `dev prs group` exists (ISS-758).
@@ -41,12 +42,6 @@ module Prs
     # the deployed ref. `ahead` and `diverged` both mean not shipped.
     CONTAINED = %w[behind identical].freeze
 
-    # A release tag we are willing to treat as "the newest release": leading
-    # digits, dot-separated. Anything else in a repo's tag list — the
-    # `explore_stuff_backup_snapshot` shape — is not a release and must not be
-    # picked as one.
-    RELEASE_TAG = /\A[vV]?\d+(\.\d+)*\z/
-
     module_function
 
     # A `deployed` lambda for `Prs::Group.build`, memoised per (repo, sha) so a
@@ -84,16 +79,13 @@ module Prs
       latest_release_tag(repo, capture: capture)
     end
 
+    # ReleaseTag is the one definition of "this repo's newest release", shared
+    # with the version probe `dev issues reconcile` reads for an app with no
+    # HTTP endpoint (ISS-904). Two notions of which tag is the release would
+    # disagree exactly where it matters — on the repos with nothing else to ask.
     def latest_release_tag(repo, capture: method(:capture))
-      out = capture.call(["gh", "api", "repos/#{OWNER}/#{bare(repo)}/tags", "--paginate",
-                          "--jq", ".[].name"])
-      return nil if out.nil?
-      out.split("\n").map(&:strip).select { |t| t.match?(RELEASE_TAG) }.max_by { |t| version_key(t) }
+      ReleaseTag.latest(bare(repo), capture: capture)
     end
-
-    # Numeric, component-wise — so `0.19.13` beats `0.19.9`, which sorting the
-    # strings does not.
-    def version_key(tag) = tag.to_s.sub(/\A[vV]/, "").split(".").map(&:to_i)
 
     def compare_status(repo, ref, sha, capture: method(:capture))
       out = capture.call(["gh", "api", "repos/#{OWNER}/#{bare(repo)}/compare/#{ref}...#{sha}", "--jq", ".status"])
