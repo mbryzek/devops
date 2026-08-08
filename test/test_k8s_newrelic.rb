@@ -171,19 +171,49 @@ class TestK8sNewRelic < Minitest::Test
                  "spans, so turning tracing off costs nothing that ISS-1070 asked for.")
   end
 
-  # Platform sets no `distributedTracing`, so its JAVA_OPTS must render exactly
-  # as before. Asserted structurally — an unset value contributes the empty
-  # string — because the alternative is a rendered-manifest comparison that
-  # needs a pkl binary the rest of this suite deliberately never depends on.
+  # An app that says nothing must still render the JAVA_OPTS it rendered before
+  # this setting existed. No app takes that branch today (ISS-1112 turned
+  # platform off, which was the last one), but the next app to be instrumented
+  # does, so the unset case has to keep working. Asserted structurally — an
+  # unset value contributes the empty string — because the alternative is a
+  # rendered-manifest comparison that needs a pkl binary the rest of this suite
+  # deliberately never depends on.
   def test_tracing_flag_is_emitted_only_when_an_app_sets_it
     assert_match(/local distributedTracing = read\?\("env:NEWRELIC_DISTRIBUTED_TRACING"\) \?\? ""/, TEMPLATE)
     assert_match(/if \(distributedTracing == ""\) "" else "-Dnewrelic\.config\.distributed_tracing\.enabled=/, TEMPLATE,
                  "unset must contribute the empty string, so an app that says nothing " \
                  "about tracing renders the JAVA_OPTS it rendered before this setting " \
                  "existed")
-    refute_match(/^distributedTracing/, PLATFORM,
-                 "platform deliberately says nothing here; the day it does, the " \
-                 "byte-identical claim in the template comment stops being true")
+  end
+
+  # The change ISS-1112 actually made, and the reason it is safe, pinned
+  # together. Turning this back on restores 31 GB / 30 days — 40% of everything
+  # the account ingests — to buy traces that provably correlate nothing, so it
+  # is worth making that require deleting a test.
+  def test_platform_disables_distributed_tracing
+    assert_match(/^distributedTracing = false$/, PLATFORM,
+                 "platform-web and platform-job do not call each other over HTTP and " \
+                 "nothing else instrumented calls either, so every span in the account " \
+                 "starts its own trace: `FROM Span SELECT count(*) FACET appName, " \
+                 "parent.app` returned parent.app = null for all 1,804,356 spans in the " \
+                 "24h to 2026-08-08. Tracing was 31.0 GB of 77.0 GB / 30 days against a " \
+                 "100 GB free tier the month was projected to reach 87% of (ISS-1112).")
+  end
+
+  # Both instrumented apps reached the same answer for the same reason, and the
+  # reason is a measurement rather than a preference. If a future app is added
+  # with tracing on, this test is where the justification has to be written.
+  def test_every_instrumented_app_has_decided_about_tracing
+    Dir[File.join(K8S, 'apps', '*.pkl')].each do |path|
+      config = File.read(path)
+      next unless config.match?(/^javaAgent = ".+"$/)
+
+      assert_match(/^distributedTracing = (true|false)$/, config,
+                   "#{File.basename(path)} attaches the New Relic agent, so it has to say " \
+                   "what it does about distributed tracing. Left unset the agent defaults " \
+                   "to ON, and tracing is the single largest line in this account's " \
+                   "ingest — an app inherits 40%-of-the-bill behaviour by saying nothing.")
+    end
   end
 
   def test_tracing_flag_is_inside_the_agent_branch

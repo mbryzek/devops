@@ -13,3 +13,45 @@ appName = "platform"
 appPort = 9300
 webMemory = "4400Mi"
 javaAgent = "/opt/newrelic/newrelic.jar"
+
+// Off for the same reason acumen is, and now MEASURED rather than argued
+// (ISS-1112). Distributed tracing exists to correlate one request across
+// services. Over the 24h to 2026-08-08, on account 7724695:
+//
+//   FROM Span SELECT count(*) FACET appName, parent.app SINCE 1 day ago
+//     platform-web  parent.app = null  1,681,090
+//     platform-job  parent.app = null    123,266
+//
+// `parent.app` is null on EVERY span in both tiers — not a majority, all of
+// them. No trace in this account has ever crossed a service boundary, because
+// platform-web and platform-job do not call each other over HTTP (work reaches
+// the job tier through the tasks table) and nothing else instrumented exists to
+// call. Faceting span category the same way says the same thing from the other
+// side: 1,506,398 of 1,681,128 web spans are `generic`, i.e. in-process.
+//
+// What that bought: TracingBytes was 31.0 GB of the 77.0 GB the account ingested
+// in the trailing 30 days — 40% of the bill — against a 100 GB/month free-tier
+// ceiling August 2026 projected to reach 87% of.
+//
+// Removing it drops the run rate from 2.80 to ~1.77 GB/day, so a FULL month at
+// that rate is ~55 GB and a trailing 30 days is ~46 GB. August itself lands
+// around 63 GB rather than 87 — the 22.2 GB the month had already spent by the
+// 8th is not refundable, which is why the check fires at 85% and not at the
+// ceiling. That is headroom for acumen's newly-attached agent (ISS-1070) AND
+// for the ~+5 GB/month trend that reaches 100 on its own by November.
+//
+// What it does NOT cost, checked rather than assumed:
+//   - Errors. TransactionError carries class, message and stack trace and is
+//     unaffected — 4,358 errors / 30 days across both tiers, 0.005 GB total.
+//     `daily-error-triage` queries Transaction, Log and TransactionError and
+//     never Span.
+//   - Slow routes. `daily-perf-prs` runs on `dev slow-routes`, which is
+//     platform's own data, not NewRelic.
+//   - Heap/OOM. `platform-memory-improvement` queries Log.
+//   - Transaction traces, which the agent still records; only span events stop.
+// No playbook, rule or script in any repo queries `FROM Span`.
+//
+// Flip to true (one line, no other change) if platform ever grows a second
+// instrumented service it actually calls, or a span-level investigation needs
+// it for a window. Re-measure the bill any time with `dev newrelic ingest`.
+distributedTracing = false
