@@ -196,7 +196,7 @@ class TestDevQueriesInvestigate < Minitest::Test
 
   def test_body_says_when_a_query_was_never_attributed
     body = queries_issue_body([stat(call_site: nil)], hours: 24, sort: "calls")
-    assert_includes body, "never got hot"
+    assert_includes body, QUERIES_NO_CALL_SITE
   end
 
   # ISS-110 was filed against a select whose 107ms mean was a 500-row batch upsert running behind
