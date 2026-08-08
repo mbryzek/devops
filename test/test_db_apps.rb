@@ -415,6 +415,63 @@ class TestDbApps < Minitest::Test
     FileUtils.remove_entry(dir) if dir
   end
 
+  # The other direction, and the one nothing reported before ISS-900: rows the
+  # database has that the checkout does not.
+  def test_orphan_applied_scripts_is_what_the_database_has_and_the_checkout_lacks
+    app, dir = repo_with_scripts(["20260801-165150.sql", "20260803-171500.sql"])
+    with_psql("SELECT filename" => ["20260803-171500.sql", "20260101-000000.sql", "20260801-165150.sql"]) do
+      assert_equal ["20260101-000000.sql"], app.orphan_applied_scripts(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  def test_orphan_applied_scripts_is_empty_when_the_sets_match
+    app, dir = repo_with_scripts(["20260801-165150.sql", "20260803-171500.sql"])
+    with_psql("SELECT filename" => ["20260803-171500.sql", "20260801-165150.sql"]) do
+      assert_empty app.orphan_applied_scripts(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  # The state ISS-900 described: the same NUMBER of scripts on both sides, and
+  # different sets. A count comparison calls this up to date; both directions
+  # have to name their file, because the pending one is a database that will
+  # fail its suite and the orphan one is the reason the counts looked right.
+  def test_equal_counts_with_unequal_sets_is_reported_in_both_directions
+    app, dir = repo_with_scripts(["20260801-165150.sql", "20260807-192638.sql"])
+    with_psql("SELECT filename" => ["20260801-165150.sql", "20260101-000000.sql"]) do
+      assert_equal 2, app.repo_scripts.length
+      assert_equal ["20260807-192638.sql"], app.pending_scripts(5555, "xdb_sess_a")
+      assert_equal ["20260101-000000.sql"], app.orphan_applied_scripts(5555, "xdb_sess_a")
+    end
+  ensure
+    FileUtils.remove_entry(dir) if dir
+  end
+
+  # ── which checkouts may skip the drift-against-main check ─────────────────
+  #
+  # Exactly one: the mirror VERIFIED at origin/main moments ago, where measuring
+  # again could only flag a migration merged during the sync in a directory the
+  # caller does not own. Every other checkout is measured, and :mirror_stale is
+  # the one that has to be — it is the same directory reached by the degraded
+  # path, holding main as of whenever origin was last reachable (ISS-900).
+  def test_only_a_freshly_pinned_mirror_skips_the_origin_check
+    pinned = DbApp::REPO_SOURCES.select { |src|
+      DbApp.new(:name => "x", :database => "xdb", :role => "api",
+                :repo_dir => "/tmp/x", :repo_source => src).pinned_to_origin?
+    }
+    assert_equal [:mirror], pinned
+  end
+
+  def test_an_unknown_repo_source_is_refused
+    assert_raises(ArgumentError) do
+      DbApp.new(:name => "x", :database => "xdb", :role => "api",
+                :repo_dir => "/tmp/x", :repo_source => :mirrror)
+    end
+  end
+
   # THE guard. psql_query swallows errors and returns [], so a database whose
   # tracking table is unreadable looks identical to one with zero scripts
   # applied. Without this check the caller would replay the entire script history

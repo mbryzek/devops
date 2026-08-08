@@ -54,9 +54,10 @@ class TestSchemaMirror < Minitest::Test
   def test_checkout_clones_from_the_url_the_existing_checkout_uses
     with_origin do |root, _origin, work|
       mirrors = File.join(root, "mirrors")
-      dir = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
-      assert_equal File.join(mirrors, "platform-postgresql"), dir
-      assert_equal ["20260101000000.sql"], scripts_in(dir)
+      mirror = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+      assert_equal File.join(mirrors, "platform-postgresql"), mirror.dir
+      assert mirror.pinned?
+      assert_equal ["20260101000000.sql"], scripts_in(mirror.dir)
     end
   end
 
@@ -66,15 +67,16 @@ class TestSchemaMirror < Minitest::Test
   def test_checkout_picks_up_migrations_merged_since_the_last_use
     with_origin do |root, _origin, work|
       mirrors = File.join(root, "mirrors")
-      dir = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
-      assert_equal ["20260101000000.sql"], scripts_in(dir)
+      mirror = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+      assert_equal ["20260101000000.sql"], scripts_in(mirror.dir)
 
       add_script(work, "20260202000000.sql")
       git!(work, "push", "--quiet", "origin", "main")
 
       again = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
-      assert_equal dir, again
-      assert_equal ["20260101000000.sql", "20260202000000.sql"], scripts_in(again)
+      assert_equal mirror.dir, again.dir
+      assert again.pinned?
+      assert_equal ["20260101000000.sql", "20260202000000.sql"], scripts_in(again.dir)
     end
   end
 
@@ -83,13 +85,13 @@ class TestSchemaMirror < Minitest::Test
   def test_checkout_discards_local_edits_and_untracked_scripts
     with_origin do |root, _origin, work|
       mirrors = File.join(root, "mirrors")
-      dir = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
-      File.write(File.join(dir, "scripts", "99999999999999.sql"), "drop table users;\n")
-      File.write(File.join(dir, "scripts", "20260101000000.sql"), "-- clobbered\n")
+      mirror = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+      File.write(File.join(mirror.dir, "scripts", "99999999999999.sql"), "drop table users;\n")
+      File.write(File.join(mirror.dir, "scripts", "20260101000000.sql"), "-- clobbered\n")
 
       again = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
-      assert_equal ["20260101000000.sql"], scripts_in(again)
-      assert_equal "select 1;\n", File.read(File.join(again, "scripts", "20260101000000.sql"))
+      assert_equal ["20260101000000.sql"], scripts_in(again.dir)
+      assert_equal "select 1;\n", File.read(File.join(again.dir, "scripts", "20260101000000.sql"))
     end
   end
 
@@ -97,15 +99,43 @@ class TestSchemaMirror < Minitest::Test
 
   # Offline with a mirror already on disk: its last known main still beats the
   # checkout nobody can pull, so it is used as it stands rather than refused.
-  def test_unreachable_origin_keeps_the_existing_mirror
+  #
+  # And it is handed back UNPINNED, which is the load-bearing half. `claude-db`
+  # skips its drift-against-main refusal for the mirror because the mirror was
+  # just pinned; on this path it was not, and a mirror nobody can fetch never
+  # gets less stale. Reported as pinned, this is a green "up to date" over a
+  # database missing however many migrations main has gained since — the runner
+  # mirror was 1 migration behind exactly this way on 2026-08-07 (ISS-900).
+  def test_unreachable_origin_keeps_the_existing_mirror_and_says_it_is_not_pinned
     with_origin do |root, origin, work|
       mirrors = File.join(root, "mirrors")
-      dir = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+      mirror = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+      assert mirror.pinned?
       FileUtils.rm_rf(origin)
 
       again = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
-      assert_equal dir, again
-      assert_equal ["20260101000000.sql"], scripts_in(again)
+      assert_equal mirror.dir, again.dir
+      refute again.pinned?
+      assert_equal ["20260101000000.sql"], scripts_in(again.dir)
+    end
+  end
+
+  # The mirror going stale is not hypothetical and not rare: it is what any
+  # migration merged after the last successful pin looks like. Unpinned, the
+  # scripts it holds are simply main-as-of-then, which is short by exactly the
+  # scripts merged since.
+  def test_an_unpinnable_mirror_is_short_by_whatever_main_gained
+    with_origin do |root, origin, work|
+      mirrors = File.join(root, "mirrors")
+      SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+
+      add_script(work, "20260202000000.sql")
+      git!(work, "push", "--quiet", "origin", "main")
+      FileUtils.rm_rf(origin)
+
+      again = SchemaMirror.checkout("platform", :origin_from => work, :root => mirrors)
+      refute again.pinned?
+      assert_equal ["20260101000000.sql"], scripts_in(again.dir)
     end
   end
 

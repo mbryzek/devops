@@ -35,32 +35,49 @@ module SchemaMirror
 
   SUFFIX = "-postgresql".freeze
 
+  # What `checkout` hands back: the directory, and whether it was actually
+  # pinned to origin/main THIS time.
+  #
+  # `pinned` is the whole reason this is a pair rather than a path. The caller
+  # skips its drift-against-main check for the mirror, on the grounds that the
+  # mirror was pinned moments ago — sound for the pinned case and a false green
+  # for the degraded one, where a stale mirror is knowingly handed back and then
+  # trusted as if it were main. A caller cannot tell those apart from a String,
+  # and the one that reads green is the one that ships a database missing a
+  # migration (ISS-900).
+  Checkout = Struct.new(:dir, :pinned) do
+    def pinned?
+      pinned ? true : false
+    end
+  end
+
   def SchemaMirror.path(base, root: ROOT)
     File.join(root, "#{base}#{SUFFIX}")
   end
 
-  # A checkout of <base>-postgresql pinned at origin/main, or nil when one
-  # cannot be produced. `origin_from` is an existing checkout to read the remote
-  # url out of — whichever transport (ssh or https) it uses is the one already
-  # known to work on this box, so the url is taken from there rather than
-  # assembled from a hardcoded org name.
+  # A Checkout of <base>-postgresql, or nil when none can be produced.
+  # `origin_from` is an existing checkout to read the remote url out of —
+  # whichever transport (ssh or https) it uses is the one already known to work
+  # on this box, so the url is taken from there rather than assembled from a
+  # hardcoded org name.
   def SchemaMirror.checkout(base, origin_from:, root: ROOT)
     dir = SchemaMirror.path(base, :root => root)
     FileUtils.mkdir_p(root)
 
     SchemaMirror.locked(base, root) do
       if SchemaMirror.git_repo?(dir)
-        next dir if SchemaMirror.pin_to_origin_main(dir)
+        next Checkout.new(dir, true) if SchemaMirror.pin_to_origin_main(dir)
         # Offline, or origin unreachable. A mirror that was pinned to main the
         # last time it was reachable is still the best checkout available —
-        # certainly better than the one nobody can pull. Use it as it stands.
-        next SchemaMirror.usable?(dir) ? dir : nil
+        # certainly better than the one nobody can pull. Use it as it stands,
+        # and say that it is not main.
+        next SchemaMirror.usable?(dir) ? Checkout.new(dir, false) : nil
       end
 
       url = SchemaMirror.origin_url(origin_from)
       next nil if url.nil?
       next nil unless SchemaMirror.git("clone", "--quiet", url, dir)
-      SchemaMirror.pin_to_origin_main(dir) && SchemaMirror.usable?(dir) ? dir : nil
+      SchemaMirror.pin_to_origin_main(dir) && SchemaMirror.usable?(dir) ? Checkout.new(dir, true) : nil
     end
   end
 
