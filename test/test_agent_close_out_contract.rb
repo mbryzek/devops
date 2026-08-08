@@ -130,9 +130,20 @@ class TestAgentCloseOutContract < Minitest::Test
 
   def test_every_flag_the_handoff_contract_names_is_a_real_flag
     invocation = usage_for("issues handoff")
-    %w[--from --key --title --body --command --url].each do |flag|
+    %w[--from --key --title --body --command --rerun --needs-env --url].each do |flag|
       assert_includes invocation, flag
     end
+  end
+
+  # ISS-917. The commands are pasted cold, by a human, in THEIR shell, days later,
+  # possibly twice. Both halves of that are enforced by `dev issues handoff`, so a
+  # session that reads only the instructions and not the help text would meet them
+  # as a rejected filing at the worst possible moment — the close-out.
+  def test_the_handoff_contract_names_both_ways_a_command_stops_being_pasteable
+    assert_includes instructions, "--rerun", "the required flag is not in the snippet a session copies"
+    assert_match(/Write the command for the RECIPIENT's shell/, instructions)
+    assert_match(/--needs-env/, instructions)
+    assert_match(/ISS-874/, instructions)
   end
 
   # `--command` is the whole difference between this and a close-out comment, and
