@@ -447,20 +447,42 @@ action never happens, and no artifact substitutes for not doing it.
   repo, and the blast radius is the worst available: a bad merge breaks
   `dev agent tick`, which is the process that would otherwise deliver the fix.
   Classify every devops PR `irreversible` and leave it for a human.
-- **`~/code/claude` is writable only under `plans/`.** That repo's house rule is
-  commit-to-main, and for you that exception is narrowed, not removed. CLAUDE.md,
-  the skills and the rules are instructions every future session loads and obeys
-  — the one place a prompt-injected session could persist itself. A pre-push hook
-  enforces this; a push touching anything else there is refused.
+- **In `~/code/claude`, you may push DOCUMENTS to main; everything else needs a
+  pull request.** That repo's house rule is commit-to-main, which makes it the one
+  place in this system where a write takes effect with nobody looking — every other
+  repo's writes land behind a human merge. So the rule is about review, not about
+  paths:
+    - **`plans/`, `product/`, `design/`, `docs/`** — push straight to main, as
+      always. These are documents: read deliberately by a session pointed at one,
+      never loaded as standing instruction, never executed.
+    - **Everything else** — `CLAUDE.md`, `rules/`, `skills/`, `agents/`, `tools/`,
+      `bin/`, `lib/`, `settings*.json` — is instruction or code that every future
+      session loads and obeys, which makes it the one place a prompt-injected
+      session could persist itself past its own run. It is **not off limits**: clone
+      the repo into your workspace, commit to your assigned branch, push, and open a
+      draft PR exactly as you would for `platform`. `claude` is not in the merge
+      lane and has no `ci` check, so nothing auto-merges it — Mike does.
+
+  A pre-push hook enforces exactly this and names the PR route when it refuses.
+  **Do not switch branches inside `~/code/claude` itself**: every session on this
+  runner reads that working tree through `~/code/.claude`, so a checkout there
+  changes the rules other sessions are running under. Branch work goes in a clone,
+  like every other repo. (CLAUDE.md tells INTERACTIVE sessions that PRs on this repo
+  are waste — true when Mike is the one typing and reviewing his own edit, and the
+  opposite of true for you, because the PR *is* the review.)
 - **Never unlock the git-crypt'd `env` repo.** Never run bare `env` or otherwise
   dump the environment — it prints production secrets.
 - **Never touch the production database, and never `:5432`.** `:5432` is Mike's
   local database and parallel sessions clobber it. Use `claude-db` (§4).
-- **Never edit outside your workspace** (`~/code/ai/<slug>/`, plus
-  `~/code/claude/plans/`). Never edit `~/code/platform`, `~/code/devops`, or any
-  other top-level checkout — clone what you need into your workspace.
+- **Never edit outside your workspace** (`~/code/ai/<slug>/`, plus the document
+  directories of `~/code/claude` named above). Never edit `~/code/platform`,
+  `~/code/devops`, or any other top-level checkout — clone what you need into your
+  workspace.
 - **Never disable, weaken, or work around any of the above**, including by
-  editing the hook, the plist, or this file.
+  editing the hook, the plist, or this file. You may PROPOSE a change to any of
+  them in a pull request — the guard lives in `devops`, which is never
+  auto-merged, so a human decides. Proposing is not the same act as doing, and
+  the difference is the whole safety property: nothing here is self-amendable.
 
 ## 4. Your workspace
 

@@ -200,9 +200,11 @@ module Agent
     # the session does the work, so a run that recorded nothing is indistinguishable
     # from a run that had nothing to record.
     #
-    #   unpushable  A write anywhere in `~/code/claude` outside `plans/`. The
+    #   unpushable  A write anywhere in `~/code/claude` outside its document
+    #               directories (`plans/`, `product/`, `design/`, `docs/`). The
     #               autonomous-session push guard (`agent/githooks/pre-push`)
-    #               refuses that push, and it refuses it at the END of the run:
+    #               refuses that push to main, and it refuses it at the END of the
+    #               run:
     #               the session has already done the thinking, already written the
     #               file, and only then discovers the write cannot leave the
     #               machine. `daily-perf-prs` pointed its dedup ledger at
@@ -247,6 +249,13 @@ module Agent
     GIT_ADD_RE = /\bgit\s+-C\s+#{CLAUDE_REPO_RE}\s+add\s+([^\n`]+)/.freeze
 
     PLANS_SEGMENT = "plans".freeze
+
+    # The directories of `~/code/claude` an unattended session can push straight to
+    # main, per `agent/githooks/pre-push`. Keep in step with `doc_dirs` there: this
+    # list decides what the lint calls unpushable, and the hook decides what
+    # actually is, so the two disagreeing means either a false finding or a silent
+    # miss. Widened from plans/-only in ISS-1061.
+    DOC_SEGMENTS = %w[plans product design docs].freeze
 
     # What a per-run snapshot's filename carries and long-lived state's never does.
     DATE_TOKEN_RE = /
@@ -299,7 +308,8 @@ module Agent
     BLOCK_START_RE = /\A\s*(?:[-*+]\s|\d+[.)]\s|\#+\s|>\s|\||```)/.freeze
 
     REASONS = {
-      unpushable: "outside `plans/` — the push guard refuses this write from an unattended session",
+      unpushable: "outside `~/code/claude`'s document directories — the push guard refuses this write " \
+                  "to main from an unattended session",
       reaped: "a top-level `plans/` file with no date in its name — `dev prune plans` removes it after 14 days",
     }.freeze
 
@@ -308,7 +318,10 @@ module Agent
     # what to do about what it found.
     REMEDIES = {
       home_path: "Use `~/…` — one playbook is read by every runner and they do not share a home.",
-      unpushable: "Write under `plans/` — `agent/githooks/pre-push` refuses every other path in `~/code/claude`.",
+      unpushable: "Write under `plans/`, `product/`, `design/` or `docs/` — `agent/githooks/pre-push` " \
+                  "refuses every other path in `~/code/claude` on main. If the playbook really does mean " \
+                  "to change an instruction (CLAUDE.md, `rules/`, `skills/`), say so: that is a PR a human " \
+                  "merges, not a push, and it needs spelling out rather than leaving to the guard.",
       reaped: "Put long-lived state in a `plans/` SUBDIRECTORY — `dev prune plans` only reaps top-level files.",
     }.freeze
 
@@ -332,7 +345,12 @@ module Agent
     def target_rule(relative_path)
       segments = relative_path.split("/").reject(&:empty?)
       return nil if segments.empty?
-      return :unpushable unless segments.first == PLANS_SEGMENT
+      return :unpushable unless DOC_SEGMENTS.include?(segments.first)
+      # Only `plans/` is reaped. The other document directories are curated files
+      # with stable names — `product/playbook.md` is meant to be overwritten in
+      # place forever — so a dateless name there is the intended shape, not state
+      # about to evaporate.
+      return nil unless segments.first == PLANS_SEGMENT
       # `plans/` itself, or anything in a subdirectory, is safe: the guard permits
       # it and the reaper does not descend.
       return nil unless segments.length == 2

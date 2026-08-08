@@ -382,13 +382,42 @@ class TestDevAgentPlaybook < Minitest::Test
     Agent::Playbook.write_targets_in(body, key: "pb").map(&:rule)
   end
 
-  # ---- 1. unpushable: outside plans/, which the push guard refuses ----
+  # ---- 1. unpushable: outside the document directories, which the guard refuses ----
 
   # Verbatim the shape ISS-632 shipped for weeks.
   def test_a_ledger_at_the_repo_root_is_unpushable
-    assert_equal ["pb:1: ~/code/claude/perf-ledger.md — outside `plans/` — the push guard refuses " \
-                  "this write from an unattended session"],
+    assert_equal ["pb:1: ~/code/claude/perf-ledger.md — outside `~/code/claude`'s document directories " \
+                  "— the push guard refuses this write to main from an unattended session"],
                  targets("Append the entry to `~/code/claude/perf-ledger.md` before finishing.")
+  end
+
+  # ISS-1061 widened the guard from `plans/`-only to the four document
+  # directories, and this lint decides what it CALLS unpushable while the hook
+  # decides what actually is. The two disagreeing is not a cosmetic drift: a lint
+  # that flags a write the guard now permits is the standing false positive the
+  # header above says kills the lint's credibility.
+  def test_the_other_document_directories_are_pushable
+    assert_empty targets("Update `~/code/claude/product/playbook.md` with the corrected inventory.")
+    assert_empty targets("Write the mockup to `~/code/claude/design/playbook/checklist.html`.")
+    assert_empty targets("Record it in `~/code/claude/docs/superpowers/notes.md`.")
+    assert_empty targets("    git -C ~/code/claude add product/playbook.md")
+  end
+
+  # Only `plans/` is reaped, so the dateless-name rule must not follow the guard's
+  # widening. `product/playbook.md` is a curated file overwritten in place forever
+  # — flagging it as state-about-to-evaporate would be exactly backwards.
+  def test_the_reaper_rule_does_not_follow_the_guard_into_the_other_doc_dirs
+    assert_equal [:reaped], rules_of("Append the entry to `~/code/claude/plans/perf-ledger.md`.")
+    assert_empty targets("Append the entry to `~/code/claude/product/playbook.md`.")
+  end
+
+  # The instruction surface is still refused — that is the half of the guard
+  # ISS-1061 deliberately did NOT widen, because an unreviewed write to a rule is
+  # how a prompt-injected session would persist itself.
+  def test_the_instruction_surface_is_still_unpushable
+    assert_equal [:unpushable], rules_of("    git -C ~/code/claude add rules/scala.general.mdc")
+    assert_equal [:unpushable], rules_of("    git -C ~/code/claude add CLAUDE.md")
+    assert_equal [:unpushable], rules_of("    git -C ~/code/claude add skills/repo-map/SKILL.md")
   end
 
   # The other half of the same defect, and the form with no prose verb anywhere:

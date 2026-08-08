@@ -1584,11 +1584,16 @@ module Agent
 
     # Enforcement, not advice (§4.6): core.hooksPath is injected through
     # GIT_CONFIG_* so it applies to EVERY git the session runs, in every repo,
-    # and the pre-push hook refuses a push to ~/code/claude that touches anything
-    # outside plans/. The rest of that repo is instructions every future session
-    # loads and obeys, which makes it the one place a prompt-injected session
-    # could persist itself. Saying so in the prompt is necessary; it is not
-    # sufficient.
+    # and the pre-push hook refuses a push to ~/code/claude's MAIN that touches
+    # anything outside its document directories (plans/, product/, design/,
+    # docs/). Instructions and code there — CLAUDE.md, rules/, skills/, tools/,
+    # settings*.json — are what every future session loads and obeys, which makes
+    # an UNREVIEWED write to one of them the one way a prompt-injected session
+    # could persist itself. The hook draws the line at review rather than at the
+    # paths: the same change is allowed on a branch, where it can only land as a
+    # PR a human merges (`claude` is not in MergeLane::LANE_REPOS and has no `ci`
+    # check, so no merge loop can reach it). Widened from plans/-only in ISS-1061.
+    # Saying so in the prompt is necessary; it is not sufficient.
     #
     # The credentials merged in last are the external-API keys a session needs
     # to VERIFY work whose subject is an external API, rather than designing it
