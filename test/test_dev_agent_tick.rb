@@ -83,16 +83,24 @@ class TestDevAgentTick < Minitest::Test
   # ---- the environment a session is spawned with ----
 
   # The credential plumbing, asserted at the tick rather than only inside
-  # Agent::Credentials: `resolve` returning the right hash is worth nothing if
-  # nothing merges it into the spawn, which is exactly the state ISS-570 found —
-  # the key sat in the env repo beside the checkout for the whole history of the
-  # fleet and no session ever received it.
+  # Agent::Credentials, because the merge is the half that has been wrong twice.
+  # ISS-570 found `resolve` returning the right hash and nothing putting it into
+  # the spawn; ISS-1037 is the same joint in the other direction — a session must
+  # now receive these names EXPLICITLY UNSET, and "unset" is not the same as
+  # "not added".
   #
-  # The value is CredentialsGuard's stand-in, not a real secret.
-  def test_a_spawned_session_is_given_the_external_api_credentials
+  # nil is what `Process.spawn` reads as "remove this variable from the child".
+  # An omitted key would leave the child inheriting whatever the runner's own
+  # shell exports, which `Agent::Credentials.probe` deliberately allows an
+  # operator to do — so the whole change would be a silent no-op on exactly the
+  # machine where someone had set it in `.zprofile`.
+  def test_a_spawned_session_is_given_no_external_api_credentials
     with_agent_home do
       env = tick.send(:child_env, "i707_abc", 707)
-      assert_equal "stub-PLAYBOOK_CLAUDE_KEY", env["PLAYBOOK_CLAUDE_KEY"]
+      Agent::Credentials::NAMES.each do |name|
+        assert_includes env.keys, name, "#{name} must be named, so the child is told to UNSET it"
+        assert_nil env[name], "#{name} must be nil — a value here is a key held for the life of the session"
+      end
       refute_includes env.keys, "ANTHROPIC_API_KEY",
                       "that variable reconfigures the `claude` CLI the session runs as"
       # ...without displacing what was already there.
@@ -1372,15 +1380,18 @@ class TestDevAgentTick < Minitest::Test
     assert_empty seen[:snoozed]
   end
 
-  # A reopened issue accumulates fixes, and `dev issues fix` appends more after the
-  # fact. Reading only the newest would defer a dependent on a follow-up PR whose
-  # merge it never needed.
-  def test_any_merged_fix_clears_the_blocker_even_with_a_later_one_still_open
+  # ISS-1105, end to end through the dispatcher. One change spanning repos is
+  # closed out as one `--status fixed --url` plus a `dev issues fix --url` per
+  # sibling (ISS-759), so a merged url beside an open one is the NORMAL shape of a
+  # blocker whose code is only half on main. This used to dispatch on the merged
+  # one alone, and that is how ISS-1009 was started against an open PR.
+  def test_a_still_open_sibling_fix_defers_even_though_the_other_one_merged
     later = "https://github.com/mbryzek/devops/pull/400"
     seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
                      blocker_issues: blocker_issue(fixes: [{ "url" => BLOCKER_PR }, { "url" => later }]),
                      prs: pr("MERGED").merge(pr("OPEN", url: later)))
-    assert seen[:spawned]
+    refute seen[:spawned], "half the blocker's code is still in an open PR"
+    assert_includes seen[:snoozed].first[:comment], later
   end
 
   # FAIL OPEN. `gh` missing, a rate limit, a url that names no PR — every unknown

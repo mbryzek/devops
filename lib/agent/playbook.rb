@@ -274,10 +274,26 @@ module Agent
     # filename. `weekly-review` writes `plans/{child}-weekly-<date>.md` every week
     # and is exactly the file this must not flag.
 
+    #   handwritten A write into the morning briefing's status directory,
+    #               `~/code/openclaw/openclaw-workspace/data/`. That is outside
+    #               the workspace `agent/instructions.md` §3 confines a session
+    #               to, and §3's stated remedy — clone it — accomplishes nothing,
+    #               because the briefing reads the original path. So the playbook
+    #               and the guardrail contradicted each other every night and the
+    #               session had to pick one unaided; the reading that honours the
+    #               guardrail drops the briefing update, and a dropped section is
+    #               invisible rather than stale (ISS-1022). `dev agent status-file
+    #               <key> --write FILE` is the command that write is now.
+
+    # The home a path is written relative to, in every form a playbook spells it.
+    # Shared by the two repo/directory matchers below so a new spelling is
+    # understood by both at once.
+    HOME_PREFIX_RE = %r{(?:~|\$HOME|\$\{HOME\}|/(?:Users|home)/[A-Za-z0-9][A-Za-z0-9._-]*)}.freeze
+
     # `~/code/claude` in any of the forms a playbook writes it. A bare mention of
     # the repo is NOT a target — `git -C ~/code/claude pull` and the prose that
     # explains the push guard both name it — so a target always has a path tail.
-    CLAUDE_REPO_RE = %r{(?:~|\$HOME|\$\{HOME\}|/(?:Users|home)/[A-Za-z0-9][A-Za-z0-9._-]*)/code/claude}.freeze
+    CLAUDE_REPO_RE = %r{#{HOME_PREFIX_RE}/code/claude}.freeze
 
     # Placeholders are part of a path here: the playbooks write `{child}` and
     # `<date>` into the very filenames this classifies, and a matcher that stopped
@@ -291,6 +307,14 @@ module Agent
     PATH_LITTER_RE = /[.,;:]+\z/.freeze
 
     CLAUDE_PATH_RE = /#{CLAUDE_REPO_RE}(#{PATH_TAIL_RE})/.freeze
+
+    # The briefing's status directory. Unlike the repo above, the DIRECTORY alone
+    # is already a finding and the filename is optional: "write the status file
+    # into `~/code/openclaw/openclaw-workspace/data/`" is the same instruction as
+    # naming the file, and both are outside the workspace.
+    BRIEFING_DIR_RE = %r{#{HOME_PREFIX_RE}/code/openclaw/openclaw-workspace/data}.freeze
+
+    BRIEFING_PATH_RE = /#{BRIEFING_DIR_RE}(?:#{PATH_TAIL_RE})?/.freeze
 
     # `git -C ~/code/claude add plans/data/perf-ledger.md` — the commit sequence a
     # playbook spells out, where the repo and the path are separate arguments and
@@ -354,6 +378,8 @@ module Agent
       unpushable: "outside `plans/` — the push guard refuses this write from an unattended session",
       reaped: "a top-level `plans/` file with no date in its name — `dev prune plans` removes it after 14 days",
       missing_state: "not on this runner — `~/.platform` holds only what the fleet provisions, and nothing creates this",
+      handwritten_status: "the briefing's status directory, outside the workspace §3 confines a session to — " \
+                          "write it with `dev agent status-file`",
     }.freeze
 
     # The one-line remedy `--lint` prints once per rule it hit. Every rule a
@@ -365,6 +391,8 @@ module Agent
       reaped: "Put long-lived state in a `plans/` SUBDIRECTORY — `dev prune plans` only reaps top-level files.",
       missing_state: "Name a file the fleet actually provisions, or drop the step — an unattended run that " \
                      "finds nothing there substitutes something rather than stopping.",
+      handwritten_status: "Record it with `dev agent status-file <key> --write FILE` — a session may not edit " \
+                          "that directory by hand, and cloning it (§3's remedy) is not one the briefing reads.",
     }.freeze
 
     WriteTarget = Struct.new(:key, :line, :path, :rule, keyword_init: true) do
@@ -431,7 +459,8 @@ module Agent
       findings = lines.each_with_index.flat_map do |line, index|
         previous = index.zero? ? "" : lines[index - 1]
         git_add_targets(line, key: key, number: index + 1) +
-          spelled_out_targets(line, previous, key: key, number: index + 1)
+          spelled_out_targets(line, previous, key: key, number: index + 1) +
+          briefing_targets(line, previous, key: key, number: index + 1)
       end
       findings.uniq { |finding| [finding.line, finding.path, finding.rule] }
     end
@@ -444,6 +473,22 @@ module Agent
           rule && WriteTarget.new(key: key, line: number, path: path, rule: rule)
         end
       end
+    end
+
+    # The briefing's status directory, under the same write-context rule as the
+    # rest: this path is legitimately NAMED in prose that explains the mechanism
+    # ("the file the morning briefing reads"), and a detector that flagged every
+    # mention of it would be one nobody runs twice. Only the instruction to write
+    # there is a finding, and its remedy is a command, not a different path — so
+    # there is nothing to classify beyond "this is that directory".
+    def briefing_targets(line, previous, key:, number:)
+      findings = []
+      line.to_enum(:scan, BRIEFING_PATH_RE).each do
+        match = Regexp.last_match
+        next unless write_context?(previous, line[0...match.begin(0)], match.post_match)
+        findings << WriteTarget.new(key: key, line: number, path: trim_path(match[0]), rule: :handwritten_status)
+      end
+      findings
     end
 
     def spelled_out_targets(line, previous, key:, number:)

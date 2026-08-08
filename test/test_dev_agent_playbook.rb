@@ -572,6 +572,58 @@ class TestDevAgentPlaybook < Minitest::Test
     assert_equal 1, state_findings("cat ~/.platform/nope.json || echo ~/.platform/nope.json").length
   end
 
+  # ---- 3. handwritten_status: the briefing's data directory (ISS-1022) ----
+  #
+  # The third way an instruction reaches a place the session cannot legitimately
+  # write. This one is not a guard refusing the push or a reaper deleting the
+  # file — it is `agent/instructions.md` §3 forbidding the write outright, with a
+  # stated remedy ("clone what you need") that does not apply, because the
+  # briefing reads the original path and never a copy. So the playbook and the
+  # guardrail contradicted each other and the session picked one unaided every
+  # night; the reading that honours §3 drops the briefing update, and a dropped
+  # section is invisible rather than stale. `dev agent status-file` is the write.
+
+  # Verbatim the shape three playbooks carried, and the reason ISS-1022 was filed.
+  def test_writing_the_briefings_status_file_by_hand_is_a_finding
+    assert_equal [:handwritten_status],
+                 rules_of("Write\n`~/code/openclaw/openclaw-workspace/data/slow-query-review-status.md`\nin this shape.")
+    assert_equal ["pb:1: ~/code/openclaw/openclaw-workspace/data/x-status.md — " \
+                  "#{Agent::Playbook::REASONS[:handwritten_status]}"],
+                 targets("Write `~/code/openclaw/openclaw-workspace/data/x-status.md` with the summary.")
+  end
+
+  # The directory alone is the same instruction, so it is the same finding — a
+  # detector that needed a filename would miss "drop the report into `…/data/`".
+  def test_the_directory_alone_is_a_target
+    assert_equal [:handwritten_status], rules_of("Save the report into `~/code/openclaw/openclaw-workspace/data/`.")
+  end
+
+  # Both detectors fire, and they are two distinct defects: hardcoded to one
+  # runner's home AND written by hand. This is the exact line ISS-633 fixed
+  # halfway — it made the path home-relative and left the write in place.
+  def test_a_hardcoded_home_status_path_is_both_defects
+    assert_equal %i[home_path handwritten_status],
+                 Agent::Playbook.lint_all([{ "key" => "pb",
+                                             "body" => "Write /Users/mbryzek/code/openclaw/openclaw-workspace/data/x.md" }])
+                                .map(&:rule)
+  end
+
+  # The command that replaces the write must never be a finding, or the fix would
+  # be flagged as the defect — and every one of these playbooks will carry this
+  # line.
+  def test_the_command_that_replaces_the_write_is_not_a_finding
+    assert_empty targets("Write the report in your workspace, then record it: " \
+                         "`dev agent status-file slow-query-review --write report.md`.")
+  end
+
+  # Prose that EXPLAINS the mechanism names the directory constantly — this file's
+  # own subject does — and a detector with a standing false positive is one nobody
+  # runs twice.
+  def test_prose_that_only_names_the_directory_is_not_a_finding
+    assert_empty targets("The morning briefing reads `~/code/openclaw/openclaw-workspace/data/` (item 21).")
+    assert_empty targets("See `~/code/openclaw/openclaw-workspace/data/slow-query-review-status.md` for last night.")
+  end
+
   def test_the_whole_store_is_linted_for_every_rule_at_once
     rows = [
       { "key" => "clean", "body" => "Write `~/code/claude/plans/data/x.md`." },
