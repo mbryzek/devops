@@ -109,6 +109,26 @@ class TestAgentDependency < Minitest::Test
     refute_includes line, "has not merged"
   end
 
+  # ---- ISS-1085: the same wording, wherever it is read ----
+
+  # `dev issues show` prints the blocker's number, status and title on its own
+  # line, so it wants the PR clause WITHOUT the "ISS-N is `fixed`" half the
+  # deferral comment carries. Both come from `pr_reason`, so the note a session
+  # reads on the timeline and the line a human reads before claiming cannot become
+  # two different accounts of one PR.
+  def test_the_pr_clause_is_the_tail_of_the_sentence_the_dispatcher_writes
+    result = unshipped(issue_with_blocker, blocker: fixed_blocker(URL), prs: { URL => pr })
+    assert_equal "its fix #{URL} has not merged", Agent::Dependency.pr_reason(result.first)
+    assert_includes Agent::Dependency.describe(result).first, Agent::Dependency.pr_reason(result.first)
+  end
+
+  # No PR to name, so there is no second line to print: the blocker never reached
+  # a shipped status, and the status already on the line is the whole reason.
+  def test_a_blocker_with_no_pr_has_no_clause
+    result = unshipped(issue_with_blocker(status: "claimed"))
+    assert_nil Agent::Dependency.pr_reason(result.first)
+  end
+
   # An open fix outranks a closed one: it is the PR that will actually ship, and
   # naming it is what makes the deferral note actionable.
   def test_an_open_fix_is_named_over_a_closed_one
