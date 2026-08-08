@@ -5,6 +5,7 @@ require 'tmpdir'
 require_relative 'test_helper'
 require 'agent/dependency_wake'
 require 'agent/tick'
+require 'prs/deploy'
 
 # The backstop that brings a dependency-deferred issue back within minutes of the
 # merge instead of within a day (ISS-922).
@@ -68,7 +69,7 @@ class TestAgentDependencyWake < Minitest::Test
   # `self` to Agent::Api, so a helper call inside one resolves against the module
   # and raises NoMethodError.
   def sweep(rows:, timelines: {}, issues: {}, blocker_fixes: [URL], merged: [URL],
-            github_readable: true, issue_error: false, timeline_error: false,
+            released: true, github_readable: true, issue_error: false, timeline_error: false,
             wake_error: false, comment_error: false, dry_run: false, cap: 25)
     writes = []
     stub_singleton(Agent::Api, :snoozed_issues, ->(**) { rows }) do
@@ -82,18 +83,21 @@ class TestAgentDependencyWake < Minitest::Test
         }) do
           stub_singleton(Agent::Github, :pr_by_url, lambda { |url|
             next nil unless github_readable
-            { "url" => url, "state" => merged.include?(url) ? "MERGED" : "OPEN" }
+            { "url" => url, "state" => merged.include?(url) ? "MERGED" : "OPEN",
+              "mergeCommit" => merged.include?(url) ? { "oid" => "deadbeef" } : nil }
           }) do
-            stub_singleton(Agent::Api, :wake, lambda { |number, **|
-              raise ApiError, "422 from the platform" if wake_error
-              writes << [:wake, number.to_s]
-            }) do
-              stub_singleton(Agent::Api, :comment, lambda { |number, text, **|
-                raise ApiError, "500 from the platform" if comment_error
-                writes << [:comment, number.to_s, text]
+            stub_singleton(Prs::Deploy, :state, ->(*, **) { released ? :shipped : :unshipped }) do
+              stub_singleton(Agent::Api, :wake, lambda { |number, **|
+                raise ApiError, "422 from the platform" if wake_error
+                writes << [:wake, number.to_s]
               }) do
-                result = Agent::DependencyWake.sweep(use_localhost: false, dry_run: dry_run, cap: cap)
-                return [result, writes]
+                stub_singleton(Agent::Api, :comment, lambda { |number, text, **|
+                  raise ApiError, "500 from the platform" if comment_error
+                  writes << [:comment, number.to_s, text]
+                }) do
+                  result = Agent::DependencyWake.sweep(use_localhost: false, dry_run: dry_run, cap: cap)
+                  return [result, writes]
+                end
               end
             end
           end
@@ -208,6 +212,18 @@ class TestAgentDependencyWake < Minitest::Test
                            merged: [])
     assert_empty writes
     assert_equal %w[859], result.blocked
+  end
+
+  # ISS-1097, from this side. The merge is not the trigger — the RELEASE is, and
+  # this is the pass that woke ISS-1024 four minutes before a session claimed it
+  # and found workers#207 on main and 0.1.77 in production.
+  def test_a_deferral_whose_fix_merged_but_has_not_been_released_is_left_alone
+    result, writes = sweep(rows: [snoozed_row(1024)],
+                           timelines: { "1024" => [DEFER_COMMENT] },
+                           issues: { "1024" => blocked_issue(1024) },
+                           released: false)
+    assert_empty writes
+    assert_equal %w[1024], result.blocked
   end
 
   # FAIL OPEN, pointed at "leave it alone". A rate-limited `gh` answers nil for

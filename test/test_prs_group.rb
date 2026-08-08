@@ -283,7 +283,32 @@ class TestPrsDeploy < Minitest::Test
   # wrong "newest" tag compares against the wrong release.
   def test_release_tags_are_ordered_numerically_and_non_releases_are_ignored
     cap = capture_for("/tags" => "0.9.2\n0.10.1\nbackup_snapshot\nv0.10.0\n")
-    assert_equal "0.10.1", Prs::Deploy.latest_release_tag("platform-postgresql", capture: cap)
+    assert_equal "0.10.1", Prs::Deploy.deployed_ref("platform-postgresql", live_version: ->(_r) { nil },
+                                                                           capture: cap)
+  end
+
+  # ISS-1097: the two kinds of "there is no ref to compare against". A repo that
+  # publishes NO releases is not an unknown — devops is the case, and merging
+  # there IS deploying — while a tag list that could not be read is. `contains?`
+  # folds both to nil because holding is the only safe act for a merge check;
+  # Agent::Dependency reads them apart.
+  def test_a_repo_that_publishes_no_releases_is_told_apart_from_one_that_could_not_be_read
+    none = capture_for("/tags" => "\n")
+    assert_equal :unreleasable, Prs::Deploy.state("devops", "abc", live_version: ->(_r) { nil }, capture: none)
+    assert_nil Prs::Deploy.contains?("devops", "abc", live_version: ->(_r) { nil }, capture: none)
+
+    silent = ->(_cmd) { nil }
+    assert_equal :unknown, Prs::Deploy.state("devops", "abc", live_version: ->(_r) { nil }, capture: silent)
+  end
+
+  def test_the_state_of_a_commit_against_what_shipped
+    cap = capture_for("compare/0.19.13...abc" => "behind\n")
+    assert_equal :shipped, Prs::Deploy.state("platform", "abc", live_version: ->(_r) { "0.19.13" }, capture: cap)
+
+    ahead = capture_for("compare/0.19.13...abc" => "ahead\n")
+    assert_equal :unshipped, Prs::Deploy.state("platform", "abc", live_version: ->(_r) { "0.19.13" },
+                                                                  capture: ahead)
+    assert_equal :unknown, Prs::Deploy.state("platform", "", live_version: ->(_r) { "0.19.13" }, capture: cap)
   end
 
   # Every failure path is nil, and Prs::Group reads nil as a HOLD.

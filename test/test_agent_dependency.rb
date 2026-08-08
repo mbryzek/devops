@@ -2,6 +2,7 @@
 require 'minitest/autorun'
 require_relative 'test_helper'
 require 'agent/dependency'
+require 'prs/deploy'
 
 # The dispatch gate that asks GitHub instead of the tracker (ISS-649), and the
 # hole ISS-739 found in it.
@@ -13,16 +14,18 @@ require 'agent/dependency'
 # test at all, which is how the closed-unmerged case shipped unnoticed.
 #
 # So the cases here are the whole answer space of one blocker: not shipped by the
-# tracker's own reckoning, dismissed, fixed+merged, fixed+open, fixed+closed, and
-# every UNKNOWN (`gh` silent, blocker unreadable, no PR fix recorded, a state
-# this code does not recognise) — which fail OPEN by policy and must keep doing
-# so, since a gate that stalls the queue whenever GitHub is unreachable is a
-# worse failure than the one it prevents.
+# tracker's own reckoning, dismissed, fixed+merged+released, fixed+merged+not
+# released (ISS-1097), fixed+open, fixed+closed, and every UNKNOWN (`gh` silent,
+# blocker unreadable, no PR fix recorded, a state this code does not recognise, a
+# release state that could not be read) — which fail OPEN by policy and must keep
+# doing so, since a gate that stalls the queue whenever GitHub is unreachable is
+# a worse failure than the one it prevents.
 class TestAgentDependency < Minitest::Test
   include DevTestSupport
 
   URL = "https://github.com/mbryzek/devops/pull/359".freeze
   OTHER_URL = "https://github.com/mbryzek/platform/pull/1600".freeze
+  SHA = "12bb30e3eb88061a10cb98bdd11d40d6fc9c76f8".freeze
 
   def issue_with_blocker(number: 633, status: "fixed")
     { "number" => "644",
@@ -30,18 +33,39 @@ class TestAgentDependency < Minitest::Test
                     "issue" => { "number" => number, "status" => status } }] }
   end
 
-  def pr(url: URL, state: "OPEN") = { "url" => url, "state" => state, "number" => 359 }
+  # A merged PR carries its merge commit — the thing a release is asked to
+  # contain. `gh` returns it under `mergeCommit` for every PR that merged.
+  def pr(url: URL, state: "OPEN", sha: SHA)
+    { "url" => url, "state" => state, "number" => 359,
+      "mergeCommit" => (state == "MERGED" && sha ? { "oid" => sha } : nil) }
+  end
 
-  # Run `unshipped` with the blocker's own record and the PR lookup stubbed.
-  # `blocker` nil stands in for an unreadable issue; `prs` maps url => PR (or
-  # nil, which is what `gh` returns for every unknown).
-  def unshipped(issue, blocker: nil, prs: {})
+  # Run `unshipped` with the blocker's own record, the PR lookup, and the release
+  # check stubbed. `blocker` nil stands in for an unreadable issue; `prs` maps
+  # url => PR (or nil, which is what `gh` returns for every unknown); `release`
+  # is what Prs::Deploy says about a merge commit — :shipped by default, so a
+  # test that says nothing about releases is testing the merge half alone.
+  def unshipped(issue, blocker: nil, prs: {}, release: :shipped)
+    with_stubs(blocker: blocker, prs: prs, release: release) do
+      Agent::Dependency.unshipped(issue, use_localhost: false)
+    end
+  end
+
+  # `release: :real` leaves Prs::Deploy alone — for the cases it answers without
+  # asking GitHub anything, which are the ones worth exercising unstubbed.
+  def with_stubs(blocker:, prs:, release:, &block)
     stub_singleton(Agent::Api, :issue, lambda { |*, **|
       raise ApiError, "500 from the platform" if blocker == :error
       blocker
     }) do
       stub_singleton(Agent::Github, :pr_by_url, ->(url) { prs[url] }) do
-        Agent::Dependency.unshipped(issue, use_localhost: false)
+        if release == :real
+          block.call
+        else
+          stub_singleton(Prs::Deploy, :state, lambda { |repo, sha, **|
+            release.is_a?(Proc) ? release.call(repo, sha) : release
+          }, &block)
+        end
       end
     end
   end
@@ -52,7 +76,7 @@ class TestAgentDependency < Minitest::Test
 
   def test_a_blocker_that_is_not_terminal_blocks_on_its_status_alone
     result = unshipped(issue_with_blocker(status: "claimed"))
-    assert_equal [{ "number" => 633, "status" => "claimed", "pr" => nil }], result
+    assert_equal [{ "number" => 633, "status" => "claimed", "pr" => nil, "state" => :working }], result
     assert_equal ["ISS-633 is still `claimed`"], Agent::Dependency.describe(result)
   end
 
@@ -251,14 +275,9 @@ class TestAgentDependency < Minitest::Test
   # inverting [] would turn a `gh` blip into a fleet-wide unsnooze. These cases
   # are the ones where the two must disagree.
 
-  def cleared?(issue, blocker: nil, prs: {})
-    stub_singleton(Agent::Api, :issue, lambda { |*, **|
-      raise ApiError, "500 from the platform" if blocker == :error
-      blocker
-    }) do
-      stub_singleton(Agent::Github, :pr_by_url, ->(url) { prs[url] }) do
-        Agent::Dependency.cleared?(issue, use_localhost: false)
-      end
+  def cleared?(issue, blocker: nil, prs: {}, release: :shipped)
+    with_stubs(blocker: blocker, prs: prs, release: release) do
+      Agent::Dependency.cleared?(issue, use_localhost: false)
     end
   end
 
@@ -335,6 +354,139 @@ class TestAgentDependency < Minitest::Test
                           { "type" => "blocked_by", "direction" => "outgoing",
                             "issue" => { "number" => 634, "status" => "claimed" } }] }
     refute cleared?(issue, blocker: fixed_blocker(URL), prs: { URL => pr(state: "MERGED") })
+  end
+
+  # ---- ISS-1097: merged is not live ----
+  #
+  # ISS-1024 said it in as many words: "Once workers#207 is merged AND the workers
+  # deploy is live, retry the held windows. Retrying BEFORE the fix is live only
+  # burns four more attempts." The gate read the first half, woke it at 16:09 with
+  # #207 merged at 16:08 and the newest workers tag still at 0.1.77, and the
+  # session that claimed it four minutes later could do nothing at all.
+  #
+  # Both directions move together, always. A wake looser than the gate wakes an
+  # issue the claim behind it re-defers on sight, walking it toward the
+  # seven-attempt escalation for nothing.
+
+  def merged_pr = { URL => pr(state: "MERGED") }
+
+  def test_a_merged_but_unreleased_fix_blocks
+    result = unshipped(issue_with_blocker, blocker: fixed_blocker(URL),
+                       prs: merged_pr, release: :unshipped)
+    assert_equal 1, result.size, "the code is on main and not in production — that is not landed"
+    assert_equal :unreleased, result.first["state"]
+    assert_equal URL, result.first["pr"]["url"]
+  end
+
+  def test_a_merged_but_unreleased_fix_does_not_wake_a_deferral
+    refute cleared?(issue_with_blocker, blocker: fixed_blocker(URL),
+                    prs: merged_pr, release: :unshipped)
+  end
+
+  def test_a_merged_and_released_fix_both_dispatches_and_wakes
+    assert_empty unshipped(issue_with_blocker, blocker: fixed_blocker(URL), prs: merged_pr, release: :shipped)
+    assert cleared?(issue_with_blocker, blocker: fixed_blocker(URL), prs: merged_pr, release: :shipped)
+  end
+
+  # …and says so in words that cannot be read as "not merged", which is flatly
+  # false about a commit sitting on main and is the confusion this was filed
+  # about. It names the repo, because "release the thing" is the action.
+  def test_the_note_distinguishes_unreleased_from_unmerged
+    result = unshipped(issue_with_blocker, blocker: fixed_blocker(URL),
+                       prs: merged_pr, release: :unshipped)
+    line = Agent::Dependency.describe(result).first
+    assert_includes line, "merged and has NOT been released"
+    assert_includes line, "not in the newest `devops` release"
+    refute_includes line, "has not merged"
+    # …and `dev issues show` prints the same clause, from the same source (ISS-1085).
+    assert_includes line, Agent::Dependency.pr_reason(result.first)
+  end
+
+  # devops, and it is the most common blocker repo in this fleet: nothing builds
+  # or ships it, every runner fast-forwards its checkout at the top of every tick,
+  # so merging IS deploying. Waiting for a tag there would park every
+  # devops-blocked issue until the daily expiry — undoing ISS-922 for the
+  # majority case in the name of a release nobody is ever going to cut.
+  def test_a_repo_that_publishes_no_releases_counts_as_landed_on_merge
+    assert_empty unshipped(issue_with_blocker, blocker: fixed_blocker(URL),
+                           prs: merged_pr, release: :unreleasable)
+    assert cleared?(issue_with_blocker, blocker: fixed_blocker(URL),
+                    prs: merged_pr, release: :unreleasable)
+  end
+
+  # A release state that could not be read is an unknown like any other: it
+  # DISPATCHES (the gate fails open) and it does not WAKE (an unreadable GitHub
+  # is not evidence that anything shipped).
+  def test_an_unreadable_release_state_dispatches_but_does_not_wake
+    assert_empty unshipped(issue_with_blocker, blocker: fixed_blocker(URL),
+                           prs: merged_pr, release: :unknown)
+    refute cleared?(issue_with_blocker, blocker: fixed_blocker(URL),
+                    prs: merged_pr, release: :unknown)
+  end
+
+  # The second compounding cause. `fixed -> deployed -> verified` is a one-way
+  # ladder a session can walk by hand, and ISS-1012 reached `verified` at 16:03
+  # for a PR that merged at 16:08 — five minutes in the future. Any check reading
+  # "is the blocker at deployed-or-better" clears on that. This reads the commit.
+  def test_a_status_past_deployed_is_not_evidence_that_anything_shipped
+    %w[fixed deployed verified].each do |status|
+      issue = issue_with_blocker(status: status)
+      refute_empty unshipped(issue, blocker: fixed_blocker(URL), prs: merged_pr, release: :unshipped),
+                   "#{status} is the tracker's word, not a release"
+      refute cleared?(issue, blocker: fixed_blocker(URL), prs: merged_pr, release: :unshipped),
+             "#{status} must not wake an issue whose blocker is not in a release"
+    end
+  end
+
+  # The repo comes from the fix url — the only place a blocker's repo is written
+  # down — and the sha from the PR's merge commit, which is what a release is
+  # asked to contain.
+  def test_the_release_check_is_asked_about_the_fixs_own_repo_and_merge_commit
+    asked = []
+    unshipped(issue_with_blocker, blocker: fixed_blocker(URL), prs: merged_pr,
+              release: ->(repo, sha) { asked << [repo, sha]; :shipped })
+    assert_equal [["devops", SHA]], asked
+  end
+
+  # A merged PR whose merge commit `gh` did not return is an UNKNOWN, not a
+  # release failure — no stub here, because Prs::Deploy answers that without
+  # asking GitHub anything.
+  def test_a_merged_pr_with_no_merge_commit_is_unknown
+    prs = { URL => pr(state: "MERGED", sha: nil) }
+    assert_empty unshipped(issue_with_blocker, blocker: fixed_blocker(URL), prs: prs, release: :real)
+    refute cleared?(issue_with_blocker, blocker: fixed_blocker(URL), prs: prs, release: :real)
+  end
+
+  # …which it can only do because the field is asked for. `gh search prs` cannot
+  # return it, which is why SEARCH_FIELDS is a separate list.
+  def test_the_pr_lookup_asks_for_the_merge_commit
+    assert_includes Agent::Github::PR_FIELDS, "mergeCommit"
+    refute_includes Agent::Github::SEARCH_FIELDS, "mergeCommit"
+  end
+
+  # Deferrals cluster on the same blocking PR — that is what a shared dependency
+  # IS — so a sweep over twenty issues waiting on one merge asks GitHub once.
+  def test_the_release_oracle_memoises_per_repo_and_sha
+    calls = 0
+    stub_singleton(Prs::Deploy, :state, lambda { |_repo, _sha, **|
+      calls += 1
+      :shipped
+    }) do
+      oracle = Agent::Dependency.release_oracle
+      3.times { assert_equal :shipped, oracle.call("workers", SHA) }
+      oracle.call("workers", "other")
+    end
+    assert_equal 2, calls
+  end
+
+  # An open PR still outranks an unreleased merge in the note: it is the one that
+  # has not landed at all, and naming it is what makes the deferral actionable.
+  def test_an_open_fix_is_named_over_an_unreleased_one
+    result = unshipped(issue_with_blocker, blocker: fixed_blocker(URL, OTHER_URL),
+                       prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "OPEN") },
+                       release: :unshipped)
+    assert_equal OTHER_URL, result.first["pr"]["url"]
+    assert_equal :open, result.first["state"]
   end
 
   # ---- ISS-922: the attempt count is CONSECUTIVE, not a running total ----

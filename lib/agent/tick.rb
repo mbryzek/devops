@@ -1345,7 +1345,9 @@ module Agent
       # whose blocker is live work; what it cannot see is a blocker sitting at
       # `fixed` on a PR that is still OPEN, which in this fleet is what `fixed`
       # means most of the day. Starting a session on one hands it a dependency
-      # that is not on main and forces it to invent a merge order.
+      # that is not on main and forces it to invent a merge order — or, since
+      # ISS-1097, one that merged but has not been released, which hands it
+      # nothing it can test against.
       unshipped = Agent::Dependency.unshipped(issue, use_localhost: @use_localhost)
       return defer_for_dependency(lease, identity, number, unshipped, comments) unless unshipped.empty?
 
@@ -1540,10 +1542,11 @@ module Agent
       text = "#{DEPENDENCY_DEFER_MARKER} — not dispatched, deferred #{DEPENDENCY_DEFER_DAYS} day " \
              "(attempt #{attempt} of #{DEPENDENCY_DEFER_LIMIT}).\n\n" \
              "#{reasons.map { |r| "- #{r}" }.join("\n")}\n\n" \
-             "A session started now would be building on code that is not on `origin/main`, and its only " \
-             "options are to re-implement the dependency or to stack on it — both of which ISS-649 exists " \
-             "to stop. Nothing to do here: this returns to the queue on its own, and the check is rerun " \
-             "against GitHub each time."
+             "A session started now would be building on code that is not on `origin/main` — where its only " \
+             "options are to re-implement the dependency or to stack on it, both of which ISS-649 exists to " \
+             "stop — or testing against a fix that has merged but is not running in production, which is a " \
+             "session with nothing it can verify (ISS-1097). Nothing to do here: this returns to the queue " \
+             "on its own, and the check is rerun against GitHub each time."
       unless @dry_run
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
         deferred = Agent::Api.snooze(number, @now + (DEPENDENCY_DEFER_DAYS * 24 * 60 * 60),
@@ -1570,11 +1573,12 @@ module Agent
     # what it did was wrong.
     def escalate_stalled_dependency(lease, identity, number, reasons, attempt, undeferrable: false)
       why = undeferrable ? "this runner could not record the deferral" : "#{attempt} daily checks have not cleared it"
-      text = "Waiting on a dependency that has not merged, and #{why}.\n\n" \
+      text = "Waiting on a dependency that has not landed, and #{why}.\n\n" \
              "#{reasons.map { |r| "- #{r}" }.join("\n")}\n\n" \
-             "Merge the PR (or drop the `blocked_by` edge with `dev issues block #{number} --on <n> --remove` " \
-             "if this issue no longer needs it) and move this back to `open`. No session has been started: " \
-             "the work is not blocked on a decision, only on the code landing on `origin/main`."
+             "Merge the PR — or release the repo it merged into, if the line above says the merge is not in " \
+             "the newest release yet — and move this back to `open`. Dropping the `blocked_by` edge with " \
+             "`dev issues block #{number} --on <n> --remove` works too, if this issue no longer needs it. " \
+             "No session has been started: the work is not blocked on a decision, only on the code landing."
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost) unless undeferrable

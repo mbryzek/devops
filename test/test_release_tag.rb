@@ -45,6 +45,22 @@ class TestReleaseTag < Minitest::Test
     assert_nil ReleaseTag.latest("workers", capture: ->(_cmd) { nil })
   end
 
+  # ISS-1097: `latest` collapses both of these to nil because neither gives it a
+  # tag to return, and a caller deciding "has this merge shipped" needs them
+  # apart. `[]` is devops — a repo that does not release, where waiting for a tag
+  # is waiting for something nobody will ever cut. `nil` is a read that failed.
+  def test_the_tag_list_tells_a_repo_with_no_releases_apart_from_one_it_could_not_read
+    assert_equal [], ReleaseTag.tags("devops", capture: capture_for("/tags" => "\n"))
+    assert_equal [], ReleaseTag.tags("workers", capture: capture_for("/tags" => "backup_snapshot\n"))
+    assert_nil ReleaseTag.tags("workers", capture: ->(_cmd) { nil })
+  end
+
+  def test_the_newest_of_an_already_read_list_needs_no_second_call
+    assert_equal "0.10.1", ReleaseTag.newest(%w[0.9.2 0.10.1 v0.10.0])
+    assert_nil ReleaseTag.newest([])
+    assert_nil ReleaseTag.newest(nil)
+  end
+
   # The tagger date, not the tagged commit's. `release` tags whatever is on main,
   # so the commit's timestamp is the last MERGE — reading it would make "released
   # since the fix merged" false for the release that shipped the fix.
