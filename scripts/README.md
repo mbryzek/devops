@@ -10,11 +10,14 @@ dev scripts run <name> [args...]    # the name comes FIRST, then any arguments
 Two kinds of scripts live here:
 
 - **First-class scripts** — `.sql` files (and standalone executables) that *are*
-  the utility. Example: `delete-test-clubs.sql`.
-- **Wrappers** — thin executables that invoke a script living in another repo
-  (it's coupled to that repo's helpers/config, so it stays there). Example:
-  `rename-xlsx-period` wraps `misc/rename-xlsx-period.scala`. This lets
-  `dev scripts list` index *every* utility without relocating coupled suites.
+  the utility. Example: `truncate-court-reserve-data.sql`.
+- **Wrappers** — thin executables that invoke a utility living somewhere else,
+  because that is where it belongs: coupled to another repo's helpers/config
+  (`rename-xlsx-period` wraps `misc/rename-xlsx-period.scala`), or behind an API
+  (`delete-test-clubs` calls `POST /dev/local/test/club/deletions` on the local
+  platform, which owns the club foreign-key order the SQL used to transcribe by
+  hand). This lets `dev scripts list` index *every* utility without relocating
+  coupled suites or keeping a second copy of somebody else's invariants here.
 
 Adding a script (or wrapper) = drop a file here. No `dev` CLI changes required.
 

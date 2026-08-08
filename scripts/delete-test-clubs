@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+# dev-script: targets=local
+# Delete every test-generated club (id like 'club-%') and all dependent rows from the local platform database.
+#
+#   dev scripts run delete-test-clubs
+#
+# A wrapper, not a script: the utility itself lives in platform, behind
+# `POST /dev/local/test/club/deletions`, and this calls it against the platform
+# running on localhost. It was 372 lines of SQL here until ISS-827.
+#
+# WHY IT MOVED. The SQL was a hand-maintained reverse-topological order over the
+# foreign-key graph rooted at playbook.clubs -- 105 `delete from` statements that
+# were a second transcription of an order the platform already has to know. It
+# drifted, as hand-maintained transcriptions do: playbook.insight_rule_logs was
+# renamed to playbook.playbook_rule_logs, the script is one transaction, so it
+# aborted there and rolled back having deleted NOTHING AT ALL, silently, for
+# months (ISS-838). Its own header shipped a recursive pg_constraint query for
+# finding the tables it had drifted away from, which was the tell.
+#
+# There is now one order, `integrations.clubs.purge.ClubPurgePlan`, shared with
+# the 30-day club purge, and `ClubPurgePlanSpec` re-derives its table set and its
+# ordering from pg_constraint on every build. Drift fails a build instead of a run.
+#
+# WHY targets=local IS NOW ENFORCED RATHER THAN REQUESTED. The `club-%` match is
+# not production-safe -- a real club named "Club Med" seeds club-med and would
+# match -- and the old header could only say so. Two things now make it true: the
+# endpoint is generated behind `controller.environments = ["development","test"]`
+# and answers NotFound in Mode.Prod before it looks at auth; and in every other
+# mode DbLocalUrlChecker refuses to start the platform at all against a database
+# that is not localhost. This wrapper therefore only ever speaks to localhost, and
+# takes no --env/--prod flag to point it anywhere else.
+#
+# Needs the platform running locally (`./run.sh` in ~/code/platform) and a
+# credential for it: a Claude session authenticates as Otto AI automatically,
+# a human needs `dev auth login --localhost`.
+
+require 'json'
+require_relative '../lib/api_client'
+
+if ARGV.any? { |a| %w[-h --help].include?(a) }
+  puts "usage: dev scripts run delete-test-clubs"
+  puts
+  puts "Deletes every club with an id like 'club-%' from the LOCAL platform database,"
+  puts "along with every row hanging off it. Local only; takes no arguments."
+  exit 0
+end
+
+unless ARGV.empty?
+  warn "delete-test-clubs takes no arguments (got: #{ARGV.join(' ')}). It only ever runs against localhost."
+  exit 1
+end
+
+endpoint = ApiClient.endpoints(use_localhost: true, app_filter: "platform").first
+
+begin
+  result = ApiClient.request(endpoint, :post, "/dev/local/test/club/deletions")
+rescue SessionExpired => e
+  warn e.message
+  exit 1
+rescue ApiError => e
+  # A 404 here is the environment guard, not a missing route: the endpoint is
+  # compiled into every build and answers NotFound in Mode.Prod. Reaching it means
+  # this is pointed at something that is not a development platform.
+  if e.code == 404
+    warn "The platform on #{endpoint[:active_url]} answered 404. That endpoint exists only in " \
+         "development/test mode -- is this pointed at a production build?"
+  else
+    warn e.message
+  end
+  exit 1
+rescue Errno::ECONNREFUSED
+  warn "No platform listening on #{endpoint[:active_url]}. Start it with `./run.sh` in ~/code/platform."
+  exit 1
+end
+
+tables = result["tables"] || []
+width = tables.map { |t| t["table"].length }.max || 0
+tables.each { |t| puts "  #{t['table'].ljust(width)}  #{t['rows']}" }
+puts "Deleted #{result['clubs']} test club(s), #{result['rows']} row(s)."

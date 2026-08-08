@@ -74,9 +74,9 @@ class TestDevScripts < Minitest::Test
   # These names must match the files committed in scripts/ — update if renamed.
   def test_available_scripts_include_seeded_and_exclude_readme
     names = scripts_available
-    assert_includes names, "delete-test-clubs.sql"
     assert_includes names, "truncate-court-reserve-data.sql"
     # Wrappers (executables) are discovered the same as first-class scripts.
+    assert_includes names, "delete-test-clubs"
     assert_includes names, "rename-xlsx-period"
     assert_includes names, "verify-data"
     refute_includes names, "README.md"
@@ -88,8 +88,8 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_resolve_by_base_name
-    assert_equal File.join(SCRIPTS_DIR, "delete-test-clubs.sql"),
-                 resolve_script("delete-test-clubs")
+    assert_equal File.join(SCRIPTS_DIR, "truncate-court-reserve-data.sql"),
+                 resolve_script("truncate-court-reserve-data")
   end
 
   # ---- run: env-target enforcement (no execution reached) ----
@@ -114,12 +114,17 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_run_refuses_undeclared_prod_target
-    # delete-test-clubs declares targets=local; --prod must be refused before
-    # any execution.
-    out, status = capture { cmd_scripts_run(["delete-test-clubs", "--prod"]) }
-    assert_equal 1, status
-    assert_match(/does not support env 'production'/, out)
-    assert_match(/Allowed: local/, out)
+    # A targets=local script must refuse --prod before any execution. Driven through
+    # run_sql_script against a tmpdir fixture rather than through cmd_scripts_run against a
+    # committed script: every .sql in scripts/ now declares production, and pinning this
+    # behaviour to whichever file happens not to is what made it a casualty of deleting one.
+    Dir.mktmpdir do |dir|
+      path = write_script(dir, "local-only.sql", "-- dev-script: targets=local\n-- Local only.\nselect 1;\n")
+      out, status = capture { run_sql_script(path, "local-only", ["--prod"]) }
+      assert_equal 1, status
+      assert_match(/does not support env 'production'/, out)
+      assert_match(/Allowed: local/, out)
+    end
   end
 
   def test_run_refuses_undeclared_development_target
@@ -149,9 +154,19 @@ class TestDevScripts < Minitest::Test
   end
 
   def test_run_rejects_args_for_sql_script
-    out, status = capture { cmd_scripts_run(["delete-test-clubs", "foo"]) }
+    out, status = capture { cmd_scripts_run(["truncate-court-reserve-data", "foo"]) }
     assert_equal 1, status
     assert_match(/is a SQL script; unexpected argument 'foo'/, out)
+  end
+
+  def test_delete_test_clubs_is_a_local_wrapper
+    # It became a wrapper in ISS-827 — the utility itself is `POST /dev/local/test/club/deletions`
+    # in platform. `targets=local` still holds and still means what it says here (the wrapper runs
+    # on your machine), but what ENFORCES it is now the endpoint's own environment guard.
+    path = File.join(SCRIPTS_DIR, "delete-test-clubs")
+    assert File.executable?(path), "delete-test-clubs must be executable to be dispatched as a wrapper"
+    assert_equal ["local"], script_targets(script_metadata(path))
+    assert_match(/Delete every test-generated club/, script_description(path))
   end
 
   def test_run_unknown_script_suggests
