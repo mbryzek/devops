@@ -146,7 +146,7 @@ class TestDevAgentOps < Minitest::Test
     end
   end
 
-  # THE ONE THAT MATTERS. The issue directory outlives an attempt (claude.log is
+  # THE ONE THAT MATTERS. The issue directory outlives an attempt (the session log is
   # appended across them on purpose), so attempt 1 running the operation and then
   # crashing leaves a successful record behind. Attempt 2, which did nothing at
   # all, must not read it and close the issue out — the same "an earlier run's

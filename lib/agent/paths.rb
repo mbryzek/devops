@@ -145,10 +145,20 @@ module Agent
     def tick_log(date)      = File.join(log_root, "tick", "#{date.strftime('%Y-%m-%d')}.log")
     def issues_dir          = File.join(log_root, "issues")
     def issue_dir(number)   = File.join(issues_dir, "ISS-#{number}")
-    def claude_log(number)  = File.join(issue_dir(number), "claude.log")
+    # Everything a session emitted, as it emitted it: JSONL from
+    # `--output-format stream-json`, plus any stderr the CLI wrote on its way out
+    # (ISS-949). Read it through `Agent::Stream`, which is what turns it back
+    # into lines for a human — `.jsonl` rather than the old `claude.log` because
+    # the name is now load-bearing, and a file that is silently a different
+    # format under the same name is how a `tail` starts printing JSON at someone.
+    def session_log(number) = File.join(issue_dir(number), "stream.jsonl")
+    # What sessions wrote before that, and only ever READ now: an attempt that
+    # was already running when its runner upgraded has one of these and no
+    # stream.jsonl, and its log should not vanish mid-run.
+    def legacy_claude_log(number) = File.join(issue_dir(number), "claude.log")
     def meta_file(number)   = File.join(issue_dir(number), "meta.json")
     # One record per operation `dev agent run-op` executed for this issue
-    # (Agent::Ops, ISS-815). Beside claude.log rather than under the workspace
+    # (Agent::Ops, ISS-815). Beside the session log rather than under the workspace
     # for the reason `exit_code` is: the reap DELETES the workspace, and an
     # artifact classification reads must outlive the thing it classifies.
     def ops_dir(number)     = File.join(issue_dir(number), "ops")
