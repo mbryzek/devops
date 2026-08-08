@@ -21,7 +21,9 @@ require 'agent/paths'
 require 'agent/playbook'
 require 'agent/prompt'
 require 'agent/shell'
+require 'agent/stream'
 require 'agent/toolchain'
+require 'agent/usage_limit'
 require 'agent/verify'
 require 'agent/workspace'
 
@@ -880,6 +882,10 @@ module Agent
         # run from closing out an attempt that did nothing.
         operations: Agent::Ops.records(number, since: started),
         exit_code: Agent::Jobs.exit_code(number),
+        # Did the API refuse to start this session at all (ISS-1129)? Read from
+        # the session log rather than inferred from the exit code, which a
+        # refusal and a failure share.
+        usage_limit: Agent::UsageLimit.detect(number),
         producer_filed: record["producer_filed"],
         attempt: failed_attempts(number, record, identity),
         timed_out: Agent::Jobs.timed_out?(record, now: @now),
@@ -889,7 +895,24 @@ module Agent
       decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status})#{siblings}: #{result.reason}")
       return [record, result, prs] if @dry_run
 
+      stand_down(number) if result.name == "usage_limit"
       [Agent::Jobs.mark_reaped(record, result: result, prs: prs, now: @now), result, prs]
+    end
+
+    # One session refused by the usage limit means the NEXT one is refused too:
+    # the limit is account-wide with a known reset instant, and the queue is not
+    # what is wrong. Without this the tick claims straight through it, which is
+    # how three issues spent their entire retry budget in ninety seconds on
+    # 2026-08-08 (ISS-1129).
+    #
+    # Best-effort, like every other bookkeeping step between the verdict and the
+    # lease release: a cooldown this tick could not write costs one more refused
+    # session, and a refused session now costs the issue nothing.
+    def stand_down(number)
+      until_time = Agent::UsageLimit.record(Agent::UsageLimit.detect(number), now: @now)
+      log("Claude usage limit — claiming nothing until #{until_time.localtime.strftime('%H:%M')}")
+    rescue StandardError => e
+      log("could not record the usage-limit cooldown (#{e.class}: #{e.message})")
     end
 
     # Which consecutive failure this attempt would be — the trailing run of
@@ -1082,6 +1105,15 @@ module Agent
       # scheduler on this box any more, so there is nothing to reserve, nothing to
       # subtract and no way for the two to oversubscribe the machine.
       verify(runner, registry)
+
+      # AFTER `verify`, and that ordering is the point (ISS-1129). A usage limit
+      # is the Claude API refusing to start SESSIONS; a verify job is sbt and npm
+      # on this machine's own hardware with no model in it, and standing those
+      # down too would idle the merge lane over somebody else's quota.
+      if (resets_at = Agent::UsageLimit.active(now: @now))
+        log("Claude usage limit until #{resets_at.localtime.strftime('%H:%M')} — claiming no issues")
+        return
+      end
 
       max = capacity(runner)
       live = live_jobs

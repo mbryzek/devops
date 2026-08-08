@@ -51,6 +51,7 @@ require 'agent/ops'
 require 'agent/paths'
 require 'agent/shell'
 require 'agent/stream'
+require 'agent/usage_limit'
 require 'agent/workspace'
 require 'agent/processes'
 require 'agent/tick'
@@ -113,7 +114,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement|product] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--snoozed | --awake] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
   "issues split"        => 'issues split <number> --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
@@ -800,7 +801,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["issues claim"]}
         Claim open issues into local plans for a Claude session to work on. With no
         --category (the default) it scans EVERY category — graphs, worker, insights,
-        suggestion, feature, bug, improvement — so no open issue is unreachable from
+        suggestion, feature, bug, improvement, product — so no open issue is unreachable
         the CLI. It lists them grouped by category, numbered 1..N across the whole
         list, and asks which to claim: numbers (`1,3`), `all` (the default — just
         press enter), or `none`. It then atomically claims the selection and writes
@@ -2913,14 +2914,19 @@ ISSUE_STATUSES = %w[open claimed needs_review fixed deployed verified dismissed 
 # infrastructure issue straight to `deployed` and the 7-day auto-verify applies
 # unchanged. What it is excluded from is release metrics and the submitter
 # digest, not the lifecycle.
-ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement infrastructure].freeze
+ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement product infrastructure].freeze
 
 # The categories `dev issues create` offers when filing from the laptop, and the
 # changelog vocabulary they mirror (a `bug` ships as changelog `fix`). A SUBSET
 # of ISSUE_CATEGORIES: the rest arrive on their own (graphs/insights captured in
 # playbook-admin, worker auto-filed by the log review, suggestion submitted by a
 # member in playbook-app), so none of them is a sensible manual pick.
-ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
+# `product` is here because the product-owner review files its recommendations
+# with `dev issues create` -- it is producer-driven but CLI-filed, unlike the
+# auto-filers above. Once a recommendation is promoted it is ordinary work and
+# runs the normal lifecycle, so it needs no special handling beyond being
+# offered here.
+ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement product].freeze
 
 ISSUE_SEVERITIES = %w[low medium high].freeze
 
@@ -3601,19 +3607,54 @@ def issue_summary_line(issue, index)
   "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_blocked_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{issue_short_title(issue)}"
 end
 
-# A timeline comment that moved the issue BACK to `open` from anything else is a
-# re-open: the issue was closed once and the close did not hold. That is the
-# single most load-bearing fact about the issue — what was already tried failed —
-# so the plan leads with it instead of reading like a fresh report.
-def issue_reopen_transitions(comments)
+# Every timeline comment that moved the issue back to `open` from something else.
+# Two different things land here and they mean opposite things, so nothing reads
+# this directly — see the two splits below.
+def issue_transitions_to_open(comments)
   Array(comments).select do |c|
     t = c["transition"]
     t && t["to"] == "open" && t["from"] != "open"
   end
 end
 
+# ISSUE_REVIEW_STATUSES — `needs_input` and `needs_review` — are the two statuses
+# that mean "waiting on a human". A move from one of them to `open` is that human
+# REPLYING, which is the opposite of a failed attempt: `dev issues review` records
+# the answer verbatim and sets `open` (issue_review_record_answer) because a
+# claimed issue nobody is working is invisible to `dev issues claim`.
+#
+# So the natural way to clear a handoff — paste what happened and send the issue
+# back to the queue — used to land on the re-open banner below, which then
+# asserted failure about terminal output reading, verbatim, "patched ..." and
+# "Already applied", and told the next session to find why it did not work. That
+# is ISS-989, on ISS-965's handoff; the cost is not just the confusion but the
+# session that believes the banner over the output and re-runs a completed
+# operation.
+def issue_answer_transition?(comment)
+  t = comment["transition"]
+  !t.nil? && t["to"] == "open" && ISSUE_REVIEW_STATUSES.include?(t["from"])
+end
+
+# A timeline comment that moved the issue BACK to `open` from a status that is NOT
+# one of those is a re-open: the issue was closed once and the close did not hold.
+# That is the single most load-bearing fact about the issue — what was already
+# tried failed — so the plan leads with it instead of reading like a fresh report.
+def issue_reopen_transitions(comments)
+  issue_transitions_to_open(comments).reject { |c| issue_answer_transition?(c) }
+end
+
 def issue_reopened?(comments)
   !issue_reopen_transitions(comments).empty?
+end
+
+# The answer to lead with, if any. It leads only while it is the LATEST thing that
+# moved this issue to `open`: a failed attempt after it makes it history — still on
+# the timeline below, but no longer the live instruction — and the re-open banner
+# leads instead. Both banners render when both are true, answer first, because the
+# answer is the newer of the two.
+def issue_answer_comment(comments)
+  last = issue_transitions_to_open(comments).last
+  last if last && issue_answer_transition?(last)
 end
 
 # The bookkeeping comment `dev issues create` writes to record a session id is
@@ -3695,6 +3736,39 @@ def issue_reopen_callout(issue, comments)
   ].join("\n")
 end
 
+# The banner an ANSWERED issue leads with — the one whose absence was ISS-989.
+# Says the two things the transition alone does not: the issue is back in the
+# queue because a human replied rather than because anything failed, and the reply
+# is the newest instruction on it.
+#
+# Quoted as a block rather than collapsed onto one line like the re-open reason
+# above, because a cleared handoff's answer is routinely pasted terminal output,
+# and whether that output says the blocking step already ran is the single fact
+# the session needs out of it.
+def issue_answer_callout(comment)
+  body = comment["body"].to_s.strip
+  said =
+    if body.empty?
+      ["No note came with it, so the timeline below is all there is."]
+    else
+      ["What they said:", ""] + body.lines.map { |line| "  > #{line.rstrip}" }
+    end
+  [
+    "**ANSWERED — a human replied to whatever this was blocked on.**",
+    "",
+    "It is `open` again because a claimed issue nobody is working is invisible to",
+    "`dev issues claim` — NOT because an attempt failed.",
+    "",
+  ].concat(said).concat(
+    [
+      "",
+      "Read that as the newest instruction on this issue. If it reports the step this",
+      "was waiting on as already done, take it at its word — do not run it again — and",
+      "finish only what is actually left.",
+    ],
+  ).join("\n")
+end
+
 # One issue rendered as a plan section. Kept separate (and pure) so the output is
 # unit-testable without any network calls. `comments` is the issue's timeline:
 # absent for a freshly filed issue, load-bearing for a re-opened one. `index`
@@ -3705,6 +3779,11 @@ def issue_render_item(issue, index = nil, comments: [], heading: true)
   lines = []
   if heading
     lines << "### #{index ? "#{index}. " : ''}#{issue_label(issue)} — #{issue['title']}"
+    lines << ""
+  end
+  answer = issue_answer_comment(comments)
+  if answer
+    lines << issue_answer_callout(answer)
     lines << ""
   end
   if issue_reopened?(comments)
@@ -5031,7 +5110,10 @@ def handoff_park_comment(issue, url)
   "Waiting on a human: the commands in this issue need a scope, a credential, or a binary no " \
     "autonomous session has. Nothing is working it — `dev issues claim` skips `needs_input`.\n\n" \
     "When they have been run:\n\n" \
-    "    dev issues status #{issue['number']} --status fixed --url \"#{target}\""
+    "    dev issues status #{issue['number']} --status fixed --url \"#{target}\"\n\n" \
+    "If something is still left to do after them, answer it instead — `dev issues review`, or any " \
+    "comment that moves it back to `open`. That is recorded as a human unblocking it, not as a " \
+    "failed attempt (ISS-989), and the queue picks up what remains."
 end
 
 def handoff_note(issue, commands, recurrence:)
@@ -13741,6 +13823,13 @@ def cmd_agent_status(args)
     puts "Runner #{identity.runner_id}#{me ? " (#{me['hostname']})" : ''}"
     puts "  concurrency: #{me ? me['max_concurrency'] : '?'}   paused: #{me ? !!me['paused'] : '?'}"
     puts "  last heartbeat: #{me && me['last_heartbeat_at']}"
+    # Beside `paused` because it answers the same question — "why is this runner
+    # taking no work" — and it is the answer nobody would otherwise find: the
+    # limit belongs to the account, not to this machine or to the queue (ISS-1129).
+    if (resets_at = Agent::UsageLimit.active)
+      puts "  CLAUDE USAGE LIMIT: claiming no issues until #{resets_at.localtime.strftime('%H:%M')} " \
+           "(verify jobs are unaffected)"
+    end
 
     jobs = Agent::Jobs.all
     if jobs.empty?

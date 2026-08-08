@@ -170,6 +170,76 @@ class TestDevAgentStream < Minitest::Test
     end
   end
 
+  # ---- was the session refused before it ever ran? (ISS-1129) ----
+  #
+  # These fixtures are the real events from ISS-993's log on 2026-08-08: a
+  # rejected `rate_limit_event`, one assistant line of prose, and a terminal
+  # `result` carrying `api_error_status`. Four tenths of a second, exit 1, and
+  # nothing to show for it — which every other signal reads as a failed attempt.
+
+  REJECTED = { "type" => "rate_limit_event",
+               "rate_limit_info" => { "status" => "rejected", "rateLimitType" => "five_hour",
+                                      "resetsAt" => 1_786_165_200 } }.freeze
+  ALLOWED = { "type" => "rate_limit_event",
+              "rate_limit_info" => { "status" => "allowed", "resetsAt" => 1_786_165_200 } }.freeze
+
+  def refusal(**rest)
+    result(text: "You've hit your session limit · resets 1am (America/New_York)", is_error: true,
+           api_error_status: 429, terminal_reason: "api_error", duration_ms: 461, **rest)
+  end
+
+  def test_a_refused_session_is_reported_with_the_reset_instant
+    with_log([INIT, REJECTED, refusal]) do |path|
+      limit = Agent::Stream.usage_limit(path)
+      assert limit, "a terminal 429 is the API refusing to start the session"
+      assert_match(/hit your session limit/, limit["message"])
+      assert_equal Time.at(1_786_165_200).utc, limit["resets_at"]
+    end
+  end
+
+  # THE CASE THAT MUST NOT FIRE. A session throttled mid-run and then finishing
+  # its work is a success; classifying it as a refusal would hand a delivered PR
+  # back to the queue and stand the runner down on a limit that let it through.
+  def test_a_rate_limit_event_in_a_session_that_finished_is_not_a_refusal
+    with_log([INIT, REJECTED, assistant(tool_use("Bash", { "command" => "gh pr create" })), result]) do |path|
+      assert_nil Agent::Stream.usage_limit(path)
+    end
+  end
+
+  def test_an_ordinary_failure_is_not_a_refusal
+    with_log([INIT, result(text: "compile failed", subtype: "error_during_execution", is_error: true)]) do |path|
+      assert_nil Agent::Stream.usage_limit(path)
+    end
+  end
+
+  # A `resetsAt` rides on rate-limit events that were ALLOWED too. Taking one
+  # would invent a cooldown out of a session nobody refused.
+  def test_only_a_rejected_rate_limit_event_supplies_the_reset_instant
+    with_log([INIT, ALLOWED, refusal]) do |path|
+      assert_nil Agent::Stream.usage_limit(path)["resets_at"]
+    end
+  end
+
+  # The executor appends, so one file can hold more than one attempt. How the
+  # run ENDED is the last result in it, not the first.
+  def test_the_last_result_decides
+    with_log([INIT, refusal, INIT, result]) do |path|
+      assert_nil Agent::Stream.usage_limit(path)
+    end
+    with_log([INIT, result, INIT, REJECTED, refusal]) do |path|
+      assert Agent::Stream.usage_limit(path)
+    end
+  end
+
+  def test_a_missing_or_empty_log_is_not_a_refusal
+    assert_nil Agent::Stream.usage_limit("/nonexistent/stream.jsonl")
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "stream.jsonl")
+      File.write(path, "")
+      assert_nil Agent::Stream.usage_limit(path)
+    end
+  end
+
   # ---- the spawn side ----
 
   def test_only_a_streaming_session_asks_for_stream_json
