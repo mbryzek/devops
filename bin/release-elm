@@ -91,10 +91,9 @@ def rewrite_version(file, version)
   file
 end
 
-def minify(helper, js)
-  Util.assert_installed("uglifyjs", "https://github.com/mishoo/UglifyJS")
+def minify(helper, js, uglifyjs)
   file = add_suffix(js, "min")
-  helper.run "uglifyjs #{js} --compress 'pure_funcs=[F2,F3,F4,F5,F6,F7,F8,F9,A2,A3,A4,A5,A6,A7,A8,A9],pure_getters,keep_fargs=false,unsafe_comps,unsafe' | uglifyjs --mangle --output #{file}"
+  helper.run "#{uglifyjs} #{js} --compress 'pure_funcs=[F2,F3,F4,F5,F6,F7,F8,F9,A2,A3,A4,A5,A6,A7,A8,A9],pure_getters,keep_fargs=false,unsafe_comps,unsafe' | #{uglifyjs} --mangle --output #{file}"
   file
 end
 
@@ -117,21 +116,23 @@ def extract_file(l, tag)
   end
 end
 
-# Prefer the compiler pinned in the app's package.json over whatever global
-# `elm` happens to sit first on PATH — the global one is shared by every elm
-# app, so it can only ever match one app's elm.json at a time. Same rationale
-# as review.sh running elm-review out of node_modules.
-def elm_binary
-  local = File.join("node_modules", ".bin", "elm")
-  if File.executable?(local)
-    File.join(Dir.pwd, local)
-  else
-    Util.assert_installed("elm")
-    "elm"
-  end
+# The tools this release shells out to, installed and resolved BEFORE anything
+# else runs.
+#
+# Up front for two reasons. minify() used to assert its tool on the far side of
+# both the elm build and Tag.ask's prompt, so a machine without uglifyjs answered
+# a version prompt and compiled for a minute before being told to go install
+# something. And the install has to precede ./review.sh rather than lean on it:
+# review.sh installs only when elm-review itself is missing, so a node_modules
+# that predates a newly declared tool satisfies it and leaves the tool absent.
+#
+# See NodeBin for why repo-local wins over a global.
+if !NodeBin.missing(["elm", "uglifyjs"]).empty?
+  Util.step("Installing node dependencies") { helper.run "npm install" }
 end
+elm = NodeBin.resolve("elm", url: "https://guide.elm-lang.org/install/elm.html")
+uglifyjs = NodeBin.resolve("uglifyjs", package: "uglify-js", url: "https://github.com/mishoo/UglifyJS")
 
-elm = elm_binary
 ensure_elm_review
 a = "elm.js"
 Util.step("Compiling") { helper.run "#{elm} make src/Main.elm --optimize --output=#{a}" }
@@ -143,7 +144,7 @@ tag = Tag.ask
 
 Util.step("Minifying") do
   b = rewrite_constants(a, helper.app_config.rewrites)
-  c = minify(helper, b)
+  c = minify(helper, b, uglifyjs)
   helper.run "rm -f #{b}"
   helper.run "mv #{c} elm.js"
 end

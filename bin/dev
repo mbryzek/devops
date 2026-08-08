@@ -45,18 +45,23 @@ require 'agent/dependency_wake'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/heap'
+require 'agent/login_shell'
 require 'agent/maintenance'
 require 'agent/merge_lane'
 require 'agent/ops'
 require 'agent/paths'
 require 'agent/shell'
 require 'agent/stream'
+require 'agent/usage_limit'
 require 'agent/workspace'
 require 'agent/processes'
 require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
+require 'agent/product_owner'
 require 'agent/toolchain'
+require 'newrelic'
+require 'newrelic_ingest'
 require 'agent/verify'
 
 # Cross-repo PR grouping (`dev prs group`). Split out for the same reason as
@@ -91,9 +96,10 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "tasks delete"        => 'tasks delete (--id TASK_ID... | --discriminator NAME) [--app APP] [--localhost] [--yes]',
-  "queries top"         => 'queries [top] [--hours N | --days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
+  "queries top"         => 'queries [top] [--hours N | --days N] [--limit N] [--by-mean | --by-calls | --by-call-site] [--localhost]',
   "queries show"        => 'queries show <sample-id> [--hours N | --days N] [--localhost]',
   "claude-usage top"    => 'claude-usage [top] [--days N] [--limit N] [--sort cost_usd|input_tokens|output_tokens|requests] [--localhost]',
+  "newrelic ingest"     => 'newrelic [ingest] [--json] [--account ID]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "deploy status"       => 'deploy [status] [--app APP]',
   "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
@@ -109,7 +115,7 @@ INVOCATIONS = {
   "codegen sync"        => 'codegen [sync] [--app APP] [--concurrency N] [--check] [--dry-run] [--regen-only] [--full-tests]',
   "dependencies check"   => 'dependencies [check] [--app APP]...',
   "dependencies upgrade" => 'dependencies upgrade [--app APP]...',
-  "issues create"       => 'issues create [--category feature|bug|improvement] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
+  "issues create"       => 'issues create [--category feature|bug|improvement|product] [--status open|claimed] [--epic | --parent NUMBER] [--title "TEXT"] [--body "TEXT"] [--repo NAME]... [--block-on NUMBER|PR]... [--severity low|medium|high] [--image PATH]... [--no-spawn] [--localhost]',
   "issues list"         => 'issues list [--category CATEGORY] [--status STATUS]... [--epic NUMBER] [--snoozed | --awake] [--localhost]',
   "issues parent"       => 'issues parent <number> (--epic NUMBER | --detach) [--localhost]',
   "issues split"        => 'issues split <number> --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
@@ -151,6 +157,7 @@ INVOCATIONS = {
   "agent producers"     => 'agent producers [--localhost]',
   "agent playbooks"     => 'agent playbooks [--lint] [--localhost]',
   "agent playbook"      => 'agent playbook <key> [--lint | --versions [--limit N] | --version VERSION | --write FILE [--create] [--yes]] [--localhost]',
+  "agent status-file"   => 'agent status-file [<key>] [--write FILE]',
   "agent runs"          => 'agent runs [KEY] [--issue N] [--limit N] [--localhost]',
   "agent refresh"       => 'agent refresh <issue> [--comment "TEXT"] [--localhost]',
   "agent release"       => 'agent release <issue> [--localhost]',
@@ -291,6 +298,20 @@ USAGE = <<~USAGE
         surfaces a query whose modest mean is multiplied by a large call count;
         --by-mean sorts by average for the opposite shape.
 
+        --by-call-site ranks the CODE rather than the statements. Rows here are
+        normalized statements, and one code path routinely emits several, each
+        ranked on its own at a fraction of the path's cost: InternalClubsDao
+        .findAll(:234) emits six, ranked 129 through 299, and together they are
+        47,851 ms over 7 days. The rollup sums by call site over a deep scan of
+        the ranking, prints each site's shapes underneath, and says how deep it
+        scanned.
+
+        Two things it will not do. Statements whose call site never resolved stay
+        separate -- an unattributed pair is not evidence of anything shared. And
+        a call site carrying many unrelated statements is an attribution that
+        failed rather than one hot path: read the SHAPES column, and treat a
+        generic frame with dozens of them as a finding about the instrument.
+
         MULTI is the share of a statement's calls whose block ran more than one
         statement. A duration covers its whole block and is charged to the first
         statement in it, so at a high share the cost belongs partly to a sibling
@@ -334,6 +355,37 @@ USAGE = <<~USAGE
         `improvement` issue investigating why that feature costs what it does,
         handed straight to a Claude session, the way `dev issues create` does.
         Blank input files nothing, and nothing is offered when output is piped.
+
+    #{INVOCATIONS["newrelic ingest"]}
+        What this account ingests into NewRelic, against the 100 GB free-tier
+        ceiling. `ingest` is the default when no subcommand is given.
+
+        Prints the month to date against the free limit, the run rate over the
+        last #{NewrelicIngest::RUN_RATE_DAYS} full days, the projection to month end, the trailing
+        30-day total (which needs no billing boundary), and a breakdown by usage
+        metric and by application. --json prints the same figures raw.
+
+        The BILLING PERIOD IS THE CALENDAR MONTH IN UTC. Read casually it does
+        not look like it: `SINCE N days ago TIMESERIES 1 day` anchors its buckets
+        to the current time of day, so the reset appears to fall on the 30th or
+        31st. It does not.
+
+        The per-application table is `bytecountestimate()` and is ATTRIBUTION,
+        not billing -- it answers "which app moved", never "how much do we owe".
+        It does not reconcile to the billed figure, and the largest thing it
+        cannot attribute is k8s log forwarding, which arrives with no appName and
+        is printed on its own row rather than dropped.
+
+        Needs `NEWRELIC_USER_KEY` (env, or the env repo's api_keys/newrelic --
+        `dev agent doctor` reports whether this machine resolves it). It refuses
+        to query without one rather than reporting an empty account: NerdGraph
+        answers an unauthenticated read with an empty result set, which reads
+        exactly like a healthy account (ISS-635).
+
+        The same measurement runs once a day inside `dev agent tick`, which files
+        an issue when the projection reaches #{(NewrelicIngest::AT_RISK_FRACTION * 100).round}% of the free limit
+        (ISS-1077). Nothing watched this number before that, and a ceiling nobody
+        measures is one the fleet discovers by being throttled.
 
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
@@ -765,7 +817,7 @@ USAGE = <<~USAGE
     #{INVOCATIONS["issues claim"]}
         Claim open issues into local plans for a Claude session to work on. With no
         --category (the default) it scans EVERY category — graphs, worker, insights,
-        suggestion, feature, bug, improvement — so no open issue is unreachable from
+        suggestion, feature, bug, improvement, product — so no open issue is unreachable
         the CLI. It lists them grouped by category, numbered 1..N across the whole
         list, and asks which to claim: numbers (`1,3`), `all` (the default — just
         press enter), or `none`. It then atomically claims the selection and writes
@@ -790,7 +842,11 @@ USAGE = <<~USAGE
         judgment needs the code read, so the session makes it, not this CLI).
         Never across categories — those are independent pipelines and repos. Pass
         --no-spawn to just write the plans and print their
-        paths. Authenticates with your persisted playbook session — run
+        paths. Work that cannot be worked yet is listed but never offered, with the
+        reason: blocked, filed for another machine, or — the one the tracker's own
+        status cannot see — waiting on a blocker whose fix PR has not merged, which
+        `dev agent tick` defers a dispatch on for the same reason (ISS-649).
+        Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first (the issues API requires a playbook
         admin, not the platform `dev auth login`).
 
@@ -1185,14 +1241,16 @@ USAGE = <<~USAGE
         append-only rows in the platform (ISS-523), managed at
         /admin/agents/playbooks — not files in this repo. This is where a
         producer's issue points, and what the claiming session is actually handed.
-        --lint reports the three defects an instruction can carry that no session
+        --lint reports the four defects an instruction can carry that no session
         can execute, and exits 1 when it finds any: a path hardcoded under one
         user's home (`/Users/mbryzek/…`), correct on the runner it was written on
         and silently wrong on every other; a write into `~/code/claude` outside
-        `plans/`, which the autonomous push guard refuses; and a write to a
-        top-level `plans/` file with no date in its name, which `dev prune plans`
-        removes after 14 days. All three fail at the END of a run, after the work
-        is done, with nothing saying so.
+        `plans/`, which the autonomous push guard refuses; a write to a top-level
+        `plans/` file with no date in its name, which `dev prune plans` removes
+        after 14 days; and a hand-written briefing status file under
+        `~/code/openclaw/…`, which `agent/instructions.md` §3 forbids and
+        `dev agent status-file` replaces. All four fail at the END of a run,
+        after the work is done, with nothing saying so.
 
     #{INVOCATIONS["agent runs"]}
         Full history: every producer run, and every lease attempt for --issue N.
@@ -1203,7 +1261,7 @@ USAGE = <<~USAGE
         One playbook (singular — the catalogue is `dev agent playbooks`). Bare,
         it prints the CURRENT body on stdout and its `key @ version` on stderr,
         so `dev agent playbook weekly-review > wr.md` captures exactly the text a
-        session reads. --lint runs the same three checks over this one playbook
+        session reads. --lint runs the same four checks over this one playbook
         and exits 1 on a finding, which is what you want before --write.
         --versions lists the history (newest first); --version VERSION prints one
         past body, matched on the created_at or any unambiguous prefix of it.
@@ -1218,6 +1276,26 @@ USAGE = <<~USAGE
         else — a Claude session, a pipe, cron — is REFUSED unless --yes is
         passed, so no autonomous run edits the instructions the next one obeys
         as a side effect.
+
+    #{INVOCATIONS["agent status-file"]}
+        The morning briefing's per-job status reports, which it reads out of
+        openclaw's workspace and dates by their first line — a section whose
+        `Last run:` is not today is SKIPPED, so a job that stops writing its file
+        goes dark rather than reporting an error. Bare, it lists every registered
+        key with its file and how fresh that file is; with a key it prints that
+        body on stdout and its path on stderr.
+
+        --write FILE records FILE as that job's status. It exists because the
+        session writing one is an autonomous session, and `agent/instructions.md`
+        §3 forbids it editing anything outside its workspace: a playbook that
+        ended "write ~/code/openclaw/…" put the guardrail and the playbook in
+        direct conflict every night, on every runner (ISS-1022). A command has no
+        such conflict, the same way `agent playbook --write` is how the playbook
+        store is edited. Two refusals, both of them silent failures otherwise: an
+        unregistered key (a file nothing reads), and a body whose first line the
+        briefing cannot date. A date that is not today is warned about, not
+        refused — a run that crossed midnight is real, and the warning is what
+        makes the skipped section explicable.
 
     #{INVOCATIONS["agent refresh"]}
         Re-open a `fixed` issue so the fleet resumes its branch — the rebase and
@@ -1405,7 +1483,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent prs ci].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage newrelic agent prs ci].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -1428,7 +1506,8 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
+  "newrelic"     => %w[ingest],
+  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook status-file runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[scan verify preflight clean-build],
 }.freeze
@@ -2868,14 +2947,19 @@ ISSUE_STATUSES = %w[open claimed needs_review fixed deployed verified dismissed 
 # infrastructure issue straight to `deployed` and the 7-day auto-verify applies
 # unchanged. What it is excluded from is release metrics and the submitter
 # digest, not the lifecycle.
-ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement infrastructure].freeze
+ISSUE_CATEGORIES = %w[graphs worker insights club_backfill suggestion feature bug improvement product infrastructure].freeze
 
 # The categories `dev issues create` offers when filing from the laptop, and the
 # changelog vocabulary they mirror (a `bug` ships as changelog `fix`). A SUBSET
 # of ISSUE_CATEGORIES: the rest arrive on their own (graphs/insights captured in
 # playbook-admin, worker auto-filed by the log review, suggestion submitted by a
 # member in playbook-app), so none of them is a sensible manual pick.
-ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement].freeze
+# `product` is here because the product-owner review files its recommendations
+# with `dev issues create` -- it is producer-driven but CLI-filed, unlike the
+# auto-filers above. Once a recommendation is promoted it is ordinary work and
+# runs the normal lifecycle, so it needs no special handling beyond being
+# offered here.
+ISSUE_MANUAL_CATEGORIES = %w[feature bug improvement product].freeze
 
 ISSUE_SEVERITIES = %w[low medium high].freeze
 
@@ -3556,19 +3640,54 @@ def issue_summary_line(issue, index)
   "  #{index}. #{issue_label(issue)} · #{issue['status']}#{issue_snooze_note(issue)}#{issue_blocked_note(issue)}#{issue_duplicate_note(issue)} · #{club}#{issue_short_title(issue)}"
 end
 
-# A timeline comment that moved the issue BACK to `open` from anything else is a
-# re-open: the issue was closed once and the close did not hold. That is the
-# single most load-bearing fact about the issue — what was already tried failed —
-# so the plan leads with it instead of reading like a fresh report.
-def issue_reopen_transitions(comments)
+# Every timeline comment that moved the issue back to `open` from something else.
+# Two different things land here and they mean opposite things, so nothing reads
+# this directly — see the two splits below.
+def issue_transitions_to_open(comments)
   Array(comments).select do |c|
     t = c["transition"]
     t && t["to"] == "open" && t["from"] != "open"
   end
 end
 
+# ISSUE_REVIEW_STATUSES — `needs_input` and `needs_review` — are the two statuses
+# that mean "waiting on a human". A move from one of them to `open` is that human
+# REPLYING, which is the opposite of a failed attempt: `dev issues review` records
+# the answer verbatim and sets `open` (issue_review_record_answer) because a
+# claimed issue nobody is working is invisible to `dev issues claim`.
+#
+# So the natural way to clear a handoff — paste what happened and send the issue
+# back to the queue — used to land on the re-open banner below, which then
+# asserted failure about terminal output reading, verbatim, "patched ..." and
+# "Already applied", and told the next session to find why it did not work. That
+# is ISS-989, on ISS-965's handoff; the cost is not just the confusion but the
+# session that believes the banner over the output and re-runs a completed
+# operation.
+def issue_answer_transition?(comment)
+  t = comment["transition"]
+  !t.nil? && t["to"] == "open" && ISSUE_REVIEW_STATUSES.include?(t["from"])
+end
+
+# A timeline comment that moved the issue BACK to `open` from a status that is NOT
+# one of those is a re-open: the issue was closed once and the close did not hold.
+# That is the single most load-bearing fact about the issue — what was already
+# tried failed — so the plan leads with it instead of reading like a fresh report.
+def issue_reopen_transitions(comments)
+  issue_transitions_to_open(comments).reject { |c| issue_answer_transition?(c) }
+end
+
 def issue_reopened?(comments)
   !issue_reopen_transitions(comments).empty?
+end
+
+# The answer to lead with, if any. It leads only while it is the LATEST thing that
+# moved this issue to `open`: a failed attempt after it makes it history — still on
+# the timeline below, but no longer the live instruction — and the re-open banner
+# leads instead. Both banners render when both are true, answer first, because the
+# answer is the newer of the two.
+def issue_answer_comment(comments)
+  last = issue_transitions_to_open(comments).last
+  last if last && issue_answer_transition?(last)
 end
 
 # The bookkeeping comment `dev issues create` writes to record a session id is
@@ -3650,6 +3769,39 @@ def issue_reopen_callout(issue, comments)
   ].join("\n")
 end
 
+# The banner an ANSWERED issue leads with — the one whose absence was ISS-989.
+# Says the two things the transition alone does not: the issue is back in the
+# queue because a human replied rather than because anything failed, and the reply
+# is the newest instruction on it.
+#
+# Quoted as a block rather than collapsed onto one line like the re-open reason
+# above, because a cleared handoff's answer is routinely pasted terminal output,
+# and whether that output says the blocking step already ran is the single fact
+# the session needs out of it.
+def issue_answer_callout(comment)
+  body = comment["body"].to_s.strip
+  said =
+    if body.empty?
+      ["No note came with it, so the timeline below is all there is."]
+    else
+      ["What they said:", ""] + body.lines.map { |line| "  > #{line.rstrip}" }
+    end
+  [
+    "**ANSWERED — a human replied to whatever this was blocked on.**",
+    "",
+    "It is `open` again because a claimed issue nobody is working is invisible to",
+    "`dev issues claim` — NOT because an attempt failed.",
+    "",
+  ].concat(said).concat(
+    [
+      "",
+      "Read that as the newest instruction on this issue. If it reports the step this",
+      "was waiting on as already done, take it at its word — do not run it again — and",
+      "finish only what is actually left.",
+    ],
+  ).join("\n")
+end
+
 # One issue rendered as a plan section. Kept separate (and pure) so the output is
 # unit-testable without any network calls. `comments` is the issue's timeline:
 # absent for a freshly filed issue, load-bearing for a re-opened one. `index`
@@ -3660,6 +3812,11 @@ def issue_render_item(issue, index = nil, comments: [], heading: true)
   lines = []
   if heading
     lines << "### #{index ? "#{index}. " : ''}#{issue_label(issue)} — #{issue['title']}"
+    lines << ""
+  end
+  answer = issue_answer_comment(comments)
+  if answer
+    lines << issue_answer_callout(answer)
     lines << ""
   end
   if issue_reopened?(comments)
@@ -3754,18 +3911,39 @@ end
 # ("implement the fixes, open PRs") would contradict it.
 ISSUE_INVESTIGATE_ONLY_CATEGORIES = %w[suggestion].freeze
 
-def issue_investigate_only?(category)
-  ISSUE_INVESTIGATE_ONLY_CATEGORIES.include?(category)
+# Playbooks whose session investigates and hands findings back rather than
+# shipping a fix. Category alone cannot answer this: `infrastructure` is the
+# producer-chore category and covers BOTH `weekly-review`, which exists to open
+# PRs, and `product-owner`, which exists not to. Keying only on category forced
+# the product review to file itself as `suggestion` — the one investigate-only
+# value — which is member-submitted feedback and the wrong queue entirely.
+#
+# The playbook IS the statement of what the session does, so it is the thing
+# that should decide. Category stays in the test for `suggestion`, which has no
+# playbook: a member's request carries its brief inline.
+ISSUE_INVESTIGATE_ONLY_PLAYBOOKS = %w[product-owner].freeze
+
+def issue_investigate_only?(category, playbook_key = nil)
+  return true if ISSUE_INVESTIGATE_ONLY_CATEGORIES.include?(category)
+
+  ISSUE_INVESTIGATE_ONLY_PLAYBOOKS.include?(playbook_key)
+end
+
+# The playbook an issue points at, or nil. Human-written issues carry their brief
+# inline and have no pointer, which is why this must tolerate a miss rather than
+# raise.
+def issue_playbook_key(issue)
+  Agent::Playbook.pointer_in(issue.is_a?(Hash) ? issue["body"] : issue)&.key
 end
 
 # The wrapper prose above the issue: what this session is FOR. `origin` is the one
 # sentence naming where the plan came from (a sweep vs a hand-filed issue);
 # everything else is keyed on the category, so a hand-filed `suggestion` gets the
 # same no-code framing a swept one does.
-def issue_plan_intro(category, origin)
+def issue_plan_intro(category, origin, playbook_key = nil)
   # `origin` gets its own line: it varies in length, so inlining it would drag the
   # wrap points of every line after it around with it.
-  if issue_investigate_only?(category)
+  if issue_investigate_only?(category, playbook_key)
     <<~INTRO.strip
       #{origin}
       This issue is CLAIMED (status `claimed`) and waiting for you. This is an
@@ -3783,20 +3961,20 @@ def issue_plan_intro(category, origin)
   end
 end
 
-def issue_claim_plan_intro(category)
-  issue_plan_intro(category, "Generated by `dev issues claim --category #{category}`.")
+def issue_claim_plan_intro(category, playbook_key = nil)
+  issue_plan_intro(category, "Generated by `dev issues claim --category #{category}`.", playbook_key)
 end
 
-def issue_manual_plan_intro(category, date)
-  issue_plan_intro(category, "Filed #{date} with `dev issues create`.")
+def issue_manual_plan_intro(category, date, playbook_key = nil)
+  issue_plan_intro(category, "Filed #{date} with `dev issues create`.", playbook_key)
 end
 
 # The closing menu: the statuses this session is allowed to end on. An
 # investigate-only session has no `fixed` to offer — its move is `needs_review`.
 # `number` is the issue's own number rather than a `<number>` placeholder: one
 # plan is one issue, so there is nothing left for the session to substitute.
-def issue_plan_closing(category, number)
-  if issue_investigate_only?(category)
+def issue_plan_closing(category, number, playbook_key = nil)
+  if issue_investigate_only?(category, playbook_key)
     <<~CLOSING.strip
       - Findings ready for a human to decide on →
         `dev issues status #{number} --status needs_review --comment "<your findings>"`
@@ -3872,7 +4050,7 @@ def issue_plan_markdown(issue:, category:, body:, intro:, comments: [], local_pa
 
     Run from anywhere (re-authenticates from ~/code/env each call):
 
-    #{issue_plan_closing(category, issue['number'])}
+    #{issue_plan_closing(category, issue['number'], issue_playbook_key(issue))}
   PLAN
 end
 
@@ -3921,7 +4099,7 @@ def write_issue_plan(issue, category, comments = [])
   path = issue_plan_path(issue, date)
   File.write(path, issue_plan_markdown(issue: issue, category: category,
                                        body: issue_body_text(category),
-                                       intro: issue_claim_plan_intro(category),
+                                       intro: issue_claim_plan_intro(category, issue_playbook_key(issue)),
                                        comments: comments))
   path
 end
@@ -3936,7 +4114,7 @@ def write_manual_issue_plan(issue, local_paths, comments = [])
   path = issue_plan_path(issue, date)
   File.write(path, issue_plan_markdown(issue: issue, category: category,
                                        body: issue_manual_body_text,
-                                       intro: issue_manual_plan_intro(category, date),
+                                       intro: issue_manual_plan_intro(category, date, issue_playbook_key(issue)),
                                        comments: comments,
                                        local_paths: local_paths))
   path
@@ -4965,7 +5143,10 @@ def handoff_park_comment(issue, url)
   "Waiting on a human: the commands in this issue need a scope, a credential, or a binary no " \
     "autonomous session has. Nothing is working it — `dev issues claim` skips `needs_input`.\n\n" \
     "When they have been run:\n\n" \
-    "    dev issues status #{issue['number']} --status fixed --url \"#{target}\""
+    "    dev issues status #{issue['number']} --status fixed --url \"#{target}\"\n\n" \
+    "If something is still left to do after them, answer it instead — `dev issues review`, or any " \
+    "comment that moves it back to `open`. That is recorded as a human unblocking it, not as a " \
+    "failed attempt (ISS-989), and the queue picks up what remains."
 end
 
 def handoff_note(issue, commands, recurrence:)
@@ -5395,7 +5576,7 @@ def cmd_issues_show(args)
     issue = issue_fetch(endpoint, number)
     puts issue_render_item(issue, comments: issue_fetch_comments(endpoint, number))
     puts issue_family_section(endpoint, issue)
-    puts issue_links_section(issue)
+    puts issue_links_section(issue, use_localhost: use_localhost)
   end
 end
 
@@ -5410,38 +5591,88 @@ end
 # Read straight off the issue's own `links`: the edges ride along with the record,
 # so nothing here costs a round trip and nothing can render one relationship while
 # silently missing another.
-def issue_links_section(issue)
+def issue_links_section(issue, use_localhost:)
   [
-    issue_blockers_lines(issue),
+    issue_blockers_lines(issue, use_localhost: use_localhost),
     issue_blocks_lines(issue),
     issue_duplicate_lines(issue),
   ].compact.join
 end
 
-def issue_blockers_lines(issue)
+# WHAT IS THIS ISSUE ACTUALLY WAITING ON — asked of GitHub, exactly as the
+# dispatcher asks it, and not of the blocker's status (ISS-1085).
+#
+# Status alone is the wrong question and it answers in the reassuring direction.
+# A blocker sits at `fixed` from the moment its session marks the PR ready, which
+# is most of a day before anything merges, so this section used to print "all
+# shipped — this is claimable now" over an open PR that `Agent::Tick` was about to
+# defer the claim on. Two costs, and the second is the worse one: it invites
+# somebody to pick up work the dispatcher will not start, and it teaches whoever
+# reads it that `--block-on` stopped working — which is the prose-dependency habit
+# ISS-644/ISS-649 exist to break.
+#
+# So the renderer runs the GATE's own query rather than a second opinion, and
+# reports what came back. Nothing about either verdict changes here: `unshipped`
+# is the same call `Agent::Tick` makes before it starts a session, down to failing
+# OPEN on every unknown — a `gh` that cannot answer reads as claimable in both
+# places, which is the point. The display can now be wrong only where the
+# dispatcher is wrong with it.
+#
+# It costs one API read per shipped blocker plus a `gh pr view` per recorded fix.
+# That is bounded by the blocker count (one, almost always) and paid only by an
+# issue that HAS blockers — the early return above is most invocations.
+def issue_blockers_lines(issue, use_localhost:)
   blockers = issue_blockers(issue)
   return nil if blockers.empty?
 
+  unshipped = Agent::Dependency.unshipped(issue, use_localhost: use_localhost)
+  waiting = unshipped.to_h { |b| [b["number"].to_s, b] }
+
   # Shipped blockers stay in the list: "why is this claimable now" is the same
   # question as "why was it not", and dropping them answers neither. The status on
-  # each line is what tells them apart.
-  live = blockers.reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
-  lines = blockers.map { |b| "  - #{issue_ref_label(b)} #{b.fetch('title')}" }.join("\n")
+  # each line, and the PR named under it, are what tell them apart.
+  lines = blockers.flat_map do |b|
+    line = "  - #{issue_ref_label(b)} #{b.fetch('title')}"
+    entry = waiting[b.fetch("number").to_s]
+    reason = entry && Agent::Dependency.pr_reason(entry)
+    reason ? [line, "      #{reason}"] : [line]
+  end.join("\n")
+
   header =
-    if live.empty?
+    if unshipped.empty?
       "\nBLOCKED BY #{blockers.length} issue(s), all shipped — this is claimable now:"
     else
-      "\nBLOCKED — waiting on #{live.length} of #{blockers.length} blocker(s):"
+      "\nBLOCKED — waiting on #{unshipped.length} of #{blockers.length} blocker(s):"
     end
-  footer =
-    if live.empty?
-      "\n"
-    else
-      "\n`dev issues claim` will refuse this issue until every blocker reaches fixed, deployed, verified\n" \
-        "or dismissed. Drop an edge that is not really a prerequisite with `dev issues block " \
-        "#{issue.fetch('number').sub(/\A0+/, '')} --on <n> --remove`.\n"
-    end
-  "#{header}\n#{lines}\n#{footer}"
+  "#{header}\n#{lines}\n#{issue_blockers_footer(issue, unshipped)}"
+end
+
+# Why it is being held, in the terms of whoever is holding it — and the two are
+# different mechanisms with different conditions, so a blocker of each kind gets
+# a sentence of its own and an issue with both gets both.
+#
+# The SERVER refuses a claim on status: that is `is_blocked`, and it clears the
+# moment the blocker reaches fixed/deployed/verified/dismissed. The DISPATCHER
+# refuses on the merge, which is the ISS-649 gate this section now shares. Saying
+# only the first over a `fixed` blocker with an open PR is what made this line
+# lie; saying only the second over a blocker still `open` would name a merge
+# nobody is waiting for yet.
+def issue_blockers_footer(issue, unshipped)
+  return "\n" if unshipped.empty?
+
+  sentences = []
+  if unshipped.any? { |b| b["pr"].nil? }
+    sentences << "`dev issues claim` will refuse this issue until every blocker reaches fixed, deployed, " \
+                 "verified or dismissed."
+  end
+  if unshipped.any? { |b| b["pr"] }
+    sentences << "A blocker at `fixed` is not enough on its own: `dev agent tick` re-checks GitHub and defers " \
+                 "this issue until the fix named above merges (ISS-649), because a session records `fixed` " \
+                 "when its PR is READY, not when it lands."
+  end
+  sentences << "Drop an edge that is not really a prerequisite with `dev issues block " \
+               "#{issue.fetch('number').sub(/\A0+/, '')} --on <n> --remove`."
+  "\n#{sentences.join("\n")}\n"
 end
 
 def issue_blocks_lines(issue)
@@ -5548,10 +5779,89 @@ def issue_print_blocked(blocked)
   puts Util.underline("blocked (#{blocked.length}) — not offered")
   blocked.each do |c|
     live = issue_blockers(c).reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
-    title = c["title"].to_s.gsub(/\s+/, " ").strip
-    title = "#{title[0, 57]}..." if title.length > 60
-    puts "  #{issue_label(c)} · waiting on #{live.map { |b| issue_ref_label(b) }.join(', ')} · #{title}"
+    puts "  #{issue_label(c)} · waiting on #{live.map { |b| issue_ref_label(b) }.join(', ')} · #{issue_short_title(c)}"
   end
+  puts ""
+end
+
+# One held-out issue and the blockers whose code is not on `origin/main` yet, as
+# `Agent::Dependency.unshipped` returned them.
+IssueDependencyHold = Struct.new(:issue, :unshipped)
+
+# THE DISPATCH GATE, run where this command builds its offer (ISS-1086).
+#
+# `Agent::Tick` has asked GitHub since ISS-649 and defers a dispatch when the
+# answer is "not merged". This command asked only the server's `is_blocked`,
+# which clears on STATUS the moment a blocker reaches `fixed` — and the close-out
+# contract has every session record `fixed` when its PR is READY, which is most
+# of a working day before anything merges. So an issue whose only blocker sat at
+# `fixed` over an OPEN PR was offered here, claimed, and (spawning by default)
+# handed to a session whose only options were to re-implement the dependency or
+# stack on it. That is the ISS-649 failure entered from the CLI instead of the
+# dispatcher, and it was not hypothetical: ISS-1084 over devops#448 was deferred
+# by the dispatcher at the same moment `dev issues claim --number 1084` would
+# have started a session on it.
+#
+# HELD OUT rather than refused at claim time. This command already has exactly
+# this shape for the three other reasons work is unworkable — blocked, snoozed,
+# filed for another machine — and every one of them keeps the thing OFF the menu
+# instead of refusing the order. Gating only the issue actually picked would also
+# have to be re-explained at each of the three ways an issue gets picked
+# (`--number`, `--yes`, the interactive selection), and would still print the
+# work as claimable one line above refusing it.
+#
+# The cost is bounded by construction and is normally ZERO round trips.
+# `unshipped` touches no network for an issue with no blockers, which is nearly
+# every issue; an issue whose blockers are still live is already in the `blocked`
+# partition and never reaches here. What is left is exactly the case this exists
+# for — a blocker shipped by the tracker's reckoning — and it pays one API read
+# plus one `gh pr view` per recorded fix. Run LAST, after the blocked and
+# assigned-elsewhere partitions, so nothing unclaimable here pays even that.
+#
+# FAILS OPEN, exactly as the dispatcher does. `unshipped` answers `[]` for every
+# unknown — `gh` missing, a rate limit, an unreadable blocker, a fix that is a
+# document rather than a PR — so an unanswerable GitHub offers the work rather
+# than emptying the queue. A gate that stalled the queue whenever GitHub was
+# unreachable would be a worse failure than the one it prevents, and a silent one.
+def issue_partition_unmerged_dependencies(issues, use_localhost)
+  held = []
+  claimable = issues.reject do |c|
+    unshipped = Agent::Dependency.unshipped(c, use_localhost: use_localhost)
+    next false if unshipped.empty?
+
+    held << IssueDependencyHold.new(c, unshipped)
+    true
+  end
+  [claimable, held]
+end
+
+# The holds among `held` that `requested` names — so a by-number claim refuses with
+# the reason instead of folding the issue into "not listed above", which reads as a
+# typo. Resolved through the same parser the offer uses, so "078", "78" and
+# "ISS-078" all land here exactly as they land there.
+def issue_holds_for(held, requested)
+  named, = issue_resolve_requested(requested.join(","), held.map(&:issue))
+  by_number = held.to_h { |h| [h.issue["number"].to_s, h] }
+  named.filter_map { |c| by_number[c["number"].to_s] }
+end
+
+# Printed, not silently filtered, for the reason blocked work is: "nothing to
+# claim" and "one issue, and it is waiting on a PR somebody opened twenty minutes
+# ago" are different situations, and a bare "No open issues" says the wrong one.
+#
+# The reason lines are `Agent::Dependency.describe` — the very sentences the
+# dispatcher writes onto the timeline when it defers the same issue — so what a
+# human reads here and what a session reads there cannot become two accounts of
+# one PR.
+def issue_print_dependency_deferred(held)
+  return if held.empty?
+
+  puts Util.underline("waiting on unmerged code (#{held.length}) — not offered")
+  held.each do |h|
+    puts "  #{issue_label(h.issue)} · #{issue_short_title(h.issue)}"
+    Agent::Dependency.describe(h.unshipped).each { |reason| puts "      #{reason}" }
+  end
+  puts "  (`dev agent tick` defers these too and re-checks GitHub every time — there is nothing to do but merge the fix)"
   puts ""
 end
 
@@ -5567,9 +5877,7 @@ def issue_print_assigned_elsewhere(assigned, runners_by_id)
   assigned.each do |c|
     id = c["assigned_runner_id"].to_s
     who = runners_by_id[id] || id
-    title = c["title"].to_s.gsub(/\s+/, " ").strip
-    title = "#{title[0, 57]}..." if title.length > 60
-    puts "  #{issue_label(c)} · for #{who} · #{title}"
+    puts "  #{issue_label(c)} · for #{who} · #{issue_short_title(c)}"
   end
   puts "  (claim these from that machine, or re-point one in the admin at /admin/issues/<n>)"
   puts ""
@@ -5678,11 +5986,16 @@ def cmd_issues_claim(args)
       c["assigned_runner_id"].nil? || c["assigned_runner_id"] == claiming_runner_id
     }
     runner_names = issue_runner_names(assigned_elsewhere, use_localhost)
+    # The half of "blocked" the server cannot see: a blocker at `fixed` over a PR
+    # that has not merged (ISS-1086). Last of the three partitions, so only work
+    # this machine could otherwise claim pays the GitHub read.
+    open, dependency_held = issue_partition_unmerged_dependencies(open, use_localhost)
     present = issue_categories_present(open)
     if present.empty?
       puts category ? "No open #{category} issues to claim." : "No open issues to claim."
       puts "(Snoozed issues and epics are not offered — `dev issues list --snoozed` shows the deferred ones, soonest to wake first; `dev issues snooze <n> --wake` brings one back, and an epic is worked through its children.)"
       issue_print_blocked(blocked)
+      issue_print_dependency_deferred(dependency_held)
       issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
       return
     end
@@ -5700,6 +6013,7 @@ def cmd_issues_claim(args)
       puts ""
     end
     issue_print_blocked(blocked)
+    issue_print_dependency_deferred(dependency_held)
     issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
 
     selected, hand_picked =
@@ -5720,6 +6034,24 @@ def cmd_issues_claim(args)
                 "#{issue_label(c)} is blocked by #{live.map { |b| issue_ref_label(b) }.join(', ')} — those have to ship first."
               }.join("\n") +
               "\nDrop an edge that is not really a prerequisite with `dev issues block <n> --on <m> --remove`."
+            )
+          end
+          # And for work the dependency gate is holding (ISS-1086), which is a
+          # SEPARATE sentence rather than a fold into the one above. The server
+          # would hand this issue over — every blocker is terminal by its rule —
+          # so "those have to ship first" would name the wrong mechanism, and the
+          # thing to go and look at is a PR rather than a status.
+          named_held = issue_holds_for(dependency_held, unknown)
+          unless named_held.empty?
+            Util.exit_with_error(
+              named_held.map { |h|
+                "#{issue_label(h.issue)} is waiting on code that has not merged:\n" +
+                  Agent::Dependency.describe(h.unshipped).map { |r| "  - #{r}" }.join("\n")
+              }.join("\n") +
+              "\nA session started now could only re-implement that fix or stack on it, which is what ISS-649 " \
+              "exists to stop. `dev agent tick` defers it for the same reason and re-checks GitHub every time, " \
+              "so this clears itself the moment the fix merges.\n" \
+              "Drop an edge that is not really a prerequisite with `dev issues block <n> --on <m> --remove`."
             )
           end
           # Same refusal, same reason, for work filed for another machine (ISS-553).
@@ -5903,7 +6235,8 @@ def cmd_issues_review(args)
       return
     end
 
-    issue_review_walk(endpoint, issues, issue_comments_by_number(endpoint, issues), all: all)
+    comments = issue_comments_by_number(endpoint, issues)
+    issue_review_walk(endpoint, issues, comments, all: all, use_localhost: use_localhost)
   end
 end
 
@@ -5930,7 +6263,7 @@ def issue_review_queue(endpoint, requested)
   resolved
 end
 
-def issue_review_walk(endpoint, issues, comments, all:)
+def issue_review_walk(endpoint, issues, comments, all:, use_localhost:)
   numbers = issues.map { |issue| issue["number"] }
   by_number = issues.to_h { |issue| [issue["number"], issue] }
 
@@ -5944,7 +6277,7 @@ def issue_review_walk(endpoint, issues, comments, all:)
   window = IssueReview::Window.new(numbers, size: IssueReview::WINDOW) do |number|
     IssueReview::Session.new(
       number: number,
-      prompt: issue_review_prompt(by_number.fetch(number), comments[number] || []),
+      prompt: issue_review_prompt(by_number.fetch(number), comments[number] || [], use_localhost: use_localhost),
       model: INTERACTIVE_CLAUDE_MODEL,
       chdir: issue_review_session_dir,
       timeout: IssueReview::TIMEOUT_SECONDS,
@@ -6059,14 +6392,14 @@ end
 # costs nothing, while a session told to go and fetch ISS-574 would need the
 # playbook credential and a Bash tool, and the second of those is exactly what is
 # denied to keep it read-only.
-def issue_review_prompt(issue, comments)
+def issue_review_prompt(issue, comments, use_localhost:)
   [
     File.read(claude_issues_path("review-summary.md")).strip,
     "",
     "---",
     "",
     issue_render_item(issue, comments: comments).strip,
-    issue_links_section(issue).strip,
+    issue_links_section(issue, use_localhost: use_localhost).strip,
   ].join("\n")
 end
 
@@ -8184,12 +8517,12 @@ def cmd_docker_prune(args)
       # channel the job has, and the briefing shows a docker-prune line only when
       # it says ERROR. Aborting first would make a broken prune look like a
       # healthy silent one.
-      Briefing.write("docker-prune-status.md", "Last run: #{Briefing.today} — ERROR: failed at step: #{step.label}")
+      Briefing.write("docker-prune", "Last run: #{Briefing.today} — ERROR: failed at step: #{step.label}")
       abort("FAILED at step: #{step.label}")
     end
     reclaimed[step.label] = freed
   end
-  Briefing.write("docker-prune-status.md", "Last run: #{Briefing.today} — ok")
+  Briefing.write("docker-prune", "Last run: #{Briefing.today} — ok")
   return puts("\nNothing to remove.") if reclaimed.empty?
 
   puts ""
@@ -10723,7 +11056,7 @@ def write_aidirs_briefing_status(removed, reclaimed_kb)
     removed.each { |name, reason| body << "#{name} (#{reason})\n" }
     body << "Reclaimed: #{docker_format_size(reclaimed_kb * 1024)}\n"
   end
-  Briefing.write("aidirs-prune-status.md", body)
+  Briefing.write("aidirs-prune", body)
 end
 
 # ---------- prune plans ----------
@@ -11230,7 +11563,7 @@ def write_browserslist_briefing_status(updated:, pending:, no_changes:, failures
       body << "Failed: #{name}#{log ? " (#{log.strip})" : ''}\n"
     end
   end
-  Briefing.write("browserslist-status.md", body)
+  Briefing.write("browserslist-update", body)
 end
 
 # ---------- scripts ----------
@@ -11441,6 +11774,7 @@ def cmd_queries_top(args)
   limit = 25
   hours = QUERIES_DEFAULT_HOURS
   sort = "total_ms"
+  by_call_site = false
   use_localhost = false
   i = 0
   while i < args.length
@@ -11453,22 +11787,40 @@ def cmd_queries_top(args)
       i += 1
     when "--by-mean"  then sort = "mean_ms"
     when "--by-calls" then sort = "calls"
+    when "--by-call-site" then by_call_site = true
     when "--localhost", "--local" then use_localhost = true
     else usage_exit("Unknown flag: #{args[i]}", example: usage_for("queries top"))
     end
     i += 1
   end
 
+  # A rollup is a sum of durations, so it is defined over total time and nothing else.
+  # Summing means across shapes averages averages, and summing calls ranks a site by how
+  # often it runs rather than by what it costs -- both are numbers, neither is an answer.
+  if by_call_site && sort != "total_ms"
+    usage_exit("--by-call-site rolls up by total_ms; drop --by-mean/--by-calls",
+               example: usage_for("queries top"))
+  end
+
   window = queries_window_label(hours)
   endpoint = platform_endpoint(use_localhost)
+  # The rollup ranks call sites, so it has to see every shape belonging to one -- including
+  # the ones that rank far below the call site itself. It scans deep and says how deep.
+  fetch = by_call_site ? QUERIES_CALL_SITE_SCAN : limit
   handle_errors do
     stats = ApiClient.request(
       endpoint, :get,
-      "/dev/query/stats?hours=#{hours}&sort=#{sort}&limit=#{limit}&offset=0"
+      "/dev/query/stats?hours=#{hours}&sort=#{sort}&limit=#{fetch}&offset=0"
     )
 
     if stats.nil? || stats.empty?
       puts "No query samples in the last #{window}."
+      next
+    end
+
+    if by_call_site
+      queries_print_call_sites(stats, limit: limit, hours: hours, window: window,
+                                      scanned: fetch, use_localhost: use_localhost)
       next
     end
 
@@ -11484,7 +11836,7 @@ def cmd_queries_top(args)
         "%4d  %12d  %10d  %9d  %9d  %7s  %s\n",
         idx + 1, s["total_ms"], s["calls"], s["mean_ms"], s["max_ms"],
         queries_multi_share(s),
-        s["call_site"] || "(never got hot)"
+        s["call_site"] || QUERIES_NO_CALL_SITE
       )
       puts "#{QUERIES_SQL_INDENT}#{queries_span_line(s, hours: hours, use_localhost: use_localhost)}"
       queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
@@ -11493,6 +11845,96 @@ def cmd_queries_top(args)
 
     queries_offer_investigation(stats, hours: hours, sort: sort, use_localhost: use_localhost)
   end
+end
+
+# How many statements the call-site rollup sums over.
+#
+# Deep on purpose: the failure this exists for is a call site whose shapes rank far apart,
+# and the measured case (InternalClubsDao.findAll, below) had its six spread from 129 to
+# 299. A depth near the number of groups displayed would reproduce the bug inside the fix.
+QUERIES_CALL_SITE_SCAN = 500
+
+# Roll the ranked statements up by the code that issued them.
+#
+# `dev queries top` ranks NORMALIZED STATEMENTS, and one code path routinely emits more than
+# one -- a different projection per branch, an optional predicate, a keyset walk's first page
+# and its `and id > ?` pages. Each is ranked on its own at a fraction of the path's cost, and
+# nothing in the output says the rows are one caller.
+#
+# Measured on production, 2026-08-08: integrations.clubs.db.InternalClubsDao.findAll
+# (InternalClubsDao.scala:234) emits six shapes, ranked 129, 236, 241, 255, 283 and 299 by
+# total_ms over 7 days. Not one of them is in reach of the ranking anybody reads, and together
+# they are 47,851 ms across 16,397 calls -- 60th of the call sites.
+#
+# Grouped by `call_site` rather than by any similarity between the statements: it is already
+# on every row, it is the column `query_stats.query_samples` exists to carry, and it needs no
+# heuristic about which predicate is "the cursor one".
+#
+# A row whose call site was never resolved is its OWN group, and that bounds what this can
+# do: two shapes of one walk are rolled up only if the walk was attributed at all. Those rows
+# have nothing in common but the absence of an attribution, and merging them would invent the
+# largest call site on the instance out of unrelated queries. ISS-1032 is the attribution gap
+# itself, which is the other half of this and lives in the platform.
+def queries_by_call_site(stats)
+  groups = []
+  by_site = {}
+  stats.each do |s|
+    site = s["call_site"].to_s.empty? ? nil : s["call_site"]
+    group = site && by_site[site]
+    unless group
+      group = { :call_site => site, :stats => [] }
+      by_site[site] = group if site
+      groups << group
+    end
+    group[:stats] << s
+  end
+
+  groups.each do |g|
+    g[:total_ms] = g[:stats].sum { |s| s["total_ms"].to_i }
+    g[:calls] = g[:stats].sum { |s| s["calls"].to_i }
+    g[:max_ms] = g[:stats].map { |s| s["max_ms"].to_i }.max
+    g[:mean_ms] = g[:calls].zero? ? 0 : (g[:total_ms].to_f / g[:calls]).round
+    g[:multi_statement_calls] = g[:stats].sum { |s| s["multi_statement_calls"].to_i }
+  end
+  groups.sort_by { |g| -g[:total_ms] }
+end
+
+def queries_print_call_sites(stats, limit:, hours:, window:, scanned:, use_localhost:)
+  groups = queries_by_call_site(stats)
+  shown = groups.first(limit)
+
+  puts ""
+  puts Util.underline("Top #{shown.length} call sites by total_ms (last #{window})")
+  puts ""
+  printf(
+    "%4s  %12s  %10s  %9s  %9s  %7s  %6s  %s\n",
+    "#", "TOTAL MS", "CALLS", "MEAN MS", "MAX MS", "MULTI", "SHAPES", "CALL SITE"
+  )
+  shown.each_with_index do |g, idx|
+    printf(
+      "%4d  %12d  %10d  %9d  %9d  %7s  %6d  %s\n",
+      idx + 1, g[:total_ms], g[:calls], g[:mean_ms], g[:max_ms],
+      queries_multi_share("calls" => g[:calls], "multi_statement_calls" => g[:multi_statement_calls]),
+      g[:stats].length,
+      g[:call_site] || "(never got hot)"
+    )
+    # Every shape, never a "+N more": the split IS the finding, so a rollup that hides which
+    # statements it summed is the same blindness one level up.
+    g[:stats].each do |s|
+      puts format("%s%d ms · %d calls · %s", QUERIES_SQL_INDENT, s["total_ms"].to_i, s["calls"].to_i,
+                  queries_span_line(s, hours: hours, use_localhost: use_localhost))
+      queries_sql_lines(s["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
+    end
+  end
+  puts ""
+  # Said out loud, always: a rollup over a truncated ranking is still a floor, and a floor
+  # that does not announce itself reads as a total.
+  puts "Rolled up from the top #{stats.length} statements by total_ms" \
+       "#{stats.length >= scanned ? ' — the scan depth, so costs below it are not counted' : ''}."
+  puts ""
+
+  queries_offer_investigation(shown, hours: hours, sort: "total_ms", use_localhost: use_localhost,
+                                     expand: ->(g) { g[:stats] })
 end
 
 # The raw samples behind one statement, oldest first.
@@ -11545,7 +11987,7 @@ def cmd_queries_show(args)
 
     samples = history["samples"] || []
     puts ""
-    puts Util.underline("Samples for #{history['call_site'] || '(never got hot)'} (last #{window})")
+    puts Util.underline("Samples for #{history['call_site'] || QUERIES_NO_CALL_SITE} (last #{window})")
     puts ""
     queries_sql_lines(history["sql"].to_s, indent: QUERIES_SQL_INDENT).each { |line| puts line }
     puts ""
@@ -11689,19 +12131,25 @@ end
 #
 # Skipped entirely when stdin is not a tty — piping this command must print the
 # table and exit, never block on a prompt nobody can answer.
-def queries_offer_investigation(stats, hours:, sort:, use_localhost:)
+#
+# `rows` are whatever the ranking numbered, so the numbers at the prompt are the numbers on
+# screen. Under --by-call-site those are call sites rather than statements, and `expand`
+# turns each picked one back into the statements the issue has to carry.
+def queries_offer_investigation(rows, hours:, sort:, use_localhost:, expand: ->(row) { [row] })
   return unless $stdin.tty?
 
   answer = Ask.for_string(
     "Investigate any of these? Enter numbers (e.g. 1,3), `all`, or `none` [none]:",
     default: "none",
   )
-  selected = Ask.parse_selection(answer, stats)
-  if selected.nil?
+  picked = Ask.parse_selection(answer, rows)
+  if picked.nil?
     puts "Invalid selection — nothing filed. Re-run to pick again."
     return
   end
-  return if selected.empty?
+  return if picked.empty?
+
+  selected = picked.flat_map(&expand)
 
   require_playbook_session!(use_localhost)
   form = {
@@ -11721,7 +12169,7 @@ QUERIES_ISSUE_CATEGORY = "improvement".freeze
 
 # A title that says which query without the session having to open the issue.
 # The call site is the identifying half when there is one; the statement's head
-# is the fallback for a query that never got hot enough to be attributed.
+# is the fallback for a query whose stack walk found no application frame.
 def queries_issue_title(selected)
   return "Expensive queries: #{selected.length} from the query-stats ranking" if selected.length > 1
 
@@ -11771,12 +12219,13 @@ def queries_issue_body(selected, hours:, sort:)
     window. `dev queries top` reads those rows back through `GET /dev/query/stats`,
     grouped by statement and summed across every node and window in the period.
 
-    The call site is resolved by walking the stack ONCE, the first time a query crosses
-    100 calls on a node — far too expensive per call, free amortized over a hot query.
+    The call site is resolved by walking the stack ONCE per statement per window, on
+    that statement's first execution after a drain — far too expensive per call, and
+    bounded by the tracking cap however much traffic the window sees.
 
     ## Where the code lives
 
-    - `~/code/platform/generated/app/util/QueryStats.scala` — the counters, the hot threshold, the 5,000-query tracking cap
+    - `~/code/platform/generated/app/util/QueryStats.scala` — the counters, the once-per-window attribution, the 5,000-query tracking cap
     - `~/code/platform/generated/app/util/PlatformDatabase.scala` — the timing decorator that records each block
     - `~/code/platform/generated/app/util/TimingConnection.scala` — which statement in a block the duration is charged to
     - `~/code/platform/generated/app/util/QuerySqlNormalizer.scala` — how bind lists are collapsed
@@ -11799,10 +12248,12 @@ def queries_issue_body(selected, hours:, sort:)
       flat (`in (?)`) and row-wise (`in ((?))`) alike, so the list may have been two
       elements or two thousand. The width is a prime suspect and is NOT visible here —
       find it at the call site.
-    - **`(never got hot)` means no call site, not no caller**: the query never reached
-      100 calls in a window on any single node, so the stack walk never ran. Find the
-      caller by grepping the statement's head (a distinctive column list or table name)
-      under `~/code/platform`.
+    - **`#{QUERIES_NO_CALL_SITE}` means no call site, not no caller.** Every statement is
+      now attributed on its first execution of a window, so this is either a row recorded
+      before that change shipped (attribution used to need 100 calls in a single window,
+      which a third of the most expensive statements never reached) or a stack whose
+      frames were all plumbing. Find the caller by grepping the statement's head (a
+      distinctive column list or table name) under `~/code/platform`.
     - **`calls`, `total_ms` and `multi-statement` are sums across nodes and windows.**
       Per-node cost is roughly this divided by the number of pods serving; `max_ms` is a
       true single-call worst case, not an average of maxima.
@@ -11859,7 +12310,7 @@ end
 # select does not bury the ranking, but the session needs the whole thing.
 def queries_issue_body_entry(s, position)
   <<~ENTRY.strip
-    ### #{position}. #{s['call_site'].to_s.empty? ? '(never got hot — no call site resolved)' : "`#{s['call_site']}`"}
+    ### #{position}. #{s['call_site'].to_s.empty? ? QUERIES_NO_CALL_SITE : "`#{s['call_site']}`"}
 
     - total: #{s['total_ms']} ms across #{s['calls']} calls
     - mean: #{s['mean_ms']} ms, max: #{s['max_ms']} ms
@@ -11912,6 +12363,13 @@ end
 QUERIES_SQL_CHARS = 440
 
 QUERIES_SQL_INDENT = "              ".freeze
+
+# Shown in place of a call site when there is none. Deliberately says what is missing rather
+# than why: a null `call_site` used to mean one thing (the statement never reached 100
+# calls in a six-hour window, so the stack walk never ran) and now means another (the walk
+# ran on the statement's first execution and found no application frame), and rows of both
+# vintages sit in the same table for 90 days. "(never got hot)" described only the first.
+QUERIES_NO_CALL_SITE = "(no call site)".freeze
 
 # The statement, whitespace-collapsed, capped at QUERIES_SQL_CHARS and wrapped to the
 # terminal so the extra length reads as text instead of one line the terminal folds
@@ -13523,6 +13981,13 @@ def cmd_agent_status(args)
     puts "Runner #{identity.runner_id}#{me ? " (#{me['hostname']})" : ''}"
     puts "  concurrency: #{me ? me['max_concurrency'] : '?'}   paused: #{me ? !!me['paused'] : '?'}"
     puts "  last heartbeat: #{me && me['last_heartbeat_at']}"
+    # Beside `paused` because it answers the same question — "why is this runner
+    # taking no work" — and it is the answer nobody would otherwise find: the
+    # limit belongs to the account, not to this machine or to the queue (ISS-1129).
+    if (resets_at = Agent::UsageLimit.active)
+      puts "  CLAUDE USAGE LIMIT: claiming no issues until #{resets_at.localtime.strftime('%H:%M')} " \
+           "(verify jobs are unaffected)"
+    end
 
     jobs = Agent::Jobs.all
     if jobs.empty?
@@ -13889,7 +14354,7 @@ def agent_playbooks_report(rows, lint:)
     # the checks is part of that: a clean line that does not say what it checked
     # cannot tell you a NEW defect class is not covered yet.
     if findings.empty?
-      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans."
+      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans, hand-written status files."
     else
       puts findings.map(&:to_s)
       # One remedy per rule actually hit, not the full catalogue: a finding is
@@ -14128,6 +14593,134 @@ def agent_playbook_write(opts, identity, use_localhost)
        "resolves to this from the next claim on."
 end
 
+# ---------- agent status-file (ISS-1022) ----------
+#
+# The briefing's status files, as a COMMAND rather than as a filesystem write.
+#
+# The conflict this resolves is total, not cosmetic. `agent/instructions.md` §3
+# says an autonomous session never edits outside its workspace, and it offers one
+# remedy — "clone what you need into your workspace" — which accomplishes nothing
+# here, because the briefing reads `~/code/openclaw/openclaw-workspace/data/` and
+# not a copy of it. Three playbooks ended by telling the session to write that
+# path anyway. So every run had to pick a rule to break unaided, and the reading
+# that honours the guardrail is the one that silently drops the briefing update:
+# the section is not marked stale, it DISAPPEARS, which is indistinguishable from
+# the job having been quietly retired.
+#
+# A command has no such conflict, and this is the shape the fleet already uses for
+# exactly this problem: `dev agent playbook --write` is how the playbook store is
+# edited, `dev agent run-op` is how an operation is recorded, `dev issues status`
+# is how an issue moves. Nothing here needs a new allowance in §3, which is the
+# point — an allowance is another line of guardrail prose for a session to weigh
+# at 3am, and this is a line of prose deleted rather than added.
+#
+# No identity, no network, no `DEV_AGENT_ISSUE`. It writes one file on the box it
+# runs on, so a human can run it to repair a section by hand.
+def cmd_agent_status_file(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  write_path = nil
+  positional = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--write"
+      write_path = rest[i + 1]
+      i += 2
+    else
+      positional << rest[i]
+      i += 1
+    end
+  end
+
+  key = positional.first
+  problems = []
+  problems << "unexpected argument(s): #{positional[1..].join(', ')}" if positional.length > 1
+  problems << "--app is not a valid option here" if app_filter
+  problems << "--write needs a file: `--write <file>`" if rest.include?("--write") && write_path.to_s.empty?
+  problems << "--write needs a key: which job's status file is this? (#{Briefing.keys.join(', ')})" if write_path && key.nil?
+  if key && !Briefing.known?(key)
+    problems << "no briefing status file is registered for `#{key}`. Known keys: #{Briefing.keys.join(', ')}"
+  end
+  report_arg_problems("agent status-file", problems, usage_for("agent status-file"))
+
+  return agent_status_file_list if key.nil?
+  return agent_status_file_write(key, write_path) if write_path
+
+  agent_status_file_show(key)
+end
+
+# The catalogue. Freshness is the column that matters and it is the briefing's
+# own rule, not a file mtime: the briefing dates a section by the `Last run:`
+# line INSIDE the file, so a file rewritten today with yesterday's header is
+# stale to the only reader there is.
+def agent_status_file_list
+  unless Dir.exist?(Briefing::DATA_DIR)
+    puts "No briefing workspace at #{Briefing::DATA_DIR} — nothing on this machine writes or reads these."
+    return
+  end
+  puts "Briefing status files in #{Briefing::DATA_DIR}"
+  Briefing.keys.each do |key|
+    body = Briefing.read(key)
+    date = body && Briefing.header_date(body)
+    state = if body.nil? then "never written"
+            elsif date.nil? then "UNDATED — the briefing cannot parse it and skips the section"
+            elsif date == Briefing.today then "today"
+            else "#{date} — stale, the briefing skips it"
+            end
+    puts format("  %-30s %-32s %s", key, Briefing.file_for(key), state)
+  end
+end
+
+# The body on stdout and the path on stderr, the same split `agent playbook` uses
+# and for the same reason: `dev agent status-file slow-query-review > s.md` has to
+# capture exactly what the briefing reads, with no banner in it.
+def agent_status_file_show(key)
+  body = Briefing.read(key)
+  if body.nil?
+    Util.exit_with_error("No status file for `#{key}` yet at #{Briefing.path_for(key)}. " \
+                         "It is written by that job's run — see `dev agent status-file` for what exists.")
+  end
+  warn "#{key} — #{Briefing.path_for(key)}"
+  print body
+end
+
+def agent_status_file_write(key, path)
+  Util.exit_with_error("No such file: #{path}") unless File.file?(path)
+  body = File.read(path)
+  if body.strip.empty?
+    Util.exit_with_error("#{path} is empty. An empty status file is the same as no status file to the briefing, " \
+                         "which is the silent failure this command exists to make impossible.")
+  end
+
+  # Refused, not warned: a body the briefing cannot date is invisible to it, and
+  # a session that wrote one has no way to find that out — the section simply
+  # never appears. This is the one check that turns "I recorded it" into a fact.
+  date = Briefing.header_date(body)
+  if date.nil?
+    Util.exit_with_error(
+      "#{path} does not start with the header the briefing parses. Line 1 must be `Last run: YYYY-MM-DD` " \
+      "(anything may follow the date — a time, ` — ok`, a note). The briefing dates each section off that " \
+      "line and skips what it cannot date, so this would have been written and never read.\n" \
+      "  Got: #{body.lines.first.to_s.strip[0, 100].inspect}",
+    )
+  end
+
+  # Warned, not refused: the briefing skips a non-today section, so this IS a
+  # defect — but a run that started at 23:50 and finished at 00:05 wrote an
+  # honest header, and refusing it would fail a good run at its last step. The
+  # warning is what makes the missing section explicable the next morning.
+  warn "briefing: `Last run: #{date}` is not today (#{Briefing.today}) — the briefing will skip this section." if date != Briefing.today
+
+  unless Briefing.write(key, body)
+    Util.exit_with_error(
+      "Could not write #{Briefing.path_for(key)}. #{Dir.exist?(Briefing::DATA_DIR) ? 'The write failed.' : "There is no briefing workspace at #{Briefing::DATA_DIR} on this machine."}\n" \
+      "  Reported here rather than swallowed: you were told to record this, so a no-op has to be visible. " \
+      "File it with `dev issues workaround` if it cannot be fixed.",
+    )
+  end
+  puts "Wrote #{Briefing.path_for(key)} (Last run: #{date})"
+end
+
 # Sugar for one transition, and deliberately nothing more: review feedback and a
 # pre-merge rebase are both "more work on this issue", and the queue already
 # models that. Mike can do the same thing from playbook-admin or `dev issues
@@ -14302,6 +14895,8 @@ def cmd_agent_doctor(args)
 
   claude_config = agent_doctor_claude_config
   agent_doctor_credentials
+  agent_doctor_login_shell
+  agent_doctor_product_owner
   agent_doctor_sbt_heap
   agent_doctor_load
 
@@ -14484,7 +15079,12 @@ def cmd_agent_merge(args)
   # Asked ONLY when a spec actually changed: it is a clone plus a hermetic diff,
   # and 43 of the 49 open PRs on 2026-08-06 touched no spec at all.
   spec_diff = Agent::MergeLane.spec_touched?(candidate.changed_paths) ? Agent::MergeLane.spec_diff(repo, candidate.number) : nil
-  asserts = Agent::MergeLane.assertions(candidate, base_sha: base, spec_diff: spec_diff)
+  # Asked HERE rather than on every Candidate the lane builds: it is one request,
+  # and the only decision that needs it is the one about to be recorded (ISS-1080).
+  asserts = Agent::MergeLane.assertions(
+    candidate, base_sha: base, spec_diff: spec_diff,
+    verified_detail: Agent::MergeLane.verified_detail(repo, candidate.head_sha),
+  )
   reversibility = Agent::MergeLane.reversibility(candidate.changed_paths, repo: repo,
                                                  spec_diff: spec_diff || :unknown)
   puts "  reversibility: #{reversibility}"
@@ -14509,7 +15109,26 @@ def agent_merge_rationale(candidate, reversibility, asserts)
     "#{asserts['diff_lines']} changed line(s). #{spec}`#{Agent::MergeLane::CI_CHECK}` passed on " \
     "#{Agent::MergeLane.short(candidate.head_sha)}, which is the exact commit that will be squashed, and " \
     "that commit contains the current tip of main (#{Agent::MergeLane.short(asserts['base_sha'])}). " \
-    "Verified by GitHub Actions rather than asserted by this session."
+    "Verified by GitHub Actions rather than asserted by this session.#{agent_merge_evidence(asserts)}"
+end
+
+# WHERE that verification can be read back, appended to the rationale so the
+# audit path starts and ends in the decision (ISS-1080).
+#
+# The rationale is prose a human reads in the feed, and until now it named the
+# verifier and stopped — leaving an auditor to go back to GitHub for the link,
+# and for a fleet-verified repo to go on from there to whichever runner built the
+# sha. Both facts are already on the decision as assertions; this is the same
+# two, in the sentence that is actually read.
+#
+# Empty when neither exists, rather than a sentence saying nothing is known: a
+# rationale that has to hedge about its own evidence is worse than one that
+# simply does not mention it.
+def agent_merge_evidence(asserts)
+  parts = []
+  parts << asserts["verified_url"] if asserts["verified_url"]
+  parts << asserts["verified_detail"] if asserts["verified_detail"]
+  parts.empty? ? "" : " Evidence: #{parts.join(' — ')}"
 end
 
 def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id:, use_localhost:)
@@ -14683,6 +15302,48 @@ end
 # because nothing is missing: the machine is fully provisioned and still hands
 # every build a heap sized for a different box. A profile pinning `-Xms40G` on a
 # 24G runner is exactly that, and it is invisible until something swaps.
+# What a bare command name means on this machine (ISS-1033).
+#
+# Here rather than in Agent::Toolchain for the same reason the heap section
+# below is: nothing is missing. Every tool resolves, every version is supported,
+# and a session still gets a different program than the one it typed. The
+# toolchain answers "is it installed"; this answers "is it what it says".
+#
+# Never fatal, and it files nothing. A `ps` alias does not stop this box running
+# sessions, and the listing is mostly harmless (`ls -F`) with one line in it that
+# cost a transcript — a section that failed provisioning over the harmless ones
+# would be routed around, taking the one that matters with it.
+def agent_doctor_login_shell
+  shadowing = Agent::LoginShell.shadowing
+  puts
+  if shadowing.nil?
+    puts "Login-shell aliases: unknown (this machine's `/bin/zsh -lc` would not answer)"
+    return
+  end
+
+  puts "Login-shell aliases that shadow a real binary (what a bare command name means here):"
+  if shadowing.empty?
+    puts "  ok   none — a bare command name on this machine is the binary"
+    return
+  end
+
+  name_width = shadowing.map { |a| a.name.length }.max
+  body_width = shadowing.map { |a| a.expansion.inspect.length }.max
+  shadowing.each do |a|
+    puts "  ALIAS #{a.name.ljust(name_width)}  #{a.expansion.inspect.ljust(body_width)}  (shadows #{a.path})"
+  end
+  puts "  A LOGIN shell defines these, and zsh expands aliases in NON-interactive shells too — so"
+  puts "  they are live in every session's Bash tool AND in `/bin/zsh -lc`, which is how launchd"
+  puts "  runs the tick and how `dev agent run-op -- /bin/zsh -lc '<line>'` runs an operation."
+  puts "  Two shapes to look for, both measured on this fleet (ISS-1033/ISS-961):"
+  puts "    - flags an alias PREPENDS may not be narrowable back — `ps -ax` makes a later"
+  puts "      `-p <pid>` a no-op, so `ps -p <pid>` prints every process on the box;"
+  puts "    - a flag that needs a tty fails OPEN — `rm -i` on a session's tty-less shell"
+  puts "      deletes nothing and still exits 0."
+  puts "  Sessions: spell the absolute path (`/bin/ps`, `/bin/rm`) when exact behaviour matters."
+  puts "  This machine: delete the line from whichever profile defines it (`~/.alias` on this fleet)."
+end
+
 def agent_doctor_sbt_heap
   puts
   puts "sbt heap: #{Agent::Heap.sbt_opts}   (`dev agent sbt-opts --explain`)"
@@ -14752,6 +15413,18 @@ end
 #
 # Prints presence, never values: `Agent::Credentials.check` cannot carry a
 # secret, so this cannot print one.
+# The product-owner review's stored logins. Reported like Agent::Credentials and
+# for the same reason it is: a machine missing this can still claim every issue
+# that is not a product review, so it prints but never changes the exit code.
+def agent_doctor_product_owner
+  state = Agent::ProductOwner.state
+  puts
+  puts "Product-owner review credentials (how the daily product review logs in):"
+  puts "  #{state.ok? ? 'ok  ' : 'MISS'} #{state.message}"
+  puts "       fix: #{state.remedy}" unless state.ok?
+  state
+end
+
 def agent_doctor_credentials
   found = Agent::Credentials.check
   return if found.empty?
@@ -14771,6 +15444,50 @@ def agent_doctor_credentials
   end
   puts "Sessions on this machine are TOLD this up front and will report such work as unverified " \
        "rather than guessing (ISS-570). Nothing else is blocked."
+end
+
+# ---------- newrelic (data ingest against the free tier) ----------
+
+# The key is resolved the same way a spawned session's is, so `dev newrelic
+# ingest` works identically at a human's prompt (where the variable is usually
+# exported) and inside the tick (where it comes out of the env repo). Never
+# printed, never put on a command line, and not stored on anything this returns.
+def newrelic_key
+  _status, value, _source = Agent::Credentials.probe(
+    Agent::Credentials::CREDENTIALS.find { |c| c.name == Newrelic::KEY_ENV },
+  )
+  value
+end
+
+def cmd_newrelic_ingest(args)
+  as_json = false
+  account_id = Newrelic::ACCOUNT_ID
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--json" then as_json = true
+    when "--account"
+      account_id = Integer(args[i + 1] || usage_exit("--account requires a value", example: usage_for("newrelic ingest")))
+      i += 1
+    else usage_exit("Unknown flag: #{args[i]}", example: usage_for("newrelic ingest"))
+    end
+    i += 1
+  end
+
+  measurement = NewrelicIngest.measure(key: newrelic_key, account_id: account_id)
+  if as_json
+    puts JSON.pretty_generate(measurement.to_h)
+  else
+    puts ""
+    puts NewrelicIngest.text_report(measurement)
+    puts ""
+  end
+  # Non-zero when the projection is worth a decision, so this composes with
+  # anything that checks an exit code. `2` and not `1` keeps it distinguishable
+  # from the argument errors above.
+  exit 2 if measurement.actionable?
+rescue Newrelic::Error => e
+  Util.exit_with_error(e.message)
 end
 
 # ---------- prs (cross-repo pull-request groups) ----------
@@ -15284,6 +16001,12 @@ when "claude-usage"
   when "top" then cmd_claude_usage_top(argv)
   else            unknown("claude-usage subcommand", sub, SUBCOMMANDS["claude-usage"])
   end
+when "newrelic"
+  sub = resolve_subcommand(argv, default: "ingest")
+  case sub
+  when "ingest" then cmd_newrelic_ingest(argv)
+  else               unknown("newrelic subcommand", sub, SUBCOMMANDS["newrelic"])
+  end
 when "schema"
   sub = resolve_subcommand(argv, default: "lint")
   case sub
@@ -15367,6 +16090,7 @@ when "agent"
   when "runs"      then cmd_agent_runs(argv)
   when "playbooks" then cmd_agent_playbooks(argv)
   when "playbook"  then cmd_agent_playbook(argv)
+  when "status-file" then cmd_agent_status_file(argv)
   when "refresh"   then cmd_agent_refresh(argv)
   when "release"   then cmd_agent_release(argv)
   when "gc"          then cmd_agent_gc(argv)

@@ -95,6 +95,46 @@ module DevTestSupport
     end
   end
 
+  # NetworkGuard covers `dev`, ApibuilderGuard covers `bin/api`. `Newrelic` is
+  # the THIRD HTTP client in this repo (ISS-1077) and routes through neither, so
+  # without this the daily ingest check in `Agent::Tick#phase_b` sent a real
+  # request to api.newrelic.com from every tick test in the suite — several
+  # dozen — using the fake key CredentialsGuard reports as present.
+  #
+  # It did not turn the suite red, which is the part worth stating: the check
+  # deliberately rescues `Newrelic::Error` so that an outage at NewRelic cannot
+  # break a runner's work phase, so the live 401s surfaced only as thread
+  # backtraces on stderr in the middle of a passing run. A guard that has to be
+  # noticed is not a guard.
+  #
+  # Guards `post` rather than `nrql`, for the same reason ApibuilderGuard guards
+  # `build_http`: it is the one place every query has to pass through, so a
+  # fourth entry point cannot route around it.
+  module NewrelicGuard
+    # The `http:` seam still works: a test that PASSES one is stubbing the
+    # network rather than reaching it, and blocking those too would leave no way
+    # to exercise the client at all. Only a seamless call — the one that would
+    # open a socket — raises.
+    def self.install
+      return unless defined?(Newrelic)
+      @saved = Newrelic.method(:post)
+      original = @saved
+      Newrelic.define_singleton_method(:post) do |json, key:, http: nil|
+        raise DevTestSupport::NetworkBlocked,
+              "test attempted a live NerdGraph request - pass the `http:` seam " \
+              "(NewrelicIngest.measure(http: ...)) rather than letting it reach the network" if http.nil?
+
+        original.call(json, key: key, http: http)
+      end
+    end
+
+    def self.uninstall
+      return unless defined?(Newrelic) && @saved
+      Newrelic.define_singleton_method(:post, @saved)
+      @saved = nil
+    end
+  end
+
   # The same reasoning as NetworkGuard, for the machine instead of the network.
   #
   # `dev agent tick` now runs runner-local housekeeping (Agent::Maintenance,
@@ -195,6 +235,35 @@ module DevTestSupport
     def self.uninstall
       return unless defined?(Agent::Toolchain) && @saved
       Agent::Toolchain.define_singleton_method(:check, @saved)
+      @saved = nil
+    end
+  end
+
+  # The same reasoning once more, for the daily NewRelic ingest measurement the
+  # tick runs (Agent::NewrelicWatch, ISS-1077).
+  #
+  # NewrelicGuard above already makes the network unreachable, and that is not
+  # sufficient here — it is what turns an unnoticed live request into a FAILING
+  # tick test. `NetworkBlocked` is not an `ApiError`, so it escapes the check's
+  # `rescue Newrelic::Error`, reaches phase_b's StandardError backstop, and
+  # records a work-phase crash: seven tests about the reap and the claim failed
+  # on a stubbed-out measurement they never asked for. Exactly the failure
+  # ToolchainGuard's header describes, one client along.
+  #
+  # The stand-in is "this machine already measured today", which is the state
+  # nearly every tick is in — the cadence is daily and the suite runs the tick
+  # dozens of times — so it is both the cheap answer and the honest one. A test
+  # ABOUT the cadence opts out (test_newrelic_ingest.rb does).
+  module NewrelicWatchGuard
+    def self.install
+      return unless defined?(Agent::NewrelicWatch)
+      @saved = Agent::NewrelicWatch.method(:due?)
+      Agent::NewrelicWatch.define_singleton_method(:due?) { |now: Time.now| false }
+    end
+
+    def self.uninstall
+      return unless defined?(Agent::NewrelicWatch) && @saved
+      Agent::NewrelicWatch.define_singleton_method(:due?, @saved)
       @saved = nil
     end
   end
@@ -319,8 +388,10 @@ module DevTestSupport
       super
       DevTestSupport::NetworkGuard.install
       DevTestSupport::ApibuilderGuard.install
+      DevTestSupport::NewrelicGuard.install
       DevTestSupport::MaintenanceGuard.install
       DevTestSupport::ToolchainGuard.install
+      DevTestSupport::NewrelicWatchGuard.install
       DevTestSupport::CredentialsGuard.install
       DevTestSupport::RegistryGuard.install
       DevTestSupport::VerifyGuard.install
@@ -332,8 +403,10 @@ module DevTestSupport
       DevTestSupport::VerifyGuard.uninstall
       DevTestSupport::RegistryGuard.uninstall
       DevTestSupport::CredentialsGuard.uninstall
+      DevTestSupport::NewrelicWatchGuard.uninstall
       DevTestSupport::ToolchainGuard.uninstall
       DevTestSupport::MaintenanceGuard.uninstall
+      DevTestSupport::NewrelicGuard.uninstall
       DevTestSupport::ApibuilderGuard.uninstall
       DevTestSupport::NetworkGuard.uninstall
       super
