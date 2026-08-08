@@ -94,6 +94,25 @@ module Agent
     # needs a change here.
     CI_CHECK = "ci".freeze
 
+    # The two things that produce that check, named apart because an auditor
+    # reading a merge decision after the fact has to go somewhere DIFFERENT for
+    # each one's evidence:
+    #
+    #   github_actions  a hosted workflow posted a CheckRun. Its evidence is a
+    #                   permanent run page on github.com, readable by anyone.
+    #   fleet_verify    the fleet verify job (Agent::Verify) posted a COMMIT
+    #                   STATUS. Its evidence is a build log on whichever runner
+    #                   built the sha — a local file, readable only from that box,
+    #                   and the status description is what names it.
+    #
+    # Since ISS-848 enrolment is `ci/build.sh` rather than a workflow, which makes
+    # `fleet_verify` the MAJORITY case: playbook-admin — the repo with the most
+    # lane traffic — has no `.github/workflows` at all. A constant here that said
+    # `github_actions` for every merge pointed every audit of that repo at a
+    # system that has never run in it, and at logs that do not exist (ISS-1079).
+    ACTIONS_VERIFIER = "github_actions".freeze
+    FLEET_VERIFIER = "fleet_verify".freeze
+
     # Reviewable posts this context once a human opens the PR there. It is NOT a
     # test result and must never be conflated with one (ISS-763): a pending
     # review means Mike is mid-pass over the diff, and merging out from under him
@@ -174,13 +193,14 @@ module Agent
     # it deferred for a review, individually, and a PR that is also red would
     # otherwise lose that fact to the higher-priority verdict.
     #
-    # `verified_url` is carried for a different reason: `assertions` needs it and
-    # only ever sees a Candidate, never the rollup entry it was read off. It is
-    # nil unless something actually verified THIS head AND left a link — see
-    # `.verified_url`.
+    # `verified_by` and `verified_url` are carried for a different reason:
+    # `assertions` needs them and only ever sees a Candidate, never the rollup
+    # entry they were read off. Both are nil unless something has actually
+    # verified THIS head — `verified_url` additionally requires that the verifier
+    # left a link. See `.verified_by` and `.verified_url`.
     Candidate = Struct.new(:repo, :number, :title, :url, :head_sha, :created_at,
                            :verdict, :review_in_flight, :diff_lines, :changed_paths,
-                           :verified_url,
+                           :verified_by, :verified_url,
                            keyword_init: true) do
       def mergeable? = verdict.mergeable?
       def label = "#{repo}##{number}"
@@ -191,6 +211,7 @@ module Agent
           "head_sha" => head_sha, "created_at" => created_at,
           "review_in_flight" => !!review_in_flight,
           "diff_lines" => diff_lines, "changed_paths" => changed_paths,
+          "verified_by" => verified_by,
           "verified_url" => verified_url,
         }.compact.merge(verdict.to_h)
       end
@@ -371,8 +392,18 @@ module Agent
     # which is what the fleet verify job does (Agent::Verify).
     PENDING_STATE = "PENDING".freeze
 
+    # WHICH OF THE TWO SHAPES this entry is, asked in exactly one place so that
+    # nothing downstream can classify an entry differently from `check_state`.
+    # A StatusContext is the one that carries `state`; a CheckRun carries
+    # `status`/`conclusion` and never `state`.
+    #
+    # Deliberately the shape rather than `__typename`: `check_state` has always
+    # read the fields it needs directly, so an entry it can read a state out of
+    # and an entry this calls a commit status are the same entry by construction.
+    def commit_status?(entry) = !entry["state"].nil?
+
     def check_state(entry)
-      if entry["state"]
+      if commit_status?(entry)
         state = entry["state"].to_s.upcase
         return state == PENDING_STATE ? nil : state
       end
@@ -509,6 +540,29 @@ module Agent
         "measured on a tree nobody is about to merge")
     end
 
+    # WHO verified this head, or nil if nobody has.
+    #
+    # Computed from the rollup entry that produced the verdict, never from a
+    # constant, because this is the assertion an auditor follows to the evidence
+    # and the two producers keep their evidence in different places (see
+    # ACTIONS_VERIFIER / FLEET_VERIFIER). The shape of the entry is the one thing
+    # about the check that the party asking for the merge does not get to write.
+    #
+    # nil is the whole answer for "nothing verified this", and it is deliberately
+    # the SAME nil for a PR with no `ci` check, a red one, one still running, and
+    # one whose green was measured on an earlier push: none of them is evidence
+    # about the commit that would land. `assertions` drops the key entirely in
+    # that case, so an envelope that requires a verifier fails closed rather than
+    # reading a placeholder as permission.
+    def verified_by(pr)
+      entry = ci_entry(pr)
+      return nil if entry.nil?
+      # `ci_state` returns nil for exactly one case — a green pass on this very
+      # head — and a verdict for every way of not being one.
+      return nil unless ci_state(pr).nil?
+      "#{commit_status?(entry) ? FLEET_VERIFIER : ACTIONS_VERIFIER}:#{CI_CHECK}"
+    end
+
     # WHERE the evidence for this head's pass is, or nil.
     #
     # Read off the rollup entry that produced the pass rather than constructed
@@ -630,8 +684,14 @@ module Agent
     # That distinction is the entire trust model: the ledger "does not defend
     # against a loop that reports false facts", so a merge bot that repeated a
     # PR author's "tests pass" would be exactly that loop. `suite_passed` here is
-    # not a session's word for it — it is the `ci` check, run by GitHub Actions
-    # on the sha named beside it.
+    # not a session's word for it — it is the `ci` check, passing on the sha named
+    # beside it, and `verified_by` names WHICH independent party ran it.
+    #
+    # Both of those are read off the Candidate rather than written here as
+    # constants, and that is the point rather than a refactor: a constant is a
+    # claim this module makes about itself, which is the one kind of fact the
+    # trust model says the ledger cannot check. `verified_by` was such a constant
+    # until ISS-1079 and it named the wrong system on most of the lane.
     #
     # `verified_url` and `verified_detail` are the same fact for a DIFFERENT
     # reader. Nothing gates on them; they exist so that a human auditing this
@@ -656,8 +716,13 @@ module Agent
         # reader never sees "non_breaking" beside a PR that changed no contract.
         "spec_diff" => (touches_spec ? (spec_diff || :unknown).to_s : nil),
         "touches_secrets" => paths.any? { |p| secrets?(p) },
-        "suite_passed_post_rebase" => true,
-        "verified_by" => "github_actions:#{CI_CHECK}",
+        # One computed fact stated twice, for two readers: the ledger gates on
+        # the boolean, a human auditing the merge afterwards follows the name to
+        # the evidence. A nil verifier is "nothing verified this head", so the
+        # boolean is false and the key is dropped — never a `true` beside a
+        # missing verifier.
+        "suite_passed_post_rebase" => !candidate.verified_by.nil?,
+        "verified_by" => candidate.verified_by,
         "verified_url" => candidate.verified_url,
         "verified_detail" => blank_to_nil(verified_detail),
         "ci_head_sha" => candidate.head_sha,
@@ -698,7 +763,7 @@ module Agent
         head_sha: raw["headRefOid"], created_at: raw["createdAt"],
         verdict: final, review_in_flight: review_in_flight?(raw),
         diff_lines: diff_lines(raw), changed_paths: changed_paths(raw),
-        verified_url: verified_url(raw),
+        verified_by: verified_by(raw), verified_url: verified_url(raw),
       )
     end
 
