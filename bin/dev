@@ -156,6 +156,7 @@ INVOCATIONS = {
   "agent producers"     => 'agent producers [--localhost]',
   "agent playbooks"     => 'agent playbooks [--lint] [--localhost]',
   "agent playbook"      => 'agent playbook <key> [--lint | --versions [--limit N] | --version VERSION | --write FILE [--create] [--yes]] [--localhost]',
+  "agent status-file"   => 'agent status-file [<key>] [--write FILE]',
   "agent runs"          => 'agent runs [KEY] [--issue N] [--limit N] [--localhost]',
   "agent refresh"       => 'agent refresh <issue> [--comment "TEXT"] [--localhost]',
   "agent release"       => 'agent release <issue> [--localhost]',
@@ -1225,14 +1226,16 @@ USAGE = <<~USAGE
         append-only rows in the platform (ISS-523), managed at
         /admin/agents/playbooks — not files in this repo. This is where a
         producer's issue points, and what the claiming session is actually handed.
-        --lint reports the three defects an instruction can carry that no session
+        --lint reports the four defects an instruction can carry that no session
         can execute, and exits 1 when it finds any: a path hardcoded under one
         user's home (`/Users/mbryzek/…`), correct on the runner it was written on
         and silently wrong on every other; a write into `~/code/claude` outside
-        `plans/`, which the autonomous push guard refuses; and a write to a
-        top-level `plans/` file with no date in its name, which `dev prune plans`
-        removes after 14 days. All three fail at the END of a run, after the work
-        is done, with nothing saying so.
+        `plans/`, which the autonomous push guard refuses; a write to a top-level
+        `plans/` file with no date in its name, which `dev prune plans` removes
+        after 14 days; and a hand-written briefing status file under
+        `~/code/openclaw/…`, which `agent/instructions.md` §3 forbids and
+        `dev agent status-file` replaces. All four fail at the END of a run,
+        after the work is done, with nothing saying so.
 
     #{INVOCATIONS["agent runs"]}
         Full history: every producer run, and every lease attempt for --issue N.
@@ -1243,7 +1246,7 @@ USAGE = <<~USAGE
         One playbook (singular — the catalogue is `dev agent playbooks`). Bare,
         it prints the CURRENT body on stdout and its `key @ version` on stderr,
         so `dev agent playbook weekly-review > wr.md` captures exactly the text a
-        session reads. --lint runs the same three checks over this one playbook
+        session reads. --lint runs the same four checks over this one playbook
         and exits 1 on a finding, which is what you want before --write.
         --versions lists the history (newest first); --version VERSION prints one
         past body, matched on the created_at or any unambiguous prefix of it.
@@ -1258,6 +1261,26 @@ USAGE = <<~USAGE
         else — a Claude session, a pipe, cron — is REFUSED unless --yes is
         passed, so no autonomous run edits the instructions the next one obeys
         as a side effect.
+
+    #{INVOCATIONS["agent status-file"]}
+        The morning briefing's per-job status reports, which it reads out of
+        openclaw's workspace and dates by their first line — a section whose
+        `Last run:` is not today is SKIPPED, so a job that stops writing its file
+        goes dark rather than reporting an error. Bare, it lists every registered
+        key with its file and how fresh that file is; with a key it prints that
+        body on stdout and its path on stderr.
+
+        --write FILE records FILE as that job's status. It exists because the
+        session writing one is an autonomous session, and `agent/instructions.md`
+        §3 forbids it editing anything outside its workspace: a playbook that
+        ended "write ~/code/openclaw/…" put the guardrail and the playbook in
+        direct conflict every night, on every runner (ISS-1022). A command has no
+        such conflict, the same way `agent playbook --write` is how the playbook
+        store is edited. Two refusals, both of them silent failures otherwise: an
+        unregistered key (a file nothing reads), and a body whose first line the
+        briefing cannot date. A date that is not today is warned about, not
+        refused — a run that crossed midnight is real, and the warning is what
+        makes the skipped section explicable.
 
     #{INVOCATIONS["agent refresh"]}
         Re-open a `fixed` issue so the fleet resumes its branch — the rebase and
@@ -1469,7 +1492,7 @@ SUBCOMMANDS = {
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
   "newrelic"     => %w[ingest],
-  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
+  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook status-file runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[scan verify preflight clean-build],
 }.freeze
@@ -8479,12 +8502,12 @@ def cmd_docker_prune(args)
       # channel the job has, and the briefing shows a docker-prune line only when
       # it says ERROR. Aborting first would make a broken prune look like a
       # healthy silent one.
-      Briefing.write("docker-prune-status.md", "Last run: #{Briefing.today} — ERROR: failed at step: #{step.label}")
+      Briefing.write("docker-prune", "Last run: #{Briefing.today} — ERROR: failed at step: #{step.label}")
       abort("FAILED at step: #{step.label}")
     end
     reclaimed[step.label] = freed
   end
-  Briefing.write("docker-prune-status.md", "Last run: #{Briefing.today} — ok")
+  Briefing.write("docker-prune", "Last run: #{Briefing.today} — ok")
   return puts("\nNothing to remove.") if reclaimed.empty?
 
   puts ""
@@ -11018,7 +11041,7 @@ def write_aidirs_briefing_status(removed, reclaimed_kb)
     removed.each { |name, reason| body << "#{name} (#{reason})\n" }
     body << "Reclaimed: #{docker_format_size(reclaimed_kb * 1024)}\n"
   end
-  Briefing.write("aidirs-prune-status.md", body)
+  Briefing.write("aidirs-prune", body)
 end
 
 # ---------- prune plans ----------
@@ -11525,7 +11548,7 @@ def write_browserslist_briefing_status(updated:, pending:, no_changes:, failures
       body << "Failed: #{name}#{log ? " (#{log.strip})" : ''}\n"
     end
   end
-  Briefing.write("browserslist-status.md", body)
+  Briefing.write("browserslist-update", body)
 end
 
 # ---------- scripts ----------
@@ -14191,7 +14214,7 @@ def agent_playbooks_report(rows, lint:)
     # the checks is part of that: a clean line that does not say what it checked
     # cannot tell you a NEW defect class is not covered yet.
     if findings.empty?
-      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans."
+      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans, hand-written status files."
     else
       puts findings.map(&:to_s)
       # One remedy per rule actually hit, not the full catalogue: a finding is
@@ -14428,6 +14451,134 @@ def agent_playbook_write(opts, identity, use_localhost)
   row = Agent::Api.save_playbook(key, proposed, token: identity.token, use_localhost: use_localhost)
   puts "Appended #{row['key']} @ #{row['created_at']}. Every issue pointing at `#{row['key']}` " \
        "resolves to this from the next claim on."
+end
+
+# ---------- agent status-file (ISS-1022) ----------
+#
+# The briefing's status files, as a COMMAND rather than as a filesystem write.
+#
+# The conflict this resolves is total, not cosmetic. `agent/instructions.md` §3
+# says an autonomous session never edits outside its workspace, and it offers one
+# remedy — "clone what you need into your workspace" — which accomplishes nothing
+# here, because the briefing reads `~/code/openclaw/openclaw-workspace/data/` and
+# not a copy of it. Three playbooks ended by telling the session to write that
+# path anyway. So every run had to pick a rule to break unaided, and the reading
+# that honours the guardrail is the one that silently drops the briefing update:
+# the section is not marked stale, it DISAPPEARS, which is indistinguishable from
+# the job having been quietly retired.
+#
+# A command has no such conflict, and this is the shape the fleet already uses for
+# exactly this problem: `dev agent playbook --write` is how the playbook store is
+# edited, `dev agent run-op` is how an operation is recorded, `dev issues status`
+# is how an issue moves. Nothing here needs a new allowance in §3, which is the
+# point — an allowance is another line of guardrail prose for a session to weigh
+# at 3am, and this is a line of prose deleted rather than added.
+#
+# No identity, no network, no `DEV_AGENT_ISSUE`. It writes one file on the box it
+# runs on, so a human can run it to repair a section by hand.
+def cmd_agent_status_file(args)
+  rest, app_filter, _use_localhost = parse_common_flags(args)
+  write_path = nil
+  positional = []
+  i = 0
+  while i < rest.length
+    case rest[i]
+    when "--write"
+      write_path = rest[i + 1]
+      i += 2
+    else
+      positional << rest[i]
+      i += 1
+    end
+  end
+
+  key = positional.first
+  problems = []
+  problems << "unexpected argument(s): #{positional[1..].join(', ')}" if positional.length > 1
+  problems << "--app is not a valid option here" if app_filter
+  problems << "--write needs a file: `--write <file>`" if rest.include?("--write") && write_path.to_s.empty?
+  problems << "--write needs a key: which job's status file is this? (#{Briefing.keys.join(', ')})" if write_path && key.nil?
+  if key && !Briefing.known?(key)
+    problems << "no briefing status file is registered for `#{key}`. Known keys: #{Briefing.keys.join(', ')}"
+  end
+  report_arg_problems("agent status-file", problems, usage_for("agent status-file"))
+
+  return agent_status_file_list if key.nil?
+  return agent_status_file_write(key, write_path) if write_path
+
+  agent_status_file_show(key)
+end
+
+# The catalogue. Freshness is the column that matters and it is the briefing's
+# own rule, not a file mtime: the briefing dates a section by the `Last run:`
+# line INSIDE the file, so a file rewritten today with yesterday's header is
+# stale to the only reader there is.
+def agent_status_file_list
+  unless Dir.exist?(Briefing::DATA_DIR)
+    puts "No briefing workspace at #{Briefing::DATA_DIR} — nothing on this machine writes or reads these."
+    return
+  end
+  puts "Briefing status files in #{Briefing::DATA_DIR}"
+  Briefing.keys.each do |key|
+    body = Briefing.read(key)
+    date = body && Briefing.header_date(body)
+    state = if body.nil? then "never written"
+            elsif date.nil? then "UNDATED — the briefing cannot parse it and skips the section"
+            elsif date == Briefing.today then "today"
+            else "#{date} — stale, the briefing skips it"
+            end
+    puts format("  %-30s %-32s %s", key, Briefing.file_for(key), state)
+  end
+end
+
+# The body on stdout and the path on stderr, the same split `agent playbook` uses
+# and for the same reason: `dev agent status-file slow-query-review > s.md` has to
+# capture exactly what the briefing reads, with no banner in it.
+def agent_status_file_show(key)
+  body = Briefing.read(key)
+  if body.nil?
+    Util.exit_with_error("No status file for `#{key}` yet at #{Briefing.path_for(key)}. " \
+                         "It is written by that job's run — see `dev agent status-file` for what exists.")
+  end
+  warn "#{key} — #{Briefing.path_for(key)}"
+  print body
+end
+
+def agent_status_file_write(key, path)
+  Util.exit_with_error("No such file: #{path}") unless File.file?(path)
+  body = File.read(path)
+  if body.strip.empty?
+    Util.exit_with_error("#{path} is empty. An empty status file is the same as no status file to the briefing, " \
+                         "which is the silent failure this command exists to make impossible.")
+  end
+
+  # Refused, not warned: a body the briefing cannot date is invisible to it, and
+  # a session that wrote one has no way to find that out — the section simply
+  # never appears. This is the one check that turns "I recorded it" into a fact.
+  date = Briefing.header_date(body)
+  if date.nil?
+    Util.exit_with_error(
+      "#{path} does not start with the header the briefing parses. Line 1 must be `Last run: YYYY-MM-DD` " \
+      "(anything may follow the date — a time, ` — ok`, a note). The briefing dates each section off that " \
+      "line and skips what it cannot date, so this would have been written and never read.\n" \
+      "  Got: #{body.lines.first.to_s.strip[0, 100].inspect}",
+    )
+  end
+
+  # Warned, not refused: the briefing skips a non-today section, so this IS a
+  # defect — but a run that started at 23:50 and finished at 00:05 wrote an
+  # honest header, and refusing it would fail a good run at its last step. The
+  # warning is what makes the missing section explicable the next morning.
+  warn "briefing: `Last run: #{date}` is not today (#{Briefing.today}) — the briefing will skip this section." if date != Briefing.today
+
+  unless Briefing.write(key, body)
+    Util.exit_with_error(
+      "Could not write #{Briefing.path_for(key)}. #{Dir.exist?(Briefing::DATA_DIR) ? 'The write failed.' : "There is no briefing workspace at #{Briefing::DATA_DIR} on this machine."}\n" \
+      "  Reported here rather than swallowed: you were told to record this, so a no-op has to be visible. " \
+      "File it with `dev issues workaround` if it cannot be fixed.",
+    )
+  end
+  puts "Wrote #{Briefing.path_for(key)} (Last run: #{date})"
 end
 
 # Sugar for one transition, and deliberately nothing more: review feedback and a
@@ -15756,6 +15907,7 @@ when "agent"
   when "runs"      then cmd_agent_runs(argv)
   when "playbooks" then cmd_agent_playbooks(argv)
   when "playbook"  then cmd_agent_playbook(argv)
+  when "status-file" then cmd_agent_status_file(argv)
   when "refresh"   then cmd_agent_refresh(argv)
   when "release"   then cmd_agent_release(argv)
   when "gc"          then cmd_agent_gc(argv)
