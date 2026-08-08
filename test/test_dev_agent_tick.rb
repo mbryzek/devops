@@ -29,7 +29,6 @@ class TestDevAgentTick < Minitest::Test
         # test can reach out and `git pull` the developer's own checkout. The
         # tests that exercise the pull point this at a throwaway clone instead.
         "DEV_AGENT_DEVOPS_REPO" => File.join(root, "devops"),
-        "DEV_AGENT_NO_NOTIFY" => "1",
       }
       FileUtils.mkdir_p(File.join(root, "devops"))
       FileUtils.cp_r(File.expand_path("../agent", __dir__), File.join(root, "devops"))
@@ -1615,45 +1614,56 @@ class TestDevAgentTick < Minitest::Test
 
   # ---- runner staleness is the PLATFORM's alert, not a runner's ----
 
-  # Restores the real method rather than removing it — Notify.event is a
-  # module_function, so remove_method would delete it for every later test in
-  # the file rather than just undoing the stub.
-  def capturing_events
-    captured = []
-    original = Agent::Notify.method(:event)
-    Agent::Notify.define_singleton_method(:event) do |kind, text|
-      captured << [kind, text]
-      Agent::Notify::DELIVERED
+  # A runner has NO notification channel, and that is the design (ISS-535, and
+  # the removal that followed it). Everything a tick would have pushed lands on
+  # the platform record instead — an outcome moves the issue to `fixed` or
+  # `needs_input` with the url and the reason, a repeated infra failure files a
+  # fingerprinted issue, and runner staleness is
+  # `CheckAgentRunnerHealthProcessor` emailing off the same
+  # `AgentInvariants.StaleAfterHours` the tick used to read back as `is_stale`.
+  #
+  # `Agent::Notify` used to sit in front of all of that, shelling out to an
+  # `openclaw` that is not installed on the runners: every push the fleet ever
+  # attempted was a no-op, and the module's own backstop table was the proof
+  # that nothing was lost by it. A parallel path that has never once delivered
+  # is not a channel, it is a second place for the truth to live, so it is gone
+  # rather than documented.
+  #
+  # Scanned out of the source, in the same spirit as the backstop test it
+  # replaces: the failure this guards is someone re-adding a runner-local alert,
+  # which by construction announces itself nowhere.
+  #
+  # Two narrowings, both deliberate. Comments are stripped, because the history
+  # above must stay written down and would otherwise trip its own guard. And the
+  # binary is matched as a bare literal (`"openclaw"`, a command) rather than
+  # anywhere in a string, because `Briefing::DATA_DIR` still reads a path under
+  # `~/code/openclaw` — a different dependency, tracked by ISS-503, and not one
+  # a notification test should be the thing that fails on.
+  def test_the_runner_has_no_local_notification_channel
+    sources = Dir[File.expand_path("../lib/**/*.rb", __dir__)] + [File.expand_path("../bin/dev", __dir__)]
+    offenders = sources.select do |file|
+      code = File.read(file).lines.grep_v(/^\s*#/).join
+      code.match?(/Agent::Notify|(["'])openclaw\1/)
     end
-    no_notify = ENV.delete("DEV_AGENT_NO_NOTIFY")
-    yield captured
-    captured
-  ensure
-    Agent::Notify.define_singleton_method(:event, original)
-    ENV["DEV_AGENT_NO_NOTIFY"] = no_notify
+    assert_empty offenders.map { |f| File.basename(f) },
+                 "a runner cannot alert anyone — send it to the platform record instead " \
+                 "(issue status, a fingerprinted issue, or a processor that emails)"
   end
 
-  # ISS-535. The tick used to push an openclaw event for every OTHER runner the
-  # fleet response called stale, and that is the wrong place for this alert by
-  # construction: it needs a peer to be awake, so the machine that matters most —
-  # the only one, or the last one standing — reports nothing. It also never
-  # delivered, because `openclaw` is not on the runners.
-  #
-  # `CheckAgentRunnerHealthProcessor` (platform, every 15 minutes, emails on the
-  # crossing tick) owns it, off the same AgentInvariants.StaleAfterHours that
-  # produced the `is_stale` below. This test is the guard against someone helpfully
-  # re-adding the local copy.
-  def test_a_stale_peer_produces_no_runner_local_notification
-    events = with_agent_home do
+  # The other half of the same rule, from the behavior side: a fleet response
+  # naming a stale PEER produces nothing here. An offline machine cannot report
+  # itself, and a one-runner fleet has no peer to report it, so a runner-local
+  # staleness check reports nothing precisely when it matters most.
+  def test_a_stale_peer_produces_no_runner_local_alert
+    out = with_agent_home do
       register_identity
-      capturing_events do
-        fleet = fleet_responses(runners: [runner_row,
-                                          runner_row(id: "rnr-2", hostname: "mini-2.local", is_stale: true),
-                                          runner_row(id: "rnr-3", hostname: "mini-3.local", is_stale: false)])
-        with_stubbed_api(fleet) { capture_stdout { tick.run } }
-      end
+      fleet = fleet_responses(runners: [runner_row,
+                                        runner_row(id: "rnr-2", hostname: "mini-2.local", is_stale: true),
+                                        runner_row(id: "rnr-3", hostname: "mini-3.local", is_stale: false)])
+      with_stubbed_api(fleet) { capture_stdout { tick.run } }
     end
-    assert_empty events, "runner-offline is the platform's alert (CheckAgentRunnerHealthProcessor), not a peer runner's"
+    refute_match(/stale|offline/i, out,
+                 "runner-offline is the platform's alert (CheckAgentRunnerHealthProcessor), not a peer runner's")
   end
 
   # ---- the ~/code/claude push guard is ENFORCED, not merely instructed ----
@@ -2048,8 +2058,7 @@ class TestDevAgentTick < Minitest::Test
   end
 
   # A healthy machine files nothing. Anything that fires on a healthy idle box
-  # trains Mike to ignore the channel, which costs the alerts that matter — the
-  # same reasoning Agent::Notify is built on.
+  # trains Mike to ignore the queue, which costs the issues that matter.
   def test_a_complete_toolchain_files_nothing
     with_agent_home do
       register_identity

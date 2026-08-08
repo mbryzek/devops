@@ -317,23 +317,33 @@ docker prune` is Ruby shelling out to `docker`; killing only the Ruby leaves the
 wedged docker), and the signal is `KILL` (a process wedged on an
 uninterruptible read is the one that ignores `TERM`).
 
-## Notifications are a nudge, and the platform is the record
+## A runner has no notification channel — the platform record IS the alert
 
-`Agent::Notify` shells out to `openclaw`, which **is not installed on the
-runners**. Every push the dispatcher has ever attempted from a mini has been a
-no-op, and nothing said so, because a `false` return went into a caller that
-discarded it (ISS-535 — the same shape as ISS-531's `check_failed`, where a
-check that *could not run* was indistinguishable from one with nothing to say).
+There is no push from a mini. Nothing here shells out to a gateway, writes to a
+chat channel, or sends mail; **everything a tick has to say, it says by writing
+to the platform.** An outcome moves the issue to `fixed` or `needs_input` with
+the url and the reason on its timeline, a repeated infra failure files a
+fingerprinted issue naming the machine (`Agent::Escalation`), and a producer
+that cannot run on this box files one too. Those writes are the record and the
+alarm at once, which is the property worth protecting: there is exactly one
+place to look, and it is durable.
 
-That is survivable, and it is survivable for a reason worth stating rather than
-rediscovering: **every kind of push carries the same fact somewhere durable on
-the platform.** `Agent::Notify::BACKSTOPS` is that table — kind → what holds the
-fact when the push does not arrive — and `test_dev_agent_notify.rb` asserts it
-matches the kinds the tick actually pushes, so a new notification cannot be added
-without naming its backstop. A missing `openclaw` therefore costs attention
-sooner, not information.
+It arrived at that shape the long way, and the history is the argument. There
+used to be an `Agent::Notify` in front of all of it, shelling out to `openclaw`
+— which **is not installed on the runners**. Every push the fleet ever attempted
+was a no-op, and nothing said so, because a `false` return went into a caller
+that discarded it (ISS-535, the same shape as ISS-531's `check_failed`: a thing
+that *could not run* was indistinguishable from one with nothing to say). What
+made that survivable was a `BACKSTOPS` table asserting that every kind of push
+carried the same fact somewhere durable anyway — which, read honestly, says the
+push was never the channel. A parallel path that has never once delivered is not
+redundancy, it is a second place for the truth to live, so it was deleted rather
+than documented further.
 
-Two consequences the code now enforces:
+`test_dev_agent_tick.rb` pins the absence from both ends: a source scan for a
+re-added push, and a fleet response with a stale peer that must produce nothing.
+
+Two consequences to keep in mind before adding an alert here:
 
 - **The runner-offline alert does not come from a runner.** It cannot: an
   offline machine cannot report itself, and a one-runner fleet has no peer to
@@ -343,25 +353,14 @@ Two consequences the code now enforces:
   alerts on the machine that *crosses* into staleness and emails Mike, off the
   same `AgentInvariants.StaleAfterHours` the runner used to read back as
   `is_stale`. Do not re-add a local copy; extend the processor.
-- **An attempt that failed does not consume its window.** `Notify.once` used to
-  mark `(kind, subject)` notified *before* the push, so one refusal from
-  `openclaw` silently ate the notification for six hours — the single failure
-  mode a retry could fix was the one guaranteed never to be retried. A `FAILED`
-  push now leaves the window open. `UNAVAILABLE` still closes it: a machine with
-  no channel will not grow one before the next tick, and retrying costs a process
-  every 30 seconds to accomplish nothing.
+- **A new thing worth waking somebody for goes on the platform, not here.**
+  Write it to the issue, file a fingerprinted one, or add a processor that
+  emails. A runner-side channel would have to be provisioned on every mini,
+  would be silent on exactly the machine that is broken, and starts the whole
+  ISS-535 cycle over.
 
-`dev agent status` prints whether this box has a channel at all, and undelivered
-pushes get a tick-log line naming the backstop that carried the fact instead.
-Both halves are needed: "undelivered" alone reads as lost work, and the backstop
-alone reads as a healthy channel.
-
-`openclaw` is not in `Agent::Toolchain::TOOLS` and `dev agent doctor` does not
-check for it — deliberately, not a shrug. It follows from the backstop table
-above: every push already survives its absence, so doctor tracking it would
-just be a second, noisier way of learning what `dev agent status` and the
-tick log already say. The day a push is added with no durable record behind
-it, the answer changes and the test is what will say so.
+`openclaw` is therefore not in `Agent::Toolchain::TOOLS` and `dev agent doctor`
+does not check for it: nothing on a runner calls it.
 
 ## Retiring an openclaw cron is a TWO-PARTY job, permanently
 
@@ -369,8 +368,8 @@ Migrating a scheduled job onto the agent has a last step the agent cannot take:
 deleting the old cron from the openclaw gateway. Two independent walls, and
 neither is a gap to close.
 
-- `openclaw` is not installed on the runners at all, the same absence ISS-535
-  documents for `Agent::Notify`.
+- `openclaw` is not installed on the runners at all — the same absence that
+  removed `Agent::Notify` outright.
 - The agent identity lacks `operator.admin`, so even on a box that has the binary,
   `openclaw cron rm` comes back `missing scope: operator.admin`.
 

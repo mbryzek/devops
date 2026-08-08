@@ -163,13 +163,11 @@ class TestAgentCi < Minitest::Test
   def test_three_consecutive_faults_file_an_issue_naming_the_machine
     with_state_dir do
       filed = []
-      with_notifications_disabled do
-        stub_singleton(Agent::Api, :create_issue, ->(payload, **_opts) { filed << payload }) do
-          with_probes(disk: :ok, registry: :fail) do
-            2.times { Agent::Ci.preflight(needs: %w[registry]) }
-            assert_empty filed, "two faults in a row is not yet an outage"
-            Agent::Ci.preflight(needs: %w[registry])
-          end
+      stub_singleton(Agent::Api, :create_issue, ->(payload, **_opts) { filed << payload }) do
+        with_probes(disk: :ok, registry: :fail) do
+          2.times { Agent::Ci.preflight(needs: %w[registry]) }
+          assert_empty filed, "two faults in a row is not yet an outage"
+          Agent::Ci.preflight(needs: %w[registry])
         end
       end
 
@@ -186,11 +184,9 @@ class TestAgentCi < Minitest::Test
   def test_a_streak_already_escalated_does_not_file_again
     with_state_dir do
       filed = []
-      with_notifications_disabled do
-        stub_singleton(Agent::Api, :create_issue, ->(payload, **_opts) { filed << payload }) do
-          with_probes(disk: :ok, registry: :fail) do
-            5.times { Agent::Ci.preflight(needs: %w[registry]) }
-          end
+      stub_singleton(Agent::Api, :create_issue, ->(payload, **_opts) { filed << payload }) do
+        with_probes(disk: :ok, registry: :fail) do
+          5.times { Agent::Ci.preflight(needs: %w[registry]) }
         end
       end
       assert_equal 1, filed.length
@@ -209,14 +205,6 @@ class TestAgentCi < Minitest::Test
   end
 
   # ---- helpers --------------------------------------------------------------
-
-  def with_notifications_disabled
-    previous = ENV["DEV_AGENT_NO_NOTIFY"]
-    ENV["DEV_AGENT_NO_NOTIFY"] = "1"
-    yield
-  ensure
-    ENV["DEV_AGENT_NO_NOTIFY"] = previous
-  end
 
   # Every probe shells out through Agent::Shell.capture, so one stub covers all
   # of them; the command's first token says which probe is asking.

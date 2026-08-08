@@ -66,5 +66,3 @@ generated, so this routes to the insight-generation improvement session.
 5. Commit, push, open a DRAFT PR (`gh pr create --draft`), then mark it ready
    (`gh pr ready`), then rebase onto latest origin/main + rerun codegen per the standard
    done-workflow.
-6. Progress reporting for long runs: `openclaw system event --text "Progress: ..." --mode now`
-   every ~15 minutes.

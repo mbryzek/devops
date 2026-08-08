@@ -1,10 +1,9 @@
 require 'time'
 require 'agent/api'
 require 'agent/errors'
-require 'agent/notify'
 
 # "This machine has failed at the same thing three times in a row" — recorded,
-# then escalated into a push and a filed issue exactly once.
+# then escalated into a filed issue exactly once.
 #
 # EXTRACTED FROM Agent::Tick (ISS-763), unchanged. It lived there because the
 # tick was the only thing on a runner that could fail repeatedly and unattended;
@@ -35,28 +34,22 @@ module Agent
     # Record one failure and escalate on the pass that crosses AT. Returns the
     # source's streak length, so a caller that wants to log it need not re-read.
     #
-    # `notifier` is how the push is sent, injected because Agent::Tick wraps
-    # Agent::Notify.event in its own logging and that logging is part of what a
-    # tick's operator reads. `log` is where anything unprintable-but-worth-saying
-    # goes; both default to doing nothing, which is right for a one-shot CLI that
-    # has already printed its own report.
+    # `log` is where anything unprintable-but-worth-saying goes; it defaults to
+    # doing nothing, which is right for a one-shot CLI that has already printed
+    # its own report.
     def record(source, message, title:, explain:, host:, now: Time.now, dry_run: false,
-               use_localhost: false, notifier: nil, log: nil)
+               use_localhost: false, log: nil)
       entries = Agent::Errors.record(source, message, now: now)
       count = entries.count { |e| e["source"] == source }
       if count == AT
         escalate(source, message, count, title: title, explain: explain, host: host, now: now,
-                 dry_run: dry_run, use_localhost: use_localhost, notifier: notifier, log: log)
+                 dry_run: dry_run, use_localhost: use_localhost, log: log)
       end
       count
     end
 
     def escalate(source, message, count, title:, explain:, host:, now:, dry_run:,
-                 use_localhost:, notifier: nil, log: nil)
-      text = "dev-agent: #{source} has failed #{count} times in a row on #{host} (#{message})"
-      Agent::Notify.once("agent_error", source, now: now) do
-        notifier ? notifier.call("agent_error", text) : Agent::Notify.event("agent_error", text)
-      end
+                 use_localhost:, log: nil)
       return if dry_run
 
       Agent::Api.create_issue(

@@ -12,7 +12,6 @@ require 'agent/github'
 require 'agent/host'
 require 'agent/jobs'
 require 'agent/maintenance'
-require 'agent/notify'
 require 'agent/ops'
 require 'agent/outcome'
 require 'agent/paths'
@@ -295,10 +294,7 @@ module Agent
       Agent::Escalation.record(
         source, message, title: title, explain: explain, host: hostname, now: @now,
         dry_run: @dry_run, use_localhost: @use_localhost,
-        # `push` rather than Agent::Notify.event directly: the tick logs what the
-        # notifier did, and that log line is part of what an operator reads off a
-        # tick. The escalation itself has no opinion about either.
-        notifier: method(:push), log: method(:log),
+        log: method(:log),
       )
     end
 
@@ -640,10 +636,6 @@ module Agent
     # issue, and the marker is already written so the next cadence retries.
     def file_toolchain_issue(result)
       host = hostname
-      Agent::Notify.once("toolchain", "#{host}:#{Agent::Toolchain.problem_key(result)}", now: @now) do
-        push("toolchain", "dev-agent: #{host} — #{result.summary}; " \
-                          "#{result.blocked_producers.join(', ')} cannot run there")
-      end
       Agent::Api.create_issue(
         {
           title: Agent::Toolchain.issue_title(result, host),
@@ -846,7 +838,6 @@ module Agent
       record_extra_fixes(number, prs, already) if SHIPPED_STATUSES.include?(landed)
 
       release_lease(record, identity, outcome: result.lease_outcome)
-      notify_outcome(number, result)
     end
 
     # The statuses `POST /issues/:number/fixes` accepts: an issue that has not
@@ -893,33 +884,6 @@ module Agent
                                                    outcome: outcome)
     rescue ApiError => e
       log("could not release lease #{record['lease_id']} (#{e.message}) — it will expire on its own")
-    end
-
-    def notify_outcome(number, result)
-      case result.name
-      when "ready_pr"
-        push("pr_ready", "dev-agent: ISS-#{number} ready for review — #{result.url}")
-      when "merged_pr"
-        push("merged_pr", "dev-agent: ISS-#{number} fixed by an already-merged PR — #{result.url}")
-      when "gave_up"
-        push("gave_up",
-             "dev-agent: ISS-#{number} gave up after #{Agent::Outcome::GIVE_UP_AFTER_FAILURES} " \
-             "failures in a row — needs input")
-      end
-    end
-
-    # One push, and a log line for every one that did not arrive (ISS-535).
-    #
-    # `Agent::Notify.event` returning a bare `false` into a caller that discarded
-    # it is what let this fleet run its whole history with no notification
-    # channel at all and nothing anywhere saying so. The line names the backstop
-    # that carries the fact instead, because the two halves are only useful
-    # together: "undelivered" alone reads as lost work, and the backstop alone
-    # reads as a healthy channel.
-    def push(kind, text)
-      outcome = Agent::Notify.event(kind, text)
-      log("notify #{kind}: #{Agent::Notify.explain(kind, outcome)}") if Agent::Notify.reportable?(outcome)
-      outcome
     end
 
     def cleanup(record, result)
@@ -1360,7 +1324,6 @@ module Agent
              "to make impossible.\n\n" \
              "Fix it in /admin/agents/playbooks (or correct the pointer line on this issue), then move it " \
              "back to `open`."
-      push("playbook_unresolved", "dev-agent: ISS-#{number} playbook did not resolve on #{hostname} (#{message})")
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost)
@@ -1435,7 +1398,6 @@ module Agent
              "Merge the PR (or drop the `blocked_by` edge with `dev issues block #{number} --on <n> --remove` " \
              "if this issue no longer needs it) and move this back to `open`. No session has been started: " \
              "the work is not blocked on a decision, only on the code landing on `origin/main`."
-      push("dependency_stalled", "dev-agent: ISS-#{number} is still waiting on an unmerged dependency (#{reasons.first})")
       unless @dry_run
         Agent::Api.set_status(number, "needs_input", comment: text, use_localhost: @use_localhost)
         Agent::Api.release_lease(lease.fetch("id"), token: identity.token, use_localhost: @use_localhost) unless undeferrable

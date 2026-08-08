@@ -260,7 +260,8 @@ USAGE = <<~USAGE
         parallel, logging to ~/Library/Logs/dev-invariants/. Without --fix a
         non-interactive run just reports and exits, as it always did. An
         unattended session is briefed to end on a ready PR, written findings, or
-        a snooze, and to announce itself with an openclaw system event. The same
+        a snooze — all three of which are durable, because a runner has no
+        notification channel to announce itself on. The same
         set of failures is not re-dispatched for 3 days, so a failure that
         persists does not spawn a session every night; any change to the set of
         failing invariant names dispatches immediately.
@@ -4420,7 +4421,7 @@ end
 # Some work ends in a command no autonomous session can run: it needs a scope, a
 # credential, or a binary that exists only on Mike's laptop. Retiring an openclaw
 # cron is the standing example — `openclaw` is not installed on the runners at all
-# (the same absence ISS-535 documents for `Agent::Notify`) and the agent identity
+# (the same absence that removed `Agent::Notify` outright) and the agent identity
 # lacks `operator.admin`, so there is no path to the cron store by binary or by
 # scope. That is not a gap to close: `operator.admin` is admin over EVERY cron on
 # the gateway, including the personal and financial ones ISS-394 deliberately left
@@ -12926,7 +12927,6 @@ def cmd_agent_status(args)
     puts "Runner #{identity.runner_id}#{me ? " (#{me['hostname']})" : ''}"
     puts "  concurrency: #{me ? me['max_concurrency'] : '?'}   paused: #{me ? !!me['paused'] : '?'}"
     puts "  last heartbeat: #{me && me['last_heartbeat_at']}"
-    puts "  notifications: #{agent_notify_channel_line}"
 
     jobs = Agent::Jobs.all
     if jobs.empty?
@@ -12940,21 +12940,6 @@ def cmd_agent_status(args)
     tail = File.file?(last_tick) ? File.readlines(last_tick).last&.strip : nil
     puts "\nLast tick: #{tail || '(nothing logged today)'}"
   end
-end
-
-# Whether this machine can push at all, on the status line rather than only in a
-# tick log nobody opens until something has already gone wrong (ISS-535). The
-# absent case names what is lost and what is not, because the honest answer is
-# "attention, not information" — every push has a durable backstop
-# (Agent::Notify::BACKSTOPS) and runner-offline is delivered by the platform.
-def agent_notify_channel_line
-  return "suppressed (DEV_AGENT_NO_NOTIFY is set)" unless Agent::Notify.enabled?
-
-  path = Agent::Notify.channel_path
-  return path if path
-
-  "no `#{Agent::Notify::BINARY}` on this PATH — pushes are no-ops. Nothing is lost: every push has a " \
-    "durable backstop (Agent::Notify::BACKSTOPS) and the runner-offline alert is emailed by the platform."
 end
 
 def agent_job_line(job)
