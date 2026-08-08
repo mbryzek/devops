@@ -73,6 +73,25 @@ module Agent
       def read(_name) = EnvRepo.read_secret("api_keys/#{file}")
     end
 
+    # The same directory, for a service whose credential is a TUPLE: one file per
+    # service, KEY=VALUE lines inside it, each `Credential` reading its own name
+    # out of it. Court Reserve is the case — a login is an email AND a password,
+    # and neither half authenticates anything on its own.
+    #
+    # Not two `KeyFile`s, and the difference is provisioning rather than taste.
+    # Two files can be half-written, which produces the one state nobody planned
+    # for: a session told it HAS a Court Reserve credential, holding an email and
+    # no password. One file is either there or it is not.
+    #
+    # Not `AppEnv` either, for the ISS-635 reason stated above: this is what a
+    # TOOL authenticates with, not what an app boots with, and a tooling
+    # credential filed under an app's env is one no application reads and nobody
+    # rotates.
+    KeyVars = Struct.new(:file, keyword_init: true) do
+      def label = "env/api_keys/#{file}"
+      def read(name) = EnvRepo.read_var("api_keys/#{file}", name)
+    end
+
     # One credential, where it is read from, and what stops working without it.
     #
     # `name` is both the key looked up in the env repo AND the environment
@@ -92,6 +111,37 @@ module Agent
     Credential = Struct.new(:name, :source, :required_by, :how_to_provide, :usage_example,
                             keyword_init: true) do
       def source_label = source.label
+    end
+
+    # One half of the Court Reserve login. Everything except the variable name is
+    # shared by CONSTRUCTION rather than by copy: two entries describing one
+    # credential must not be able to drift into telling a session two different
+    # stories about where its login comes from.
+    def self.court_reserve(name)
+      Credential.new(
+        name: name,
+        source: KeyVars.new(file: "court-reserve"),
+        required_by: "logging in to Court Reserve from a crawler harness — `recon-refunds.ts` in the " \
+                     "workers repo, and any live re-crawl — the only way a session can VERIFY a change " \
+                     "to crawler behaviour against the live site rather than arguing it from recorded " \
+                     "production console logs and letting the next scheduled crawl be the test (ISS-1012). " \
+                     "A harness run connects DIRECTLY, where production always crawls through a " \
+                     "residential proxy, so expect a Cloudflare challenge and keep live runs few — a " \
+                     "flagged test account helps nobody",
+        how_to_provide: "put CR_EMAIL and CR_PASSWORD in the env repo at api_keys/court-reserve, as one " \
+                        "KEY=VALUE file (both halves or neither). It MUST be a login scoped to a Court " \
+                        "Reserve TEST org — picklejar-test — never a real club's credential and never an " \
+                        "account with write access: every session on this runner inherits whatever is " \
+                        "put here",
+        # A shell assignment PREFIX, deliberately, rather than a tidier bare
+        # command. The prefix is consumed by the shell — the harness is exec'd
+        # with argv `npx tsx recon-refunds.ts`, and the values reach it only
+        # through its environment — so this satisfies "pass it explicitly"
+        # without putting a secret on a command line that `ps` shows to every
+        # sibling session for the several minutes a crawl takes (ISS-961, §4).
+        usage_example: 'CR_EMAIL="$CR_EMAIL" CR_PASSWORD="$CR_PASSWORD" RECON_OUT=/tmp/recon ' \
+                       'npx tsx recon-refunds.ts',
+      )
     end
 
     CREDENTIALS = [
@@ -129,6 +179,26 @@ module Agent
         usage_example: 'curl -X POST https://api.newrelic.com/graphql ' \
                        '-H "Content-Type: application/json" -H "API-Key: $NEWRELIC_USER_KEY" ...',
       ),
+      # ISS-1023, and it is ISS-565's shape a third time. ISS-1012 changed how the
+      # refunds crawler asks Court Reserve for a date window — behaviour whose
+      # only real test is a live crawl — and the session had no Court Reserve
+      # login, so `recon-refunds.ts` (the repo's own harness, which exists for
+      # exactly this) could not be run at all. workers#207 shipped with its
+      # central behaviour argued from production console logs, and the first
+      # scheduled crawl after deploy became the actual test, on real clubs.
+      #
+      # THE PAIR IS THE POINT: two entries, one file. See `KeyVars`.
+      #
+      # WHY THIS IS NOT DEAD WEIGHT WHILE THAT FILE IS ABSENT. Listing a
+      # credential nobody has provisioned yet is the ENTIRE ISS-570 mechanism:
+      # `credentials_section` renders an absent credential as "cannot be closed
+      # out here", names `dev issues workaround`, and says it BEFORE the session
+      # plans. Today a crawler session is told nothing about Court Reserve at
+      # all, so it works the gap out for itself once the code already exists —
+      # which is the failure, not the missing secret. The day the file lands,
+      # every session gets the login with no further change here.
+      court_reserve("CR_EMAIL"),
+      court_reserve("CR_PASSWORD"),
     ].freeze
 
     NAMES = CREDENTIALS.map(&:name).freeze

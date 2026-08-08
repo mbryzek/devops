@@ -14,13 +14,16 @@ require 'agent/heap'
 require 'agent/host'
 require 'agent/jobs'
 require 'agent/maintenance'
+require 'agent/newrelic_watch'
 require 'agent/ops'
 require 'agent/outcome'
 require 'agent/paths'
 require 'agent/playbook'
 require 'agent/prompt'
 require 'agent/shell'
+require 'agent/stream'
 require 'agent/toolchain'
+require 'agent/usage_limit'
 require 'agent/verify'
 require 'agent/workspace'
 
@@ -520,6 +523,7 @@ module Agent
     def phase_b
       run_maintenance
       check_toolchain
+      check_newrelic_ingest
       identity = Agent::Host.cached_identity
       if identity.nil?
         log("no runner identity yet — skipping work phase")
@@ -673,6 +677,74 @@ module Agent
       log("toolchain: could not file an issue (#{e.message})")
     end
 
+    # ---- newrelic ingest against the free tier (ISS-1077) ----
+    #
+    # `Agent::NewrelicWatch` carries the reasoning for why this is a tick check
+    # rather than a producer, and why running it on every runner is not N times
+    # the work. What is here is only the wiring.
+    #
+    # It files on the FIRST actionable reading, like the toolchain check and
+    # unlike `record_failure`: a projection crossing the threshold is not a
+    # transient blip that a three-strike debounce would filter, and at a daily
+    # cadence three strikes would mean three days of a month there are fewer of
+    # every day. The server's fingerprint dedup — month plus verdict — is what
+    # keeps that from becoming a daily issue.
+    def check_newrelic_ingest
+      return unless Agent::NewrelicWatch.due?(now: @now)
+
+      key = Agent::NewrelicWatch.key
+      if key.nil?
+        # Recorded, not silent, and not an issue of its own — see the module
+        # header. The cadence marker is stamped so a machine in this state does
+        # not retry a credential lookup it cannot satisfy on every 30-second tick.
+        Agent::NewrelicWatch.record(nil, now: @now, skipped: "no #{Newrelic::KEY_ENV}") unless @dry_run
+        decide("newrelic_ingest", "skipped — this machine cannot resolve #{Newrelic::KEY_ENV} " \
+                                  "(`dev agent doctor`); other runners still measure the same account")
+        return
+      end
+
+      measurement = Agent::NewrelicWatch.measure(key: key, now: @now)
+      summary = "#{measurement.verdict}: #{format('%.1f', measurement.projected_gb)} GB projected for " \
+                "#{measurement.period_label}#{measurement.free_tier? ? " of #{format('%.0f', measurement.free_limit_gb)} GB free" : ''}"
+      if @dry_run
+        decide("newrelic_ingest", "#{summary} — would #{measurement.actionable? ? 'file an issue' : 'record the check'}")
+        return
+      end
+
+      Agent::NewrelicWatch.record(measurement, now: @now)
+      decide("newrelic_ingest", summary)
+      return unless measurement.actionable?
+
+      file_newrelic_ingest_issue(measurement)
+    rescue Newrelic::Error => e
+      # A NerdGraph failure is NOT `record_failure`'d into the 3-in-a-row
+      # escalation. That channel is for a machine that has stopped working, and
+      # this is a third party being unreachable — an outage at NewRelic would
+      # otherwise file "the tick is failing on <host>" simultaneously on every
+      # runner in the fleet, about the one thing none of them can fix. The marker
+      # is stamped either way, so a persistently broken key shows up as a check
+      # whose last recorded pass keeps saying it skipped.
+      Agent::NewrelicWatch.record(nil, now: @now, skipped: e.message) unless @dry_run
+      decide("newrelic_ingest", "could not measure (#{e.message})")
+    end
+
+    # Best-effort in the same sense as the toolchain issue above: the marker is
+    # already written, so the next cadence retries.
+    def file_newrelic_ingest_issue(measurement)
+      Agent::Api.create_issue(
+        {
+          title: NewrelicIngest.issue_title(measurement),
+          category: "improvement",
+          fingerprint: measurement.fingerprint,
+          body: NewrelicIngest.issue_body(measurement),
+          claim_on_create: false,
+        },
+        use_localhost: @use_localhost,
+      )
+    rescue SessionExpired, ApiError => e
+      log("newrelic_ingest: could not file an issue (#{e.message})")
+    end
+
     # THE RUNNER-OFFLINE ALERT IS NOT SENT FROM HERE, DELIBERATELY (ISS-535).
     #
     # It used to be: this method read `is_stale` off every OTHER runner in the
@@ -794,6 +866,10 @@ module Agent
         # run from closing out an attempt that did nothing.
         operations: Agent::Ops.records(number, since: started),
         exit_code: Agent::Jobs.exit_code(number),
+        # Did the API refuse to start this session at all (ISS-1129)? Read from
+        # the session log rather than inferred from the exit code, which a
+        # refusal and a failure share.
+        usage_limit: Agent::UsageLimit.detect(number),
         producer_filed: record["producer_filed"],
         attempt: failed_attempts(number, record, identity),
         timed_out: Agent::Jobs.timed_out?(record, now: @now),
@@ -803,7 +879,24 @@ module Agent
       decide("reap", "ISS-#{number} → #{result.name} (issue #{result.status})#{siblings}: #{result.reason}")
       return [record, result, prs] if @dry_run
 
+      stand_down(number) if result.name == "usage_limit"
       [Agent::Jobs.mark_reaped(record, result: result, prs: prs, now: @now), result, prs]
+    end
+
+    # One session refused by the usage limit means the NEXT one is refused too:
+    # the limit is account-wide with a known reset instant, and the queue is not
+    # what is wrong. Without this the tick claims straight through it, which is
+    # how three issues spent their entire retry budget in ninety seconds on
+    # 2026-08-08 (ISS-1129).
+    #
+    # Best-effort, like every other bookkeeping step between the verdict and the
+    # lease release: a cooldown this tick could not write costs one more refused
+    # session, and a refused session now costs the issue nothing.
+    def stand_down(number)
+      until_time = Agent::UsageLimit.record(Agent::UsageLimit.detect(number), now: @now)
+      log("Claude usage limit — claiming nothing until #{until_time.localtime.strftime('%H:%M')}")
+    rescue StandardError => e
+      log("could not record the usage-limit cooldown (#{e.class}: #{e.message})")
     end
 
     # Which consecutive failure this attempt would be — the trailing run of
@@ -996,6 +1089,15 @@ module Agent
       # scheduler on this box any more, so there is nothing to reserve, nothing to
       # subtract and no way for the two to oversubscribe the machine.
       verify(runner)
+
+      # AFTER `verify`, and that ordering is the point (ISS-1129). A usage limit
+      # is the Claude API refusing to start SESSIONS; a verify job is sbt and npm
+      # on this machine's own hardware with no model in it, and standing those
+      # down too would idle the merge lane over somebody else's quota.
+      if (resets_at = Agent::UsageLimit.active(now: @now))
+        log("Claude usage limit until #{resets_at.localtime.strftime('%H:%M')} — claiming no issues")
+        return
+      end
 
       max = capacity(runner)
       live = live_jobs

@@ -194,9 +194,18 @@ module Agent
                    "an unauthenticated request usually answers an empty result rather than an error. The " \
                    "command refuses when it cannot see `#{f.name}` in what you gave it."
           lines << "  **Never print, echo, commit, or paste it** into a PR, an issue comment, a plan or a " \
-                   "test fixture — and never write the value into a command line. `ps` shows every " \
-                   "argument of every process to every sibling session on this runner; `exec` keeps the " \
-                   "value in an environment instead, for one command's lifetime. See §4."
+                   "test fixture."
+          # ISS-961. The line above is what a session obeys and it was not
+          # enough, because inlining a value into a command reads as none of
+          # those four verbs — and the `exec` example right above it is a shell
+          # command, which is the moment the question actually arises. Stated per
+          # credential, with the variable's own name in it, so the correct form
+          # is the thing on screen at the point of use.
+          lines << "  **And never write the value into a command line — pass `$#{f.name}`, never what it " \
+                   "resolves to.** Several sessions share this runner as one user, and `ps` shows every " \
+                   "argument of every one of their processes to all the others — so a sibling's routine " \
+                   "process listing sweeps an inlined key into ITS transcript, which outlives this machine. " \
+                   "`exec` keeps the value in an environment instead, for one command's lifetime. See §4."
         else
           lines << "- `#{f.name}` — **NOT available on this runner** (#{f.explanation})."
           lines << "  Anything in your assignment that asks you to verify behaviour against the live API " \
@@ -206,6 +215,29 @@ module Agent
                    "then report it as verified."
         end
       end
+      # ISS-1028. Stated once, as a footer, because it is a fact about the MACHINE
+      # rather than about any one key — and stated at all because the per-credential
+      # rule above, read alone, implies a protection that does not exist. "Never
+      # write the value into a command line" is true, but a session takes from it
+      # that the ENVIRONMENT is the safe place to keep a credential. It is not:
+      # `ps -Eax` prints a sibling's whole environment to any process with the
+      # same uid, for the whole life of the session, and the env repo these values
+      # are read out of is unlocked on disk under that same uid. Measured on a
+      # runner: 88 of 770 processes disclosing, 13 of them carrying
+      # PLAYBOOK_CLAUDE_KEY. A session that obeys
+      # the argv rule perfectly still holds nothing back from its siblings. So the
+      # honest statement, plus the two rules that survive it: the durable artifact
+      # is the boundary, and harvesting is the way a credential reaches one.
+      lines << ""
+      lines << "This runner is SHARED and the isolation boundary is the MACHINE, not your session: every " \
+               "other session runs as the same user and can already read these keys out of your " \
+               "environment (`ps -Eax`), out of your command lines (`ps -U`), and off disk. macOS " \
+               "withholds only an Apple platform binary's environment, so the processes that DO disclose " \
+               "are `claude`, `node`, `ruby`, `java`, `vite` — every process a session actually runs. " \
+               "Hiding a key from a sibling is not possible and is not the rule. The rule is that it must never " \
+               "reach a DURABLE artifact — a transcript, a PR, an issue comment, a plan, a commit, a test " \
+               "fixture — and that you never run a command that harvests one: no `ps -E`, no `ps auxww`, " \
+               "no `pgrep -fl`, no bare `env`. See §4 (ISS-1028)."
       # A footer rather than a per-credential line: this is a fact about the
       # PROCESS the environment is handed to, not about any one key. `claude`
       # resolves ANTHROPIC_API_KEY as its own credential, so copying anything
