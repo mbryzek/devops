@@ -171,22 +171,44 @@ module Agent
       lines = ["## Live external-API credentials on this runner", ""]
       Array(found).each do |f|
         if f.present?
-          lines << "- `#{f.name}` — **available in your environment** (#{f.explanation}). Needed for " \
-                   "#{f.credential.required_by}."
-          lines << "  Pass it explicitly to whatever you are verifying — e.g. " \
-                   "`#{f.credential.usage_example}`."
+          # ISS-1037. This used to read "available in your environment", and it
+          # was true: every session held every key for its whole life, so a
+          # `ps -Eax`, an inherited dev server, or a stray `pgrep -fl` could
+          # sweep one up without the session doing anything wrong (ISS-961). The
+          # value is no longer there. What the session is told is unchanged in
+          # the part ISS-570 cares about — this machine HAS the key, so work that
+          # needs it can be closed out here — and changed in where it lives.
+          lines << "- `#{f.name}` — **available on this runner, and deliberately NOT in your " \
+                   "environment** (#{f.explanation}). Needed for #{f.credential.required_by}."
+          lines << "  Ask for it per command, and it exists only in that command's own process:"
+          lines << ""
+          lines << "        dev agent credential exec --name #{f.name} -- \\"
+          lines << "          /bin/zsh -c '#{f.credential.usage_example}'"
+          lines << ""
+          # The quoting is the whole failure mode, so it is stated at the point
+          # of use rather than left to §4. Double quotes make the session's own
+          # shell expand the reference to the empty string before `dev` runs, and
+          # an unauthenticated NerdGraph query answers an empty result set rather
+          # than a 401 — a graph that reads as healthy and was never queried
+          # (ISS-635). The command refuses when it cannot see the name in the
+          # argv, which is exactly what that mistake leaves behind.
+          lines << "  **SINGLE quotes around the inner command**, so the shell that expands `$#{f.name}` " \
+                   "is the one that has it. Double quotes expand it to nothing before `dev` starts, and " \
+                   "an unauthenticated request usually answers an empty result rather than an error. The " \
+                   "command refuses when it cannot see `#{f.name}` in what you gave it."
           lines << "  **Never print, echo, commit, or paste it** into a PR, an issue comment, a plan or a " \
                    "test fixture."
           # ISS-961. The line above is what a session obeys and it was not
           # enough, because inlining a value into a command reads as none of
-          # those four verbs — and `usage_example` right above it is a shell
+          # those four verbs — and the `exec` example right above it is a shell
           # command, which is the moment the question actually arises. Stated per
           # credential, with the variable's own name in it, so the correct form
           # is the thing on screen at the point of use.
           lines << "  **And never write the value into a command line — pass `$#{f.name}`, never what it " \
                    "resolves to.** Several sessions share this runner as one user, and `ps` shows every " \
-                   "argument of every one of their processes to all the others; a key you inline is readable " \
-                   "by all of them for as long as the command runs (hours, for anything backgrounded). See §4."
+                   "argument of every one of their processes to all the others — so a sibling's routine " \
+                   "process listing sweeps an inlined key into ITS transcript, which outlives this machine. " \
+                   "`exec` keeps the value in an environment instead, for one command's lifetime. See §4."
         else
           lines << "- `#{f.name}` — **NOT available on this runner** (#{f.explanation})."
           lines << "  Anything in your assignment that asks you to verify behaviour against the live API " \
@@ -196,6 +218,29 @@ module Agent
                    "then report it as verified."
         end
       end
+      # ISS-1028. Stated once, as a footer, because it is a fact about the MACHINE
+      # rather than about any one key — and stated at all because the per-credential
+      # rule above, read alone, implies a protection that does not exist. "Never
+      # write the value into a command line" is true, but a session takes from it
+      # that the ENVIRONMENT is the safe place to keep a credential. It is not:
+      # `ps -Eax` prints a sibling's whole environment to any process with the
+      # same uid, for the whole life of the session, and the env repo these values
+      # are read out of is unlocked on disk under that same uid. Measured on a
+      # runner: 88 of 770 processes disclosing, 13 of them carrying
+      # PLAYBOOK_CLAUDE_KEY. A session that obeys
+      # the argv rule perfectly still holds nothing back from its siblings. So the
+      # honest statement, plus the two rules that survive it: the durable artifact
+      # is the boundary, and harvesting is the way a credential reaches one.
+      lines << ""
+      lines << "This runner is SHARED and the isolation boundary is the MACHINE, not your session: every " \
+               "other session runs as the same user and can already read these keys out of your " \
+               "environment (`ps -Eax`), out of your command lines (`ps -U`), and off disk. macOS " \
+               "withholds only an Apple platform binary's environment, so the processes that DO disclose " \
+               "are `claude`, `node`, `ruby`, `java`, `vite` — every process a session actually runs. " \
+               "Hiding a key from a sibling is not possible and is not the rule. The rule is that it must never " \
+               "reach a DURABLE artifact — a transcript, a PR, an issue comment, a plan, a commit, a test " \
+               "fixture — and that you never run a command that harvests one: no `ps -E`, no `ps auxww`, " \
+               "no `pgrep -fl`, no bare `env`. See §4 (ISS-1028)."
       # A footer rather than a per-credential line: this is a fact about the
       # PROCESS the environment is handed to, not about any one key. `claude`
       # resolves ANTHROPIC_API_KEY as its own credential, so copying anything
