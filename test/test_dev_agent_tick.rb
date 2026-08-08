@@ -1434,6 +1434,35 @@ class TestDevAgentTick < Minitest::Test
     assert_equal ["lse-1"], seen[:released]
   end
 
+  # ...and the week is counted from the LAST WAKE (ISS-923). The merge lane clears
+  # the snooze the moment a blocking PR merges, so an issue with a second blocker
+  # can accumulate deferrals across two independent waits. Carrying the first
+  # wait's count into the second would walk it to `needs_input` on churn this
+  # feature caused — the deferrals before the wake were waiting on a PR that then
+  # MERGED, which is the opposite of the evidence the limit looks for.
+  def test_deferrals_before_a_wake_do_not_count_toward_the_limit
+    prior = Array.new(Agent::Tick::DEPENDENCY_DEFER_LIMIT - 1) do
+      { "body" => "#{Agent::Tick::DEPENDENCY_DEFER_MARKER} — not dispatched, deferred 1 day." }
+    end
+    woke = { "body" => "#{Agent::Dependency::WAKE_MARKER} — #{BLOCKER_PR} merged." }
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"), comments: prior + [woke])
+    assert_empty seen[:statuses], "the wait that escalated is over — this is a fresh one"
+    assert_match(/attempt 1 of #{Agent::Tick::DEPENDENCY_DEFER_LIMIT}/, seen[:snoozed].first[:comment])
+  end
+
+  # Only the deferrals since the wake, though: a blocker that goes on to stall for
+  # its own week still reaches a human.
+  def test_deferrals_after_a_wake_still_reach_the_limit
+    woke = [{ "body" => "#{Agent::Dependency::WAKE_MARKER} — #{BLOCKER_PR} merged." }]
+    after = Array.new(Agent::Tick::DEPENDENCY_DEFER_LIMIT - 1) do
+      { "body" => "#{Agent::Tick::DEPENDENCY_DEFER_MARKER} — not dispatched, deferred 1 day." }
+    end
+    seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
+                     blocker_issues: blocker_issue, prs: pr("OPEN"), comments: woke + after)
+    assert_equal ["needs_input"], seen[:statuses].map { |s| s[:status] }
+  end
+
   # The undeferrable path arrives at the escalation with the lease ALREADY
   # released by `defer_for_dependency`. A second DELETE answers 404/409, which is
   # an ApiError, and it unwound the rest of the claim loop — the status write had

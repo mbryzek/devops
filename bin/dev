@@ -41,6 +41,7 @@ require 'depsguard'
 # outcome classification, retention — are pure functions that get real tests.
 require 'agent/checkout'
 require 'agent/ci'
+require 'agent/dependency'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/heap'
@@ -1277,6 +1278,10 @@ USAGE = <<~USAGE
         only reliable way never to merge something is never to ask about it.
         Refuses a self-deploying repo (`devops`) from two independent code
         paths, whatever the ledger would say (ISS-660).
+        After a merge it wakes the issues that were DEFERRED waiting on this PR
+        (ISS-923). The lane is the only merger in the fleet, so it is the only
+        thing that knows the moment the wait ended; without it a dependent sits
+        out the rest of its day-long snooze for nothing.
     #{INVOCATIONS["prs group"]}
         Group open pull requests across every tracked repo by head branch — the
         join key a cross-repo change already has, since the executor assigns one
@@ -14316,6 +14321,7 @@ def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id
     puts "Merged #{candidate.label}."
     autonomy_submit_outcome(decision["id"], applied: true, use_localhost: use_localhost,
                                             undo_command: "gh pr revert #{candidate.number} --repo #{repo}")
+    agent_merge_wake_dependents(candidate, use_localhost: use_localhost)
     return
   end
 
@@ -14326,6 +14332,23 @@ def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id
   autonomy_submit_outcome(decision["id"], applied: false, use_localhost: use_localhost,
                                           error: "#{result.summary}: #{result.output.to_s.strip[0, 500]}")
   exit 1
+end
+
+# The last thing a merge does, and the only one that touches the tracker rather
+# than GitHub (ISS-923): an issue deferred because it was waiting on THIS PR has
+# just stopped waiting, and the lane is the only thing in the fleet that knows so
+# the moment it is true.
+#
+# AFTER the outcome, deliberately. The ledger's record of what was applied is the
+# merge's own account of itself and must not be delayed by — or lost to — a
+# tracker call. Nothing here can fail the merge either: `wake_dependents` swallows
+# its own unknowns and answers with the issues it actually woke, because the merge
+# has already happened and there is nothing left to refuse.
+def agent_merge_wake_dependents(candidate, use_localhost:)
+  woken = Agent::Dependency.wake_dependents(candidate.url, use_localhost: use_localhost)
+  return if woken.empty?
+
+  puts "  woke #{woken.map { |n| "ISS-#{n}" }.join(', ')} — every dependency they were deferred on has merged."
 end
 
 # The other thing the lane can DO, and the one that is not a merge (ISS-769).

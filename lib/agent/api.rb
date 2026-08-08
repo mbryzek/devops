@@ -298,6 +298,36 @@ module Agent
               token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost, body: body)
     end
 
+    # Clear a snooze and put the issue back in the queue NOW — the `--wake` half
+    # of `dev issues snooze`, and the write behind Agent::Dependency.wake_dependents
+    # (ISS-923). A DELETE rather than a snooze into the past: "not deferred" is the
+    # absence of a wake time, and writing one that has already elapsed would leave
+    # `dev issues list --snoozed` rendering a deferral nobody is waiting on.
+    #
+    # The status is untouched, exactly as `snooze` leaves it — a deferred issue is
+    # still `open`, and waking it changes only whether the queue can see it.
+    def wake(number, use_localhost:)
+      request(:delete, "/#{TENANT}/issues/#{number}/snooze",
+              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost)
+    end
+
+    # Every issue that is deferred right now: `open`, snoozed, and a unit of work
+    # rather than an epic — the population Agent::Dependency.wake_dependents walks
+    # after a merge.
+    #
+    # ONE PAGE, and 100 is not a policy so much as a ceiling far above the real
+    # number: a deferral is a day long and the fleet defers a handful of issues at
+    # a time. A tracker that ever held more simultaneously deferred issues than
+    # this would wake the first hundred and leave the rest to the daily expiry that
+    # backstops this whole feature — the same fail-open the dependency gate takes
+    # everywhere else.
+    def snoozed_issues(use_localhost:, limit: 100)
+      params = { "statuses" => ["open"], "types" => ["issue"], "is_snoozed" => true,
+                 "limit" => limit, "offset" => 0 }
+      request(:get, "/#{TENANT}/issues?#{URI.encode_www_form(params)}",
+              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost) || []
+    end
+
     # An ADDITIONAL fix url on an issue that has already shipped, leaving its
     # status alone — the API behind `dev issues fix`, and the only non-destructive
     # way to say "this also shipped in that PR" (ISS-536).

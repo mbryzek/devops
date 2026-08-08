@@ -1365,7 +1365,7 @@ module Agent
     # and undeferred is the one outcome that spins.
     def defer_for_dependency(lease, identity, number, unshipped, comments)
       reasons = Agent::Dependency.describe(unshipped)
-      attempt = comments.count { |c| c["body"].to_s.include?(DEPENDENCY_DEFER_MARKER) } + 1
+      attempt = dependency_defer_attempt(comments)
       if attempt >= DEPENDENCY_DEFER_LIMIT
         return escalate_stalled_dependency(lease, identity, number, reasons, attempt)
       end
@@ -1387,6 +1387,25 @@ module Agent
         end
       end
       decide("claim", "ISS-#{number}: #{reasons.join('; ')} — no session started, deferred #{DEPENDENCY_DEFER_DAYS} day")
+    end
+
+    # Which deferral this is, counted from the timeline — and counted only SINCE
+    # THE LAST WAKE (ISS-923).
+    #
+    # The count exists to recognise one thing: a PR that nobody is going to merge.
+    # Every deferral before a `Agent::Dependency::WAKE_MARKER` was waiting on a PR
+    # that then MERGED, which is the opposite of that evidence, and carrying it
+    # forward would walk an issue toward `needs_input` on churn this feature
+    # caused — a second blocker taking its own week is a fresh week's wait, not
+    # the continuation of the first one's.
+    #
+    # Oldest first, which is how the comments endpoint returns them, so the last
+    # wake is the last INDEX rather than the first.
+    def dependency_defer_attempt(comments)
+      bodies = comments.map { |c| c["body"].to_s }
+      woke = bodies.rindex { |b| b.include?(Agent::Dependency::WAKE_MARKER) }
+      since = woke ? bodies[(woke + 1)..] : bodies
+      since.count { |b| b.include?(DEPENDENCY_DEFER_MARKER) } + 1
     end
 
     # A dependency that has not merged after a week of daily checks is no longer a
