@@ -37,12 +37,30 @@ module ReleaseTag
     name.include?("/") ? name : "#{OWNER}/#{name}"
   end
 
-  # The newest release tag in a repo, or nil.
-  def latest(repo, capture: method(:capture))
+  # Every release tag a repo has, or nil when the list could not be read.
+  #
+  # `nil` and `[]` are DIFFERENT ANSWERS and that is the whole reason this is
+  # separate from `latest`, which collapses both to nil because neither gives it
+  # a tag to return. A repo with no release tags at all is not an unknown: it is
+  # a repo that does not release, and devops is the standing case — nothing
+  # builds or ships it, the checkout at ~/code/devops IS the deployment, and
+  # every runner fast-forwards it at the top of every tick. A caller deciding
+  # "has this merge shipped" must read that as "there is no release to wait for"
+  # rather than as "cannot tell", or it waits forever on evidence that will never
+  # exist (ISS-1097).
+  def tags(repo, capture: method(:capture))
     out = capture.call(["gh", "api", "repos/#{slug(repo)}/tags", "--paginate", "--jq", ".[].name"])
     return nil if out.nil?
-    out.split("\n").map(&:strip).select { |t| t.match?(RELEASE_TAG) }.max_by { |t| version_key(t) }
+    out.split("\n").map(&:strip).select { |t| t.match?(RELEASE_TAG) }
   end
+
+  # The newest release tag in a repo, or nil.
+  def latest(repo, capture: method(:capture))
+    newest(tags(repo, capture: capture))
+  end
+
+  # The newest of an already-read tag list, or nil for an empty one.
+  def newest(tags) = Array(tags).max_by { |t| version_key(t) }
 
   # Numeric, component-wise — so `0.19.13` beats `0.19.9`, which sorting the
   # strings does not.

@@ -318,7 +318,7 @@ answer is yes, it is your work — do it. Handing over something you were capabl
 doing is worse than the problem this solves, because it teaches the queue that
 handoffs are noise.
 
-### When you file follow-up work that CANNOT START until your PR merges
+### When you file follow-up work that CANNOT START until your PR ships
 
 The third of the same family, and the one you will hit most often: not something
 you routed around, not something only a human can run, but a follow-up whose
@@ -336,6 +336,17 @@ also takes a bare issue number when you have one. Repeat it per dependency. It
 records the same `blocked_by` edge `dev issues block` writes, so the queue stops
 offering the issue, and the dispatcher re-checks the PR against GitHub before it
 ever starts a session on it.
+
+**It covers "not until it is LIVE", not just "not until it merges" (ISS-1097).**
+The edge clears only when the PR has merged AND that merge commit is contained in
+its repo's newest release — so a follow-up that can only be tested against the
+running pod (a crawler fix re-crawl, a club_backfill retry) needs no extra flag
+and no sentence: `--block-on` is already the right answer. A repo that publishes
+no releases, devops among them, clears on the merge alone, because there merging
+is what deploys. Do not write the deploy requirement in prose beside the flag —
+ISS-1024 did, the dependency sweep woke it 60 seconds after its blocker merged,
+and the session that claimed it four minutes later found the fix on `main` and
+the old build still in production with nothing it could verify.
 
 **A dependency written in prose does not work, and the failure is not obvious.**
 ISS-644's body said "Depends on devops#359 merging first, since that is where the

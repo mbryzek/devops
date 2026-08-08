@@ -62,29 +62,51 @@ module Prs
 
     # true / false / nil (unknown).
     def contains?(repo, sha, live_version:, capture: method(:capture))
-      return nil if repo.to_s.empty? || sha.to_s.empty?
+      case state(repo, sha, live_version: live_version, capture: capture)
+      when :shipped then true
+      when :unshipped then false
+      end
+    end
+
+    # Where a merge commit has got to, as four answers rather than three:
+    #
+    #   :shipped      — contained in what production is running (or, with no
+    #                   probe, in the newest release tag)
+    #   :unshipped    — demonstrably not contained in it
+    #   :unreleasable — the repo publishes no releases AT ALL, so there is no
+    #                   release for it to be contained in
+    #   :unknown      — every read that did not answer
+    #
+    # `contains?` folds the last two together, because both mean "I cannot say
+    # this shipped" and holding is the only safe act for a merge check. The
+    # dependency gate (Agent::Dependency, ISS-1097) needs them apart: a repo that
+    # never releases — devops, where merging IS deploying — must not park a
+    # dependent issue forever waiting for a tag nobody is ever going to cut.
+    def state(repo, sha, live_version:, capture: method(:capture))
+      return :unknown if repo.to_s.empty? || sha.to_s.empty?
       ref = deployed_ref(repo, live_version: live_version, capture: capture)
-      return nil if ref.to_s.empty?
+      return ref if ref.is_a?(Symbol)
       status = compare_status(repo, ref, sha, capture: capture)
-      return nil if status.nil?
-      CONTAINED.include?(status)
+      return :unknown if status.nil?
+      CONTAINED.include?(status) ? :shipped : :unshipped
     end
 
     # What production is running, expressed as something GitHub can compare
     # against: the running version when there is a probe, else the newest release
-    # tag.
+    # tag — or the SYMBOL saying which kind of nothing there is instead, since
+    # "this repo has no releases" and "this repo could not be read" are opposite
+    # answers to every caller above.
+    #
+    # ReleaseTag is the one definition of "this repo's releases", shared with the
+    # version probe `dev issues reconcile` reads for an app with no HTTP endpoint
+    # (ISS-904). Two notions of which tag is the release would disagree exactly
+    # where it matters — on the repos with nothing else to ask.
     def deployed_ref(repo, live_version:, capture: method(:capture))
       running = live_version.call(bare(repo)).to_s.strip
       return running unless running.empty?
-      latest_release_tag(repo, capture: capture)
-    end
-
-    # ReleaseTag is the one definition of "this repo's newest release", shared
-    # with the version probe `dev issues reconcile` reads for an app with no
-    # HTTP endpoint (ISS-904). Two notions of which tag is the release would
-    # disagree exactly where it matters — on the repos with nothing else to ask.
-    def latest_release_tag(repo, capture: method(:capture))
-      ReleaseTag.latest(bare(repo), capture: capture)
+      tags = ReleaseTag.tags(bare(repo), capture: capture)
+      return :unknown if tags.nil?
+      ReleaseTag.newest(tags) || :unreleasable
     end
 
     def compare_status(repo, ref, sha, capture: method(:capture))

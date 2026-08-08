@@ -14568,12 +14568,19 @@ end
 # AFTER the outcome, and it can neither fail nor slow the merge: the ledger's
 # record of what was applied is the merge's own account of itself, and this is a
 # convenience on top of a deferral that was always going to expire on its own.
+#
+# A MERGE NO LONGER CLEARS EVERY DEPENDENT (ISS-1097). The gate now wants the
+# merge commit to be in a release too, so in a repo that releases this pass
+# usually finds nothing and the wake comes from the five-minute sweep after the
+# deploy instead. It still fires immediately for a dependent blocked on a repo
+# with no releases — devops, where merging IS deploying — which is the most
+# common blocker repo there is, so the fast path keeps earning its place.
 def agent_merge_wake_deferrals(use_localhost:)
   result = Agent::DependencyWake.sweep(use_localhost: use_localhost)
   Agent::DependencyWake.mark_swept
   return if result.woken.empty?
 
-  puts "  woke #{result.woken.map { |n| "ISS-#{n}" }.join(', ')} — every dependency they were deferred on has merged."
+  puts "  woke #{result.woken.map { |n| "ISS-#{n}" }.join(', ')} — every dependency they were deferred on has landed."
 rescue StandardError => e
   # Named, not swallowed: the merge stands either way, and the daily expiry plus
   # the tick's own sweep both still apply, but a fast path that quietly stopped
