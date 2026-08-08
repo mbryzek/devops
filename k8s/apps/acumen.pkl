@@ -16,3 +16,26 @@ webMemory = "1100Mi"
 // default is now sized for platform-job's playbook upload pipeline (13000Mi) and would
 // be far more than acumen-job needs on its next redeploy.
 jobMemory = "5600Mi"
+
+// New Relic APM. Until this was set, acumen reported NOTHING to account
+// 7724695 — which reports platform-web and platform-job and nothing else — so
+// every acumen 500 was invisible to the only production signal an autonomous
+// session can query. `GET /g/<group>/duplicate/transactions` returned 500 from
+// February 2025 until August 2026, eighteen months, and was found by a human
+// paging to the end of a queue rather than by any alert (ISS-1056, ISS-1070).
+//
+// The agent jar is not new here: templates/Dockerfile.scala-play has always
+// baked it into every scala-play image, acumen's included. Only the -javaagent
+// flag was missing, and the license key still is — see the guard in
+// bin/k8s-secrets, which refuses to sync this app until NEW_RELIC_LICENSE_KEY
+// is set for it.
+javaAgent = "/opt/newrelic/newrelic.jar"
+
+// Off because acumen is one standalone service. Nothing calls it but its own
+// frontend and nothing downstream is instrumented, so distributed tracing would
+// buy a call graph that never leaves the process — and tracing is 40% of what
+// platform ingests. The measurement and the reasoning are in
+// k8s/templates/scala-play-app.pkl; flip this to true (one line, no other
+// change) if acumen ever grows a second instrumented service or a span-level
+// investigation needs it.
+distributedTracing = false
