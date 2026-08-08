@@ -1,5 +1,6 @@
 require 'agent/credentials'
 require 'agent/paths'
+require 'agent/prod_read'
 
 # The prompt fed to a session on stdin (design §4.3.2). Four parts, in this
 # order:
@@ -35,11 +36,12 @@ module Agent
     end
 
     def build(issue:, comments:, slug:, workspace:, resume_repo: nil, prepared_repos: [], continued_repos: [],
-              playbook: nil, credentials: Agent::Credentials.check)
+              playbook: nil, credentials: Agent::Credentials.check, prod_read: Agent::ProdRead.check)
       [
         instructions.strip,
         assignment(issue: issue, slug: slug, workspace: workspace, resume_repo: resume_repo,
-                   prepared_repos: prepared_repos, continued_repos: continued_repos, credentials: credentials),
+                   prepared_repos: prepared_repos, continued_repos: continued_repos, credentials: credentials,
+                   prod_read: prod_read),
         issue_section(issue),
         playbook_section(playbook),
         comments_section(comments),
@@ -47,7 +49,7 @@ module Agent
     end
 
     def assignment(issue:, slug:, workspace:, resume_repo: nil, prepared_repos: [], continued_repos: [],
-                   credentials: Agent::Credentials.check)
+                   credentials: Agent::Credentials.check, prod_read: Agent::ProdRead.check)
       lines = []
       lines << "# Your assignment"
       lines << ""
@@ -114,6 +116,7 @@ module Agent
         lines << "work there. Never edit a checkout under ~/code outside this workspace."
       end
       lines << "" << credentials_section(credentials)
+      lines << "" << prod_read_section(prod_read)
       lines.join("\n")
     end
 
@@ -246,6 +249,53 @@ module Agent
       lines << ""
       lines << "Never copy any of these into `ANTHROPIC_API_KEY` — that variable reconfigures the " \
                "`claude` CLI you are running inside."
+      lines.join("\n")
+    end
+
+    # Which production APIs this runner can READ, stated beside the credentials
+    # for the same reason they are (ISS-1062).
+    #
+    # The ISS-1056 session had this exact access and did not know it. It read §3's
+    # "never touch the production database", found no acumen key in the
+    # credentials section above, and concluded — reasonably, from what it was
+    # told — that production was unreachable. So it inferred a list of stale enum
+    # values from git history and shipped a migration naming them, while the
+    # producer's own six-second probe sat one command away.
+    #
+    # That is why this is a section and not a line in the standing instructions.
+    # A capability a session is not told about does not exist, and the shape of
+    # the mistake is identical to ISS-565's: the run did not fail, it quietly
+    # lowered what it claimed to have established.
+    def prod_read_section(found)
+      lines = ["## Production data you can READ on this runner", ""]
+      lines << "An issue that cites an on-screen or per-row observation is CHECKABLE. Check it — do not"
+      lines << "reconstruct it from the repos and ship the inference (ISS-1062)."
+      lines << ""
+      lines << "This is not a relaxation of §3. §3 forbids the production DATABASE and still does;"
+      lines << "`dev prod get` sends one authenticated GET against the product's own API and cannot send"
+      lines << "anything else. There is no write form of this command."
+      lines << ""
+      Array(found).each do |f|
+        t = f.target
+        if f.present?
+          lines << "- **`#{t.app}`** (#{t.host}) — **readable** as #{f.explanation}. Use it for #{t.answers}."
+          lines << ""
+          lines << "        #{t.example}"
+          lines << ""
+          # A stored session EXPIRES, unlike an API key, and `ProdRead.check`
+          # deliberately does not spend a network round-trip finding out (see its
+          # module comment). So the confirming call is named here, at the point
+          # the session decides whether to rely on it.
+          lines << "  Confirm it in one call before you rely on it — `dev prod get --app #{t.app} #{t.confirm_path}`."
+          t.guardrails.each { |g| lines << "  - #{g}" }
+        else
+          lines << "- **`#{t.app}`** (#{t.host}) — **NOT readable on this runner** (#{f.explanation}). To provide it, " \
+                   "#{t.how_to_provide}."
+          lines << "  Anything in your assignment that asks you to confirm an observation against #{t.product} " \
+                   "**cannot be confirmed here**. Say so up front, do the offline work in full, state plainly in " \
+                   "the PR which part is INFERRED rather than observed, and file it with `dev issues workaround`."
+        end
+      end
       lines.join("\n")
     end
 
