@@ -338,13 +338,13 @@ USAGE = <<~USAGE
         List active invariant snoozes.
 
     #{INVOCATIONS["invariants snooze"]}
-        Snooze an invariant for N days. --app is required.
+        Snooze an invariant for N days. --app is required. Human-only.
 
     #{INVOCATIONS["invariants unsnooze"]}
-        Remove an invariant snooze. --app is required.
+        Remove an invariant snooze. --app is required. Human-only.
 
     #{INVOCATIONS["tasks requeue"]}
-        Requeue failed async tasks.
+        Requeue failed async tasks. Human-only.
 
     #{INVOCATIONS["tasks delete"]}
         Delete task rows outright, in any state (pending, working, gave-up,
@@ -358,7 +358,19 @@ USAGE = <<~USAGE
         Deleting by discriminator prints the matching row count per app and asks
         before doing anything; --yes skips the prompt and is required when stdin
         is not a terminal. Find candidates with `dev invariants check` or the
-        Task Queues board in playbook-admin.
+        Task Queues board in playbook-admin. Human-only.
+
+    Human-only commands
+
+        `invariants snooze`, `invariants unsnooze`, `tasks requeue`, `tasks
+        delete` and `features cancel` are mutations on the /dev console, which
+        requires `platform_admin`. That scheme does not admit the AI actor, by
+        design: reading the console is how an autonomous session forms a theory,
+        writing it is how a human acts on one. Run inside a Claude session each
+        of these refuses BEFORE it sends anything and prints the
+        `dev issues handoff` line that parks the exact invocation for a human --
+        the reads it needed to fill that in are admitted, so the handoff carries
+        real numbers (ISS-945).
 
     #{INVOCATIONS["slow-routes"]}
         Show the slowest routes by response time over the last N days
@@ -1540,6 +1552,100 @@ def platform_endpoint(use_localhost)
   ApiClient.endpoints(use_localhost: use_localhost, app_filter: "platform").first
 end
 
+# ---------- the /dev console's human-only mutations ----------
+#
+# Every mutation on the /dev console requires `platform_admin`. `platform_diagnostics` -- the
+# scheme that admits the AI actor -- is declared on that console's READS and on no write, and
+# spec/dev.json says why in as many words: reading the console is how an autonomous session
+# forms a theory, writing it (requeueing tasks, deleting task rows, snoozing an invariant,
+# cancelling a feature removal) is how a HUMAN acts on one. That boundary is right and this
+# code does not move it.
+#
+# What was wrong is that nothing said so until after the fact. A session following a briefing
+# that prescribes one of these commands -- and claude-invariants/investigate-body.md prescribes
+# three of them as THE remediation for a failing invariant -- issued the call, got a 401, and
+# had no next step. ISS-921 hit exactly that on `dev tasks delete` and got through it only
+# because the row count happened to be zero; had rows been stranded it could have proved the
+# problem and been unable to act on it, and the next session would have hit the identical wall.
+#
+# So the refusal moves here, ahead of the request, and it hands back the one thing that
+# resolves the situation: the `dev issues handoff` line that parks this exact invocation for a
+# human. Nothing is attempted, so nothing half-runs, and the 401 that used to read as an auth
+# hiccup now reads as what it is -- a step this identity is not the one to take.
+#
+# A human at a keyboard is unaffected: the guard fires only when THIS process would present the
+# AI actor's token, which is `CLAUDECODE` plus a provisioned token (ApiClient.auth_header_for).
+
+# `word` as it must be typed to survive a shell. Single-quoted only when it needs to be, since
+# the output of this is a line a human pastes and `Shellwords.escape` renders a sentence as an
+# unreadable run of backslashes.
+def shell_word(word)
+  text = word.to_s
+  return text if text.match?(%r{\A[A-Za-z0-9_@%+=:,./-]+\z})
+  # Block form deliberately: in a gsub REPLACEMENT string `\'` is the post-match backreference,
+  # not an escaped quote, so the two-argument form silently duplicates the rest of the word.
+  "'#{text.gsub("'") { "'\\''" }}'"
+end
+
+def shell_line(words)
+  words.map { |w| shell_word(w) }.join(" ")
+end
+
+# Whether this process would authenticate as the AI actor against any of `endpoints` -- i.e.
+# whether the caller is an autonomous session rather than Mike.
+def ai_actor?(endpoints)
+  endpoints.any? { |e| ApiClient.ai_credential?(e[:app], use_localhost: e.fetch(:use_localhost)) }
+end
+
+# The issue this session was spawned for, from the environment the executor set, or nil when
+# this is not an autonomous session. Only used to pre-fill `--from`, so nil is a placeholder
+# rather than an error -- unlike `agent_run_op_issue!`, which is filing a record and must not
+# guess.
+def agent_issue_number
+  number = ENV["DEV_AGENT_ISSUE"].to_s
+  number.match?(/\A\d+\z/) ? number : nil
+end
+
+# Refuse a `platform_admin` mutation for the AI actor, with the handoff that unblocks it.
+#
+# `command` is the CLI command ("tasks delete"), `args` its arguments exactly as they were
+# passed, so the handed-over `--command` is the invocation that was actually attempted rather
+# than a reconstruction of it. `key` is the handoff's dedup slug and must name WHAT IS PENDING,
+# not this run. `detail` is whatever the caller already learned from the console's reads (a row
+# count, say) and belongs in the handoff body. `rerun` says what a second run of the command
+# does, which `dev issues handoff` requires and nothing verifies.
+#
+# Returns normally for a human, so every call site reads as a guard.
+def refuse_human_only_mutation!(command, args, endpoints, key:, rerun:, detail: nil)
+  return unless ai_actor?(endpoints)
+
+  from = agent_issue_number || "<this issue's number>"
+  invocation = "dev #{command} #{shell_line(args)}".rstrip
+
+  warn ""
+  warn "#{command}: refused. This is a human-only command and this process is #{ApiClient::AI_USER_LABEL}."
+  warn ""
+  warn "  Every mutation on the /dev console requires `platform_admin`, which does not admit the AI"
+  warn "  actor by design (spec/dev.json); the console's READS do admit it, and are yours. Sending"
+  warn "  this request anyway returns 401 -- the server working correctly, not a credential problem,"
+  warn "  and `dev auth login` is not the fix."
+  warn ""
+  detail.to_s.split("\n").each { |line| warn "  #{line}" } unless detail.to_s.strip.empty?
+  warn "" unless detail.to_s.strip.empty?
+  warn "  Hand it over instead. A handoff files at `needs_input`, which no agent can claim, and"
+  warn "  lists in the daily nudge every morning until a human runs it:"
+  warn ""
+  warn "    dev issues handoff --from #{from} --key #{shell_word(key)} \\"
+  warn "      --title '<the step that is still pending>' \\"
+  warn "      --body '<what you found, and what stays broken until this runs>' \\"
+  warn "      --command #{shell_word(invocation)} \\"
+  warn "      --rerun #{shell_word(rerun)}"
+  warn ""
+  warn "  Then finish the rest of your work and close out as usual -- the handoff is the tail of"
+  warn "  this run, not a failure of it."
+  exit 1
+end
+
 # ---------- auth ----------
 #
 # One home for every credential `dev` holds: the per-app sessions a human logs in
@@ -2488,6 +2594,7 @@ def report_arg_problems(command, problems, example)
 end
 
 def cmd_invariants_snooze(args)
+  original = args.dup
   rest, app_filter, use_localhost = parse_common_flags(args)
   days = nil
   reason = nil
@@ -2519,6 +2626,14 @@ def cmd_invariants_snooze(args)
   report_arg_problems("snooze", problems, usage_for("invariants snooze"))
 
   endpoints = resolve_endpoints(app_filter, use_localhost)
+  refuse_human_only_mutation!(
+    "invariants snooze", original, endpoints,
+    key: "dev-invariants-snooze-#{name.to_s.tr('_', '-')}",
+    detail: "Deciding an invariant may keep failing for #{days_i} day(s) is a judgment about\n" \
+            "production, which is why it is a human's to make. Investigate it and say what you\n" \
+            "found; the snooze is the human's call on the strength of that.",
+    rerun: "A second run replaces the snooze with an identical one; nothing accumulates.",
+  )
 
   handle_errors do
     endpoints.each do |endpoint|
@@ -2530,11 +2645,19 @@ def cmd_invariants_snooze(args)
 end
 
 def cmd_invariants_unsnooze(args)
+  original = args.dup
   rest, app_filter, use_localhost = parse_common_flags(args)
   name, problems = collect_invariant_name(rest)
   problems << APP_REQUIRED if app_filter.nil? || app_filter.empty?
   report_arg_problems("unsnooze", problems, usage_for("invariants unsnooze"))
   endpoints = resolve_endpoints(app_filter, use_localhost)
+  refuse_human_only_mutation!(
+    "invariants unsnooze", original, endpoints,
+    key: "dev-invariants-unsnooze-#{name.to_s.tr('_', '-')}",
+    detail: "Ending a snooze early puts '#{name}' back in the daily check, which is the same\n" \
+            "judgment as granting it and belongs to whoever granted it.",
+    rerun: "A second run finds no snooze to remove and changes nothing.",
+  )
 
   handle_errors do
     endpoints.each do |endpoint|
@@ -2547,9 +2670,18 @@ end
 # ---------- tasks ----------
 
 def cmd_tasks_requeue(args)
+  original = args.dup
   rest, app_filter, use_localhost = parse_common_flags(args)
   reject_unknown_args("tasks requeue", rest)
   endpoints = resolve_endpoints(app_filter, use_localhost)
+  refuse_human_only_mutation!(
+    "tasks requeue", original, endpoints,
+    key: "dev-tasks-requeue",
+    detail: "Read the lane first — `dev tasks` and the Task Queues board in playbook-admin are\n" \
+            "both admitted — and say in the handoff WHY the tasks failed. A requeue that runs\n" \
+            "before anyone knows that is a retry of whatever broke them.",
+    rerun: "A second run requeues whatever has failed since; it is the same operation, not a duplicate one.",
+  )
 
   puts ""
   puts Util.underline("Requeuing Failed Tasks#{use_localhost ? ' (localhost)' : ''}")
@@ -2648,6 +2780,7 @@ def tasks_delete_confirmed?(discriminator, previews)
 end
 
 def cmd_tasks_delete(args)
+  original = args.dup
   rest, app_filter, use_localhost = parse_common_flags(args)
   task_ids, discriminator, assume_yes = parse_tasks_delete_args(rest)
   endpoints = resolve_endpoints(app_filter, use_localhost)
@@ -2657,10 +2790,39 @@ def cmd_tasks_delete(args)
   puts Util.underline("Deleting Tasks#{use_localhost ? ' (localhost)' : ''}")
 
   handle_errors do
-    if discriminator && !assume_yes
-      previews = endpoints.map { |e| [e[:name], tasks_delete_preview(e, discriminator)] }
-      return unless tasks_delete_confirmed?(discriminator, previews)
+    ai = ai_actor?(endpoints)
+    # The preview is a READ, so the AI actor IS admitted to it, and it is the whole difference
+    # between a handoff that says "rows may be stranded" and one that says how many. So it runs
+    # for the AI actor even under --yes, where a human skips it.
+    previews =
+      if discriminator && (ai || !assume_yes)
+        endpoints.map { |e| [e[:name], tasks_delete_preview(e, discriminator)] }
+      end
+
+    if ai
+      # Nothing to hand over: the lane is already drained, so this run has nothing left to do and
+      # says so, rather than parking a no-op on a human. Exactly ISS-921's situation, which took a
+      # session reading the preview by hand to establish. Scoped to this branch on purpose — a
+      # human who asks to delete zero rows still gets the confirmation they asked for.
+      if previews&.all? { |(_name, count)| count == "0" }
+        puts ""
+        previews.each { |name, count| puts "  #{name}: #{count} task row(s) match '#{discriminator}'" }
+        puts ""
+        puts "  Nothing to delete. This command is human-only (`platform_admin`), but there is"
+        puts "  nothing here to hand over: the queue is already drained."
+        puts ""
+        return
+      end
+
+      refuse_human_only_mutation!(
+        "tasks delete", original, endpoints,
+        key: discriminator ? "dev-tasks-delete-#{discriminator.tr('_', '-')}" : "dev-tasks-delete-by-id",
+        detail: previews&.map { |name, count| "#{name}: #{count} task row(s) match '#{discriminator}' and can never be dispatched." }&.join("\n"),
+        rerun: "A second run finds the rows already gone and deletes nothing, so it is safe to repeat.",
+      )
     end
+
+    return if discriminator && !assume_yes && !tasks_delete_confirmed?(discriminator, previews)
 
     puts ""
     all_ok = true
@@ -7468,6 +7630,7 @@ def cmd_features_reconcile(args)
 end
 
 def cmd_features_cancel(args)
+  original = args.dup
   rest, _app, use_localhost = parse_common_flags(args)
   subproject = rest.shift
   feature = rest.shift
@@ -7477,6 +7640,16 @@ def cmd_features_cancel(args)
   end
 
   endpoint = platform_endpoint(use_localhost)
+  # The REVERSE path of the removal lifecycle. The forward path (`retire`, and the reconciler's
+  # `process`/`purge`) carries `feature_cleanup` and a session runs it itself; restoring a
+  # soft-deleted flag row is the undo, and spec/dev.json keeps it `platform_admin`.
+  refuse_human_only_mutation!(
+    "features cancel", original, [endpoint],
+    key: "dev-features-cancel-#{subproject}-#{feature}",
+    detail: "Cancelling restores the soft-deleted flag row for #{subproject}/#{feature}. Say in the\n" \
+            "handoff why the removal should not have been recorded — that is the decision being asked for.",
+    rerun: "A second run finds no removal to cancel and changes nothing.",
+  )
   handle_errors do
     ApiClient.request(endpoint, :delete, feature_removal_path({ "subproject" => subproject, "feature" => feature }))
     puts "Cancelled the removal for #{subproject}/#{feature}; a soft-deleted flag row has been restored."

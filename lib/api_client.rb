@@ -118,6 +118,21 @@ class ApiClient
     nil
   end
 
+  # Whether this process would present the AI actor's token for `app` — the first arm of
+  # `auth_header_for`, asked on its own.
+  #
+  # For the operations the AI identity is deliberately OUTSIDE of: every mutation on the /dev console
+  # is `platform_admin`, and until this existed the only way to discover that was to send the request
+  # and read the 401 (ISS-945). Asked beforehand, a command can refuse constructively — name the
+  # boundary, and hand back the `dev issues handoff` line that parks it for a human — instead of
+  # leaving an autonomous session with a failed call and no next step.
+  #
+  # Deliberately NOT `credential_for?`: that one answers "can I authenticate at all", which is true
+  # for both identities and is the wrong question here. What matters is WHICH identity goes out.
+  def self.ai_credential?(app, use_localhost:)
+    !auth_header_for(app, use_localhost: use_localhost).nil?
+  end
+
   # Whether `request` can authenticate as `app` at all — either arm of `auth_header_for`'s fallback:
   # the AI's token inside a Claude session, or a logged-in human's session id. For callers that gate
   # optional work on having a credential, rather than letting it 401 mid-way.

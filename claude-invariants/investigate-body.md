@@ -63,6 +63,21 @@ are already wrong. Reach for an existing `dev` command before you write a
 migration or, worse, hand-patch rows — and never reach for one just to turn a
 check green (see Hard rules).
 
+**Every one of these that WRITES is human-only, and that is not a snag to work
+around — it is the shape of the job.** The /dev console's mutations require
+`platform_admin`, which does not admit the AI actor by design: reading the
+console is how you form a theory, writing it is how a human acts on one. So
+`tasks requeue`, `tasks delete` and `invariants snooze` all refuse for you,
+before they send anything, and print the `dev issues handoff` line that parks the
+exact invocation for a human. Run the command, paste the handoff it gives you,
+fill in the title and body from what you actually found, and carry on — the
+handoff is the tail of your investigation, not a failure of it. What you are
+never short of is the evidence: every READ here is admitted to you, and the
+refusal uses them (`tasks delete --discriminator` reports the live row count on
+its way out, and tells you outright when the answer is zero and there is nothing
+to hand over at all). Do not go looking for another route to the write; there
+isn't one, and there is not meant to be (ISS-945).
+
 - `dev tasks requeue [--app APP]` — force every failed async task to run now.
   The right move when the rows are fine and the work simply did not happen
   (category 2): a wedged lane, a job tier that crashlooped, a deploy that ate a
