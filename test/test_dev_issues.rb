@@ -839,6 +839,125 @@ class TestDevIssues < Minitest::Test
     assert_includes out, "ISS-091"
   end
 
+  # ---- ISS-1086: the dependency gate, on the claim path ----
+  #
+  # `Agent::Tick` has re-read a blocker's fix PR from GitHub since ISS-649 and
+  # defers the dispatch when nothing merged. This command asked only the server's
+  # `is_blocked`, which clears on STATUS — and a session records `fixed` when its
+  # PR is READY, so a blocker at `fixed` over an OPEN PR was offered here, claimed,
+  # and handed to a session that could only re-implement the dependency or stack
+  # on it. ISS-1084 over devops#448 was the live example: deferred by the
+  # dispatcher and claimable from the CLI at the same moment.
+
+  CLAIM_BLOCKER_PR = "https://github.com/mbryzek/devops/pull/448".freeze
+
+  # The issue the server calls claimable: its one blocker is `fixed`, so `is_blocked`
+  # is false and nothing short of GitHub can say the code is not on main.
+  def unmerged_dependency_issue
+    blocked_issue(blocker_status: "fixed").merge("status" => "open")
+  end
+
+  def claim_pr(state) = { "url" => CLAIM_BLOCKER_PR, "state" => state, "number" => 448 }
+
+  # `cmd_issues_claim` with both halves of the gate's GitHub read stubbed, and with
+  # every call to either COUNTED — the cost argument for gating the whole offer is
+  # that an issue with no blockers pays nothing, and only a count can hold that.
+  #
+  # Returns [stdout, stderr, reads], where `reads` is [blocker fetches, gh pr view
+  # calls]. A refusal exits, so SystemExit is swallowed here and the message it
+  # printed is what the test reads — a `--number` that names nothing on offer takes
+  # that path too, which is how the offer-list tests below name a number at all.
+  def claim_with_gate(argv, issues, blocker: nil, pr: nil)
+    path = issues_list_path(statuses: "open", is_snoozed: false, types: "issue")
+    reads = [0, 0]
+    out, err = capture_io do
+      stub_singleton(Agent::Host, :cached_identity, -> { nil }) do
+        stub_singleton(Agent::Api, :issue, ->(*, **) { reads[0] += 1; blocker }) do
+          stub_singleton(Agent::Github, :pr_by_url, ->(_url) { reads[1] += 1; pr }) do
+            with_stubbed_api("GET #{path}" => issues) { cmd_issues_claim(argv) }
+          end
+        end
+      end
+    rescue SystemExit
+      nil
+    end
+    [out, err, reads]
+  end
+
+  def claim_blocker_record = { "fixes" => [{ "url" => CLAIM_BLOCKER_PR }] }
+
+  # THE bug. The server hands this issue over; GitHub says its fix is still open.
+  def test_claim_holds_out_an_issue_whose_dependency_has_not_merged
+    out, = claim_with_gate([], [unmerged_dependency_issue],
+                           blocker: claim_blocker_record, pr: claim_pr("OPEN"))
+    assert_includes out, "No open issues to claim."
+    assert_includes out, "waiting on unmerged code (1) — not offered"
+    # Named, not just counted, and in the dispatcher's own words: the PR is the
+    # thing to go and look at.
+    assert_includes out, "its fix #{CLAIM_BLOCKER_PR} has not merged"
+    assert_includes out, "ISS-526"
+  end
+
+  # A closed-unmerged fix never resolves itself, and the wording says so rather than
+  # reading as "not yet" — the distinction ISS-739 put into the gate.
+  def test_claim_says_a_closed_unmerged_dependency_will_never_ship
+    out, = claim_with_gate([], [unmerged_dependency_issue],
+                           blocker: claim_blocker_record, pr: claim_pr("CLOSED"))
+    assert_includes out, "waiting on unmerged code (1)"
+    assert_includes out, "CLOSED WITHOUT MERGING"
+  end
+
+  # The merge is what the gate is waiting for, so a merged fix restores the offer.
+  def test_claim_offers_work_whose_dependency_has_merged
+    out, = claim_with_gate(["--number", "999"], [unmerged_dependency_issue],
+                           blocker: claim_blocker_record, pr: claim_pr("MERGED"))
+    refute_includes out, "waiting on unmerged code"
+    assert_includes out, "ISS-526"
+  end
+
+  # FAILS OPEN, exactly as the dispatcher does. A gate that emptied the queue every
+  # time `gh` could not answer would be a worse failure than the one it prevents,
+  # and a silent one.
+  def test_claim_offers_work_when_github_cannot_answer
+    out, = claim_with_gate(["--number", "999"], [unmerged_dependency_issue],
+                           blocker: claim_blocker_record, pr: nil)
+    refute_includes out, "waiting on unmerged code"
+    assert_includes out, "ISS-526"
+  end
+
+  # Named by number, the answer is not "that number is wrong" — it is "that work is
+  # not workable yet", with the PR that says so. A separate refusal from the blocked
+  # one above it: the SERVER would hand this issue over, so "those have to ship
+  # first" would name the wrong mechanism entirely.
+  def test_claim_refuses_a_held_issue_named_by_number
+    workable = graph_issue.merge("number" => "091", "status" => "open")
+    out, err = claim_with_gate(["--number", "526"], [unmerged_dependency_issue, workable],
+                               blocker: claim_blocker_record, pr: claim_pr("OPEN"))
+    # Held out of the offer, and the rest of the queue is unaffected by it.
+    assert_includes out, "ISS-091"
+    assert_includes out, "waiting on unmerged code (1)"
+    assert_includes err, "ISS-526 is waiting on code that has not merged"
+    assert_includes err, "its fix #{CLAIM_BLOCKER_PR} has not merged"
+    assert_includes err, "ISS-649"
+    refute_includes err, "those have to ship first"
+  end
+
+  # THE COST ARGUMENT for gating the whole offer rather than only the issue picked:
+  # an issue with no blockers reads no network at all, which is nearly every issue.
+  def test_claim_reads_no_github_for_work_with_no_blockers
+    _, _, reads = claim_with_gate(["--number", "999"], [graph_issue.merge("number" => "091", "status" => "open")])
+    assert_equal [0, 0], reads
+  end
+
+  # Nor does work this machine cannot claim anyway. The gate runs LAST, after the
+  # blocked and assigned-elsewhere partitions have taken their issues out.
+  def test_claim_reads_no_github_for_work_it_would_hold_out_anyway
+    filed_elsewhere = unmerged_dependency_issue.merge("assigned_runner_id" => "agr-other")
+    still_blocked = blocked_issue.merge("number" => "527")
+    _, _, reads = claim_with_gate([], [filed_elsewhere, still_blocked])
+    assert_equal [0, 0], reads
+  end
+
   # An assignment changes what a reader may DO with the issue, so `dev issues show`
   # says so outright rather than leaving it to be inferred from the body.
   def test_render_item_names_the_machine_an_issue_is_filed_for
