@@ -41,6 +41,7 @@ require 'depsguard'
 # outcome classification, retention — are pure functions that get real tests.
 require 'agent/checkout'
 require 'agent/ci'
+require 'agent/dependency_wake'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/heap'
@@ -1280,6 +1281,10 @@ USAGE = <<~USAGE
         only reliable way never to merge something is never to ask about it.
         Refuses a self-deploying repo (`devops`) from two independent code
         paths, whatever the ledger would say (ISS-660).
+        After a merge it runs the dependency-wake sweep immediately rather than
+        leaving it to the next five-minute pass (ISS-923): this is the one merge
+        the fleet does not have to observe from outside, so an issue deferred on
+        it goes back in the queue the moment the PR lands.
     #{INVOCATIONS["prs group"]}
         Group open pull requests across every tracked repo by head branch — the
         join key a cross-repo change already has, since the executor assigns one
@@ -14356,6 +14361,7 @@ def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id
     puts "Merged #{candidate.label}."
     autonomy_submit_outcome(decision["id"], applied: true, use_localhost: use_localhost,
                                             undo_command: "gh pr revert #{candidate.number} --repo #{repo}")
+    agent_merge_wake_deferrals(use_localhost: use_localhost)
     return
   end
 
@@ -14366,6 +14372,41 @@ def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id
   autonomy_submit_outcome(decision["id"], applied: false, use_localhost: use_localhost,
                                           error: "#{result.summary}: #{result.output.to_s.strip[0, 500]}")
   exit 1
+end
+
+# The fast path off a merge this process just performed (ISS-923).
+#
+# Agent::DependencyWake already asks the question — which deferred issues have
+# had every blocker land — on a five-minute cadence, and that sweep is the
+# BACKSTOP: it covers the merges nothing local observes, which is most of them
+# (ISS-922). This is the one merge nothing has to observe, because the lane is
+# the merger, so the answer is knowably different the instant `merge!` returns
+# and there is no reason to make a dependent wait out the rest of the interval.
+#
+# IT RUNS THE SAME SWEEP rather than matching this PR's url against the deferred
+# issues' blockers. The targeted version would have to re-derive `cleared?`, the
+# defer-marker filter and the wake-and-note write that the sweep already owns,
+# for a saving of maybe two API calls against a set that is normally 0-3 rows —
+# and it would answer a NARROWER question, since a hand-merge that landed in the
+# same five minutes released its dependents too. One code path, one behaviour to
+# reason about, and the cadence mark means this pass REPLACES the tick's rather
+# than being extra work.
+#
+# AFTER the outcome, and it can neither fail nor slow the merge: the ledger's
+# record of what was applied is the merge's own account of itself, and this is a
+# convenience on top of a deferral that was always going to expire on its own.
+def agent_merge_wake_deferrals(use_localhost:)
+  result = Agent::DependencyWake.sweep(use_localhost: use_localhost)
+  Agent::DependencyWake.mark_swept
+  return if result.woken.empty?
+
+  puts "  woke #{result.woken.map { |n| "ISS-#{n}" }.join(', ')} — every dependency they were deferred on has merged."
+rescue StandardError => e
+  # Named, not swallowed: the merge stands either way, and the daily expiry plus
+  # the tick's own sweep both still apply, but a fast path that quietly stopped
+  # working would look exactly like a fleet with nothing deferred.
+  warn "agent merge: merged, but the dependency wake did not run (#{e.class}: #{e.message}). " \
+       "The next sweep will pick it up."
 end
 
 # The other thing the lane can DO, and the one that is not a merge (ISS-769).
