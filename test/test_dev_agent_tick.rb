@@ -1372,15 +1372,18 @@ class TestDevAgentTick < Minitest::Test
     assert_empty seen[:snoozed]
   end
 
-  # A reopened issue accumulates fixes, and `dev issues fix` appends more after the
-  # fact. Reading only the newest would defer a dependent on a follow-up PR whose
-  # merge it never needed.
-  def test_any_merged_fix_clears_the_blocker_even_with_a_later_one_still_open
+  # ISS-1105, end to end through the dispatcher. One change spanning repos is
+  # closed out as one `--status fixed --url` plus a `dev issues fix --url` per
+  # sibling (ISS-759), so a merged url beside an open one is the NORMAL shape of a
+  # blocker whose code is only half on main. This used to dispatch on the merged
+  # one alone, and that is how ISS-1009 was started against an open PR.
+  def test_a_still_open_sibling_fix_defers_even_though_the_other_one_merged
     later = "https://github.com/mbryzek/devops/pull/400"
     seen = claim_one(body: "Wire the new lint into D4.", links: blocked_by,
                      blocker_issues: blocker_issue(fixes: [{ "url" => BLOCKER_PR }, { "url" => later }]),
                      prs: pr("MERGED").merge(pr("OPEN", url: later)))
-    assert seen[:spawned]
+    refute seen[:spawned], "half the blocker's code is still in an open PR"
+    assert_includes seen[:snoozed].first[:comment], later
   end
 
   # FAIL OPEN. `gh` missing, a rate limit, a url that names no PR — every unknown

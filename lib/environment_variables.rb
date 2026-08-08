@@ -54,12 +54,8 @@ class EnvironmentVariables
             next unless File.exist?(path)
             seen = true
             return [:locked, nil] if EnvRepo.locked?(path)
-            File.readlines(path).each do |line|
-                k, v = line.strip.split("=", 2)
-                next unless k.to_s.strip == key
-                value = v.to_s.strip
-                return [:present, value] unless value.empty?
-            end
+            value = EnvRepo.parse_var(File.read(path), key)
+            return [:present, value] unless value.nil?
         end
         seen ? [:missing, nil] : [:no_file, nil]
     end
