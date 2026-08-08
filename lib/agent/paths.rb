@@ -111,6 +111,25 @@ module Agent
     def ci_checkouts_dir  = File.join(state_dir, "ci-checkouts")
     def ci_checkout(repo) = File.join(ci_checkouts_dir, repo.to_s.tr("/", "-"))
 
+    # ---- the changelog's own copy of a released repo (ISS-911)
+    #
+    # `dev changelog` reads tags and commits out of a git repo, and it used to
+    # read them out of `~/code/<repo>` — a checkout NOBODY on a fleet runner
+    # fetches. Agent::Checkout deliberately fast-forwards only `~/code/devops`,
+    # and a session may not write outside its workspace, so capture ran against
+    # months-old tags on every runner and recorded nothing while exiting 0.
+    #
+    # A BARE MIRROR, not a working tree: every git read on that path is
+    # `tag --list`, `log -1 <tag>` and `log <a>..<b>`, all of which work in a
+    # bare repo, and a mirror is the one shape whose refs are exactly origin's.
+    #
+    # Under state_dir for the same reason ci_checkouts_dir is, with the same
+    # property: it is expensive (~17MB for the largest tracked repo) and it is
+    # still only a cache. Deleting it costs one re-clone, so "delete ~/.platform
+    # and lose nothing that is a source of truth" stays true.
+    def changelog_mirrors_dir  = File.join(state_dir, "changelog-mirrors")
+    def changelog_mirror(repo) = File.join(changelog_mirrors_dir, "#{repo.to_s.tr('/', '-')}.git")
+
     # A verify job's log tree, beside the issue logs and for the same reason: the
     # artifact has to outlive the process that produced it, because a red `ci`
     # status names this path and a human reads it hours later.
