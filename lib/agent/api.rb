@@ -19,6 +19,11 @@ module Agent
     # `dev issues` — /playbook/issue/leases, not /issue/leases.
     TENANT = "playbook".freeze
 
+    # One page of an issues list. The contract caps `limit` at 101 (platform
+    # spec/issues.json), so a caller that gets this many rows back has to assume
+    # there are more — the response is a bare array with no total.
+    ISSUES_PAGE_LIMIT = 100
+
     module_function
 
     def endpoint(use_localhost:)
@@ -296,6 +301,44 @@ module Agent
       body[:comment] = comment if comment && !comment.empty?
       request(:put, "/#{TENANT}/issues/#{number}/snooze",
               token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost, body: body)
+    end
+
+    # Clear an issue's snooze NOW, returning it to the queue at its unchanged
+    # status — the write `dev issues snooze --wake` and playbook-admin's "Wake
+    # now" button make, reached from the dispatcher by Agent::DependencyWake.
+    #
+    # Idempotent server-side: waking an issue that is not snoozed returns it
+    # unchanged rather than erroring, which is what makes the sweep safe to run
+    # on every runner at once — two boxes racing the same issue produce one wake.
+    #
+    # The platform writes its own timeline note ("Snooze cleared; back in the
+    # queue."); there is no body, so anything a caller wants to SAY about why is
+    # a separate `comment`.
+    def wake(number, use_localhost:)
+      request(:delete, "/#{TENANT}/issues/#{number}/snooze",
+              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost)
+    end
+
+    # Every issue currently DEFERRED and still workable: `open`, a unit of work
+    # rather than an epic, and snoozed into the future. The set Agent::
+    # DependencyWake sweeps, and normally 0-3 rows fleet-wide.
+    #
+    # `is_snoozed` is the load-bearing filter and it is the one that is easy to
+    # get wrong: omitted, the server returns snoozed AND awake issues, which here
+    # would be the whole open queue. `statuses` is plural for the same reason a
+    # singular `status=open` is silently ignored (see `issues_list_path` in
+    # bin/dev), and `types` keeps epics out — an epic is never claimed, so it is
+    # never dependency-deferred either.
+    #
+    # ONE PAGE, and the caller is told when it filled: the contract caps `limit`
+    # at 101 and the response is a bare array with no total, so a full page can
+    # neither carry everything nor say that it didn't. Paging is not worth it for
+    # a set this size; SAYING that the page filled is (ISS-889).
+    def snoozed_issues(use_localhost:, limit: ISSUES_PAGE_LIMIT)
+      params = { "statuses" => ["open"], "types" => ["issue"], "is_snoozed" => true,
+                 "limit" => limit, "offset" => 0 }
+      request(:get, "/#{TENANT}/issues?#{URI.encode_www_form(params)}",
+              token: ai_token(use_localhost: use_localhost), use_localhost: use_localhost) || []
     end
 
     # An ADDITIONAL fix url on an issue that has already shipped, leaving its

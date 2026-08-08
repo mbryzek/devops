@@ -5,6 +5,7 @@ require 'agent/ci'
 require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/dependency'
+require 'agent/dependency_wake'
 require 'agent/errors'
 require 'agent/escalation'
 require 'agent/gc'
@@ -115,19 +116,34 @@ module Agent
     # time (ISS-649). A day rather than an hour because the thing being waited on
     # is a human merging a PR, and rechecking that every tick would burn a lease
     # and a `gh` call every 30 seconds to learn the same thing.
+    #
+    # It is the CEILING on the wait rather than the wait itself since ISS-922:
+    # Agent::DependencyWake re-asks the same question every few minutes for the
+    # issues that are already deferred, so the ordinary case comes back within
+    # minutes of the merge and this is what covers the case where GitHub could
+    # not be read at all. Nothing about the argument above changed — that sweep
+    # is not the every-tick recheck rejected here, because it touches only the
+    # 0-3 issues currently parked and holds no lease.
     DEPENDENCY_DEFER_DAYS = 1
 
     # ...but not forever. On the seventh consecutive deferral the issue goes to
     # `needs_input` instead: a week of daily checks means the PR is not merely
     # unmerged, it is stuck, and a snoozed issue is invisible to both the queue
     # and the daily nudge while it waits.
+    #
+    # CONSECUTIVE is enforced by Agent::Dependency.defer_attempts, which resets
+    # the run at the last wake (ISS-922). Before that it was a running total, and
+    # once a deferral can be lifted early — so an issue can go blocked → cleared
+    # → dispatched → blocked again on a different PR — a total escalates on
+    # somebody else's history.
     DEPENDENCY_DEFER_LIMIT = 7
 
     # How a prior deferral is recognised on the timeline, which is where the
-    # attempt count is kept. Deliberately a marker in the comment rather than a
-    # field: the tracker has nowhere to store a per-issue dispatch counter, and a
-    # comment is what a human reads anyway.
-    DEPENDENCY_DEFER_MARKER = "Blocked on a dependency that has not merged".freeze
+    # attempt count is kept. Lives on Agent::Dependency since ISS-922, where the
+    # sweep that reads it also is; kept here as the name this file and the suite
+    # already use, so there is exactly one string and two ways to spell it —
+    # the same arrangement ERROR_ESCALATE_AT has with Agent::Escalation.
+    DEPENDENCY_DEFER_MARKER = Agent::Dependency::DEFER_MARKER
 
     # What `self_runner` answers when the fleet read FAILED, as distinct from the
     # nil it answers when the read succeeded and this machine was simply not in
@@ -510,6 +526,10 @@ module Agent
         return
       end
       reap(identity)
+      # BEFORE the claim, so an issue this pass wakes can be claimed in the same
+      # tick rather than 30 seconds later. It takes no lease and no capacity, so
+      # there is nothing for it to take from the claim behind it.
+      wake_dependency_deferrals
       claim(identity, self_runner(identity))
     rescue SessionExpired, ApiError => e
       log("work phase: platform error (#{e.message})")
@@ -1038,6 +1058,51 @@ module Agent
       Agent::Jobs.all.count { |r| Agent::Jobs.alive?(r["pid"]) } + Agent::Verify.live.length
     end
 
+    # ---- dependency deferrals (ISS-922) ----
+    #
+    # The other half of `defer_for_dependency`: an issue parked on an unmerged
+    # PR used to wait out a full day whatever GitHub did in the meantime, and
+    # most PRs in this fleet still merge by hand in GitHub's UI where nothing
+    # local sees them. This re-asks, every few minutes, for the issues that are
+    # already parked — see Agent::DependencyWake for why that is not the
+    # every-tick recheck DEPENDENCY_DEFER_DAYS rejects.
+    #
+    # Its own rescue rather than the phase's, and it records NOTHING: a sweep
+    # that cannot run costs latency on work that was going to come back on its
+    # own at the daily expiry, which is the same outcome this fleet had before
+    # any of it existed. Letting it reach `record_work_phase_crash` would let a
+    # convenience take down the reap and the claim behind it.
+    def wake_dependency_deferrals
+      return unless Agent::DependencyWake.due?(now: @now)
+
+      result = Agent::DependencyWake.sweep(use_localhost: @use_localhost, dry_run: @dry_run)
+      # Marked even on a pass that woke nothing — the cadence is about how often
+      # the question is ASKED, and a pass that found nothing must not re-ask 30
+      # seconds later.
+      Agent::DependencyWake.mark_swept(now: @now) unless @dry_run
+      # NAMED rather than silently dropped, for the reason the verify cap is: a
+      # bound nobody can see reads as "everything was covered".
+      decide("dependency", "#{result.dropped} more deferred issue(s) left for the next pass " \
+                           "(cap #{Agent::DependencyWake::CANDIDATE_CAP})") if result.dropped.positive?
+      decide("dependency", "the snoozed-issue page filled — there may be deferred issues this pass did not see") if result.truncated
+      # A pass that changed nothing is a LOG line and not a decision: it happens
+      # every five minutes forever, and "still blocked" is the steady state this
+      # sweep exists to sit in. It is written anyway, because a sweep that
+      # silently examines nothing is indistinguishable from a healthy quiet
+      # fleet, and the symptom of that is a day of latency nobody attributes.
+      log("dependency wake: #{result.examined} deferral(s) examined, #{result.woken.length} woken, " \
+          "#{result.skipped.length} snoozed for other reasons")
+      decide("dependency", "#{result.failed.map { |n| "ISS-#{n}" }.join(', ')} — dependency merged, but the " \
+                           "platform refused the wake; the #{DEPENDENCY_DEFER_DAYS}-day deferral still applies") if result.failed.any?
+      return if result.woken.empty?
+
+      decide("dependency", "#{result.woken.map { |n| "ISS-#{n}" }.join(', ')} — " \
+                           "#{@dry_run ? 'would be woken' : 'dependency merged, woken'} ahead of the " \
+                           "#{DEPENDENCY_DEFER_DAYS}-day deferral")
+    rescue StandardError => e
+      log("dependency wake: sweep failed (#{e.class}: #{e.message}) — the deferrals expire on their own")
+    end
+
     # ---- verify jobs (ISS-848) ----
     #
     # The second unit of work the tick schedules, and deliberately NOT a Claude
@@ -1365,7 +1430,7 @@ module Agent
     # and undeferred is the one outcome that spins.
     def defer_for_dependency(lease, identity, number, unshipped, comments)
       reasons = Agent::Dependency.describe(unshipped)
-      attempt = comments.count { |c| c["body"].to_s.include?(DEPENDENCY_DEFER_MARKER) } + 1
+      attempt = Agent::Dependency.defer_attempts(comments) + 1
       if attempt >= DEPENDENCY_DEFER_LIMIT
         return escalate_stalled_dependency(lease, identity, number, reasons, attempt)
       end

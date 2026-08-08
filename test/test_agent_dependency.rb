@@ -170,4 +170,122 @@ class TestAgentDependency < Minitest::Test
                            prs: { URL => pr(state: "SOMETHING_NEW") })
     assert_empty unshipped(issue_with_blocker, blocker: fixed_blocker(URL), prs: { URL => pr(state: nil) })
   end
+
+  # ---- ISS-922: `cleared?`, the same question asked from the other side ----
+  #
+  # `unshipped` decides whether to DISPATCH and fails open, so every unknown
+  # answers []. `cleared?` decides whether to WAKE an issue already parked, and
+  # inverting [] would turn a `gh` blip into a fleet-wide unsnooze. These cases
+  # are the ones where the two must disagree.
+
+  def cleared?(issue, blocker: nil, prs: {})
+    stub_singleton(Agent::Api, :issue, lambda { |*, **|
+      raise ApiError, "500 from the platform" if blocker == :error
+      blocker
+    }) do
+      stub_singleton(Agent::Github, :pr_by_url, ->(url) { prs[url] }) do
+        Agent::Dependency.cleared?(issue, use_localhost: false)
+      end
+    end
+  end
+
+  def test_a_merged_fix_clears_the_deferral
+    assert cleared?(issue_with_blocker, blocker: fixed_blocker(URL), prs: { URL => pr(state: "MERGED") })
+  end
+
+  def test_an_open_fix_does_not_clear_the_deferral
+    refute cleared?(issue_with_blocker, blocker: fixed_blocker(URL), prs: { URL => pr })
+  end
+
+  # The whole safety argument. Every one of these dispatches through `unshipped`
+  # by design; none of them is evidence of a merge, so none of them wakes.
+  def test_every_unknown_leaves_the_deferral_in_place
+    { "an unreachable github" => [fixed_blocker(URL), { URL => nil }],
+      "an unreadable blocker" => [nil, {}],
+      "a blocker read that raised" => [:error, {}],
+      "a fix that is a document" => [{ "fixes" => [{ "url" => "https://github.com/mbryzek/claude/blob/main/plans/x.md" }] }, {}],
+      "no fix recorded at all" => [{ "fixes" => [] }, {}],
+      "an unrecognised pr state" => [fixed_blocker(URL), { URL => pr(state: "SOMETHING_NEW") }] }
+      .each do |label, (blocker, prs)|
+      assert_empty unshipped(issue_with_blocker, blocker: blocker, prs: prs),
+                   "#{label} must still DISPATCH — the gate fails open"
+      refute cleared?(issue_with_blocker, blocker: blocker, prs: prs),
+             "#{label} is not evidence of a merge, so it must not wake a deferral"
+    end
+  end
+
+  # A merge found anywhere in the fix list is a merge, even beside a url `gh`
+  # could not read: the unreadable one is one absent piece of evidence, not a
+  # contradiction of the one that IS positive.
+  def test_a_merged_fix_beside_an_unreadable_one_still_clears
+    assert cleared?(issue_with_blocker, blocker: fixed_blocker(URL, OTHER_URL),
+                    prs: { URL => pr(state: "MERGED"), OTHER_URL => nil })
+  end
+
+  # A blocker still being worked has nothing merged to find, whatever GitHub says.
+  def test_a_live_blocker_never_clears
+    refute cleared?(issue_with_blocker(status: "claimed"))
+  end
+
+  # Nobody is ever going to ship it, so there is no merge to wait for — the one
+  # place this agrees with the tracker's status by itself.
+  def test_a_dismissed_blocker_clears
+    assert cleared?(issue_with_blocker(status: "dismissed"))
+  end
+
+  # What `dev issues block --remove` leaves behind, which is exactly what the
+  # escalation note asks a human to produce.
+  def test_an_issue_whose_edge_was_removed_clears
+    assert cleared?({ "number" => "644", "links" => [] })
+  end
+
+  # EVERY blocker, not any: one still-open fix holds the issue even when the
+  # other merged.
+  def test_one_unmerged_blocker_among_several_holds_the_deferral
+    issue = { "number" => "644",
+              "links" => [{ "type" => "blocked_by", "direction" => "outgoing",
+                            "issue" => { "number" => 633, "status" => "fixed" } },
+                          { "type" => "blocked_by", "direction" => "outgoing",
+                            "issue" => { "number" => 634, "status" => "claimed" } }] }
+    refute cleared?(issue, blocker: fixed_blocker(URL), prs: { URL => pr(state: "MERGED") })
+  end
+
+  # ---- ISS-922: the attempt count is CONSECUTIVE, not a running total ----
+
+  def defer(n = 1) = Array.new(n) { { "body" => "Snoozed until whenever. #{Agent::Dependency::DEFER_MARKER} — attempt x of 7." } }
+  def wake_note = { "body" => "#{Agent::Dependency::WAKE_MARKER}.\n\nEverything landed." }
+  def platform_wake = { "body" => "#{Agent::Dependency::PLATFORM_WAKE_MARKER}." }
+
+  def test_deferrals_accumulate_while_an_issue_stays_blocked
+    assert_equal 0, Agent::Dependency.defer_attempts([])
+    assert_equal 3, Agent::Dependency.defer_attempts(defer(3))
+  end
+
+  # The escalation means "a week of daily checks has not cleared it". An issue
+  # that WAS cleared, dispatched, and later blocked again on a different PR is
+  # not that, and a running total would push it to needs_input on history that
+  # is no longer about anything.
+  def test_a_wake_resets_the_run
+    assert_equal 1, Agent::Dependency.defer_attempts(defer(4) + [wake_note] + defer(1))
+    assert_equal 0, Agent::Dependency.defer_attempts(defer(4) + [wake_note])
+  end
+
+  # A human clearing the snooze by hand — `dev issues snooze --wake`, or the
+  # button in playbook-admin — ends the run for the same reason, and it is the
+  # note the platform writes on the sweep's own DELETE too.
+  def test_the_platforms_own_wake_note_resets_the_run
+    assert_equal 2, Agent::Dependency.defer_attempts(defer(5) + [platform_wake] + defer(2))
+  end
+
+  # Only the LAST wake, and only what came after it.
+  def test_only_the_most_recent_wake_counts
+    comments = defer(2) + [wake_note] + defer(3) + [platform_wake] + defer(1)
+    assert_equal 1, Agent::Dependency.defer_attempts(comments)
+  end
+
+  # Unrelated chatter between a wake and the next deferral changes nothing.
+  def test_other_comments_are_ignored
+    comments = defer(1) + [{ "body" => "Claimed by Mac." }, wake_note, { "body" => nil }] + defer(2)
+    assert_equal 2, Agent::Dependency.defer_attempts(comments)
+  end
 end

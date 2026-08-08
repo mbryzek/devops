@@ -107,6 +107,13 @@ module Agent
     # decided here rather than by launchd.
     def verify_scan_file = File.join(state_dir, "verify-scan.json")
 
+    # When this machine last re-asked whether a deferred issue's dependency has
+    # merged (Agent::DependencyWake, ISS-922). The same kind of throttle, for the
+    # same reason: the sweep is worth running every few minutes and would be
+    # pure waste at the tick's own 30 seconds. Losing the file costs one extra
+    # pass, which is why it needs no more durability than this.
+    def dependency_wake_file = File.join(state_dir, "dependency-wake.json")
+
     # Where a repo is checked out to BUILD it — never a session's workspace, or
     # the green measures a tree nobody is merging.
     #
