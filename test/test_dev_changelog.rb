@@ -236,31 +236,66 @@ end
 class TestChangelogCaptureGap < Minitest::Test
   def scan(tags: 375, **rest) = { app: "playbook-admin", tags: tags, **rest }
 
+  def gap(recorded, **rest) = changelog_gap_message(changelog_capture_diff(scan(**rest), recorded))
+
   def test_no_gap_when_the_counts_agree
-    assert_nil changelog_capture_gap(scan, 375)
+    assert_nil changelog_capture_diff(scan, 375)
+    assert_nil gap(375)
   end
 
   def test_reports_releases_the_server_is_missing
-    assert_equal "is missing 4 release(s)", changelog_capture_gap(scan, 371)
+    assert_equal 4, changelog_capture_diff(scan, 371)
+    assert_equal "is missing 4 release(s)", gap(371)
   end
 
   # The other direction is real too: a tag deleted locally, or a recorded release whose tag is gone.
+  # The SIGN is what the exit status reads, so assert it and not only the sentence.
   def test_reports_releases_git_does_not_have
-    assert_equal "has 2 release(s) not in git", changelog_capture_gap(scan, 377)
+    assert_equal(-2, changelog_capture_diff(scan, 377))
+    assert_equal "has 2 release(s) not in git", gap(377)
   end
 
   # A platform that predates release_count returns nothing here. Reading that as zero would
   # report every tag as missing on every run -- a false alarm is worse than no check.
   def test_an_absent_count_is_not_zero
-    assert_nil changelog_capture_gap(scan, nil)
+    assert_nil gap(nil)
   end
 
   def test_an_app_with_no_tags_is_not_compared
-    assert_nil changelog_capture_gap(scan(tags: 0), 5)
+    assert_nil gap(5, tags: 0)
   end
 
   def test_a_skipped_app_is_not_compared
-    assert_nil changelog_capture_gap(scan(skipped: "no checkout"), 0)
+    assert_nil gap(0, skipped: "no checkout")
+  end
+end
+
+# WHICH gap fails the command, and which only warns (ISS-911).
+#
+# The asymmetry is the whole point: posting releases can only raise the server's
+# count, so a re-read racing the write reads SHORT. A positive gap therefore has a
+# benign explanation and a negative one does not.
+class TestChangelogCaptureFailures < Minitest::Test
+  def scan(**rest) = { app: "playbook-admin", tags: 375, new: 0, **rest }
+
+  def test_a_clean_capture_fails_nothing
+    assert_empty changelog_capture_failures([scan(diff: nil)])
+  end
+
+  def test_a_repo_that_could_not_be_read_fails
+    failures = changelog_capture_failures([scan(skipped: "unavailable, fetch: fatal: no such host")])
+    assert_equal ["playbook-admin: unavailable, fetch: fatal: no such host"], failures
+  end
+
+  # The ISS-911 condition itself: the cursor is unknown, so capture resends every tag
+  # it has and prints a large number while recording nothing new.
+  def test_a_server_ahead_of_the_repo_fails
+    failures = changelog_capture_failures([scan(diff: -7, gap: "has 7 release(s) not in git")])
+    assert_equal ["playbook-admin: server has 7 release(s) not in git (375 tag(s) in git)"], failures
+  end
+
+  def test_a_server_behind_the_repo_only_warns
+    assert_empty changelog_capture_failures([scan(diff: 2, gap: "is missing 2 release(s)")])
   end
 end
 
@@ -300,8 +335,20 @@ class TestDevChangelogBuild < Minitest::Test
     @missing = %w[]
     @entries_by_version = {}
     @commits_by_version = Hash.new { [] }
+    @sync_error = nil
+    reset_changelog_ops!
     stub_world!
   end
+
+  # The ops accumulator is a process-global (bin/dev is `load`ed once for the whole
+  # suite), so one test's counts would otherwise show up in the next one's marker.
+  def reset_changelog_ops!
+    %i[@changelog_ops_summary @changelog_ops_effects].each do |name|
+      Object.send(:remove_instance_variable, name) if Object.instance_variable_defined?(name)
+    end
+  end
+
+  attr_accessor :sync_error
 
   def teardown
     FileUtils.remove_entry(@checkout)
@@ -344,6 +391,8 @@ class TestDevChangelogBuild < Minitest::Test
     end
     checkout = @checkout
     stub_global_for_test(:changelog_app_checkout) { |_app| checkout }
+    test = self
+    stub_global_for_test(:changelog_sync_checkout) { |_app| test.sync_error }
 
     stub_global_for_test(:changelog_post_batches) do |_endpoint, path, _key, records|
       posted << [path, records]
@@ -434,6 +483,17 @@ class TestDevChangelogBuild < Minitest::Test
     assert_includes out, "nothing to build"
     assert_empty @posted
   end
+
+  # ISS-911, the build half. A repo it cannot read produced no pending versions and
+  # therefore "nothing to build" -- the one sentence a human reads as finished.
+  def test_a_repo_that_cannot_be_read_fails_the_build
+    pending_version("0.3.0", "2026-07-20T14:00:00-04:00")
+    @sync_error = "fetch: fatal: could not read from remote repository"
+    err, = capture_stderr_and_exit { cmd_changelog_build(["--app", "playbook-admin"]) }
+    assert_includes err, "1 version(s) of playbook-admin need notes"
+    assert_includes err, "could not read from remote repository"
+    assert_empty posted_notes
+  end
 end
 
 # The wiring around changelog_capture_gap: capture has to re-read the count AFTER sending,
@@ -449,7 +509,17 @@ class TestDevChangelogCapture < Minitest::Test
     @tags = %w[0.3.0 0.3.1 0.3.2]
     @max_version = nil
     @release_count = 0
+    @sync_error = nil
+    reset_changelog_ops!
     stub_world!
+  end
+
+  # The ops accumulator is a process-global (bin/dev is `load`ed once for the whole
+  # suite), so one test's counts would otherwise show up in the next one's marker.
+  def reset_changelog_ops!
+    %i[@changelog_ops_summary @changelog_ops_effects].each do |name|
+      Object.send(:remove_instance_variable, name) if Object.instance_variable_defined?(name)
+    end
   end
 
   def teardown
@@ -457,6 +527,7 @@ class TestDevChangelogCapture < Minitest::Test
   end
 
   attr_reader :tags, :max_version, :release_count
+  attr_accessor :sync_error
 
   def record_status_read = @status_reads += 1
 
@@ -467,6 +538,7 @@ class TestDevChangelogCapture < Minitest::Test
     stub_global_for_test(:platform_endpoint) { |_localhost| { name: "test" } }
     stub_global_for_test(:changelog_app_repo) { |_app| "playbook-admin" }
     stub_global_for_test(:changelog_app_checkout) { |_app| checkout }
+    stub_global_for_test(:changelog_sync_checkout) { |_app| test.sync_error }
     stub_global_for_test(:changelog_tags) { |_checkout| test.tags.dup }
     stub_global_for_test(:changelog_commits) { |_checkout, _range| [] }
     stub_global_for_test(:changelog_git_out) { |*_cmd| "2026-07-20T14:00:00-04:00" }
@@ -485,6 +557,24 @@ class TestDevChangelogCapture < Minitest::Test
 
   def capture
     capture_io { cmd_changelog_capture(["--app", "playbook-admin"]) }
+  end
+
+  def with_env(pairs)
+    original = pairs.keys.to_h { |k| [k, ENV[k]] }
+    pairs.each { |k, v| ENV[k] = v }
+    yield
+  ensure
+    original.each { |k, v| ENV[k] = v }
+  end
+
+  # A failing capture still prints its scan lines. Swallow them so the suite's own
+  # output stays readable; the assertions are on stderr and the exit status.
+  def capture_failure(&block)
+    original = $stdout
+    $stdout = StringIO.new
+    capture_stderr_and_exit(&block)
+  ensure
+    $stdout = original
   end
 
   # Without the re-read the count would be short by exactly what this run just sent, and a
@@ -525,5 +615,153 @@ class TestDevChangelogCapture < Minitest::Test
     out, err = capture
     refute_includes out, "SERVER"
     assert_empty err
+  end
+
+  # --- ISS-911: the conditions that must not exit 0 -------------------------------
+
+  # A repo capture could not read captured nothing for it, by construction.
+  def test_a_repo_that_cannot_be_read_fails_the_command
+    @sync_error = "fetch: fatal: could not read from remote repository"
+    err, status = capture_failure { cmd_changelog_capture(["--app", "playbook-admin"]) }
+    refute_nil status, "capture must not exit 0 when it could not read the repo"
+    assert_includes err, "changelog capture did not capture"
+    assert_includes err, "could not read from remote repository"
+    assert_empty @posted, "nothing may be sent for a repo that was never read"
+  end
+
+  # THE ISS-911 SHAPE. The server's cursor is not in the tag list, so
+  # changelog_new_releases falls back to resending everything: 3 sent, 0 recorded,
+  # and before this it exited 0 having captured nothing.
+  def test_a_server_ahead_of_the_repo_fails_the_command
+    @max_version = "0.3.9"
+    @release_count = 5
+    err, status = capture_failure { cmd_changelog_capture(["--app", "playbook-admin"]) }
+    refute_nil status, "capture must not exit 0 when the server holds releases git has no tag for"
+    assert_includes err, "server has 2 release(s) not in git (3 tag(s) in git)"
+  end
+
+  # The other direction stays a warning: posting can only RAISE the server's count,
+  # so a re-read racing the write is short, and failing on it would return a healthy
+  # issue to the queue three times and then wake somebody up.
+  def test_a_server_behind_the_repo_only_warns
+    _out, err = capture
+    assert_includes err, "playbook-admin is missing 3 release(s)"
+  end
+
+  # The executor classifies an ops run from what the OPERATION printed. A capture
+  # that emitted nothing is indistinguishable from a session that never ran one.
+  def test_it_emits_what_it_did_for_an_ops_run
+    @max_version = "0.3.2"
+    @release_count = 3
+    with_env(Agent::Ops::LISTENER_ENV => "1") do
+      out, = capture
+      report = out.lines.find { |l| l.start_with?(Agent::Ops::MARKER) }
+      refute_nil report, "capture must emit an ops result inside an ops run"
+      payload = JSON.parse(report.sub(Agent::Ops::MARKER, ""))
+      assert_equal 0, payload["effects"]["sent"]
+      assert_equal 1, payload["effects"]["apps"]
+      assert_equal 0, payload["effects"]["unavailable"]
+    end
+  end
+
+  # Ops keeps the LAST marker, and `dev changelog` runs both halves in one process.
+  # Two independent emits would therefore drop the capture counts — the numbers this
+  # whole issue is about — on the ordinary invocation.
+  def test_the_full_pipeline_emits_a_running_total
+    @max_version = "0.3.2"
+    @release_count = 3
+    with_env(Agent::Ops::LISTENER_ENV => "1") do
+      out, = capture_io { cmd_changelog_all(["--app", "playbook-admin"]) }
+      markers = out.lines.select { |l| l.start_with?(Agent::Ops::MARKER) }
+      assert_equal 2, markers.length
+      payload = JSON.parse(markers.last.sub(Agent::Ops::MARKER, ""))
+      assert_equal 1, payload["effects"]["apps"], "the build's marker must still carry the capture counts"
+      assert_equal 0, payload["effects"]["built"]
+      assert_includes payload["summary"], "captured 0 new release(s)"
+      assert_includes payload["summary"], "Nothing to build."
+    end
+  end
+end
+
+# The mirror itself, against a real local origin: capture's whole job is reading
+# tags out of a repo NOBODY ELSE FETCHES, so the fetch is the part worth exercising
+# for real rather than stubbing (ISS-911).
+class TestChangelogMirror < Minitest::Test
+  include DevTestSupport
+
+  def setup
+    @root = Dir.mktmpdir("changelog-mirror")
+    @origin = File.join(@root, "origin")
+    @state = File.join(@root, "state")
+    git_init_origin
+    ENV["DEV_AGENT_STATE_DIR"] = @state
+    origin = @origin
+    stub_global_for_test(:changelog_app_repo) { |_app| "playbook-admin" }
+    stub_global_for_test(:changelog_repo_url) { |_repo| origin }
+  end
+
+  def teardown
+    ENV.delete("DEV_AGENT_STATE_DIR")
+    FileUtils.remove_entry(@root)
+  end
+
+  def git(*args, dir: @origin)
+    out, status = Open3.capture2e("git", "-C", dir, *args)
+    raise "git #{args.join(' ')} failed: #{out}" unless status.success?
+    out
+  end
+
+  def git_init_origin
+    FileUtils.mkdir_p(@origin)
+    Open3.capture2e("git", "init", "-q", "-b", "main", @origin)
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    commit_tag("0.0.1")
+  end
+
+  def commit_tag(tag)
+    File.write(File.join(@origin, "f.txt"), tag)
+    git("add", "f.txt")
+    git("commit", "-q", "-m", "release #{tag}")
+    git("tag", tag)
+  end
+
+  def mirror = changelog_app_checkout("playbook-admin")
+
+  def test_clones_on_first_use_and_picks_up_later_tags
+    assert_nil changelog_sync_checkout("playbook-admin")
+    assert_equal %w[0.0.1], changelog_tags(mirror)
+
+    # The regression: a tag pushed after the first sync has to be visible on the next
+    # one. This is exactly what ~/code/<repo> never did on a runner.
+    commit_tag("0.0.2")
+    assert_nil changelog_sync_checkout("playbook-admin")
+    assert_equal %w[0.0.1 0.0.2], changelog_tags(mirror)
+  end
+
+  # A bare mirror, not a working tree: every git read capture and build make has to
+  # work against it.
+  def test_the_mirror_serves_commits_and_dates
+    changelog_sync_checkout("playbook-admin")
+    commit_tag("0.0.2")
+    changelog_sync_checkout("playbook-admin")
+    refute_empty changelog_git_out("-C", mirror, "log", "-1", "--format=%cI", "0.0.2").strip
+    subjects = changelog_commits(mirror, "0.0.1..0.0.2").map { |c| c["subject"] }
+    assert_equal ["release 0.0.2"], subjects
+  end
+
+  # A killed clone leaves a directory that looks like a mirror and fetches forever.
+  # One re-clone recovers it; without that, every later run fails on the same corpse.
+  def test_a_corrupt_mirror_is_recloned
+    FileUtils.mkdir_p(File.join(mirror, "objects"))
+    assert_nil changelog_sync_checkout("playbook-admin")
+    assert_equal %w[0.0.1], changelog_tags(mirror)
+  end
+
+  def test_an_unreachable_origin_reports_rather_than_raising
+    stub_global_for_test(:changelog_repo_url) { |_repo| File.join(@root, "nope") }
+    error = changelog_sync_checkout("playbook-admin")
+    refute_nil error, "an origin that does not exist must be reported"
+    assert_includes error, "clone:"
   end
 end

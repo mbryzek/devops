@@ -39,12 +39,16 @@ require 'depsguard'
 # The autonomous dispatcher (`dev agent`). Split into lib/agent/* rather than
 # inlined here because the pieces that decide anything — schedule due-ness,
 # outcome classification, retention — are pure functions that get real tests.
+require 'agent/checkout'
 require 'agent/ci'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/maintenance'
 require 'agent/merge_lane'
 require 'agent/ops'
+require 'agent/paths'
+require 'agent/shell'
+require 'agent/workspace'
 require 'agent/processes'
 require 'agent/tick'
 require 'agent/claude_config'
@@ -1053,8 +1057,13 @@ USAGE = <<~USAGE
         git tags (playbook-admin, playbook-app, playbook-www) and records every release
         past the server's max_version, with all commits since the previous tag —
         idempotent, so it both records new releases and backfills history. Repeat --app to scope;
-        default is all tracked apps. Runs automatically (best-effort) at the end of
-        `release`; never blocks a release.
+        default is all tracked apps.
+
+        Tags come from a bare MIRROR of origin that this command clones and fetches
+        itself (~/.platform/changelog-mirrors), never from ~/code/<repo>: nothing on a
+        fleet runner fetches a top-level checkout, so reading one captured months-old
+        tags and still exited 0 (ISS-911). A repo it cannot fetch, or a server holding
+        releases the repo has no tag for, now exits non-zero.
 
     #{INVOCATIONS["changelog build"]}
         Turn the raw commits of each recorded release into curated notes via a headless
@@ -11873,8 +11882,87 @@ def changelog_claude_timeout_secs(version_count)
   [[20 * 60, 5 * 60 * version_count].max, 60 * 60].min
 end
 
+# Where capture and build read an app's tags and commits from.
+#
+# A MIRROR THIS COMMAND OWNS AND FETCHES, never `~/code/<repo>` (ISS-911). The
+# old path assumed the machine running `dev changelog` was the machine that had
+# just pushed the tags, which was true while this ran at the end of a release and
+# stopped being true the moment ISS-816 moved it onto the fleet. Nothing fetches
+# a top-level checkout on a runner — Agent::Checkout fast-forwards `~/code/devops`
+# and nothing else, deliberately — so capture read months-old tags, found nothing
+# past the cursor it recognized, and exited 0. Worse, a runner that has no
+# `~/code/<repo>` at all skipped the app entirely with a warning.
+#
+# Reading from origin instead of from whatever a machine happens to have is also
+# the only version of this that is MACHINE-INDEPENDENT: capture posts to a shared
+# server, so the only tags that can matter are the pushed ones, and every runner
+# now computes the same answer.
 def changelog_app_checkout(app)
-  File.expand_path("~/code/#{changelog_app_repo(app)}")
+  Agent::Paths.changelog_mirror(changelog_app_repo(app))
+end
+
+# How long ONE git call against a mirror may take. A full mirror clone of the
+# largest tracked repo measures ~2s on a runner and a fetch is a fraction of
+# that, so this is ~100x the real cost — generous on purpose, because what it
+# bounds is a hung network read rather than a slow one. Unbounded is the one
+# option that is wrong: `dev changelog` runs inside `dev agent run-op`, whose own
+# deadline would then fire with no way to say which repo wedged it.
+CHANGELOG_MIRROR_TIMEOUT_SECONDS = 300
+
+# Nothing on this path may block on a credential prompt. `dev changelog` runs
+# unattended inside an ops run, and a git that sits waiting for a password nobody
+# is there to type is the hang Agent::Shell's deadline exists to convert into a
+# report — but a report of a timeout is a much worse diagnosis than "auth failed".
+CHANGELOG_GIT_ENV = {
+  "GIT_TERMINAL_PROMPT" => "0",
+  "GIT_SSH_COMMAND" => "ssh -oBatchMode=yes",
+  "GIT_ASKPASS" => "/usr/bin/true",
+}.freeze
+
+# Bring `app`'s mirror up to date with origin, cloning it on first use.
+# Returns nil when the mirror is current, or a one-line reason it is not.
+#
+# A fetch that fails gets exactly one shot at recovery by re-cloning from scratch,
+# in the same spirit as Agent::Checkout's `fetch + reset --hard`: the thing being
+# recovered is a cache with no local state worth keeping, and the realistic cause
+# is a directory a killed run left half-written — which every later fetch, and
+# every later clone-into-a-non-empty-directory, would keep failing on forever.
+def changelog_sync_checkout(app)
+  repo = changelog_app_repo(app)
+  dir = changelog_app_checkout(app)
+  if File.directory?(File.join(dir, "objects"))
+    error = changelog_git_bounded("fetch", "-C", dir, "fetch", "--prune", "origin")
+    return nil if error.nil?
+  end
+  FileUtils.rm_rf(dir) if changelog_mirror_path?(dir)
+  FileUtils.mkdir_p(File.dirname(dir))
+  changelog_git_bounded("clone", "clone", "--mirror", changelog_repo_url(repo), dir)
+end
+
+# Owner-qualified https, not `gh repo clone`: gh does post-clone setup (remote
+# rewriting for forks) that a bare mirror has no working tree to receive, and the
+# credential helper it installs answers a plain `git clone` just as well.
+def changelog_repo_url(repo) = "https://github.com/#{Agent::Workspace::OWNER}/#{repo}.git"
+
+# rm -rf runs unattended here, so the target is PROVEN to be under the mirror
+# root rather than assumed to be — same guard, and the same reason, as
+# Agent::Workspace.delete.
+def changelog_mirror_path?(dir)
+  File.expand_path(dir).start_with?("#{Agent::Paths.changelog_mirrors_dir}/")
+end
+
+# nil on success, or "<label>: <git's own diagnosis>". `label` rather than the
+# argv, because the argv is mostly an absolute path and the operator-facing line
+# needs the verb.
+def changelog_git_bounded(label, *args)
+  result = Agent::Shell.capture("git", *args, timeout: CHANGELOG_MIRROR_TIMEOUT_SECONDS,
+                                env: CHANGELOG_GIT_ENV)
+  return nil if result.ok?
+  reason = result.timed_out? ? "timed out after #{CHANGELOG_MIRROR_TIMEOUT_SECONDS}s"
+                             : Agent::Checkout.first_error_line(result.output)
+  "#{label}: #{reason}"
+rescue Errno::ENOENT => e
+  "#{label}: #{e.message}"
 end
 
 # The GitHub repo backing a changelog app. They match today, but a deployable can be
@@ -12045,14 +12133,20 @@ def cmd_changelog_capture(args)
     sent = 0
     scans = []
     apps.each do |app|
-      checkout = changelog_app_checkout(app)
       scan = { app: app, repo: changelog_app_repo(app), tags: 0, new: 0, latest: nil }
       scans << scan
-      unless Dir.exist?(File.join(checkout, ".git"))
-        scan[:skipped] = "skipped, no checkout at #{checkout}"
-        warn "changelog: skipping #{app} (no checkout at #{checkout})"
+      # Before anything is read. A mirror that cannot be made current is the
+      # ISS-911 condition itself, and it is now a FAILURE rather than a warning:
+      # capture that could not read the repo has, by construction, not captured
+      # anything, and saying so with an exit status is the only thing an ops run
+      # can hear.
+      unavailable = changelog_sync_checkout(app)
+      if unavailable
+        scan[:skipped] = "unavailable, #{unavailable}"
+        warn "changelog: cannot read #{app} — #{unavailable}"
         next
       end
+      checkout = changelog_app_checkout(app)
       tags = changelog_tags(checkout)
       scan[:tags] = tags.length
       scan[:latest] = tags.last
@@ -12064,13 +12158,76 @@ def cmd_changelog_capture(args)
     # Re-read after sending, or every count would be short by exactly what this run just
     # recorded and a clean capture would report a gap.
     status = changelog_status(endpoint) if sent.positive?
-    scans.each { |s| s[:gap] = changelog_capture_gap(s, status.dig(s[:app], "release_count")) }
+    scans.each do |s|
+      s[:diff] = changelog_capture_diff(s, status.dig(s[:app], "release_count"))
+      s[:gap] = changelog_gap_message(s[:diff])
+    end
 
     puts "changelog capture: sent #{sent} release(s) from #{scans.length} app(s)"
     scans.each { |s| puts changelog_capture_scan_line(s) }
     scans.select { |s| s[:gap] }.each do |s|
       warn "changelog: #{s[:app]} #{s[:gap]} -- re-capture with the missing tags present locally"
     end
+
+    changelog_capture_emit(sent, scans)
+    failures = changelog_capture_failures(scans)
+    return if failures.empty?
+    Util.exit_with_error("changelog capture did not capture:\n#{failures.map { |f| "  #{f}" }.join("\n")}")
+  end
+end
+
+# What this capture DID, for the executor rather than for a human (ISS-815).
+# Unconditional, including the zero state the lines above are deliberately quiet
+# about: a `dev agent run-op changelog-<app>` record with no summary is exactly
+# the "sent 438 release(s), captured nothing" run that ISS-911 was filed over,
+# and the counts are what tell it apart from a real one.
+def changelog_capture_emit(sent, scans)
+  changelog_ops_emit(
+    "captured #{scans.sum { |s| s[:new].to_i }} new release(s) across " \
+    "#{scans.count { |s| !s[:skipped] }} of #{scans.length} app(s); sent #{sent}.",
+    "sent" => sent, "new" => scans.sum { |s| s[:new].to_i },
+    "apps" => scans.length, "unavailable" => scans.count { |s| s[:skipped] },
+    "gaps" => scans.count { |s| s[:gap] },
+  )
+end
+
+# ONE ops marker for the WHOLE pipeline, re-emitted with a running total.
+#
+# `dev changelog` with no subcommand runs capture and then build in a single
+# process, and Agent::Ops keeps the LAST marker it sees — so two independent
+# emits would silently drop the capture counts, which are precisely the numbers
+# ISS-911 was filed over. Accumulating instead means each of `capture`, `build`
+# and the full pipeline reports everything that actually ran in it.
+def changelog_ops_emit(summary, effects)
+  @changelog_ops_summary = [*@changelog_ops_summary, summary]
+  @changelog_ops_effects = (@changelog_ops_effects || {}).merge(effects)
+  Agent::Ops.emit(summary: @changelog_ops_summary.join(" "), effects: @changelog_ops_effects)
+end
+
+# The conditions under which capture must NOT exit 0, one line each.
+#
+# Two, and the asymmetry between the gap directions is deliberate:
+#
+#   unavailable   The repo could not be read at all, so nothing was captured
+#                 for it. Retryable — a transient fetch failure is exactly what
+#                 a re-run fixes — and after GIVE_UP_AFTER_FAILURES the executor
+#                 turns it into a question for a human rather than a loop.
+#   NEGATIVE gap  The server holds releases this repo has no tag for. Against a
+#                 mirror of origin that means a deleted tag, and it is the
+#                 condition under which `changelog_new_releases` silently falls
+#                 back to resending every tag it has — the run that prints "sent
+#                 438 release(s)" and records nothing.
+#
+# A POSITIVE gap stays a warning, and that is not timidity. Posting releases can
+# only ever RAISE the server's count, so a re-read racing the write is short, not
+# long: the positive direction has a benign explanation and the negative one does
+# not. Failing on a race would return a healthy issue to the queue three times
+# and then wake somebody up.
+def changelog_capture_failures(scans)
+  scans.filter_map do |s|
+    next "#{s[:app]}: #{s[:skipped]}" if s[:skipped]
+    next "#{s[:app]}: server #{s[:gap]} (#{s[:tags]} tag(s) in git)" if s[:diff]&.negative?
+    nil
   end
 end
 
@@ -12082,10 +12239,18 @@ end
 #
 # A nil count is "the server did not say", not zero: a platform that predates release_count
 # would otherwise report every tag as missing. Silence beats a false alarm.
-def changelog_capture_gap(scan, recorded)
+#
+# The SIGN is kept rather than folded straight into a sentence, because the two
+# directions do not mean the same thing to the exit status — see
+# changelog_capture_failures.
+def changelog_capture_diff(scan, recorded)
   return nil if scan[:skipped] || recorded.nil? || scan[:tags].zero?
   diff = scan[:tags] - recorded.to_i
-  return nil if diff.zero?
+  diff.zero? ? nil : diff
+end
+
+def changelog_gap_message(diff)
+  return nil if diff.nil?
   diff.positive? ? "is missing #{diff} release(s)" : "has #{-diff} release(s) not in git"
 end
 
@@ -12102,11 +12267,16 @@ def changelog_pending(endpoint, apps, workdir)
   apps.flat_map do |app|
     versions = status.dig(app, "versions_missing_notes") || []
     next [] if versions.empty?
-    checkout = changelog_app_checkout(app)
-    unless Dir.exist?(File.join(checkout, ".git"))
-      warn "changelog: #{versions.length} version(s) of #{app} need notes but there is no checkout at #{checkout}"
-      next []
+    # Same fetch capture does, and fatal for the same reason (ISS-911). Build can
+    # be run on its own, so it cannot assume capture just synced this repo — and
+    # a build whose input is missing prints "nothing to build", which is the one
+    # sentence a human reads as finished.
+    unavailable = changelog_sync_checkout(app)
+    if unavailable
+      Util.exit_with_error("changelog build: #{versions.length} version(s) of #{app} need notes " \
+                           "but its repo could not be read (#{unavailable})")
     end
+    checkout = changelog_app_checkout(app)
     tags = changelog_tags(checkout)
     versions.filter_map do |version|
       i = tags.index(version)
@@ -12241,6 +12411,7 @@ def cmd_changelog_build(args)
       pending = pending.first(flags[:limit]) if flags[:limit]
       if pending.empty?
         puts "changelog build: nothing to build"
+        changelog_ops_emit("Nothing to build.", "built" => 0, "pending" => 0)
         next
       end
       if flags[:limit] && total_pending > pending.length
@@ -12298,6 +12469,12 @@ def cmd_changelog_build(args)
           p[:entry_count].positive? ? "#{p[:entry_count]} note(s)" : "no user-facing changes"
         }
       end
+      # Before the failure exit, not after: a build that wrote eight of ten still
+      # did eight versions' work, and the record has to say so.
+      changelog_ops_emit("Built notes for #{built.length} of #{pending.length} version(s).",
+                         "built" => built.length, "pending" => pending.length,
+                         "build_failed" => failed.length)
+
       unless failed.empty?
         Util.exit_with_error("changelog build: #{failed.length} version(s) failed (re-run to retry):\n" \
                              "#{failed.map { |p| "  #{p[:app]}/#{p[:version]}" }.join("\n")}")
