@@ -512,7 +512,8 @@ class TestDevIssuesReview < Minitest::Test
     # The issue is rendered IN rather than looked up: a session told to fetch it
     # would need the playbook credential and a Bash tool, and Bash is exactly
     # what is denied to keep it read-only.
-    prompt = issue_review_prompt(blocked_issue, [comment(at: "2026-05-02T00:00:00Z", body: "Which subdomain?", to: "needs_input")])
+    prompt = issue_review_prompt(blocked_issue, [comment(at: "2026-05-02T00:00:00Z", body: "Which subdomain?", to: "needs_input")],
+                                 use_localhost: false)
     assert_match(/READ THE CODE/, prompt)
     assert_match(/ISS-574/, prompt)
     assert_match(/Route the inbound mail\./, prompt)
