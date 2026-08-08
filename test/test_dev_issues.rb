@@ -1490,14 +1490,16 @@ class TestDevIssues < Minitest::Test
   end
 
   # A deployable stand-in. The adoption path asks only for name and repo_name;
-  # `docker_k8s` is the third thing a live-version probe reads, and nil is the
-  # honest answer for a fake — no k8s rollout to ask about, so the probe reports
-  # that it cannot read a version instead of going looking for one.
-  Deployable = Struct.new(:name, :repo_name, :docker_k8s)
+  # `docker_k8s` and `repo` are what the release probe reads, and nil is the
+  # honest answer for both in a fake — no rollout to ask about and no repo of its
+  # own, so the probe reports that it cannot read a version instead of going
+  # looking for one. The workers regression test below sets `docker_k8s`, which
+  # is the shape that used to need a cluster (ISS-904).
+  Deployable = Struct.new(:name, :repo_name, :docker_k8s, :repo)
 
   # `prod_url` answers nil so an unstubbed live-version probe reads as "no prod
   # url" rather than reaching production: with the REAL registry here,
-  # fetch_app_version resolved a real deployable's real production URL and made
+  # fetch_release_info resolved a real deployable's real production URL and made
   # the request for real, every suite run (ISS-795).
   def registry_with(*apps)
     Struct.new(:deploy_tracked) do
@@ -1906,11 +1908,11 @@ class TestDevIssues < Minitest::Test
   # The overwhelmingly common shape: one devops PR, merged.
   def with_merged_fix_pr(url, &block) = with_fix_pr_states({ url => "merged" }, &block)
 
-  # Answer the live-version probe from a map of app name => info, so no test
-  # reaches production. An app the map does not mention reads as unreachable,
+  # Answer the release probe from a map of app name => info, so no test reaches
+  # production or GitHub. An app the map does not mention reads as unreachable,
   # which is the fail-closed case.
   def with_app_versions(versions, &block)
-    with_stubbed_function(:fetch_app_version, lambda { |_registry, app|
+    with_stubbed_function(:fetch_release_info, lambda { |_registry, app|
       versions[app.name] || { error: "no prod url or docker_k8s config" }
     }, &block)
   end
@@ -2025,6 +2027,60 @@ class TestDevIssues < Minitest::Test
       end
     end
     assert_match(/waiting  ISS-034: acumen still 0\.10\.24, from before acumen#130 merged/, out)
+    refute_match(/would deploy/, out)
+  end
+
+  # ISS-904: `workers` has no HTTP endpoint, so its version used to come from
+  # `kubectl get statefulset/workers` — and an agent runner has no kubeconfig at
+  # all. Every workers issue was skipped by every reconcile pass on every runner,
+  # silently, forever (ISS-890 and ISS-884 were two of them).
+  #
+  # The release record it reads instead is the app repo's newest tag, which is
+  # what `release` cut. ReleaseTag is stubbed here rather than the probe above it,
+  # so this exercises the whole path — and it would fail if anything in it reached
+  # for a cluster, since nothing here has one.
+  def test_deploy_pass_advances_a_cluster_only_app_from_its_release_tag
+    registry_fleet(registry_with(Deployable.new("workers", "workers", { "namespace" => "bryzek-production" })))
+    url = "https://github.com/mbryzek/workers/pull/61"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => ["merged", "2026-08-01T10:00:00Z"]) do
+          stub_singleton(ReleaseTag, :latest, ->(_repo, **) { "0.1.9" }) do
+            stub_singleton(ReleaseTag, :cut_at, ->(_repo, _tag, **) { "2026-08-02T09:00:00Z" }) do
+              with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                               "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+                cmd_issues_reconcile([])
+              end
+            end
+          end
+        end
+      end
+    end
+    assert_match(/would deploy ISS-034: workers 0\.1\.9 released after workers#61 merged/, out)
+    refute_match(/kubectl/, out)
+  end
+
+  # …and the same app whose last release predates the merge still waits. The tag
+  # is a release RECORD, not a rubber stamp: reading one must not advance an issue
+  # whose fix shipped after it.
+  def test_deploy_pass_waits_when_the_cluster_only_app_was_tagged_before_the_merge
+    registry_fleet(registry_with(Deployable.new("workers", "workers", { "namespace" => "bryzek-production" })))
+    url = "https://github.com/mbryzek/workers/pull/61"
+    out, = capture_io do
+      with_merged_prs({}) do
+        with_fix_pr_states(url => ["merged", "2026-08-02T10:00:00Z"]) do
+          stub_singleton(ReleaseTag, :latest, ->(_repo, **) { "0.1.9" }) do
+            stub_singleton(ReleaseTag, :cut_at, ->(_repo, _tag, **) { "2026-08-01T09:00:00Z" }) do
+              with_stubbed_api("GET #{issues_list_path(statuses: 'claimed')}" => [],
+                               "GET #{issues_list_path(statuses: 'fixed')}" => [fixed_via_pr(url)]) do
+                cmd_issues_reconcile([])
+              end
+            end
+          end
+        end
+      end
+    end
+    assert_match(/waiting  ISS-034: workers still 0\.1\.9, from before workers#61 merged/, out)
     refute_match(/would deploy/, out)
   end
 

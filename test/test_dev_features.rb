@@ -81,14 +81,14 @@ class TestDevFeatures < Minitest::Test
   def state_for(rem, versions)
     registry = Object.new
     cache = {}
-    # Stub the per-app lookup rather than the registry: fetch_app_version is the
-    # shared probe and is covered by the deploy tests.
-    orig = method(:feature_version_info)
-    define_singleton_method(:feature_version_info) { |_r, _c, app| versions[app] }
+    # Stub the per-app lookup rather than the registry: fetch_release_info is the
+    # shared probe and is covered by the deploy and release-tag tests.
+    orig = method(:named_release_info)
+    define_singleton_method(:named_release_info) { |_r, _c, app| versions[app] }
     begin
       feature_removal_state(registry, cache, rem)
     ensure
-      define_singleton_method(:feature_version_info, orig)
+      define_singleton_method(:named_release_info, orig)
     end
   end
 
