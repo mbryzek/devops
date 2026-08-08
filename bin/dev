@@ -14505,11 +14505,24 @@ end
 
 def agent_merge_rationale(candidate, reversibility, asserts)
   spec = asserts["spec_diff"] ? "apibuilder classified the spec change #{asserts['spec_diff']}. " : ""
+  # The verifier is NAMED, not assumed. The `ci` check is posted by GitHub Actions
+  # on one repo in the lane and by the fleet verify job on the rest (ISS-848), and
+  # this rationale is what a human auditing the merge afterwards reads to find out
+  # where the evidence actually lives — a run page on github.com, or a build log
+  # on the runner that built the sha. Naming the wrong one sent them to logs that
+  # do not exist (ISS-1079). Nil cannot happen behind `mergeable?`; it says so
+  # rather than implying a verification that did not occur.
+  verified = asserts["verified_by"]
+  by =
+    if verified
+      "Verified by `#{verified}` rather than asserted by this session."
+    else
+      "NOTHING verified this head: no green `#{Agent::MergeLane::CI_CHECK}` check on the commit that would land."
+    end
   "Lane merge: classified #{reversibility} from #{Array(candidate.changed_paths).length} changed path(s), " \
     "#{asserts['diff_lines']} changed line(s). #{spec}`#{Agent::MergeLane::CI_CHECK}` passed on " \
     "#{Agent::MergeLane.short(candidate.head_sha)}, which is the exact commit that will be squashed, and " \
-    "that commit contains the current tip of main (#{Agent::MergeLane.short(asserts['base_sha'])}). " \
-    "Verified by GitHub Actions rather than asserted by this session."
+    "that commit contains the current tip of main (#{Agent::MergeLane.short(asserts['base_sha'])}). #{by}"
 end
 
 def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id:, use_localhost:)
