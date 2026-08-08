@@ -51,6 +51,7 @@ require 'agent/ops'
 require 'agent/paths'
 require 'agent/shell'
 require 'agent/stream'
+require 'agent/usage_limit'
 require 'agent/workspace'
 require 'agent/processes'
 require 'agent/tick'
@@ -13817,6 +13818,13 @@ def cmd_agent_status(args)
     puts "Runner #{identity.runner_id}#{me ? " (#{me['hostname']})" : ''}"
     puts "  concurrency: #{me ? me['max_concurrency'] : '?'}   paused: #{me ? !!me['paused'] : '?'}"
     puts "  last heartbeat: #{me && me['last_heartbeat_at']}"
+    # Beside `paused` because it answers the same question — "why is this runner
+    # taking no work" — and it is the answer nobody would otherwise find: the
+    # limit belongs to the account, not to this machine or to the queue (ISS-1129).
+    if (resets_at = Agent::UsageLimit.active)
+      puts "  CLAUDE USAGE LIMIT: claiming no issues until #{resets_at.localtime.strftime('%H:%M')} " \
+           "(verify jobs are unaffected)"
+    end
 
     jobs = Agent::Jobs.all
     if jobs.empty?

@@ -170,6 +170,68 @@ module Agent
       nil
     end
 
+    # ---- "was this session refused before it ever ran?" (ISS-1129)
+
+    # The HTTP status the API answers a session with when the account is out of
+    # usage for the window. The CLI reports it on the terminal `result` event as
+    # `api_error_status`, and nowhere else that is machine-readable — the prose
+    # ("You've hit your session limit · resets 1am") is a message to a human and
+    # is not parsed for anything but display.
+    USAGE_LIMIT_STATUS = 429
+
+    # nil, or what the API said when it refused this session:
+    # { "message" => …, "resets_at" => Time|nil }.
+    #
+    # Read from the FINAL `result` event, which is the only one that says how the
+    # run ENDED. A `rate_limit_event` on its own is not enough and must not be
+    # used: one arrives on ordinary turns too, and a session that was throttled
+    # mid-run and then finished its work is a success, not a refusal. The one
+    # thing the rate-limit events are read for is `resetsAt`, which the result
+    # event does not carry.
+    #
+    # Whole-file, unlike every other reader here, and deliberately: a refused
+    # session's log is two kilobytes because nothing ran, and a session that DID
+    # run has a terminal result whose status is not 429, so the window read would
+    # be answering a question this never asks. `window` bounds the pathological
+    # case rather than the ordinary one.
+    def usage_limit(path, window: 4 * 1024 * 1024)
+      return nil unless File.file?(path)
+      size = File.size(path)
+      return nil if size.zero?
+
+      final = nil
+      resets_at = nil
+      complete_lines(tail_bytes(path, window, size), cut_at_start: window < size).each do |raw|
+        event = parse_event(raw)
+        next unless event
+        case event["type"]
+        when "result" then final = event
+        when "rate_limit_event" then resets_at = rejected_reset(event) || resets_at
+        end
+      end
+      return nil unless final && final["api_error_status"].to_i == USAGE_LIMIT_STATUS
+
+      { "message" => one_line(final["result"]), "resets_at" => resets_at }
+    end
+
+    # The reset instant from a rate-limit event the API REJECTED. A `status` of
+    # anything else — "allowed", a warning as the window fills — carries a
+    # `resetsAt` too, and taking it would invent a cooldown out of a session that
+    # was never refused.
+    def rejected_reset(event)
+      info = event["rate_limit_info"]
+      return nil unless info.is_a?(Hash) && info["status"] == "rejected"
+      epoch = info["resetsAt"]
+      epoch.is_a?(Numeric) ? Time.at(epoch).utc : nil
+    end
+
+    def parse_event(raw)
+      event = JSON.parse(raw.to_s)
+      event.is_a?(Hash) ? event : nil
+    rescue JSON::ParserError
+      nil
+    end
+
     # The log as human lines, newest `limit` of them, oldest first. Bounded read
     # for the same reason `last_line` is bounded — this file grows to megabytes.
     def render_file(path, limit: 200, stamp: true, raw: false, window: 4 * 1024 * 1024)
