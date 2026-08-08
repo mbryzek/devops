@@ -293,12 +293,16 @@ module Agent
       return nil if urls.empty?
 
       states = urls.map { |url| fix_state(url, deployed: deployed) }
-      # UNKNOWNS first, and they fail OPEN: one url `gh` could not read is not
-      # evidence either way, and not knowing must never stall the queue.
+      # An OPEN fix is asked FIRST, ahead of the fail-open unknown check, because
+      # it is positive evidence in its own right: this url has demonstrably not
+      # landed, and no unreadable sibling makes that less true. Everything after
+      # it is an inference from the whole list, so one unknown there poisons the
+      # answer and dispatches (ISS-1105 over ISS-739's fail-open policy).
+      open_fix = states.find { |state, _| state == :open }
+      return open_fix if open_fix
       return nil if states.any? { |state, _| state == :unknown }
 
-      states.find { |state, _| state == :open } ||
-        states.find { |state, _| state == :unreleased } ||
+      states.find { |state, _| state == :unreleased } ||
         (states.any? { |state, _| state == :shipped } ? nil : states.reverse.find { |state, _| state == :closed })
     end
 
