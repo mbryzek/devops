@@ -56,6 +56,7 @@ require 'agent/processes'
 require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
+require 'agent/product_owner'
 require 'agent/toolchain'
 require 'agent/verify'
 
@@ -14302,6 +14303,7 @@ def cmd_agent_doctor(args)
 
   claude_config = agent_doctor_claude_config
   agent_doctor_credentials
+  agent_doctor_product_owner
   agent_doctor_sbt_heap
   agent_doctor_load
 
@@ -14752,6 +14754,18 @@ end
 #
 # Prints presence, never values: `Agent::Credentials.check` cannot carry a
 # secret, so this cannot print one.
+# The product-owner review's stored logins. Reported like Agent::Credentials and
+# for the same reason it is: a machine missing this can still claim every issue
+# that is not a product review, so it prints but never changes the exit code.
+def agent_doctor_product_owner
+  state = Agent::ProductOwner.state
+  puts
+  puts "Product-owner review credentials (how the daily product review logs in):"
+  puts "  #{state.ok? ? 'ok  ' : 'MISS'} #{state.message}"
+  puts "       fix: #{state.remedy}" unless state.ok?
+  state
+end
+
 def agent_doctor_credentials
   found = Agent::Credentials.check
   return if found.empty?
