@@ -7,6 +7,7 @@
 #   3. whether the tick itself killed this session, and why
 #   4. the operations `dev agent run-op` executed, and what each one reported
 #   5. the process exit code
+#   6. whether the API refused to start the session at all (ISS-1129)
 #
 # The session's own words are not one of them. A session that says "I opened a
 # PR" and did not, or that summarizes a failure as a success, must not be able
@@ -29,9 +30,11 @@
 #
 # Pure: every input is passed in and nothing here shells out. `Agent::Github`
 # and `Agent::Ops` are required only for their predicates, which are plain
-# functions over records those modules produced; the tick gathers the signals.
+# functions over records those modules produced, and `Agent::Stream` only for
+# the status code it names; the tick gathers the signals.
 require 'agent/github'
 require 'agent/ops'
+require 'agent/stream'
 
 module Agent
   module Outcome
@@ -94,8 +97,10 @@ module Agent
     # timed_out:       did Phase A kill it on the 4-hour hard timeout?
     # producer_filed:  was this issue filed by a producer rather than a human?
     # attempt:         which consecutive failure this one would be — `attempt_number`
+    # usage_limit:     nil, or Agent::Stream.usage_limit's record of the API
+    #                  refusing this session ({ "message" =>, "resets_at" => })
     def classify(pr:, plans_committed:, exit_code:, producer_filed:, attempt: 1, timed_out: false, killed: nil,
-                 operations: [])
+                 operations: [], usage_limit: nil)
       # A MERGED PR outranks every other signal, including a kill and a non-zero
       # exit. It is the strongest possible evidence the work landed, and until
       # ISS-364 it was the one case that read as failure: classification looked
@@ -148,6 +153,31 @@ module Agent
       if broken.any?
         return failure("Operation#{'s' if broken.length > 1} failed: #{Agent::Ops.describe(broken)}",
                        attempt, url: pr && pr["url"])
+      end
+
+      # THE API REFUSED THE SESSION (ISS-1129). Not a failure of the work, and
+      # not an attempt: the CLI was answered 429 by the usage limit, printed
+      # "You've hit your session limit", and exited 1 in under a second having
+      # done nothing at all.
+      #
+      # Every arm below reads that exit code as a verdict on the WORK, and on
+      # 2026-08-08 that is exactly what happened to ISS-986, ISS-992 and ISS-993:
+      # three sessions refused in 90 seconds spent the whole `GIVE_UP_AFTER_FAILURES`
+      # budget and parked all three in `needs_input`, which `dev issues claim`
+      # never offers again. The issues were not hard; nothing ever looked at them.
+      #
+      # So it returns to `open` with the lease RELEASED rather than `failed` —
+      # the platform's own word for a hand-back nobody failed at, which is
+      # precisely this — and `attempt_number` therefore does not count it. A
+      # refusal is free; it must cost the issue nothing.
+      #
+      # Below the delivered-artifact arms and below a failed operation, because a
+      # session that did real work and was cut off at the limit still has to
+      # report what it did. Above the draft/exit-code arms, which would otherwise
+      # blame the session for stopping.
+      if usage_limit
+        return Result.new(name: "usage_limit", status: "open", lease_outcome: "released",
+                          reason: usage_limit_reason(usage_limit))
       end
 
       # A draft PR is unfinished work, not a result: the session opened it and
@@ -245,6 +275,22 @@ module Agent
                    reason: "#{reason}. Failure #{attempt} of #{GIVE_UP_AFTER_FAILURES} in a row — " \
                            "returning to the queue.")
       end
+    end
+
+    # Written for the person reading the issue timeline weeks later, whose first
+    # question is "what was wrong with this issue" — and the answer is nothing.
+    # It says so in the first clause, before any detail, because that is the
+    # whole point of separating this from a failure.
+    def usage_limit_reason(usage_limit)
+      message = usage_limit.is_a?(Hash) ? usage_limit["message"].to_s : usage_limit.to_s
+      resets = usage_limit.is_a?(Hash) ? usage_limit["resets_at"] : nil
+      [
+        "NOT a failure of this issue: no session ever ran. The Claude API refused to start one " \
+        "(HTTP #{Agent::Stream::USAGE_LIMIT_STATUS}, usage limit) and the CLI exited immediately",
+        message.empty? ? nil : " — #{message}",
+        resets.respond_to?(:utc) ? ". The limit resets at #{resets.utc.strftime('%Y-%m-%d %H:%M UTC')}" : nil,
+        ". Returned to the queue; this attempt is not counted against the give-up limit.",
+      ].compact.join
     end
 
     # The kill record's own words. An unrecognized reason is still reported as a
