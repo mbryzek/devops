@@ -59,6 +59,7 @@ require 'agent/processes'
 require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
+require 'agent/credential_use'
 require 'agent/product_owner'
 require 'agent/toolchain'
 require 'newrelic'
@@ -155,6 +156,7 @@ INVOCATIONS = {
   "agent resume"        => 'agent resume [--localhost]',
   "agent runners"       => 'agent runners [--localhost]',
   "agent sbt-opts"      => 'agent sbt-opts [--explain]',
+  "agent credential"    => 'agent credential [list] | agent credential exec --name NAME [--implicit] -- <command> [args...]',
   "agent producers"     => 'agent producers [--localhost]',
   "agent playbooks"     => 'agent playbooks [--lint] [--localhost]',
   "agent playbook"      => 'agent playbook <key> [--lint | --versions [--limit N] | --version VERSION | --write FILE [--create] [--yes]] [--localhost]',
@@ -1209,6 +1211,36 @@ USAGE = <<~USAGE
         with `&&`, `;` or a pipe in it, which no argv can express — goes to a
         shell explicitly: `-- /bin/zsh -lc '<the line>'`.
 
+    #{INVOCATIONS["agent credential"]}
+        An external-API credential, put into ONE command's process and nowhere
+        else (ISS-1037). Sessions no longer carry these keys in their environment:
+        `ps -Eax` hands a process's whole environment to every process of the same
+        uid, three sessions share a runner, and two of seventeen playbooks use a
+        credential at all — so every session held both keys for hours to no
+        purpose, and twice a routine command swept one up by accident (ISS-961,
+        ISS-1035). `exec` resolves the key, records the use under the issue's log
+        tree, and replaces itself with your command. It never prints a value.
+        Quote the inner command with SINGLE quotes so the shell that expands the
+        reference is the one that has it:
+
+            dev agent credential exec --name NEWRELIC_USER_KEY -- \\
+              /bin/zsh -c 'curl -sS -X POST https://api.newrelic.com/graphql \\
+                -H "API-Key: $NEWRELIC_USER_KEY" ...'
+
+        Double quotes expand it to the empty string before `dev` starts, and an
+        unauthenticated request tends to answer an empty RESULT rather than an
+        error — so this refuses a command that never mentions the name it is
+        asking for. `--implicit` is the escape for a program that reads the
+        variable itself and never names it on a command line.
+        This is NOT an access control and cannot be one: every session is the
+        same uid and the env repo is readable on disk. It shrinks blast radius
+        and makes credential use auditable, which is the honest half of the
+        "token broker" ISS-1028 asked for — the rest of that idea needs an
+        upstream that mints short-lived scoped tokens, and neither Anthropic nor
+        NewRelic offers one.
+        `list` (the default) prints which credentials this machine resolves and
+        why, and never a value.
+
     #{INVOCATIONS["agent pause"]}
     #{INVOCATIONS["agent resume"]}
         Kill switch. A paused runner finishes what it is working and claims
@@ -1527,7 +1559,7 @@ SUBCOMMANDS = {
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
   "newrelic"     => %w[ingest],
-  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook status-file runs refresh release gc maintenance doctor dotfiles merge-lane merge update-branch],
+  "agent"        => %w[tick status logs run-op credential pause resume runners sbt-opts producers playbooks playbook status-file runs refresh release gc maintenance doctor dotfiles merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[scan verify preflight clean-build],
 }.freeze
@@ -14180,6 +14212,55 @@ def cmd_agent_run_op_apply(number, operation, argv, timeout, env = {})
   exit(record.timed_out ? 124 : record.status.to_i)
 end
 
+# `dev agent credential exec --name NAME -- <command>` — one credential, one
+# process, one command (ISS-1037). See lib/agent/credential_use.rb for why the
+# values left the session environment and what this does and does not fix.
+#
+# Shaped like `run-op` on purpose: everything after `--` is argv handed to the
+# command untouched, never through parse_common_flags, which would eat the
+# `--app` and `--localhost` that belong to the command rather than to this
+# wrapper. A session that already knows one of these knows the other.
+def cmd_agent_credential(args)
+  sub = args.first.to_s
+  return cmd_agent_credential_exec(args.drop(1)) if sub == "exec"
+  return agent_doctor_credentials if sub.empty? || sub == "list"
+
+  unknown("agent credential subcommand", sub, %w[list exec])
+end
+
+def cmd_agent_credential_exec(args)
+  separator = args.index("--")
+  mine = separator ? args[0...separator] : args
+  argv = separator ? args[(separator + 1)..] : []
+
+  name = nil
+  implicit = false
+  positional = []
+  i = 0
+  while i < mine.length
+    case mine[i]
+    when "--name" then (name = mine[i + 1]; i += 2)
+    when "--implicit" then (implicit = true; i += 1)
+    else (positional << mine[i]; i += 1)
+    end
+  end
+
+  problems = []
+  problems << "missing --name: which credential to use (#{Agent::Credentials::NAMES.join(', ')})" if name.to_s.empty?
+  problems << "unexpected argument(s) before `--`: #{positional.join(', ')}" if positional.any?
+  problems << "missing `-- <command>`: name the command to run after a bare `--`" if argv.empty?
+  report_arg_problems("agent credential", problems, usage_for("agent credential"))
+
+  # Every refusal is a MESSAGE, and each one has to teach the correct
+  # invocation. A session told only "no" retries by inlining the value it
+  # resolved some other way, which is the ISS-961 hazard this exists to remove.
+  begin
+    Agent::CredentialUse.exec(name: name, argv: argv, implicit: implicit)
+  rescue Agent::CredentialUse::Refusal => e
+    Util.exit_with_error("agent credential exec: #{e.message}")
+  end
+end
+
 def cmd_agent_pause(args) = agent_set_paused(args, "agent pause", true)
 def cmd_agent_resume(args) = agent_set_paused(args, "agent resume", false)
 
@@ -16258,6 +16339,7 @@ when "agent"
   when "resume"    then cmd_agent_resume(argv)
   when "runners"   then cmd_agent_runners(argv)
   when "sbt-opts"  then cmd_agent_sbt_opts(argv)
+  when "credential" then cmd_agent_credential(argv)
   when "producers" then cmd_agent_producers(argv)
   when "playbooks" then cmd_agent_playbooks(argv)
   when "runs"      then cmd_agent_runs(argv)
