@@ -270,15 +270,32 @@ module Agent
     # wording that reads as "not yet".
     def describe(unshipped)
       unshipped.map do |b|
-        pr = b["pr"]
-        if pr && Agent::Github.closed?(pr)
-          "ISS-#{b['number']} is `#{b['status']}`, but its fix #{pr['url']} was CLOSED WITHOUT MERGING — " \
-            "nothing shipped, and no open PR will ship it"
-        elsif pr
-          "ISS-#{b['number']} is `#{b['status']}`, but its fix #{pr['url']} has not merged"
-        else
-          "ISS-#{b['number']} is still `#{b['status']}`"
-        end
+        reason = pr_reason(b)
+        next "ISS-#{b['number']} is still `#{b['status']}`" if reason.nil?
+
+        "ISS-#{b['number']} is `#{b['status']}`, but #{reason}"
+      end
+    end
+
+    # The PR half of one of those sentences, or nil when the blocker has no PR to
+    # name — which is the blocker that never reached a shipped status, and whose
+    # own status is the whole reason.
+    #
+    # Split out of `describe` because there are two readers now and only one of
+    # them wants the "ISS-N is `fixed`" half (ISS-1085). The dispatcher writes
+    # whole sentences into a timeline comment; `dev issues show` prints the
+    # blocker's number, status and title on its own line and then this clause
+    # underneath it. One source for the wording, so the note a session reads on
+    # the timeline and the line a human reads before claiming cannot drift into
+    # two different accounts of the same PR.
+    def pr_reason(entry)
+      pr = entry["pr"]
+      return nil if pr.nil?
+
+      if Agent::Github.closed?(pr)
+        "its fix #{pr['url']} was CLOSED WITHOUT MERGING — nothing shipped, and no open PR will ship it"
+      else
+        "its fix #{pr['url']} has not merged"
       end
     end
   end

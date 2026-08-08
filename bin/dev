@@ -5395,7 +5395,7 @@ def cmd_issues_show(args)
     issue = issue_fetch(endpoint, number)
     puts issue_render_item(issue, comments: issue_fetch_comments(endpoint, number))
     puts issue_family_section(endpoint, issue)
-    puts issue_links_section(issue)
+    puts issue_links_section(issue, use_localhost: use_localhost)
   end
 end
 
@@ -5410,38 +5410,88 @@ end
 # Read straight off the issue's own `links`: the edges ride along with the record,
 # so nothing here costs a round trip and nothing can render one relationship while
 # silently missing another.
-def issue_links_section(issue)
+def issue_links_section(issue, use_localhost:)
   [
-    issue_blockers_lines(issue),
+    issue_blockers_lines(issue, use_localhost: use_localhost),
     issue_blocks_lines(issue),
     issue_duplicate_lines(issue),
   ].compact.join
 end
 
-def issue_blockers_lines(issue)
+# WHAT IS THIS ISSUE ACTUALLY WAITING ON — asked of GitHub, exactly as the
+# dispatcher asks it, and not of the blocker's status (ISS-1085).
+#
+# Status alone is the wrong question and it answers in the reassuring direction.
+# A blocker sits at `fixed` from the moment its session marks the PR ready, which
+# is most of a day before anything merges, so this section used to print "all
+# shipped — this is claimable now" over an open PR that `Agent::Tick` was about to
+# defer the claim on. Two costs, and the second is the worse one: it invites
+# somebody to pick up work the dispatcher will not start, and it teaches whoever
+# reads it that `--block-on` stopped working — which is the prose-dependency habit
+# ISS-644/ISS-649 exist to break.
+#
+# So the renderer runs the GATE's own query rather than a second opinion, and
+# reports what came back. Nothing about either verdict changes here: `unshipped`
+# is the same call `Agent::Tick` makes before it starts a session, down to failing
+# OPEN on every unknown — a `gh` that cannot answer reads as claimable in both
+# places, which is the point. The display can now be wrong only where the
+# dispatcher is wrong with it.
+#
+# It costs one API read per shipped blocker plus a `gh pr view` per recorded fix.
+# That is bounded by the blocker count (one, almost always) and paid only by an
+# issue that HAS blockers — the early return above is most invocations.
+def issue_blockers_lines(issue, use_localhost:)
   blockers = issue_blockers(issue)
   return nil if blockers.empty?
 
+  unshipped = Agent::Dependency.unshipped(issue, use_localhost: use_localhost)
+  waiting = unshipped.to_h { |b| [b["number"].to_s, b] }
+
   # Shipped blockers stay in the list: "why is this claimable now" is the same
   # question as "why was it not", and dropping them answers neither. The status on
-  # each line is what tells them apart.
-  live = blockers.reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
-  lines = blockers.map { |b| "  - #{issue_ref_label(b)} #{b.fetch('title')}" }.join("\n")
+  # each line, and the PR named under it, are what tell them apart.
+  lines = blockers.flat_map do |b|
+    line = "  - #{issue_ref_label(b)} #{b.fetch('title')}"
+    entry = waiting[b.fetch("number").to_s]
+    reason = entry && Agent::Dependency.pr_reason(entry)
+    reason ? [line, "      #{reason}"] : [line]
+  end.join("\n")
+
   header =
-    if live.empty?
+    if unshipped.empty?
       "\nBLOCKED BY #{blockers.length} issue(s), all shipped — this is claimable now:"
     else
-      "\nBLOCKED — waiting on #{live.length} of #{blockers.length} blocker(s):"
+      "\nBLOCKED — waiting on #{unshipped.length} of #{blockers.length} blocker(s):"
     end
-  footer =
-    if live.empty?
-      "\n"
-    else
-      "\n`dev issues claim` will refuse this issue until every blocker reaches fixed, deployed, verified\n" \
-        "or dismissed. Drop an edge that is not really a prerequisite with `dev issues block " \
-        "#{issue.fetch('number').sub(/\A0+/, '')} --on <n> --remove`.\n"
-    end
-  "#{header}\n#{lines}\n#{footer}"
+  "#{header}\n#{lines}\n#{issue_blockers_footer(issue, unshipped)}"
+end
+
+# Why it is being held, in the terms of whoever is holding it — and the two are
+# different mechanisms with different conditions, so a blocker of each kind gets
+# a sentence of its own and an issue with both gets both.
+#
+# The SERVER refuses a claim on status: that is `is_blocked`, and it clears the
+# moment the blocker reaches fixed/deployed/verified/dismissed. The DISPATCHER
+# refuses on the merge, which is the ISS-649 gate this section now shares. Saying
+# only the first over a `fixed` blocker with an open PR is what made this line
+# lie; saying only the second over a blocker still `open` would name a merge
+# nobody is waiting for yet.
+def issue_blockers_footer(issue, unshipped)
+  return "\n" if unshipped.empty?
+
+  sentences = []
+  if unshipped.any? { |b| b["pr"].nil? }
+    sentences << "`dev issues claim` will refuse this issue until every blocker reaches fixed, deployed, " \
+                 "verified or dismissed."
+  end
+  if unshipped.any? { |b| b["pr"] }
+    sentences << "A blocker at `fixed` is not enough on its own: `dev agent tick` re-checks GitHub and defers " \
+                 "this issue until the fix named above merges (ISS-649), because a session records `fixed` " \
+                 "when its PR is READY, not when it lands."
+  end
+  sentences << "Drop an edge that is not really a prerequisite with `dev issues block " \
+               "#{issue.fetch('number').sub(/\A0+/, '')} --on <n> --remove`."
+  "\n#{sentences.join("\n")}\n"
 end
 
 def issue_blocks_lines(issue)
@@ -5903,7 +5953,8 @@ def cmd_issues_review(args)
       return
     end
 
-    issue_review_walk(endpoint, issues, issue_comments_by_number(endpoint, issues), all: all)
+    comments = issue_comments_by_number(endpoint, issues)
+    issue_review_walk(endpoint, issues, comments, all: all, use_localhost: use_localhost)
   end
 end
 
@@ -5930,7 +5981,7 @@ def issue_review_queue(endpoint, requested)
   resolved
 end
 
-def issue_review_walk(endpoint, issues, comments, all:)
+def issue_review_walk(endpoint, issues, comments, all:, use_localhost:)
   numbers = issues.map { |issue| issue["number"] }
   by_number = issues.to_h { |issue| [issue["number"], issue] }
 
@@ -5944,7 +5995,7 @@ def issue_review_walk(endpoint, issues, comments, all:)
   window = IssueReview::Window.new(numbers, size: IssueReview::WINDOW) do |number|
     IssueReview::Session.new(
       number: number,
-      prompt: issue_review_prompt(by_number.fetch(number), comments[number] || []),
+      prompt: issue_review_prompt(by_number.fetch(number), comments[number] || [], use_localhost: use_localhost),
       model: INTERACTIVE_CLAUDE_MODEL,
       chdir: issue_review_session_dir,
       timeout: IssueReview::TIMEOUT_SECONDS,
@@ -6059,14 +6110,14 @@ end
 # costs nothing, while a session told to go and fetch ISS-574 would need the
 # playbook credential and a Bash tool, and the second of those is exactly what is
 # denied to keep it read-only.
-def issue_review_prompt(issue, comments)
+def issue_review_prompt(issue, comments, use_localhost:)
   [
     File.read(claude_issues_path("review-summary.md")).strip,
     "",
     "---",
     "",
     issue_render_item(issue, comments: comments).strip,
-    issue_links_section(issue).strip,
+    issue_links_section(issue, use_localhost: use_localhost).strip,
   ].join("\n")
 end
 
