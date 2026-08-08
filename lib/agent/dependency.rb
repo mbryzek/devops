@@ -368,36 +368,53 @@ module Agent
     # One line per blocker for the timeline note, naming what is actually being
     # waited on — the PR when there is one, the status when the blocker has not
     # got that far.
-    #
-    # A sentence per state, because they want different things from whoever reads
-    # the note. An OPEN PR resolves itself: it merges, and the next attempt of
-    # this gate passes. A CLOSED-unmerged one never will — either the real fix
-    # went in under a url nobody recorded (`dev issues fix`) or the blocker was
-    # never actually fixed — so that deferral loop can only end with a human, and
-    # saying "has not merged" would hide it behind wording that reads as "not
-    # yet". An UNRELEASED one waits on a deploy rather than on a review, and
-    # describing it as unmerged would be flatly false about a commit that is
-    # sitting on main — which is the confusion ISS-1097 was filed about.
-    #
-    # Driven off the recorded state rather than re-derived from the PR: the PR in
-    # the unreleased case IS merged, so `merged?` can no longer stand in for
-    # "landed".
     def describe(unshipped)
       unshipped.map do |b|
-        pr = b["pr"]
-        case b["state"]
-        when :closed
-          "ISS-#{b['number']} is `#{b['status']}`, but its fix #{pr['url']} was CLOSED WITHOUT MERGING — " \
-            "nothing shipped, and no open PR will ship it"
-        when :unreleased
-          "ISS-#{b['number']} is `#{b['status']}` and its fix #{pr['url']} has MERGED, but that commit is not " \
-            "in the newest `#{pr['url'][FIX_PR_URL, 1]}` release — the code is on `origin/main`, and not in " \
-            "production where a session would have to test against it"
-        when :open
-          "ISS-#{b['number']} is `#{b['status']}`, but its fix #{pr['url']} has not merged"
-        else
-          "ISS-#{b['number']} is still `#{b['status']}`"
-        end
+        reason = pr_reason(b)
+        next "ISS-#{b['number']} is still `#{b['status']}`" if reason.nil?
+
+        "ISS-#{b['number']} is `#{b['status']}`, but #{reason}"
+      end
+    end
+
+    # The PR half of one of those sentences, or nil when the blocker has no PR to
+    # name — which is the blocker that never reached a shipped status, and whose
+    # own status is the whole reason.
+    #
+    # Split out of `describe` because there are two readers now and only one of
+    # them wants the "ISS-N is `fixed`" half (ISS-1085). The dispatcher writes
+    # whole sentences into a timeline comment; `dev issues show` prints the
+    # blocker's number, status and title on its own line and then this clause
+    # underneath it. One source for the wording, so the note a session reads on
+    # the timeline and the line a human reads before claiming cannot drift into
+    # two different accounts of the same PR.
+    #
+    # A clause per state, because they want different things from whoever reads
+    # it. An OPEN PR resolves itself: it merges, and the next attempt of this gate
+    # passes. A CLOSED-unmerged one never will — either the real fix went in under
+    # a url nobody recorded (`dev issues fix`) or the blocker was never actually
+    # fixed — so that deferral loop can only end with a human, and "has not
+    # merged" would hide it behind wording that reads as "not yet". An UNRELEASED
+    # one waits on a DEPLOY rather than on a review, so it names the repo to
+    # release; calling it unmerged would be flatly false about a commit sitting on
+    # main, which is the confusion ISS-1097 was filed about.
+    #
+    # Driven off the recorded state rather than re-derived from the PR, because
+    # the PR in the unreleased case IS merged — `merged?` can no longer stand in
+    # for "landed".
+    def pr_reason(entry)
+      pr = entry["pr"]
+      return nil if pr.nil?
+
+      case entry["state"]
+      when :closed
+        "its fix #{pr['url']} was CLOSED WITHOUT MERGING — nothing shipped, and no open PR will ship it"
+      when :unreleased
+        "its fix #{pr['url']} merged and has NOT been released — that commit is not in the newest " \
+          "`#{pr['url'][FIX_PR_URL, 1]}` release, so the code is on `origin/main` and not in production " \
+          "where a session would have to test against it"
+      else
+        "its fix #{pr['url']} has not merged"
       end
     end
   end

@@ -14,6 +14,7 @@ require 'agent/heap'
 require 'agent/host'
 require 'agent/jobs'
 require 'agent/maintenance'
+require 'agent/newrelic_watch'
 require 'agent/ops'
 require 'agent/outcome'
 require 'agent/paths'
@@ -520,6 +521,7 @@ module Agent
     def phase_b
       run_maintenance
       check_toolchain
+      check_newrelic_ingest
       identity = Agent::Host.cached_identity
       if identity.nil?
         log("no runner identity yet — skipping work phase")
@@ -671,6 +673,74 @@ module Agent
       )
     rescue SessionExpired, ApiError => e
       log("toolchain: could not file an issue (#{e.message})")
+    end
+
+    # ---- newrelic ingest against the free tier (ISS-1077) ----
+    #
+    # `Agent::NewrelicWatch` carries the reasoning for why this is a tick check
+    # rather than a producer, and why running it on every runner is not N times
+    # the work. What is here is only the wiring.
+    #
+    # It files on the FIRST actionable reading, like the toolchain check and
+    # unlike `record_failure`: a projection crossing the threshold is not a
+    # transient blip that a three-strike debounce would filter, and at a daily
+    # cadence three strikes would mean three days of a month there are fewer of
+    # every day. The server's fingerprint dedup — month plus verdict — is what
+    # keeps that from becoming a daily issue.
+    def check_newrelic_ingest
+      return unless Agent::NewrelicWatch.due?(now: @now)
+
+      key = Agent::NewrelicWatch.key
+      if key.nil?
+        # Recorded, not silent, and not an issue of its own — see the module
+        # header. The cadence marker is stamped so a machine in this state does
+        # not retry a credential lookup it cannot satisfy on every 30-second tick.
+        Agent::NewrelicWatch.record(nil, now: @now, skipped: "no #{Newrelic::KEY_ENV}") unless @dry_run
+        decide("newrelic_ingest", "skipped — this machine cannot resolve #{Newrelic::KEY_ENV} " \
+                                  "(`dev agent doctor`); other runners still measure the same account")
+        return
+      end
+
+      measurement = Agent::NewrelicWatch.measure(key: key, now: @now)
+      summary = "#{measurement.verdict}: #{format('%.1f', measurement.projected_gb)} GB projected for " \
+                "#{measurement.period_label}#{measurement.free_tier? ? " of #{format('%.0f', measurement.free_limit_gb)} GB free" : ''}"
+      if @dry_run
+        decide("newrelic_ingest", "#{summary} — would #{measurement.actionable? ? 'file an issue' : 'record the check'}")
+        return
+      end
+
+      Agent::NewrelicWatch.record(measurement, now: @now)
+      decide("newrelic_ingest", summary)
+      return unless measurement.actionable?
+
+      file_newrelic_ingest_issue(measurement)
+    rescue Newrelic::Error => e
+      # A NerdGraph failure is NOT `record_failure`'d into the 3-in-a-row
+      # escalation. That channel is for a machine that has stopped working, and
+      # this is a third party being unreachable — an outage at NewRelic would
+      # otherwise file "the tick is failing on <host>" simultaneously on every
+      # runner in the fleet, about the one thing none of them can fix. The marker
+      # is stamped either way, so a persistently broken key shows up as a check
+      # whose last recorded pass keeps saying it skipped.
+      Agent::NewrelicWatch.record(nil, now: @now, skipped: e.message) unless @dry_run
+      decide("newrelic_ingest", "could not measure (#{e.message})")
+    end
+
+    # Best-effort in the same sense as the toolchain issue above: the marker is
+    # already written, so the next cadence retries.
+    def file_newrelic_ingest_issue(measurement)
+      Agent::Api.create_issue(
+        {
+          title: NewrelicIngest.issue_title(measurement),
+          category: "improvement",
+          fingerprint: measurement.fingerprint,
+          body: NewrelicIngest.issue_body(measurement),
+          claim_on_create: false,
+        },
+        use_localhost: @use_localhost,
+      )
+    rescue SessionExpired, ApiError => e
+      log("newrelic_ingest: could not file an issue (#{e.message})")
     end
 
     # THE RUNNER-OFFLINE ALERT IS NOT SENT FROM HERE, DELIBERATELY (ISS-535).
