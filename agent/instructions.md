@@ -456,6 +456,17 @@ action never happens, and no artifact substitutes for not doing it.
   dump the environment — it prints production secrets.
 - **Never touch the production database, and never `:5432`.** `:5432` is Mike's
   local database and parallel sessions clobber it. Use `claude-db` (§4).
+
+  **That is a rule about the DATABASE, not about production data.** Reading a
+  product's own API is a different act with a different blast radius, and it is
+  sanctioned — `dev prod get` (§4) sends one authenticated GET and has no write
+  form. Do not read this bullet as "production is unreachable, infer instead".
+  The ISS-1056 session did: it found no acumen key in its credentials block,
+  concluded there was no way to look, reconstructed the cause from git history,
+  and shipped a migration naming four stale enum values it had never observed
+  plus a delete of rows it had never counted — while the producer's own
+  six-second probe sat one command away (ISS-1062). **When an issue cites an
+  on-screen or per-row observation, go and look at it.**
 - **Never edit outside your workspace** (`~/code/ai/<slug>/`, plus
   `~/code/claude/plans/`). Never edit `~/code/platform`, `~/code/devops`, or any
   other top-level checkout — clone what you need into your workspace.
@@ -560,6 +571,31 @@ the one way to bring `main` under a branch like this, and it needs no force.
   plainly in the PR which part is unverified, and file it with `dev issues
   workaround`. Either way a credential is never yours to print, echo, commit, or
   paste into a PR, an issue comment, a plan or a test fixture.
+- **Reading production:** `dev prod get --app <app> <path>` sends ONE authenticated
+  GET against that product's own production API using the credential this runner
+  already holds, and prints the JSON on stdout — guardrails and the HTTP status go
+  to stderr, so `| jq` works. There is no write form and no `--localhost`. Which
+  apps are readable HERE is in your assignment block under "Production data you can
+  READ on this runner", and it is there for the same reason the credential list is:
+  read it while you are still planning. A non-2xx exits 1 with the body on stderr,
+  which makes a 500 an observation rather than a dead end — so probing a range
+  reports each row honestly:
+
+      for o in 672 673 678; do dev prod get --app acumen "/g/bryzek/duplicate/transactions?status=pending_review&limit=1&offset=$o"; done
+
+  Quote the path: unquoted, the shell splits it on `&` and the command sees a
+  fragment. If the stored session has expired the command says so and hands back
+  the `dev issues handoff` line, because refreshing it is an interactive login no
+  session can run.
+
+  **Acumen is Mike's real household finances.** Read-only, and only the
+  `Bryzek Family` group (`/g/bryzek/...`) — the session can reach other households
+  and `dev prod get` refuses them, because that is the one rule here a typo is
+  enough to break. **Never quote a real merchant name, amount, balance or account identifier**
+  into an issue, PR, comment, plan, commit message or test fixture; cite shapes,
+  counts and percentages ("seven rows in this group fail to decode"), never a
+  transaction. Never initiate or complete a Plaid link or reauthentication flow —
+  that is a bank login and §3 forbids it outright.
 - **This runner is SHARED, and a command line is PUBLIC.** Several agent sessions
   run on one Mac mini as the same user, and `ps -U <uid>` shows every argument of
   every one of their processes to all the others. Two rules follow, and neither is
@@ -782,6 +818,10 @@ error is the most expensive mistake available here.
    `dev queries top` for slow-query symptoms; playbook-admin's invocation and
    worker pages decode a failing pipeline run into its actual exception. Logs do
    not survive the pod, so read the recorded artifact, not a reconstruction.
+   For an acumen symptom there is no APM at all, so the failing request IS the
+   artifact: `dev prod get --app acumen <path>` (§4) reissues it and prints what
+   production actually answers. An issue's "Evidence (checkable in under a
+   minute)" line is usually that request, already written out for you.
 3. **Locate it in the pipeline before editing.** Trace producer → table →
    consumer: which job wrote the row, which DAO reads it, which controller
    serves it. Fix the producer, not the receiver — a receiver-side patch hides

@@ -53,6 +53,7 @@ require 'agent/shell'
 require 'agent/stream'
 require 'agent/workspace'
 require 'agent/processes'
+require 'agent/prod_read'
 require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
@@ -91,6 +92,7 @@ INVOCATIONS = {
   "invariants unsnooze" => 'invariants unsnooze <name> --app APP [--localhost]',
   "tasks requeue"       => 'tasks requeue [--app APP] [--localhost]',
   "tasks delete"        => 'tasks delete (--id TASK_ID... | --discriminator NAME) [--app APP] [--localhost] [--yes]',
+  "prod get"            => 'prod [get] --app (acumen|platform|playbook) <path>',
   "queries top"         => 'queries [top] [--hours N | --days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
   "queries show"        => 'queries show <sample-id> [--hours N | --days N] [--localhost]',
   "claude-usage top"    => 'claude-usage [top] [--days N] [--limit N] [--sort cost_usd|input_tokens|output_tokens|requests] [--localhost]',
@@ -283,6 +285,29 @@ USAGE = <<~USAGE
         verdict is not trustworthy — nothing is filed, no session is dispatched,
         and the exit code is 2 (uncheckable) rather than 1 (findings). Passes
         are never deferred, and an unreachable version endpoint defers nothing.
+
+    #{INVOCATIONS["prod get"]}
+        One authenticated GET against a product's own production API, printed as
+        JSON. `get` is the default when no subcommand is given, and it is the only
+        subcommand there is: there is deliberately no way to send a write with
+        this command, and no --localhost (a localhost read is what curl and a dev
+        server are for — this command means "read production").
+
+        The credential is the one `dev` already holds for that app: acumen's
+        stored session for `acumen`, the AI actor's API token for anything on the
+        platform host. Nothing is passed on the command line, so no session id
+        reaches a process listing another session on this runner can read.
+
+        It exists because a capability nobody is told about does not exist. The
+        `product-owner` producer files acumen issues whose evidence IS an API read
+        — ISS-1056 named the seven row ordinals that 500, checked one at a time
+        with limit=1 — and the session that fixed it believed no such access
+        existed, inferred the cause from git history, and shipped a migration
+        naming values it had never observed (ISS-1062).
+
+        A non-2xx is the answer as often as it is a failure here: the body and
+        status go to stderr and the exit status is 1, so probing a range of
+        offsets in a shell loop reports each one honestly.
 
     #{INVOCATIONS["queries top"]}
         Rank the queries the platform ran, with the code that issued each, from
@@ -1405,7 +1430,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent prs ci].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features prod queries claude-usage agent prs ci].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -1426,6 +1451,11 @@ SUBCOMMANDS = {
   "issues"       => %w[create list parent split block duplicate workaround handoff claim review show status fix snooze reconcile resume],
   "autonomy"     => %w[decide outcome workflows decisions run reverts reverted],
   "features"     => %w[list retire status reconcile cancel],
+  # One subcommand, and the singleton is the point rather than an accident: a
+  # `prod` command that could also write would be a write path to production
+  # wearing a read command's name. Adding one is a decision, not an edit — the
+  # suite asserts this list is exactly `get` (ISS-1062).
+  "prod"         => %w[get],
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
   "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
@@ -11424,6 +11454,147 @@ def run_sql_script(path, name, args)
   end
 end
 
+# ---------- prod ----------
+#
+# One authenticated GET against a product's own production API.
+#
+# WHY. The `product-owner` producer files issues whose evidence is a production
+# READ -- ISS-1056 named the seven `duplicate_transactions` row ordinals that
+# return 500 and the one between them that does not, "checked one row at a time
+# with limit=1". The session that fixed it reported there was no credential for
+# trueacumen.com on this runner, reconstructed the cause from git history, and
+# shipped a migration naming four stale enum values it had never observed plus a
+# delete of rows it had never counted (ISS-1062).
+#
+# Every one of those reads was available to it. `~/.platform/devops_acumen` is a
+# live session and ApiClient has known how to present it since acumen shipped;
+# re-running the producer's probe from a session reproduces the ordinals in six
+# seconds. What was missing was a command to point at and a sentence in the
+# assignment saying it exists -- the second half lives in Agent::ProdRead.
+#
+# WHAT IT DELIBERATELY IS NOT. Not a write path: `get` is the only subcommand and
+# there is no method flag, so the write form is not disabled, it is absent. Not a
+# database client: §3's prohibition on the production DATABASE is untouched and
+# this reaches only what the product's own API already serves to the identity
+# asking. Not a localhost tool: a local read is what curl and a dev server are
+# for, and a --localhost flag on a command named `prod` invites exactly the
+# prod/local session mix-up ApiClient.session_file exists to prevent.
+
+# Every app `dev` holds a credential for. `playbook` is a tenant surface on the
+# platform host rather than a deployable, which is why it needs tenant_endpoint.
+PROD_APPS = ApiClient::SESSION_CONFIG.keys.freeze
+
+def prod_endpoint(app)
+  return ApiClient.tenant_endpoint(app, use_localhost: false) unless ApiClient::ENDPOINTS.any? { |e| e[:app] == app }
+  ApiClient.endpoints(use_localhost: false, app_filter: app).first
+end
+
+# What may be done with what comes back, printed to STDERR so stdout stays a
+# clean JSON document for `jq`. Sourced from Agent::ProdRead so the rules a
+# session reads in its assignment and the rules it sees at the moment of use are
+# one text, not two that drift.
+def prod_read_notice(app)
+  target = Agent::ProdRead::TARGETS.find { |t| t.app == app }
+  return if target.nil?
+
+  warn "prod get: #{target.product} production, read as #{target.identity}."
+  target.guardrails.each { |g| warn "  - #{g.gsub('**', '')}" }
+  warn ""
+end
+
+# An expired stored session is a human-only fix -- `dev auth login --app acumen`
+# is an interactive password prompt -- so it gets the same treatment as a
+# human-only mutation (ISS-945): name the boundary and hand back the line that
+# parks it, rather than leaving a session with a 401 and no next step.
+def prod_session_expired!(app, args, message)
+  warn message
+  unless ApiClient.ai_session?
+    warn ""
+    warn "  Run `dev auth login --app #{app}` to refresh it." if app != "platform"
+    exit 1
+  end
+
+  from = agent_issue_number || "<this issue's number>"
+  remedy = app == "platform" ? "dev auth ai provision --rotate" : "dev auth login --app #{app}"
+  warn ""
+  warn "  The credential `dev` holds for #{app} is no longer accepted, and refreshing it is a human-only"
+  warn "  step: `#{remedy}` prompts interactively and no session has a terminal for it. Nothing you can"
+  warn "  try harder at will get past this."
+  warn ""
+  warn "  Hand it over. A handoff files at `needs_input`, which no agent can claim, and lists in the"
+  warn "  daily nudge every morning until a human runs it:"
+  warn ""
+  warn "    dev issues handoff --from #{from} --key #{shell_word("prod-read-session-expired-#{app}")} \\"
+  warn "      --title #{shell_word("dev's stored #{app} session has expired, so no session can read #{app} production")} \\"
+  warn "      --body '<what you were trying to observe, and what stays inferred until this runs>' \\"
+  warn "      --command #{shell_word(remedy)} \\"
+  warn "      --rerun #{shell_word('safe -- it replaces the stored credential with a fresh one either way')}"
+  warn ""
+  warn "  Then do the offline work in full, say in the PR which part is INFERRED rather than observed,"
+  warn "  and close out as usual -- the handoff is the tail of this run, not a failure of it."
+  exit 1
+end
+
+def cmd_prod_get(args)
+  app = nil
+  path = nil
+  i = 0
+  while i < args.length
+    arg = args[i]
+    case arg
+    when "--app"
+      app = args[i + 1] || usage_exit("--app requires a value", example: usage_for("prod get"))
+      i += 1
+    else
+      usage_exit("Unknown flag: #{arg}", example: usage_for("prod get")) if arg.start_with?("-")
+      # A path holding `&` that was not quoted reaches us as its first segment
+      # and the rest becomes separate shell commands, so a second positional is
+      # nearly always a swallowed query string rather than a typo.
+      if path
+        usage_exit("prod get takes ONE path (got #{path.inspect} then #{arg.inspect}) -- quote it, " \
+                   "or the shell splits it on & and ?", example: usage_for("prod get"))
+      end
+      path = arg
+    end
+    i += 1
+  end
+
+  usage_exit("prod get requires --app (one of: #{PROD_APPS.join(', ')})", example: usage_for("prod get")) if app.nil?
+  unknown("--app", app, PROD_APPS) unless PROD_APPS.include?(app)
+  usage_exit("prod get requires a path", example: usage_for("prod get")) if path.nil?
+  unless path.start_with?("/")
+    usage_exit("Path must start with '/' (got #{path.inspect}) -- the host comes from --app, so pass the " \
+               "path alone, not a full URL", example: usage_for("prod get"))
+  end
+
+  # The one guardrail here that is checked rather than written down. Acumen's
+  # stored session can reach households that are not Mike's, and the difference
+  # between reading his and reading theirs is one path segment in a line a session
+  # is otherwise typing offsets into -- so it is refused before the request, not
+  # warned about after it. See Agent::ProdRead::Target#refusal_for.
+  target = Agent::ProdRead::TARGETS.find { |t| t.app == app }
+  if (refusal = target&.refusal_for(path))
+    warn "prod get: refused -- #{refusal}"
+    exit 1
+  end
+
+  prod_read_notice(app)
+
+  begin
+    body = ApiClient.request(prod_endpoint(app), :get, path)
+  rescue SessionExpired => e
+    prod_session_expired!(app, args, e.message)
+  rescue ApiError => e
+    # The body is the answer as often as it is a failure: "this row 500s" IS the
+    # observation a product-owner issue asks to have confirmed. It goes to stderr
+    # with a non-zero status so a shell loop over offsets still reports each one.
+    warn "prod get: #{e.message}"
+    exit 1
+  end
+
+  puts body.nil? ? "" : JSON.pretty_generate(body)
+end
+
 # ---------- queries ----------
 
 # Rank the queries the platform ran, from the samples core.actors.QueryStatsActor
@@ -15270,6 +15441,12 @@ when "dependencies"
   when "check"   then cmd_dependencies_check(argv)
   when "upgrade" then cmd_dependencies_upgrade(argv)
   else                unknown("dependencies subcommand", sub, SUBCOMMANDS["dependencies"])
+  end
+when "prod"
+  sub = resolve_subcommand(argv, default: "get")
+  case sub
+  when "get" then cmd_prod_get(argv)
+  else            unknown("prod subcommand", sub, SUBCOMMANDS["prod"])
   end
 when "queries"
   sub = resolve_subcommand(argv, default: "top")
