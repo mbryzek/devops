@@ -29,6 +29,24 @@ module K8sAppConfig
     File.join(DIR, "apps", "#{app}.pkl")
   end
 
+  # Whether this app's manifests are rendered from k8s/templates/scala-play-app.pkl
+  # — i.e. whether it has a `k8s/apps/<app>.pkl` at all.
+  #
+  # A `docker_k8s` app does not: it ships hand-written manifests under
+  # k8s/manifests/<app>/ (today only `workers`, a Node service — templating one
+  # app isn't a win), so there is nothing for `load` to read and no javaAgent for
+  # anything to honor.
+  #
+  # The test is the app's own deploy shape rather than "the pkl file happens to
+  # be missing" ON PURPOSE. File-absence is exactly the condition `load` exists
+  # to shout about: a scala-play app whose config is deleted or misspelled must
+  # still abort, because an empty config has no javaAgent and would ship the app
+  # silently un-instrumented (ISS-1070). Keying off docker_k8s exempts the apps
+  # that never had a config without also exempting the ones that lost theirs.
+  def self.template_rendered?(app_config)
+    app_config.docker_k8s.nil?
+  end
+
   # The app's deploy config as a Hash. Aborts rather than returning a partial
   # or empty one; see the header for why an empty hash is the dangerous answer.
   def self.load(app)
