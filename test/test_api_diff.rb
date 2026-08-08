@@ -39,10 +39,20 @@ class TestApiDiff < Minitest::Test
     out
   end
 
-  def write_spec(name, models)
+  def write_spec(name, models, imports: [])
     path = File.join(@dir, "spec", name)
     FileUtils.mkdir_p(File.dirname(path))
-    IO.write(path, JSON.pretty_generate({ "name" => File.basename(name, ".json"), "models" => models }))
+    spec = { "name" => File.basename(name, ".json"), "models" => models }
+    if !imports.empty?
+      spec["imports"] = imports.map { |key| { "uri" => "https://app.apibuilder.io/bryzek/#{key}/latest/service.json" } }
+    end
+    IO.write(path, JSON.pretty_generate(spec))
+  end
+
+  # Spec files this repo's config does NOT name — the shape of another repo's specs,
+  # which reach the chain through a sibling clone or a producer checkout.
+  def external(app_keys)
+    app_keys.to_h { |key| [["bryzek", key], { path: File.join(@dir, "spec", "#{key}.json"), root: @dir }] }
   end
 
   def commit(message)
@@ -60,6 +70,14 @@ class TestApiDiff < Minitest::Test
 
   def build(app_keys, base: "main")
     build_diff_request(config_for(app_keys), "bryzek", [], nil, @dir, @dir, base, nil)
+  end
+
+  # The real resolution chain, built from a plain {[org, app] => source} map. The diff
+  # goes through SpecSources for both things it needs of a source — where a spec
+  # resolves from, and which specs exist at all — so the tests use the real class
+  # rather than a hash that answers only the first.
+  def sources_for(specs)
+    SpecSources.new(local: specs, siblings: {}, producers: {})
   end
 
   def user_model(fields) = { "user" => { "fields" => fields } }
@@ -101,12 +119,79 @@ class TestApiDiff < Minitest::Test
       ),
     )
 
-    sources = { %w[bryzek b] => { path: File.join(@dir, "spec", "b.json"), root: @dir } }
+    sources = sources_for(%w[bryzek b] => { path: File.join(@dir, "spec", "b.json"), root: @dir })
     request = build_diff_request(config_for(%w[a b]), "bryzek", [], nil, @dir, @dir, "main", sources)
     by_key = request[:form]["applications"].to_h { |app| [app["application_key"], app] }
 
     assert by_key.key?("b"), "an import of a changed spec must ride along, or its types stop resolving"
     refute by_key["b"].key?("previous"), "context is not a subject: it gets no verdict"
+  end
+
+  # The other direction, and the one position-aware classification is unsound without.
+  # `importer` is not in this repo's config at all — it is exactly the case that gets
+  # missed: another repo's spec that POSTs a model this one only ever returns.
+  def test_an_importer_of_a_changed_spec_rides_along
+    write_spec("a.json", user_model(ID_ONLY))
+    commit("base")
+    write_spec("a.json", user_model(ID_AND_EMAIL))
+    write_spec("importer.json", {}, imports: %w[a])
+    write_spec("stranger.json", {})
+
+    request = build_diff_request(config_for(%w[a]), "bryzek", [], nil, @dir, @dir, "main",
+                                 sources_for(external(%w[importer stranger])))
+    by_key = request[:form]["applications"].to_h { |app| [app["application_key"], app] }
+
+    assert by_key.key?("importer"), "a spec that imports the subject must ride along, or its use of the subject's types is invisible"
+    refute by_key["importer"].key?("previous"), "an importer is context: it gets no verdict"
+    refute by_key.key?("stranger"), "a spec that neither imports nor is imported by the subject stays out"
+    assert_equal %w[importer], request[:importers]
+  end
+
+  # Transitively: J POSTs a model of I that carries a model of the subject, so J's
+  # evidence about the subject's types is one import hop further out.
+  def test_the_importer_closure_is_transitive
+    write_spec("a.json", user_model(ID_ONLY))
+    commit("base")
+    write_spec("a.json", user_model(ID_AND_EMAIL))
+    write_spec("near.json", {}, imports: %w[a])
+    write_spec("far.json", {}, imports: %w[near])
+
+    request = build_diff_request(config_for(%w[a]), "bryzek", [], nil, @dir, @dir, "main",
+                                 sources_for(external(%w[near far])))
+
+    assert_equal %w[far near], request[:importers].sort
+  end
+
+  # Importers are evidence about a VERDICT, and only a changed application gets one.
+  # A new application has no prior contract, so there is nothing for an importer to
+  # sharpen — and scanning every spec on disk to sharpen it would be pure cost.
+  def test_a_new_application_alone_pulls_in_no_importers
+    write_spec("a.json", user_model(ID_ONLY))
+    commit("base")
+    write_spec("new.json", user_model(ID_ONLY))
+    write_spec("importer.json", {}, imports: %w[new])
+
+    request = build_diff_request(config_for(%w[a new]), "bryzek", [], nil, @dir, @dir, "main",
+                                 sources_for(external(%w[importer])))
+
+    assert_equal %w[new], request[:added]
+    assert_empty request[:importers]
+    assert_nil request[:form_without_importers], "with no importers there is nothing to fall back to"
+  end
+
+  # The fallback payload is the request as it was before importers existed: the same
+  # subjects, the same import closure, and none of the specs that import them.
+  def test_the_fallback_payload_is_the_request_without_importers
+    write_spec("a.json", user_model(ID_ONLY))
+    commit("base")
+    write_spec("a.json", user_model(ID_AND_EMAIL))
+    write_spec("importer.json", {}, imports: %w[a])
+
+    request = build_diff_request(config_for(%w[a]), "bryzek", [], nil, @dir, @dir, "main",
+                                 sources_for(external(%w[importer])))
+
+    assert_equal %w[a importer], request[:form]["applications"].map { |a| a["application_key"] }.sort
+    assert_equal %w[a], request[:form_without_importers]["applications"].map { |a| a["application_key"] }
   end
 
   # A reformatted spec is not a contract change. Sending it as one would make every
@@ -161,6 +246,78 @@ class TestApiDiff < Minitest::Test
 
     assert_raises(ApiDiffError) { diff_assert_ref!(@dir, "origin/does-not-exist") }
     assert_raises(ApiDiffError) { build(%w[a], base: "origin/does-not-exist") }
+  end
+
+  # Widening the payload widens what can fail to resolve, and the server names the side
+  # it failed on. The base side is `origin/main` plus specs this branch did not write,
+  # so a failure there predates the branch: drop the importer context, answer as this
+  # command answered before it sent any, and say so.
+  def test_a_base_side_resolution_failure_falls_back_to_the_narrow_payload
+    client = RecordingClient.new(
+      ApibuilderClient::Error.new("POST /apibuilder/diffs: Validation errors:\n  bryzek/cycle (previous): Import uri not found"),
+    )
+    request = { form: { "applications" => %w[a importer] }, form_without_importers: { "applications" => %w[a] },
+                importers: %w[importer] }
+
+    results = nil
+    dropped = nil
+    _out, err = capture_io { results, dropped = post_diff_with_context_fallback(client, request) }
+
+    assert_equal :ok, results
+    assert_equal "importer", dropped
+    assert_equal [{ "applications" => %w[a importer] }, { "applications" => %w[a] }], client.forms
+    assert_includes err, "Importer context dropped"
+    assert_includes err, "bryzek/cycle (previous)", "the warning has to name what the server actually refused"
+  end
+
+  # The other side is this branch's own doing: the change broke a spec that imports it
+  # badly enough that the importer no longer resolves. Retrying without that importer
+  # would answer "non-breaking" for exactly the change that broke it.
+  def test_a_change_side_resolution_failure_is_never_retried
+    client = RecordingClient.new(
+      ApibuilderClient::Error.new("POST /apibuilder/diffs: Validation errors:\n  bryzek/importer (original): Type[user] not found"),
+    )
+    request = { form: { "applications" => %w[a importer] }, form_without_importers: { "applications" => %w[a] },
+                importers: %w[importer] }
+
+    assert_raises(ApibuilderClient::Error) { post_diff_with_context_fallback(client, request) }
+    assert_equal 1, client.forms.size, "the change side must not be retried"
+  end
+
+  # An error nothing attributed to a side is one this cannot classify, and "cannot
+  # classify" is not a licence to retry with less evidence.
+  def test_an_unattributed_error_is_never_retried
+    refute diff_error_is_base_side_only?("POST /apibuilder/diffs: Not found (404)")
+    refute diff_error_is_base_side_only?("bryzek/a (previous): x\n  bryzek/b (original): y")
+    assert diff_error_is_base_side_only?("bryzek/a (previous): x\n  bryzek/b (previous): y")
+  end
+
+  # A size limit says nothing about the contents, so the narrow payload answers exactly
+  # as it did before importers were sent. This is also what lets the two halves of
+  # ISS-799 deploy in either order: the diffs route is capped at 1MB until platform's
+  # RequestBodyLimits entry ships, and 60 importers do not fit in it.
+  def test_a_payload_too_large_for_the_route_falls_back_instead_of_failing
+    assert_equal "the request is larger than the server's limit for this route",
+      diff_context_fallback_reason("POST /apibuilder/diffs: HTTP 413\nRequest Entity Too Large")
+    assert_nil diff_context_fallback_reason("POST /apibuilder/diffs: HTTP 500\nboom")
+    assert_nil diff_context_fallback_reason("POST /apibuilder/diffs: Validation errors:\n  bryzek/x (original): nope")
+  end
+
+  # A client that fails the first request and succeeds on every one after it, recording
+  # each form: the fallback is about which payloads go out, in which order.
+  class RecordingClient
+    attr_reader :forms
+
+    def initialize(error)
+      @error = error
+      @forms = []
+    end
+
+    def request(_method, _path, form)
+      @forms << form
+      raise @error if @forms.size == 1
+      :ok
+    end
   end
 
   def test_summarize_marks_breaking_from_the_servers_own_discriminator
