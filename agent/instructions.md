@@ -554,12 +554,35 @@ the one way to bring `main` under a branch like this, and it needs no force.
   credentials on this runner" — **read it while you are still planning**, because
   an absent credential looks exactly like one you have not thought to look for
   yet, and the cost of finding out late is a request shape you designed against
-  the documentation and cannot test (ISS-565). If the one you need is present it
-  is already exported into your environment; pass it explicitly to what you are
-  verifying. If it is absent, say so up front, do the offline work in full, state
-  plainly in the PR which part is unverified, and file it with `dev issues
-  workaround`. Either way a credential is never yours to print, echo, commit, or
-  paste into a PR, an issue comment, a plan or a test fixture.
+  the documentation and cannot test (ISS-565). If it is absent, say so up front,
+  do the offline work in full, state plainly in the PR which part is unverified,
+  and file it with `dev issues workaround`. A credential is never yours to print,
+  echo, commit, or paste into a PR, an issue comment, a plan or a test fixture.
+
+  **A credential you DO have is not in your environment, and that is deliberate**
+  (ISS-1037). `$PLAYBOOK_CLAUDE_KEY` and `$NEWRELIC_USER_KEY` are empty in your
+  shell. Ask for one per command instead, and it exists only inside that
+  command's own process:
+
+      dev agent credential exec --name NEWRELIC_USER_KEY -- \
+        /bin/zsh -c 'curl -sS -X POST https://api.newrelic.com/graphql \
+          -H "Content-Type: application/json" -H "API-Key: $NEWRELIC_USER_KEY" ...'
+
+  **SINGLE quotes around the inner command.** Double quotes make YOUR shell
+  expand the reference before `dev` runs — to nothing — and an unauthenticated
+  NerdGraph query answers an empty result set rather than a 401, which reads
+  exactly like a healthy graph (ISS-635). The command refuses when it cannot see
+  the name in what you gave it, which is precisely what that mistake leaves
+  behind; `--implicit` is the escape for a program that reads the variable itself
+  and never names it on a command line. `dev agent credential list` says which
+  credentials this machine has, and never a value.
+
+  This is not a permission you have to earn and it is not an access control: any
+  session can run it, because every session on this runner is the same uid. What
+  it changes is that a run which never touches an external API no longer carries
+  the keys to two — so nothing can sweep them out of your environment by accident,
+  which is how both of the leaks that have actually happened happened (ISS-961,
+  ISS-1035). Every use is recorded under the issue's log tree.
 - **This runner is SHARED, and a command line is PUBLIC.** Several agent sessions
   run on one Mac mini as the same user, and `ps -U <uid>` shows every argument of
   every one of their processes to all the others. Two rules follow, and neither is

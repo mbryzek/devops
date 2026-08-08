@@ -18,11 +18,19 @@ require 'environment_variables'
 #
 # TWO PUBLIC FACES, AND THE SPLIT IS THE SAFETY PROPERTY. `check` reports
 # WHETHER a credential resolves and never carries its value, so it is safe to
-# print, log, and render into a prompt. `resolve` returns values, is called from
-# exactly one place (the spawn environment), and its result is never printed.
-# Keeping them apart is what stops a doctor listing, a tick log line, or an
-# exception's `inspect` from leaking a live API key into a file a PR might
-# quote.
+# print, log, and render into a prompt. `probe` returns values, and nothing that
+# calls it prints its result. Keeping them apart is what stops a doctor listing,
+# a tick log line, or an exception's `inspect` from leaking a live API key into a
+# file a PR might quote.
+#
+# WHERE THE VALUES GO, SINCE ISS-1037. Not into the session. A spawned session's
+# environment gets `withheld` — every credential name explicitly removed — and a
+# session that needs one runs `dev agent credential exec`, which puts it into one
+# child process for one command (`Agent::CredentialUse`). ISS-570's promise is
+# unchanged and is made by `check`: a session is told up front which credentials
+# this machine holds, before it plans, so an absent one is never discovered
+# halfway through. What changed is that being TOLD about a key and HOLDING it for
+# the life of the run are no longer the same thing.
 #
 # WHY NOT `ANTHROPIC_API_KEY`. That name is exactly the one that must never
 # appear here. The process this environment is handed to IS `claude`, and the
@@ -123,6 +131,8 @@ module Agent
       ),
     ].freeze
 
+    NAMES = CREDENTIALS.map(&:name).freeze
+
     # What `check` reports. Carries a STATUS, never a value — see the module
     # comment. `source` is where the answer came from: :process_env when the
     # runner's own environment already carries it, :env_repo when it was read
@@ -165,23 +175,41 @@ module Agent
       end
     end
 
-    # The values to ADD to a spawned session's environment. The one caller is
-    # `Agent::Tick#child_env`, and its result is never logged.
-    #
-    # Credentials the runner's own environment already carries are deliberately
-    # omitted: `Process.spawn` merges this hash over an inherited ENV, so the
-    # child gets those anyway, and re-listing them would pull a secret through
-    # more code for no effect.
-    def resolve(credentials: CREDENTIALS, env: ENV)
-      credentials.each_with_object({}) do |credential, resolved|
-        status, value, source = probe(credential, env: env)
-        next unless status == :present && source == :env_repo
-        resolved[credential.name] = value
-      end
+    # One credential by the name a session was told, or nil.
+    def find(name, credentials: CREDENTIALS)
+      credentials.find { |c| c.name == name.to_s }
     end
 
-    # [status, value, source]. The single read, so `check` and `resolve` cannot
-    # disagree about what this machine has.
+    # What a spawned session's environment says about credentials: NOTHING
+    # (ISS-1037). Every name mapped to nil, which is how `Process.spawn` is told
+    # to REMOVE a variable from the child rather than merely not to add one.
+    #
+    # Not-adding is not enough, and the difference is the whole reason this is a
+    # method rather than an omission. `spawn` merges its env hash over an
+    # INHERITED environment, so a credential the runner's own shell exports —
+    # which `probe` deliberately lets an operator do, and which one of the two
+    # runners may well be doing — would otherwise ride down into every session
+    # untouched, and the change would be a no-op on exactly the machine nobody
+    # checked. Explicit nils make the grant independent of how the runner was
+    # started.
+    #
+    # WHAT REPLACES IT. `dev agent credential exec` (Agent::CredentialUse) puts
+    # one credential into one child process for one command. That is not an
+    # access control — same uid, and the env repo is readable on disk — and the
+    # module comment there says so. It is a blast-radius change: a run that never
+    # touches an external API no longer holds the keys to two.
+    def withheld(credentials: CREDENTIALS)
+      credentials.each_with_object({}) { |credential, env| env[credential.name] = nil }
+    end
+
+    # [status, value, source]. The single read, so `check` and every caller that
+    # needs a VALUE cannot disagree about what this machine has.
+    #
+    # There used to be a `resolve` beside `check` here, building the whole spawn
+    # environment in one call. ISS-1037 deleted it rather than leaving it unused:
+    # nothing hands a session a hash of credentials any more, and a
+    # value-carrying function with no callers is the one kind of dead code worth
+    # going out of the way to remove.
     #
     # The process environment wins over the env repo so an operator can override
     # one key from `.zprofile` without editing (or unlocking) the secrets repo.

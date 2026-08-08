@@ -1488,14 +1488,26 @@ module Agent
     # could persist itself. Saying so in the prompt is necessary; it is not
     # sufficient.
     #
-    # The credentials merged in last are the external-API keys a session needs
-    # to VERIFY work whose subject is an external API, rather than designing it
-    # against the documentation (ISS-570). They are read from the env repo at
-    # spawn time and never logged — `Agent::Credentials.resolve` is the only
-    # call in this file that carries a secret, and its result goes straight into
-    # the spawn and nowhere else. What the session is TOLD about them (present
-    # or absent, and why) is `Agent::Credentials.check`, which carries no values
-    # and is rendered into the prompt by Agent::Prompt.
+    # The credentials merged in last are the external-API keys a session needs to
+    # VERIFY work whose subject is an external API, rather than designing it
+    # against the documentation (ISS-570) — and since ISS-1037 what is merged is
+    # their ABSENCE. `Agent::Credentials.withheld` maps every name to nil, which
+    # is how `Process.spawn` is told to remove a variable rather than merely not
+    # to add one; that matters because the runner's own shell may export a key,
+    # and a child inherits what it is not explicitly denied.
+    #
+    # No line in this file carries a secret any more. A session that needs one
+    # runs `dev agent credential exec`, which resolves it into that one command's
+    # process and records the use. The reason is blast radius, not access control
+    # — every session is the same uid and the env repo is readable on disk, so
+    # this can only change how many runs hold a key they were never going to use.
+    # Measured on a runner while ISS-1037 was written: 16 of 604 processes
+    # carried PLAYBOOK_CLAUDE_KEY, and two of seventeen playbooks use a
+    # credential at all. Agent::CredentialUse has the full argument.
+    #
+    # What the session is TOLD about them (present or absent, and why) is
+    # unchanged and is `Agent::Credentials.check`, which carries no values and is
+    # rendered into the prompt by Agent::Prompt.
     # CLAUDE_SESSION_ID is set by the RUNNER, not left to the session, and that is
     # what makes the reclamation in `cleanup` possible: `claude-db` names a
     # session's databases after this variable (falling back to the ~/code/ai
@@ -1528,7 +1540,7 @@ module Agent
         "GIT_CONFIG_KEY_0" => "core.hooksPath",
         "GIT_CONFIG_VALUE_0" => Agent::Paths.githooks_dir,
         "DEV_AGENT_CLAUDE_REPO" => Agent::Paths.claude_repo,
-      }.merge(Agent::Credentials.resolve)
+      }.merge(Agent::Credentials.withheld)
     end
 
     # ---------------- plumbing ----------------
