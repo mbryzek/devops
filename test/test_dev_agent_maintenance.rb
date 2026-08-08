@@ -453,6 +453,51 @@ class TestDevAgentMaintenance < Minitest::Test
     end
   end
 
+  # ISS-783. The other headroom. `run_processes` above reclaims only the leaks it
+  # can PROVE are leaks; a machine oversubscribed for any other reason is left as
+  # slow as it was, and nothing off the box says so.
+  def test_the_report_carries_both_ends_of_the_load_average
+    with_agent_home do
+      stub_singleton(Agent::Maintenance, :disk, ->(*) { [1, 2] }) do
+        stub_singleton(Agent::Processes, :load_average, ->(*) { [48.5, 30.0, 12.25] }) do
+          report = Agent::Maintenance.report
+          assert_equal 48.5, report[:load_average_1m], "1m is the operator's 'right now'"
+          assert_equal 12.25, report[:load_average_15m],
+                       "15m is what the server's sustained check reads — it summarises the whole " \
+                       "gap between two heartbeats rather than one minute in every ten"
+        end
+      end
+    end
+  end
+
+  # cpu_cores is already on the runner row from registration, off the same
+  # `sysctl -n hw.ncpu`. A second copy on every heartbeat could only agree with
+  # the first or be a bug, so the quotient is the server's to compute.
+  def test_the_report_does_not_restate_the_core_count
+    with_agent_home do
+      stub_singleton(Agent::Maintenance, :disk, ->(*) { [1, 2] }) do
+        stub_singleton(Agent::Processes, :load_average, ->(*) { [1.0, 1.0, 1.0] }) do
+          refute Agent::Maintenance.report.key?(:cpu_count)
+        end
+      end
+    end
+  end
+
+  # Same posture as an unreadable df: omitted, never 0. A reported 0 load is the
+  # picture of a healthy machine, so it is the one wrong answer that would make
+  # an oversubscribed box look fine forever.
+  def test_a_machine_that_will_not_report_its_load_sends_nothing_rather_than_zero
+    with_agent_home do
+      stub_singleton(Agent::Maintenance, :disk, ->(*) { [1, 2] }) do
+        stub_singleton(Agent::Processes, :load_average, ->(*) { nil }) do
+          report = Agent::Maintenance.report
+          refute report.key?(:load_average_1m)
+          refute report.key?(:load_average_15m)
+        end
+      end
+    end
+  end
+
   # `df -Pk` is POSIX output — one record per filesystem on ONE line. Without -P
   # a long device name wraps and the columns are read off the wrong line, which
   # is how a healthy machine reports a full disk.

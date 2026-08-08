@@ -326,13 +326,15 @@ module Agent
     # failure someone is trying to see. update_checkout runs BEFORE this in phase_a, so a failure
     # recorded this tick is reported by this tick.
     #
-    # And (ISS-528) this machine's housekeeping vitals — last_maintenance_at plus its disk headroom.
+    # And (ISS-528/ISS-783) this machine's housekeeping vitals — last_maintenance_at plus its disk
+    # and CPU headroom.
     # Same noun as the errors and for the same reason: the subject is the MACHINE. They rode the
     # registry report first, which was the wrong home twice over — that noun is deleted at the
     # server-side-scheduling cutover, and a liveness signal that quietly stops having rows is
     # indistinguishable from a healthy fleet, which is the exact failure it exists to catch.
     #
-    # They are DELIBERATELY not part of the change test above. Free disk moves on almost every tick,
+    # They are DELIBERATELY not part of the change test above. Free disk and load average both move
+    # on almost every tick,
     # so gating on it would turn a ten-minute heartbeat into a 30-second one for a signal whose
     # threshold is HALF A DAY (AgentInvariants.MaintenanceStaleAfterHours, 12h since ISS-561 —
     # deliberately not restated as a number the platform can move without us) — the floor is still
