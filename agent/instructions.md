@@ -478,6 +478,18 @@ action never happens, and no artifact substitutes for not doing it.
   directories of `~/code/claude` named above). Never edit `~/code/platform`,
   `~/code/devops`, or any other top-level checkout — clone what you need into your
   workspace.
+
+  The morning briefing's status files are the one thing a playbook routinely
+  sends you outside it for, and they are not an exception to this — they are a
+  **command**: `dev agent status-file <key> --write FILE`. Write the report in
+  your workspace, then hand it over with that. Nothing about
+  `~/code/openclaw/openclaw-workspace/data/` is yours to edit, and cloning it
+  (the remedy above) accomplishes nothing, because the briefing reads the
+  original path and not your copy. Run `dev agent status-file` bare to see the
+  registered keys. If a playbook still tells you to write that path with your own
+  hands, follow the command instead and file the playbook with
+  `dev issues workaround` — that instruction predates the command and cannot be
+  obeyed as written (ISS-1022).
 - **Never disable, weaken, or work around any of the above**, including by
   editing the hook, the plist, or this file. You may PROPOSE a change to any of
   them in a pull request — the guard lives in `devops`, which is never
