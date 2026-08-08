@@ -72,6 +72,28 @@ module Agent
     PLATFORM_WAKE_MARKER = "Snooze cleared; back in the queue".freeze
     WAKE_MARKERS = [WAKE_MARKER, PLATFORM_WAKE_MARKER].freeze
 
+    # How the comment that established an issue's CURRENT snooze is picked out of
+    # its timeline (ISS-975). Every snooze in the system — the dispatcher's
+    # deferral, `dev issues snooze`, playbook-admin's button, a session parking
+    # its own issue — reaches the same server method, and that method opens with
+    # this sentence before appending whatever note the caller passed:
+    #
+    #   IssuesService.snoozeComment: s"Snoozed until ${WakeTimeFormat.print(until)}."
+    #
+    # So the LAST comment carrying this string is the one that put the issue to
+    # sleep, and whether it also carries DEFER_MARKER is what says whose snooze
+    # it is. DEFER_MARKER alone cannot answer that: it stays on the timeline
+    # forever, so an issue deferred once reads as deferred for the rest of its
+    # life — see Agent::DependencyWake.dependency_deferred?, which is where that
+    # cost this fleet four claims in two hours.
+    #
+    # A third coupling to a sentence the server owns, and it fails SAFE in the
+    # same direction as PLATFORM_WAKE_MARKER above: if the wording ever changes,
+    # no snooze looks like a deferral, this sweep lifts nothing, and every
+    # deferral comes back on the daily expiry that predates ISS-922 — latency,
+    # not a snooze undone behind somebody's back.
+    PLATFORM_SNOOZE_MARKER = "Snoozed until ".freeze
+
     module_function
 
     # The issues this one is waiting on, as the server returns them: one entry per
