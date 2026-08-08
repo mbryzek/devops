@@ -55,8 +55,13 @@ class DbApp
   #   :default   nothing pointed anywhere, so ~/code/<app>-postgresql was
   #              assumed. NOBODY chose this one, which is what makes it the only
   #              one safe to swap out — see SchemaMirror.
-  #   :mirror    the tooling's own clone, pinned to origin/main.
-  REPO_SOURCES = [:explicit, :cwd, :sibling, :default, :mirror].freeze
+  #   :mirror    the tooling's own clone, VERIFIED at origin/main just now.
+  #   :mirror_stale  the same clone, which could NOT be pinned this time (the
+  #              fetch or the reset failed — offline, or origin unreachable). It
+  #              is still the best checkout available and is used, but it is not
+  #              main and must not be trusted as if it were; see
+  #              pinned_to_origin?.
+  REPO_SOURCES = [:explicit, :cwd, :sibling, :default, :mirror, :mirror_stale].freeze
 
   def initialize(name:, database:, role:, repo_dir:, repo_source: :explicit)
     # Fail loud on a typo. A misspelled source is not inert: `claude-db` decides
@@ -348,6 +353,40 @@ class DbApp
   def pending_scripts(port, db)
     applied = applied_scripts(port, db).to_set
     repo_scripts.reject { |f| applied.include?(f) }
+  end
+
+  # The OTHER direction: scripts `db` has a tracking row for that this checkout
+  # does not contain. Call only when sem_tracking? is true.
+  #
+  # Nothing can be done about these — a migration removed or squashed since the
+  # image baseline reads exactly this way, and so does a branch migration
+  # applied before a rebase dropped it — so this is never a refusal. It is
+  # reported because it is the only evidence that the database was built from a
+  # DIFFERENT set of scripts than the one it is about to be tested against, and
+  # an unreported one is indistinguishable from a clean database right up until
+  # the suite fails on a table the branch never created.
+  #
+  # It is also why the up-to-date report must name SETS rather than a count:
+  # "N scripts applied" printed as a count of checkout files reads identical
+  # whether the sets match or merely happen to be the same size, and that
+  # reading is what sent ISS-900 chasing a phantom row (there wasn't one).
+  def orphan_applied_scripts(port, db)
+    have = repo_scripts.to_set
+    applied_scripts(port, db).reject { |f| have.include?(f) }.sort
+  end
+
+  # True when this checkout was just verified to BE origin/main, so measuring it
+  # against origin again can only produce a false alarm (a migration merged
+  # during the sync, in a checkout the caller does not own and cannot rebase).
+  #
+  # Only the freshly pinned mirror qualifies. :mirror_stale deliberately does
+  # not: it is the same directory reached by the degraded path, where the pin
+  # failed and the mirror is whatever main looked like the last time it was
+  # reachable. Treating that one as pinned is a false green with no floor under
+  # it — the mirror on this runner sat 2 commits and 1 migration behind main on
+  # 2026-08-07, missing precisely the script ISS-900 was filed about.
+  def pinned_to_origin?
+    repo_source == :mirror
   end
 
   # The checkout's HEAD, short — printed alongside a drift count so "up to date"

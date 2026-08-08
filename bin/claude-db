@@ -542,7 +542,8 @@ def do_sync(app)
   end
 
   pending = app.pending_scripts(port, db)
-  puts "Schema repo : #{app.repo_dir} @ #{app.repo_head}#{app.repo_source == :mirror ? '  (tooling clone, pinned to origin/main)' : ''}"
+  orphans = app.orphan_applied_scripts(port, db)
+  puts "Schema repo : #{app.repo_dir} @ #{app.repo_head}#{mirror_note(app)}"
 
   # "In sync" only ever means in sync WITH THIS CHECKOUT, so the checkout has to
   # be measured against main before anything here can be called up to date.
@@ -550,7 +551,16 @@ def do_sync(app)
   fetched = app.repo_fetch_origin
 
   if pending.empty?
-    puts "Schema      : up to date with the checkout (#{app.repo_scripts.length} scripts applied)."
+    # Named as a SET, not as a count. "N scripts applied" was printed from
+    # app.repo_scripts.length — a count of files in the checkout, labelled as a
+    # count of rows in the database — so the one line a caller reads to decide
+    # whether their database is current asserted something it had not measured.
+    # It was right (pending is a set difference and always has been), but it is
+    # unfalsifiable from the outside, and ISS-900 was filed against the phantom
+    # row it appeared to describe. Say what was compared.
+    puts "Schema      : up to date with the checkout — all #{app.repo_scripts.length} " \
+         "script(s) in scripts/ are recorded as applied in #{db}."
+    report_orphans(orphans, app, db)
     assert_matches_origin!(app, db, fetched)
     return
   end
@@ -616,7 +626,56 @@ def do_sync(app)
 
   puts ""
   puts "Applied #{pending.length} migration(s) to #{db} in #{container}."
+  report_orphans(orphans, app, db)
   assert_matches_origin!(app, db, fetched)
+end
+
+# How the checkout in the header line was arrived at, when the tooling chose it
+# rather than the caller. Silent for a caller's own checkout — they know where
+# they are standing.
+def mirror_note(app)
+  case app.repo_source
+  when :mirror       then "  (tooling clone, pinned to origin/main)"
+  when :mirror_stale then "  (tooling clone, NOT pinned — origin unreachable, so this is main as of its last fetch)"
+  else ""
+  end
+end
+
+# Enumerating orphans stops being information and becomes scrolling at about
+# this many. Below it the list is the useful part — a handful is most likely a
+# branch migration a rebase took away, and the filename is what identifies it.
+ORPHAN_LIST_LIMIT = 5
+
+# The other half of the set comparison: rows the database has and the checkout
+# does not.
+#
+# ONE LINE, deliberately, because on a real app this is neither rare nor
+# actionable: platform's image carries 277 of them, spanning 2023 to 2026, every
+# one an ordinary squash or removal from a baseline older than the scripts it
+# keeps. Printing 277 filenames on every sync would bury the two lines above it
+# that a caller actually reads, and a warning that fires identically every time
+# is one nobody reads at all.
+#
+# But it must be SAID. Not because it is a problem — it is never a refusal, and
+# nothing here can be applied or reverted — but because it is the number that
+# makes the up-to-date line falsifiable. `sync` compares sets; a caller can only
+# see counts, and the two counts are 920 and 1197 on a healthy platform
+# database. Print only the first and the second one is inferred to be equal to
+# it, which is exactly the reasoning ISS-900 was filed on.
+def report_orphans(orphans, app, db)
+  return if orphans.empty?
+  listed = orphans.length <= ORPHAN_LIST_LIMIT ? " (#{orphans.join(', ')})" : ""
+  puts "Recorded    : #{orphans.length} script(s) applied in #{db} that this checkout " \
+       "does not contain#{listed} — squashed or removed migrations, expected; " \
+       "sync neither applies nor reverts them."
+  return unless orphans.length <= ORPHAN_LIST_LIMIT
+  # Few enough to be a rebase rather than a baseline, which is the one shape of
+  # this worth a caller's attention: the database is then carrying DDL from a
+  # script the branch no longer has, and that surfaces later as a table or
+  # column nothing in the checkout accounts for.
+  puts "              If the suite fails on a table or column this branch does not define, " \
+       "start clean:"
+  puts "                claude-db end --app #{app.name} && claude-db start --app #{app.name}"
 end
 
 # Refuse to report success over a database that is provably missing migrations
@@ -638,10 +697,11 @@ end
 # main, offline with refs never fetched) means no refusal — an unknown must
 # never become a block.
 #
-# Nothing here fires for the fallback checkout any more: that one is the
-# tooling's own clone, pinned to origin/main before it is used (SchemaMirror).
-# What is left is a checkout the CALLER owns and only the caller can move, so
-# the remedy is theirs and the message names it.
+# This fires for every checkout that is not PROVABLY main: one the caller owns
+# and only the caller can move, and the tooling's own clone on the runs where it
+# could not be pinned (SchemaMirror hands that one back marked, and the remedy
+# below differs because the caller does not own that directory). The only thing
+# skipped is a mirror verified at origin/main seconds ago.
 def assert_matches_origin!(app, db, fetched)
   # The mirror was pinned to origin/main moments ago, so measuring it against
   # origin again buys nothing and can only produce a false alarm: a migration
@@ -649,13 +709,39 @@ def assert_matches_origin!(app, db, fetched)
   # not own, cannot rebase, and is not responsible for. The next start or sync
   # picks it up. Only checkouts the caller owns are measured, because those are
   # the ones that go stale and stay stale.
-  return if app.repo_source == :mirror
+  #
+  # "The mirror was pinned moments ago" is a claim about what HAPPENED, not
+  # about which directory this is, and SchemaMirror hands the mirror back
+  # unpinned whenever origin was unreachable. Reading that one as pinned skipped
+  # the only check standing between a knowingly-stale checkout and a green
+  # "up to date" — with no floor under how stale, because a mirror nobody can
+  # fetch never gets less stale (ISS-900). So the test is the flag, not the
+  # directory: :mirror_stale falls through to the measurement below, where its
+  # last-fetched refs are still worth reading and an unreadable comparison still
+  # degrades to nil rather than to a block.
+  return if app.pinned_to_origin?
 
   missing = app.missing_scripts_vs_origin
   return if missing.nil? || missing.empty?
 
   behind = app.repo_behind_origin
   context = behind && behind > 0 ? " (#{fetched ? '' : 'at least '}#{behind} commit(s) behind)" : ""
+  # The mirror is the tooling's directory, so telling the caller to rebase it is
+  # telling them to fix something they do not own and did not choose.
+  remedy =
+    if app.repo_source == :mirror_stale
+      "The tooling's own clone could not reach origin this run, so it is behind main.\n" \
+      "Re-run once the network is back:\n" \
+      "  claude-db sync --app #{app.name}\n\n" \
+      "Or sync from a checkout you control:\n" \
+      "  claude-db sync --app #{app.name} --repo-dir <path-to-#{app.name}#{DbApp::POSTGRESQL_SUFFIX}>"
+    else
+      "Update the checkout, then re-run:\n" \
+      "  git -C #{app.repo_dir} fetch origin && git -C #{app.repo_dir} rebase origin/main\n" \
+      "  claude-db sync --app #{app.name}\n\n" \
+      "Or sync from a checkout that is current:\n" \
+      "  claude-db sync --app #{app.name} --repo-dir <path-to-#{app.name}#{DbApp::POSTGRESQL_SUFFIX}>"
+    end
   Util.exit_with_error(
     "#{db} is synced to #{app.repo_dir}, and THAT CHECKOUT is missing " \
     "#{missing.length} migration(s) that origin/main has#{context}:\n" \
@@ -663,11 +749,7 @@ def assert_matches_origin!(app, db, fetched)
     "So the database is missing them too. A test suite run against it fails in " \
     "ways that look like code defects rather than like a stale database, which " \
     "is why this stops here instead of warning.\n\n" \
-    "Update the checkout, then re-run:\n" \
-    "  git -C #{app.repo_dir} fetch origin && git -C #{app.repo_dir} rebase origin/main\n" \
-    "  claude-db sync --app #{app.name}\n\n" \
-    "Or sync from a checkout that is current:\n" \
-    "  claude-db sync --app #{app.name} --repo-dir <path-to-#{app.name}#{DbApp::POSTGRESQL_SUFFIX}>" \
+    "#{remedy}" \
     "#{fetched ? '' : "\n\n(The fetch failed, so this is read from the last one the checkout did — there can be more.)"}"
   )
 end
@@ -1106,13 +1188,22 @@ end
 def with_current_schema(app)
   return app if app.nil? || app.repo_source != :default
 
-  dir = SchemaMirror.checkout(app.name, :origin_from => app.repo_dir)
-  if dir.nil?
+  mirror = SchemaMirror.checkout(app.name, :origin_from => app.repo_dir)
+  if mirror.nil?
     puts "NOTE: could not refresh the tooling's clone of #{app.name}#{DbApp::POSTGRESQL_SUFFIX} " \
          "(offline?) — falling back to #{app.repo_dir}, which may be behind main."
     return app
   end
-  app.with_repo_dir(dir, :repo_source => :mirror)
+  unless mirror.pinned?
+    # The mirror exists but could not be moved to main this time. It is still
+    # the best checkout available, so it is used — but it is NOT main, and the
+    # source it carries says so, which is what puts assert_matches_origin! back
+    # in front of it (ISS-900).
+    puts "NOTE: could not pin the tooling's clone of #{app.name}#{DbApp::POSTGRESQL_SUFFIX} " \
+         "to origin/main (offline?) — using it as it stands, at whatever main was when it " \
+         "last reached origin."
+  end
+  app.with_repo_dir(mirror.dir, :repo_source => mirror.pinned? ? :mirror : :mirror_stale)
 end
 
 # The app AND the schema checkout its scripts come from.
