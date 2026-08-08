@@ -90,6 +90,25 @@ module Agent
     # `-U` so this only ever sees the agent user's own processes, never root's
     # and never another login's. `command=` last, because it is the one field
     # that contains spaces.
+    #
+    # NEVER add `-E` (ISS-1028). `ps -E` appends a process's whole ENVIRONMENT to
+    # the listing, and every agent session on this runner is the same uid — so it
+    # is every sibling's `PLAYBOOK_CLAUDE_KEY` and `NEWRELIC_USER_KEY`, for the
+    # entire life of those sessions, in a struct field this module hands around.
+    #
+    # Two measured details, because the first one is the tempting excuse to
+    # relax this. `-E` is IGNORED whenever `-o` is given, so asking for it here
+    # today would leak nothing — and that is an implementation detail of one
+    # `ps`, not a guarantee, and it evaporates the moment somebody simplifies
+    # this call away from `-o`. Second, `ps` is aliased to `ps -ax` in the shell
+    # (`~/code/misc/env/.alias`), so the disclosing form is one word away from
+    # anything typed interactively against this module's behaviour.
+    #
+    # `Agent::Redact` runs over what comes back, but its own header calls itself
+    # a net rather than a seal, and there is nothing this codebase wants from a
+    # sibling's environment in the first place. The sweep needs pids, ancestry
+    # and age; it has never needed an environment. test_agent_shared_runner_rule.rb
+    # asserts the flag stays out.
     PS_FORMAT = "pid=,ppid=,pgid=,etime=,time=,command=".freeze
 
     # The NUMERIC uid, not `Etc.getlogin` and not `$USER`. Under launchd — which
