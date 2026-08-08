@@ -42,6 +42,7 @@ require 'depsguard'
 require 'agent/checkout'
 require 'agent/ci'
 require 'agent/dependency_wake'
+require 'agent/dotfiles'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/heap'
@@ -157,6 +158,7 @@ INVOCATIONS = {
   "agent gc"            => 'agent gc [--dry-run]',
   "agent maintenance"   => 'agent maintenance [--dry-run] [--force]',
   "agent doctor"        => 'agent doctor',
+  "agent dotfiles"      => 'agent dotfiles [PATH]... [--grep PATTERN]',
   "agent merge-lane"    => 'agent merge-lane [REPO]... [--json]',
   "agent merge"         => 'agent merge <repo> <pr> [--run-id ID] [--dry-run] [--localhost]',
   "agent update-branch" => 'agent update-branch <repo> <pr> [--dry-run]',
@@ -1258,6 +1260,24 @@ USAGE = <<~USAGE
         costs them all of it silently (ISS-615). The tick creates it; this only
         reads.
 
+    #{INVOCATIONS["agent dotfiles"]}
+        This machine's shell startup files — `.zshenv`, `.zprofile`, `.zshrc`,
+        `.zlogin` and what they source — with every value taken out (ISS-1035).
+        Run this INSTEAD of reading them: the ones on this fleet hold a human's
+        own third-party credentials as plaintext literals, and answering an
+        ordinary question about shell configuration reads one into a transcript.
+        Aliases, `source` lines, `PATH`, conditionals and comments come through
+        verbatim, which is everything such a question is ever about. What is
+        hidden is ASSIGNMENT VALUES, and by default: a value is shown only when
+        it is recognisably structure — a path, a `$VAR`, a flag, a number — so a
+        credential is hidden whatever its variable is called. `[redacted]` marks
+        one a pattern positively identified; `[hidden]` is every other value.
+        --grep filters to matching lines, and matches the SAFE text, so it
+        cannot be used to feel out a value a line is hiding.
+        Naming a PATH reads that file instead of the startup set. It is redacted
+        the same way — naming a file buys you past the size guard on vendored
+        scripts, never past the redaction.
+
     #{INVOCATIONS["agent merge-lane"]}
         The per-repo merge lane (ISS-754), READ-ONLY. For each repo, every open
         PR oldest-first with the lane's verdict on it and what to do about it:
@@ -1428,7 +1448,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
+  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor dotfiles merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[scan verify preflight clean-build],
 }.freeze
@@ -14302,6 +14322,7 @@ def cmd_agent_doctor(args)
 
   claude_config = agent_doctor_claude_config
   agent_doctor_credentials
+  agent_doctor_dotfiles
   agent_doctor_sbt_heap
   agent_doctor_load
 
@@ -14341,6 +14362,104 @@ def cmd_agent_doctor(args)
     return
   end
   exit 1
+end
+
+# The shell startup files, safe to read (ISS-1035).
+#
+# THIS COMMAND IS THE POINT OF THE WHOLE MODULE, and it exists because the rule
+# it enforces is unenforceable without it. "Do not read `~/.zshrc`" is a rule
+# with no alternative, and a rule with no alternative is broken by exactly the
+# person who has a real question — which here is everyone, since answering
+# anything about shell configuration on this fleet means opening those files.
+# ISS-1033 was "where is `alias ps='ps -ax'` defined?"; there is no other way to
+# find out, and finding out put a Jira token and an Artifactory password into a
+# session transcript.
+#
+# So this prints the same files with the same structure and no values. The
+# question ISS-1033 asked is answered in full by the output — aliases, `source`
+# lines, `PATH`, conditionals and comments are verbatim — and the two
+# credentials are not in it.
+#
+# READ-ONLY, and it can only ever be. A human's dotfiles are outside every
+# session's writable area, which is also why this reports rather than repairs:
+# the fix is to move the values into the `env` repo, and that is a human's to do
+# on both runners.
+def cmd_agent_dotfiles(args)
+  pattern = nil
+  paths = []
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--grep"
+      pattern = args[i + 1]
+      usage_exit("--grep requires a value", example: usage_for("agent dotfiles")) if pattern.nil?
+      i += 2
+    when /\A-/
+      # Every other argument is a PATH, so an unknown flag would otherwise be
+      # read as a filename and reported as "could not be read" — a typo'd flag
+      # answering with a file error is how you conclude the command is broken.
+      usage_exit("agent dotfiles: unknown argument: #{args[i]}", example: usage_for("agent dotfiles"))
+    else
+      paths << args[i]
+      i += 1
+    end
+  end
+
+  filter = begin
+    pattern.nil? ? nil : Regexp.new(pattern, Regexp::IGNORECASE)
+  rescue RegexpError => e
+    usage_exit("agent dotfiles: --grep is not a valid pattern: #{e.message}", example: usage_for("agent dotfiles"))
+  end
+
+  home = Dir.home
+  files = Agent::Dotfiles.read(home: home, paths: paths)
+  if files.empty?
+    puts paths.empty? ? "No shell startup files on this machine." : "None of those files could be read."
+    return
+  end
+
+  files.each do |file|
+    # `.dup`, not `+file.display`: unary plus returns the receiver itself when
+    # it is not frozen, so appending would rewrite the struct's own display name
+    # and every later mention of the file would carry this header's decorations.
+    header = file.display.dup
+    header << " -> #{file.resolves_to}" if file.resolves_to
+    header << "  (sourced by #{file.sourced_by})" if file.sourced_by
+    puts
+    puts header
+    puts "-" * header.length
+
+    unless file.shown?
+      puts "  #{file.note}"
+      next
+    end
+
+    lines = filter ? file.lines.select { |l| l.text.match?(filter) } : file.lines
+    if lines.empty?
+      puts "  (no matching lines)" if filter
+    else
+      width = lines.last.number.to_s.length
+      lines.each { |l| puts "  #{l.number.to_s.rjust(width)}  #{l.text}" }
+    end
+
+    unresolved = Agent::Dotfiles.unresolved_sources(file, home: home)
+    next if unresolved.empty?
+    puts "  not followed (not statically resolvable, or outside $HOME): #{unresolved.join(', ')}"
+  end
+
+  # Said every time, not only when something was hidden. A reader who sees no
+  # placeholder in the output needs to know the values were withheld by policy
+  # rather than that this file happens to have none — otherwise the absence of a
+  # `[hidden]` reads as "nothing here to worry about" and the next question is
+  # answered with `cat` again.
+  puts
+  puts "Assignment values are hidden unless they are recognisably a path, a `$VAR`, a flag or a number."
+  puts "`#{Agent::Redact::PLACEHOLDER}` is a value a pattern positively identified as a credential; " \
+       "`#{Agent::Dotfiles::HIDDEN}` is every other value."
+  findings = Agent::Dotfiles.findings(files)
+  return if findings.empty?
+  puts
+  findings.each { |f, l| puts "CREDENTIAL #{f.resolves_to || f.display}:#{l.number} — #{l.name} (see `dev agent doctor`)" }
 end
 
 # ---- the merge lane (ISS-754) ----------------------------------------------
@@ -14771,6 +14890,60 @@ def agent_doctor_credentials
   end
   puts "Sessions on this machine are TOLD this up front and will report such work as unverified " \
        "rather than guessing (ISS-570). Nothing else is blocked."
+end
+
+# The credentials in this machine's OWN dotfiles (ISS-1035).
+#
+# A different problem from the section above it, and the ordering here is
+# deliberate: `agent_doctor_credentials` reports the keys the FLEET hands a
+# session and whether they arrived. This reports a human's own third-party
+# credentials sitting in a file every session is positively encouraged to read,
+# which no rule covered and nothing warned about.
+#
+# NEVER fatal, for the reason every other soft section here is not: a runner
+# whose `~/.zshrc` holds a Jira token runs the entire queue perfectly well, and
+# failing provisioning over a dotfile habit would get the whole doctor routed
+# around. What it must not do is stay invisible — the leak is silent by
+# construction, since the session doing it is answering an ordinary question
+# correctly.
+#
+# Prints the FILE, the LINE and the VARIABLE NAME, and never a value. A name is
+# metadata: `JIRA_API_TOKEN` is what makes this actionable to whoever has to go
+# move it, and it is not the credential.
+def agent_doctor_dotfiles
+  files = Agent::Dotfiles.read
+  return if files.empty?
+
+  findings = Agent::Dotfiles.findings(files)
+  opaque = files.sum { |f| f.opaque.length }
+  puts
+  puts "Shell startup files (read `dev agent dotfiles`, never the files — ISS-1035):"
+  files.each do |f|
+    detail = f.shown? ? "#{f.lines.length} lines" : f.note
+    detail += " -> #{f.resolves_to}" if f.resolves_to
+    detail += "  (sourced by #{f.sourced_by})" if f.sourced_by
+    puts "  #{findings.any? { |file, _| file.equal?(f) } ? 'LEAK' : 'ok  '} #{f.display.ljust(12)} #{detail}"
+  end
+
+  if findings.empty?
+    puts "  No assignment here matches a known credential shape. #{opaque} value(s) are hidden anyway —"
+    puts "  `dev agent dotfiles` shows a value only when it is recognisably a path, a flag or a number,"
+    puts "  so a credential is hidden whatever its variable happens to be called."
+    return
+  end
+
+  puts
+  findings.each { |f, l| puts "CREDENTIAL #{f.resolves_to || f.display}:#{l.number} — #{l.name}" }
+  puts "  These are readable in plaintext by anything that opens the file, and reading it is a NORMAL"
+  puts "  investigation step: ISS-1033 was \"where is `alias ps` defined?\" and answering it put two of"
+  puts "  them in a session transcript. Move them into the `env` repo the fleet already uses for"
+  puts "  credentials and have the profile read them from there, then ROTATE them — every one of these"
+  puts "  is in at least one transcript already, whatever is done next."
+  return if findings.none? { |f, _| f.resolves_to }
+
+  puts "  Note the `->` above: these files are SYMLINKS into a checkout, so the value is committed."
+  puts "  Editing the working tree does not remove it from that repo's history, and rotating is then"
+  puts "  the only thing that actually revokes it."
 end
 
 # ---------- prs (cross-repo pull-request groups) ----------
@@ -15372,6 +15545,7 @@ when "agent"
   when "gc"          then cmd_agent_gc(argv)
   when "maintenance" then cmd_agent_maintenance(argv)
   when "doctor"      then cmd_agent_doctor(argv)
+  when "dotfiles"    then cmd_agent_dotfiles(argv)
   when "merge-lane"  then cmd_agent_merge_lane(argv)
   when "merge"       then cmd_agent_merge(argv)
   when "update-branch" then cmd_agent_update_branch(argv)

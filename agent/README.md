@@ -79,6 +79,21 @@ shell's**. That is the same bug in its other form: `-lc` is a login,
 nvm's `node` is on PATH in your terminal and on no PATH the agent has ever had.
 Install anything the agent shells out to with homebrew.
 
+**Those startup files are also where this fleet keeps three plaintext
+credentials** (ISS-1035), which makes reading them a hazard rather than a
+formality: `~/.zshrc` holds a Jira token, `~/.alias` an Artifactory password and
+`~/.zprofile` a GitHub token, all symlinks into a `~/code/misc/env` checkout, so
+each value is committed as well as on disk. The trap is that reading them is the
+CORRECT thing to do — every question in the two paragraphs above is answered by
+opening them, and ISS-1033 answered one and took two credentials into a session
+transcript doing it. So sessions are told not to, and given `dev agent dotfiles`
+instead: the same files with assignment values withheld by default and aliases,
+`source` lines, `PATH` and conditionals intact. `dev agent doctor` reports which
+assignments are credential-shaped, by file, line and variable name, never by
+value. Both are read-only — a human's dotfiles are outside every session's
+writable area, and the fix (move the values into the `env` repo, then rotate
+them, on both runners) is a human's to make.
+
 The rest — auto-login, FileVault (stays on, deliberately), sleep disabled, Docker
 Desktop at login — is in the XML comment at the top of the plist. Those are the
 ones no command can check for itself.

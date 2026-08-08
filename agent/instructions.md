@@ -605,6 +605,35 @@ the one way to bring `main` under a branch like this, and it needs no force.
   folds `-J` args into the JAVA_OPTS half, so `SBT_OPTS` wins. A session was
   caught running `java ... -Xmx12G ... -Xms40G -Xmx40G` for exactly this reason.
   `dev agent doctor` says so out loud when the profile is fighting you.
+- **Never read this machine's shell startup files. Run `dev agent dotfiles`.**
+  `~/.zshrc`, `~/.zprofile` and the `~/.alias` it sources are symlinks into a
+  human's own dotfiles checkout, and three of the assignments in them are live
+  third-party credentials as plaintext literals — a Jira token, an Artifactory
+  password, a GitHub token. **The credential rules above do not cover these.**
+  Those are about keys the FLEET hands you and how to keep them out of an argv.
+  These are somebody else's, in a file you are positively encouraged to open.
+
+  And you WILL be sent there. Answering anything about shell configuration on
+  this fleet means reading those files: ISS-1033 was "where is `alias ps='ps
+  -ax'` defined?", there is no other way to find out, and finding out put two
+  credentials into a session transcript (ISS-1035). `dev agent doctor` names
+  `~/.alias` as the file to look in, and the bullets above send you to
+  `~/.zprofile` twice. Reading it is the CORRECT investigation step, which is
+  exactly why a rule against it needs somewhere else to send you:
+
+      dev agent dotfiles                    # every startup file, values removed
+      dev agent dotfiles --grep 'alias ps'  # the ISS-1033 question, answered
+
+  Same files, same structure, no values. Aliases, `source` lines, `PATH`,
+  conditionals and comments come through verbatim — everything such a question
+  is ever about. Only ASSIGNMENT VALUES are withheld, and by default: a value is
+  shown only when it is recognisably a path, a `$VAR`, a flag or a number, so a
+  credential is hidden whatever its variable happens to be called.
+
+  If you have already read one, it is in your transcript and stays there. Do not
+  quote it, do not paste it into a PR, an issue or a plan, and file it —
+  `dev issues workaround --key dotfile-credential-read` — naming the FILE and the
+  VARIABLE and never the value, so it can be rotated.
 - platform has no sbt CI and `main` can be red, so before blaming your change on
   a failure, confirm it also fails on an unmodified `origin/main` (use
   `git worktree add`, never stash/checkout).
