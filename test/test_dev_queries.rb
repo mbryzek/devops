@@ -462,3 +462,165 @@ class TestDevQueriesShow < Minitest::Test
     assert_equal 1, status
   end
 end
+
+# Covers `dev queries top --by-call-site`: the ranking rolled up by the code that issued the
+# statements, rather than by the statements themselves.
+#
+# The rows this command ranks are NORMALIZED STATEMENTS, and one code path routinely emits
+# more than one — a different projection per branch, an optional predicate, a keyset walk's
+# first page and its `and id > ?` pages. Each is ranked on its own at a fraction of the path's
+# cost, hundreds of ranks apart, with nothing in the output saying they are one caller.
+# Measured on production 2026-08-08: InternalClubsDao.findAll(:234) emits six shapes at ranks
+# 129, 236, 241, 255, 283 and 299, which are 47,851 ms across 16,397 calls together.
+class TestDevQueriesByCallSite < Minitest::Test
+  include DevTestSupport
+
+  CLUBS = "integrations.clubs.db.InternalClubsDao.findAll(InternalClubsDao.scala:234)".freeze
+  UPSERT = "playbook.db.InternalPlaybookRevenueEntriesDao.upsertBatch(InternalPlaybookRevenueEntriesDao.scala:119)".freeze
+
+  def stat(sql:, call_site:, total_ms:, calls:, max_ms: 100, multi_statement_calls: 0, id: "qs-#{rand(1 << 32)}")
+    { "id" => id, "sql" => sql, "call_site" => call_site, "total_ms" => total_ms, "calls" => calls,
+      "mean_ms" => calls.zero? ? 0 : total_ms / calls, "max_ms" => max_ms,
+      "multi_statement_calls" => multi_statement_calls, "sample_count" => 3,
+      "first_sample_at" => "2026-08-01T00:00:00.000Z", "last_sample_at" => "2026-08-07T00:00:00.000Z" }
+  end
+
+  # The shape of the measured case: two statements from one caller, each individually
+  # outranked by a query that costs less than the two of them together.
+  def split_caller_rows
+    [
+      stat(sql: "select 1 from playbook.revenue_entries where club_id = ?", call_site: UPSERT,
+           total_ms: 40_000, calls: 100, max_ms: 900, id: "qs-upsert"),
+      stat(sql: "select * from integrations.clubs where tenant_id = ? order by id limit ?",
+           call_site: CLUBS, total_ms: 35_000, calls: 150, max_ms: 7_444, id: "qs-first-page"),
+      stat(sql: "select * from integrations.clubs where tenant_id = ? and id > ? order by id limit ?",
+           call_site: CLUBS, total_ms: 31_753, calls: 150, max_ms: 5_100, id: "qs-next-page"),
+    ]
+  end
+
+  def top(args, rows, scanned: QUERIES_CALL_SITE_SCAN)
+    path = "/dev/query/stats?hours=168&sort=total_ms&limit=#{scanned}&offset=0"
+    out = nil
+    with_stdin("", tty: false) do
+      stub_global(:platform_endpoint, ->(_local) { { name: "platform", app: "platform" } }) do
+        with_stubbed_api("GET #{path}" => rows) { out = capture_stdout { cmd_queries_top(args) } }
+      end
+    end
+    out
+  end
+
+  # The whole point: neither shape outranks the upsert, and the walk does.
+  def test_a_call_site_outranks_a_query_that_beats_either_of_its_shapes
+    groups = queries_by_call_site(split_caller_rows)
+    assert_equal [CLUBS, UPSERT], groups.map { |g| g[:call_site] }
+    assert_equal 66_753, groups.first[:total_ms]
+    assert_equal 300, groups.first[:calls]
+  end
+
+  # A mean of means is not a mean. 300 calls costing 66,753 ms average 223 ms, and averaging
+  # the two shapes' own means (233 and 212) is a different number arrived at by accident.
+  def test_the_mean_is_weighted_by_calls_not_averaged_across_shapes
+    assert_equal 223, queries_by_call_site(split_caller_rows).first[:mean_ms]
+  end
+
+  # The worst single call is a fact about the call site, so it survives the rollup rather
+  # than being averaged away with it.
+  def test_the_max_is_the_worst_call_across_the_shapes
+    assert_equal 7_444, queries_by_call_site(split_caller_rows).first[:max_ms]
+  end
+
+  def test_multi_statement_calls_are_summed_across_the_shapes
+    rows = [stat(sql: "a", call_site: CLUBS, total_ms: 10, calls: 100, multi_statement_calls: 100),
+            stat(sql: "b", call_site: CLUBS, total_ms: 10, calls: 100, multi_statement_calls: 0)]
+    assert_equal 100, queries_by_call_site(rows).first[:multi_statement_calls]
+  end
+
+  # Statements whose call site never resolved have nothing in common but the absence of an
+  # attribution. Merging them would invent the largest call site on the instance out of
+  # unrelated queries.
+  def test_unattributed_statements_are_never_merged_with_each_other
+    rows = [stat(sql: "select 1", call_site: nil, total_ms: 500, calls: 1),
+            stat(sql: "select 2", call_site: "", total_ms: 400, calls: 1)]
+    groups = queries_by_call_site(rows)
+    assert_equal 2, groups.length
+    assert_equal [500, 400], groups.map { |g| g[:total_ms] }
+    assert groups.all? { |g| g[:stats].length == 1 }
+  end
+
+  def test_the_ranking_names_the_call_site_and_counts_its_shapes
+    out = top(["--by-call-site"], split_caller_rows)
+    assert_includes out, "Top 2 call sites by total_ms (last 7 day(s))"
+    assert_match(/66753.*300.*223.*7444.*2\s+#{Regexp.escape(CLUBS)}/, out)
+  end
+
+  # The split IS the finding, so the rollup that hides which statements it summed would be
+  # the same blindness one level up.
+  def test_every_shape_is_printed_under_its_call_site
+    out = top(["--by-call-site"], split_caller_rows)
+    assert_includes out, "35000 ms · 150 calls"
+    assert_includes out, "31753 ms · 150 calls"
+    assert_includes out, "dev queries show qs-first-page"
+    assert_includes out, "dev queries show qs-next-page"
+    assert_includes out, "and id > ?"
+  end
+
+  # A rollup over a truncated ranking is a floor. A floor that does not announce itself
+  # reads as a total.
+  def test_the_scan_depth_is_stated
+    assert_includes top(["--by-call-site"], split_caller_rows), "Rolled up from the top 3 statements by total_ms."
+  end
+
+  def test_a_scan_that_hit_its_depth_says_the_total_is_a_floor
+    rows = Array.new(QUERIES_CALL_SITE_SCAN) { |i| stat(sql: "select #{i}", call_site: "Site#{i}", total_ms: 1, calls: 1) }
+    assert_includes top(["--by-call-site"], rows), "the scan depth, so costs below it are not counted"
+  end
+
+  def test_limit_bounds_the_call_sites_shown_not_the_statements_scanned
+    out = top(["--by-call-site", "--limit", "1"], split_caller_rows)
+    assert_includes out, "Top 1 call sites"
+    refute_includes out, UPSERT
+  end
+
+  # Summing means averages averages and summing calls ranks a site by how often it runs
+  # rather than by what it costs. Both are numbers; neither is an answer.
+  def test_rejects_a_sort_it_cannot_roll_up
+    %w[--by-mean --by-calls].each do |flag|
+      err, status = capture_stderr_and_exit { cmd_queries_top(["--by-call-site", flag]) }
+      assert_equal 1, status
+      assert_includes err, "--by-call-site rolls up by total_ms"
+    end
+  end
+
+  def test_an_empty_window_says_so_rather_than_ranking_nothing
+    assert_includes top(["--by-call-site"], []), "No query samples in the last 7 day(s)."
+  end
+
+  # The numbers at the prompt are the numbers on screen: under this flag those are call
+  # sites, and picking one has to hand the investigation every statement it summed — the
+  # shapes are the evidence that the walk is one loop.
+  def test_picking_a_call_site_files_every_shape_it_summed
+    filed = nil
+    with_stdin("", tty: true) do
+      stub_global(:platform_endpoint, ->(_local) { { name: "platform", app: "platform" } }) do
+        stub_singleton(Ask, :for_string, ->(_msg, _opts = {}) { "1" }) do
+          stub_global(:require_playbook_session!, ->(_local) { nil }) do
+            stub_global(:issue_endpoint, ->(_local) { "endpoint" }) do
+              stub_global(:issue_file_and_start, lambda { |**kwargs|
+                filed = kwargs[:form]
+                { "number" => "1031" }
+              }) do
+                path = "/dev/query/stats?hours=168&sort=total_ms&limit=#{QUERIES_CALL_SITE_SCAN}&offset=0"
+                with_stubbed_api("GET #{path}" => split_caller_rows) { capture_stdout { cmd_queries_top(["--by-call-site"]) } }
+              end
+            end
+          end
+        end
+      end
+    end
+
+    refute_nil filed, "expected an issue to be filed"
+    assert_includes filed[:body], "2 queries selected"
+    assert_includes filed[:body], "and id > ?"
+    refute_includes filed[:body], "revenue_entries"
+  end
+end

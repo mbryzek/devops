@@ -97,8 +97,17 @@ module Agent
     # even in a process running as athena, so a sweep keyed on it silently
     # examined root's 136 processes instead of the agent's 542 and found no leak
     # it was looking for. A uid cannot be wrong about itself.
+    # `/bin/ps` ABSOLUTE, not a bare `ps` (ISS-1033). Nothing is broken today —
+    # `Agent::Shell.capture` takes an argv and never a shell, so this was already
+    # immune to the `alias ps='ps -ax'` this fleet's profile defines. What it was
+    # not immune to is the OTHER half of that issue: a bare name resolves against
+    # `~/code/devops/bin` FIRST on this fleet's PATH, which is how ISS-893/896
+    # turned a `run-op`'s `env` into devops' own script and killed the operation.
+    # This is the leak sweep — the code that decides which abandoned processes are
+    # holding a runner down — so it is the last call site that should resolve its
+    # own name through a directory we add scripts to.
     def read(user: Process.uid)
-      result = Agent::Shell.capture("ps", "-U", user.to_s, "-o", PS_FORMAT, timeout: 10)
+      result = Agent::Shell.capture("/bin/ps", "-U", user.to_s, "-o", PS_FORMAT, timeout: 10)
       return [] unless result.ok?
       parse(result.output)
     rescue SystemCallError

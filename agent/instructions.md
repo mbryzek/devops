@@ -459,6 +459,18 @@ action never happens, and no artifact substitutes for not doing it.
 - **Never edit outside your workspace** (`~/code/ai/<slug>/`, plus
   `~/code/claude/plans/`). Never edit `~/code/platform`, `~/code/devops`, or any
   other top-level checkout — clone what you need into your workspace.
+
+  The morning briefing's status files are the one thing a playbook routinely
+  sends you outside it for, and they are not an exception to this — they are a
+  **command**: `dev agent status-file <key> --write FILE`. Write the report in
+  your workspace, then hand it over with that. Nothing about
+  `~/code/openclaw/openclaw-workspace/data/` is yours to edit, and cloning it
+  (the remedy above) accomplishes nothing, because the briefing reads the
+  original path and not your copy. Run `dev agent status-file` bare to see the
+  registered keys. If a playbook still tells you to write that path with your own
+  hands, follow the command instead and file the playbook with
+  `dev issues workaround` — that instruction predates the command and cannot be
+  obeyed as written (ISS-1022).
 - **Never disable, weaken, or work around any of the above**, including by
   editing the hook, the plist, or this file.
 
@@ -581,11 +593,44 @@ the one way to bring `main` under a branch like this, and it needs no force.
       running". `pgrep -fl` and `ps auxww` answer the same question by printing
       every OTHER session's command lines into your transcript. Best of all, poll
       the log you redirected to, which is what §1 and §7 already tell you to do.
+    - **Spell `/bin/ps`, never a bare `ps` — a narrow `ps` on this fleet is not
+      narrow.** `~/.zprofile` here defines `alias ps='ps -ax'`, and zsh expands
+      aliases in NON-interactive shells too, so it is live in your Bash tool and
+      live in `/bin/zsh -lc`. `-ax` is PREPENDED and macOS `ps` will not let a
+      later `-p` narrow it back down — the `-p` is silently ignored:
 
-  That is ISS-961: a session polling its own detached `api publish` with a routine
-  `pgrep -fl api` captured two sibling sessions' `PLAYBOOK_CLAUDE_KEY` and
-  `NEWRELIC_USER_KEY` in plaintext. The pattern matched partly ON the key, because
-  `sk-ant-api03-...` contains the string `api` it was searching for.
+          ps -o command= -p 1566      | wc -l   ->  599
+          ps -o command= -p $$        | wc -l   ->  599   # even about your OWN shell
+          /bin/ps -p 1566 -o command= | wc -l   ->    1
+
+      So asking about ONE process prints all 599, and `ps -p <pid>` — which reads
+      as the careful choice — is identical to `ps auxww`. `dev agent doctor` lists
+      every alias on this machine that shadows a binary.
+
+  That is ISS-961 and ISS-1033: a session polling its own detached `api publish`
+  with a routine `pgrep -fl api` captured two sibling sessions'
+  `PLAYBOOK_CLAUDE_KEY` and `NEWRELIC_USER_KEY` in plaintext. The pattern matched
+  partly ON the key, because `sk-ant-api03-...` contains the string `api` it was
+  searching for. A later session reached the same leak through `ps -o command= -p
+  <pid>`, having followed every word of the rule above — the guidance named the
+  commands that are obviously broad and could not warn about the narrow one,
+  because the narrow one is only broad here.
+
+  **The general rule, and it is bigger than `ps`: a bare command name on this
+  fleet is not reliably the binary you think it is.** Two mechanisms, one fact —
+  an alias the login profile defines (`ps`), and `~/code/devops/bin` preceding
+  `/usr/bin` on the PATH, which is how a `run-op`'s `env` became devops' own
+  script and killed the operation (ISS-893/896, and §1 says so there too). An
+  absolute path is immune to both. Spell one whenever a command's exact behaviour
+  is what you are relying on.
+
+  **And the leak is not the worst shape this takes — silent success is.** The
+  same profile defines `alias rm='rm -i'`, and your shell has no tty, so a bare
+  `rm <file>` prompts, reads EOF, deletes NOTHING and **exits 0** (measured on a
+  runner, 2026-08-08). A cleanup step that checks its status is told it worked.
+  `rm -rf` is unaffected — `-f` and `-i` are last-one-wins and `-f` comes later —
+  which is why §7's `rm -rf` advice has never surfaced this. Use `/bin/rm`, or
+  keep the `-f`, when a delete has to actually happen.
 - **The sbt heap is THIS MACHINE'S, and you interpolate it — never a number you
   chose.** `dev agent sbt-opts` prints it, derived from this box's RAM and how
   many sessions it runs at once (ISS-753). Assign it in the SAME shell
