@@ -55,12 +55,14 @@ USAGE = <<~TEXT
                       Exits non-zero if it removed anything or a spec failed to
                       parse — review and commit the changes (git diff to inspect/revert).
     diff [--base REF]  Ask apibuilder whether this checkout's spec changes break anything
-                      generated against REF (default `origin/main`). Every spec in
-                      .api/config.pkl is sent, the changed ones with the REF version
-                      alongside, and the server returns its own breaking / non-breaking
-                      classification of each difference — the same one it records on
-                      every upload. Hermetic: nothing is published. Exits 0 when nothing
-                      is breaking, 1 when something is, 2 when it could not answer.
+                      generated against REF (default `origin/main`). The changed specs
+                      are sent with the REF version alongside, and around them the specs
+                      they import AND the specs that import them — the latter is what
+                      tells the server where a changed type sits on the wire. The server
+                      returns its own breaking / non-breaking classification of each
+                      difference, the same one it records on every upload. Hermetic:
+                      nothing is published. Exits 0 when nothing is breaking, 1 when
+                      something is, 2 when it could not answer.
     result            Generate a repo-wide ApiResult.scala from the union of all
                       specs whose blocks bind the play_controller generator in
                       .api/config.pkl. Hermetic like codegen: local/sibling spec
@@ -779,6 +781,24 @@ class SpecSources
     source
   end
 
+  # Every application the chain can ENUMERATE, as {[org, app_key] => source}, in the
+  # same precedence `[]` resolves by. This is what makes the reverse of an import
+  # closure computable: `[]` answers "where does this app come from", and finding the
+  # apps that IMPORT a given one needs the set to scan in the first place.
+  #
+  # It deliberately does NOT record a resolution. A spec read to see what it imports
+  # is not a spec this run sends, and announcing 130 of them would bury the handful
+  # that are actually in the payload — the announcement's whole job. Anything the scan
+  # decides to send is resolved through `[]` afterward, so nothing reaches the server
+  # unannounced.
+  #
+  # The registry is absent by construction: it answers lookups, not listings. An
+  # importer that exists only there is invisible here, which is the one gap this
+  # cannot close (see payload_importer_entries).
+  def known_specs(org)
+    @tiers.reverse.reduce({}) { |specs, tier| specs.merge(tier_specs(tier, org)) }
+  end
+
   def announce
     return if @resolutions.empty?
     puts "==> Spec sources:"
@@ -793,6 +813,14 @@ class SpecSources
   end
 
   private
+
+  # A tier keyed by [org, app_key] enumerates itself. The producer tier is indexed by
+  # app key alone — spec file names are globally unique across producers, which is
+  # what makes that safe — so its entries take the org of the run being built.
+  def tier_specs(tier, org)
+    return tier if tier.is_a?(Hash)
+    tier.app_keys.to_h { |app_key| [[org, app_key], tier[[org, app_key]]] }
+  end
 
   def wrap_names(names, width: 92)
     lines = [+""]
@@ -960,6 +988,90 @@ def payload_context_entries(applications, available)
     end
   end
   extras
+end
+
+# The OTHER direction, and the one a breaking-change diff actually needs: every spec
+# that (transitively) IMPORTS something already in `applications`, as context.
+#
+# Position-aware classification (platform's TypePolarity) is only sound over the
+# closure of a type's IMPORTERS. A model that is response-only in the spec that
+# defines it can be a POST body in a spec that imports it, and then a widening change
+# to it — a new required field, a removed enum value — IS breaking for that importer.
+# The server computes polarity over the whole payload at once, so an importer that is
+# in the set is handled correctly; one that is absent is invisible, and only the
+# caller can close that gap by sending it. See ISS-794/ISS-799.
+#
+# `candidates` is the enumerable universe (SpecSources#known_specs) — every spec this
+# session can list. Their imports are read in bulk and the edge set inverted, so the
+# cost is one pass over the specs on disk rather than one request per candidate.
+#
+# Two limits, both deliberate and neither silent-by-design:
+#   - an importer that exists ONLY in the registry cannot be enumerated, so it cannot
+#     be found. Every spec in this ecosystem is owned by a producer checkout, so the
+#     universe here is the ecosystem; a spec that is not is one nothing here can see.
+#   - the seed is `applications`, i.e. the SUBJECTS. Importers of a subject's imports
+#     are not pulled in: they can only reference the imported spec's types, never the
+#     subject's, so they cannot change the subject's polarity.
+def payload_importer_entries(applications, available, candidates)
+  present = {}
+  applications.each { |a| present[[a["organization_key"], a["application_key"]]] = true }
+
+  pending = candidates.reject { |key, _source| present[key] }
+  return [] if pending.empty?
+
+  importers_of = Hash.new { |h, k| h[k] = [] }
+  spec_contents_bulk(pending).each do |key, contents|
+    spec = begin
+             JSON.parse(contents)
+           rescue JSON::ParserError
+             next
+           end
+    (spec["imports"] || []).each do |imp|
+      imported = parse_import_key(imp["uri"]) or next
+      importers_of[imported] << key
+    end
+  end
+
+  extras = []
+  queue = present.keys
+  until queue.empty?
+    imported = queue.shift
+    importers_of.fetch(imported, []).each do |key|
+      next if present[key]
+      present[key] = true
+      # Resolved through the chain rather than read from `candidates`, so an importer
+      # this decides to SEND is announced like every other payload spec.
+      source = available[key] or next
+      extras << { "organization_key" => key[0], "application_key" => key[1], "original" => read_payload(source) }
+      queue << key
+    end
+  end
+  extras
+end
+
+# The raw text of many spec sources at once, as {key => contents}. Git-backed sources
+# are read one batch per checkout rather than one `git show` each: the importer scan
+# reads EVERY spec the chain can enumerate (130 across the three producers today), and
+# a process per file is seconds of fork/exec for a read that takes milliseconds.
+# A source that cannot be read is omitted — it contributes no import edge, which
+# leaves it out of the context set rather than failing the run.
+def spec_contents_bulk(sources_by_key)
+  contents = {}
+  git, plain = sources_by_key.partition { |_key, source| source[:git] }
+
+  plain.each do |key, source|
+    contents[key] = IO.read(source[:path]) if File.exist?(source[:path].to_s)
+  end
+
+  git.group_by { |_key, source| [source[:dir], source[:ref]] }.each do |(dir, ref), pairs|
+    by_path = ApiProducers.show_many(dir, ref, pairs.map { |_key, source| source[:path] }.uniq)
+    pairs.each do |key, source|
+      text = by_path[source[:path]] or next
+      contents[key] = text
+    end
+  end
+
+  contents
 end
 
 # --- Batch Operations ---
@@ -1231,10 +1343,14 @@ end
 # about which keys are safe to add, would be a second and weaker opinion about a
 # contract apibuilder already owns the semantics of.
 #
-# The payload is the same hermetic set codegen builds: every configured application
-# rides along so imports resolve against this checkout rather than the registry, and
-# the ones that actually changed carry `previous` (the spec at the base ref) as well.
-# An application without `previous` is context, and gets no verdict.
+# The payload is hermetic like codegen's, but it is NOT the whole config: it is the
+# changed applications plus what is reachable from them in both directions. A changed
+# application carries `previous` (the spec at the base ref) and gets a verdict; an
+# application without `previous` is context and gets none. See build_diff_request for
+# why the set is exactly that — the short version is that a spec the subject IMPORTS
+# has to be here or the diff reports somebody else's change, and a spec that IMPORTS
+# the subject has to be here or the diff cannot see that one of the subject's types is
+# a request body somewhere and under-reports its own widening (ISS-799).
 #
 # Exit codes are the producer contract, matching `dev codegen`: 0 clean, 1 findings,
 # 2 could-not-answer. `Util.exit_with_error` exits 1, so this command never routes an
@@ -1367,13 +1483,35 @@ def build_diff_request(config, org, app_filter, group_filter, project_root, git_
     build_diff_application(org, app_key, file_path, project_root, git_root, base_ref, project_name)
   end
 
-  # Only the applications that changed are sent as subjects; the rest of the repo's
-  # specs arrive as the import closure of those, through the same source chain codegen
-  # uses. Sending every configured spec would be correct but brittle: the server
-  # resolves a payload set as a whole, so one unrelated spec that cannot resolve —
-  # a cyclic import pair falling back to a registry that has not seen it — would take
-  # the answer for a change that had nothing to do with it.
-  applications = built.reject { |b| b[:status] == :context }.map { |b| b[:entry] }
+  # Only the applications that CHANGED are subjects. Around them the payload carries
+  # context in both directions, because a diff needs both and for different reasons:
+  #
+  #   IMPORTS, so the subject resolves against this checkout rather than the registry
+  #   — otherwise a spec it imports is read at its RELEASED version and the diff
+  #   reports differences belonging to somebody else's change;
+  #
+  #   IMPORTERS, so the server can see where the subject's types actually sit on the
+  #   wire. A model that is response-only in its own spec can be a request body in one
+  #   that imports it, and without that spec in the set the widening rules under-report
+  #   (ISS-799).
+  #
+  # What it does NOT send is every configured spec, which was the first shape and was
+  # brittle: the server resolves a payload set as a whole, so one unrelated spec that
+  # cannot resolve — a cyclic import pair falling back to a registry that has not seen
+  # it — took the answer for a change that had nothing to do with it. Both closures are
+  # reachability from the subject, so an unrelated spec is still not in the set. For
+  # the one that IS related and still cannot resolve, see post_diff_with_context_fallback.
+  subjects = built.reject { |b| b[:status] == :context }.map { |b| b[:entry] }
+  # Importers only matter for an application that gets a verdict, and only a changed
+  # one does; an added application has no prior contract to break.
+  importers =
+    if sources && subjects.any? { |a| a.key?("previous") }
+      payload_importer_entries(subjects, sources, sources.known_specs(org))
+    else
+      []
+    end
+
+  applications = subjects + importers
   applications += payload_context_entries(applications, sources) if sources && !applications.empty?
 
   spec_dirs = built.map { |b| File.dirname(b[:path]) }.uniq
@@ -1382,14 +1520,84 @@ def build_diff_request(config, org, app_filter, group_filter, project_root, git_
   {
     org: org,
     form: { "applications" => applications },
+    # The payload as it was before importers were added — the fallback when the wider
+    # set cannot resolve for a reason that predates this branch.
+    form_without_importers: diff_form_without_importers(subjects, importers, sources),
+    importers: importers.map { |a| a["application_key"] },
     changed: built.select { |b| b[:status] == :changed }.map { |b| b[:entry]["application_key"] },
     added: built.select { |b| b[:status] == :added }.map { |b| b[:entry]["application_key"] },
     deleted: deleted,
   }
 end
 
+def diff_form_without_importers(subjects, importers, sources)
+  return nil if importers.empty?
+  applications = subjects.dup
+  applications += payload_context_entries(applications, sources) if sources && !applications.empty?
+  { "applications" => applications }
+end
+
 def post_diff(client, form)
   client.request(:post, "/apibuilder/diffs", form)
+end
+
+# Sends the widened payload, and degrades to the narrow one in exactly the cases where
+# doing so cannot hide anything this branch did.
+#
+# Adding importers is strictly more evidence and strictly more that can go wrong with
+# the request. What must never happen is a retry that turns this branch's own breakage
+# into a "non-breaking" answer, so the two survivable failures are named individually
+# and everything else raises.
+#
+# Falling back is the answer this command gave before it sent any importers at all —
+# weaker, and it says so on stderr and in `--json`.
+def post_diff_with_context_fallback(client, request)
+  [post_diff(client, request[:form]), nil]
+rescue ApibuilderClient::Error => e
+  reason = request[:form_without_importers] && diff_context_fallback_reason(e.message)
+  raise if reason.nil?
+
+  names = request[:importers].sort
+  dropped = names.size <= 6 ? names.join(", ") : "#{names.first(6).join(", ")} (+#{names.size - 6} more)"
+  Util.warning(
+    "Importer context dropped — #{reason}:\n" \
+    "  #{e.message.lines.map(&:rstrip).reject(&:empty?).join("\n  ")}\n" \
+    "  Diffing without #{dropped}. Widening a type those specs send as a request body\n" \
+    "  reads as non-breaking until this is fixed."
+  )
+  [post_diff(client, request[:form_without_importers]), dropped]
+end
+
+# Why the widened payload may be retried narrow, or nil for "it may not".
+#
+#   413 — the request is bigger than the route accepts. A size limit says nothing
+#   about the contents, so the narrow payload answers exactly as it always did. This
+#   is also what makes the two halves of ISS-799 independently deployable: until
+#   platform's RequestBodyLimits entry for `/apibuilder/diffs` ships, every diff here
+#   degrades to the old answer instead of failing.
+#
+#   `(previous)` — the BASE contract plus these importers does not resolve. The base
+#   is `origin/main`; nothing on this branch authored it, so this is pre-existing (a
+#   cyclic import pair, an importer whose own dependency is unpublished). It must not
+#   turn a condition somewhere else in the repo into "could not answer" here.
+#
+# Not `(original)`: that is the CHANGE breaking a spec that imports it, badly enough
+# that the importer no longer resolves, and retrying without that importer would
+# answer "non-breaking" for exactly the change that broke it. Not an unattributed
+# error either — an unreachable server or a 500 is a check that broke, and a check
+# that broke must never read as a check that passed.
+def diff_context_fallback_reason(message)
+  return "the request is larger than the server's limit for this route" if message.to_s.include?("HTTP 413")
+  return "the base contract does not resolve alongside it" if diff_error_is_base_side_only?(message)
+  nil
+end
+
+# Every application-attributed error names the side it failed on. True only when at
+# least one is attributed and every one of them is the base side — an unattributed
+# message means this cannot tell, which is not a licence to retry.
+def diff_error_is_base_side_only?(message)
+  sides = message.to_s.scan(/\((previous|original)\)/).flatten
+  !sides.empty? && sides.uniq == ["previous"]
 end
 
 def diff_breaking?(diff)
@@ -1466,13 +1674,15 @@ def diff_verdict(profile, base:, apps_filter:, group_filter:, json:)
   sources = build_spec_sources(roots)
   client = ApibuilderClient.new(profile)
 
+  dropped_importers = []
   applications = roots.flat_map do |config, project_root|
     git_root = diff_git_root(project_root)
     diff_assert_ref!(git_root, base)
     config.orgs.flat_map do |org|
       request = build_diff_request(config, org, apps_filter, group_filter, project_root, git_root, base, sources)
       subjects = request[:form]["applications"].count { |a| a.key?("previous") }
-      results = subjects.zero? ? [] : post_diff(client, request[:form])
+      results, dropped = subjects.zero? ? [[], nil] : post_diff_with_context_fallback(client, request)
+      dropped_importers << dropped if dropped
       summarize_diff(request, results)
     end
   end
@@ -1480,7 +1690,14 @@ def diff_verdict(profile, base:, apps_filter:, group_filter:, json:)
   breaking = applications.any? { |a| a["diffs"].any? { |d| d["breaking"] } }
 
   if json
-    puts JSON.pretty_generate({ "base" => base, "breaking" => breaking, "applications" => applications })
+    puts JSON.pretty_generate({
+      "base" => base,
+      "breaking" => breaking,
+      # Absent importer context is the difference between "nothing is breaking" and
+      # "nothing this set can see is breaking", so it is part of the answer.
+      "importer_context" => dropped_importers.empty? ? "complete" : "dropped",
+      "applications" => applications,
+    })
   else
     puts "==> Diffing against #{base}"
     sources.announce

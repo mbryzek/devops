@@ -56,6 +56,65 @@ class TestApiHermetic < Minitest::Test
     assert_empty payload_context_entries(applications, {})
   end
 
+  # payload_importer_entries is the same closure run backwards: it inverts the import
+  # edges of every spec the chain can enumerate and pulls in whatever reaches the
+  # payload. Transitive, because an importer's importer can put the subject's types in
+  # a request position one hop further out.
+  def test_payload_importer_entries_transitive
+    Dir.mktmpdir do |dir|
+      write_spec(dir, "near.json", { "name" => "near", "imports" => [import_of("a")] })
+      write_spec(dir, "far.json", { "name" => "far", "imports" => [import_of("near")] })
+      write_spec(dir, "stranger.json", { "name" => "stranger", "imports" => [import_of("elsewhere")] })
+      candidates = %w[near far stranger].to_h do |key|
+        [["bryzek", key], { path: File.join(dir, "#{key}.json"), root: dir }]
+      end
+      applications = [{ "organization_key" => "bryzek", "application_key" => "a", "original" => { "name" => "a" } }]
+
+      extras = payload_importer_entries(applications, candidates, candidates)
+
+      assert_equal [["bryzek", "far"], ["bryzek", "near"]],
+        extras.map { |e| [e["organization_key"], e["application_key"]] }.sort
+      extras.each { |e| refute_nil e["original"] }
+    end
+  end
+
+  # An importer already in the payload is not added twice, and a candidate whose spec
+  # cannot be read contributes no edge rather than failing the run.
+  def test_payload_importer_entries_skips_present_and_unreadable
+    Dir.mktmpdir do |dir|
+      write_spec(dir, "importer.json", { "name" => "importer", "imports" => [import_of("a")] })
+      candidates = {
+        ["bryzek", "importer"] => { path: File.join(dir, "importer.json"), root: dir },
+        ["bryzek", "gone"] => { path: File.join(dir, "gone.json"), root: dir },
+      }
+      applications = [
+        { "organization_key" => "bryzek", "application_key" => "a", "original" => { "name" => "a" } },
+        { "organization_key" => "bryzek", "application_key" => "importer", "original" => { "name" => "importer" } },
+      ]
+
+      assert_empty payload_importer_entries(applications, candidates, candidates)
+    end
+  end
+
+  # known_specs is what makes the inversion possible: the chain can LIST what it holds,
+  # in the same precedence it resolves by. The producer tier is keyed by app key alone,
+  # so it takes the org of the run.
+  def test_known_specs_enumerates_every_tier_in_resolution_order
+    local = { ["bryzek", "own"] => { path: "/repo/spec/own.json", label: "working tree (.)" } }
+    siblings = { ["bryzek", "own"] => { path: "/sib/spec/own.json", label: "sibling" },
+                 ["bryzek", "shared"] => { path: "/sib/spec/shared.json", label: "sibling" } }
+    producers = { ["bryzek", "shared"] => { git: true, label: "producer" },
+                  ["bryzek", "far"] => { git: true, label: "producer" } }
+    sources = SpecSources.new(local: local, siblings: siblings, producers: producers)
+
+    known = sources.known_specs("bryzek")
+
+    assert_equal [["bryzek", "far"], ["bryzek", "own"], ["bryzek", "shared"]], known.keys.sort
+    assert_equal "/repo/spec/own.json", known[["bryzek", "own"]][:path], "local must win"
+    assert_equal "/sib/spec/shared.json", known[["bryzek", "shared"]][:path], "a sibling must win over a producer"
+    assert_empty sources.resolutions, "listing what exists is not resolving it — the announcement is for what is sent"
+  end
+
   # sibling_spec_paths only activates under an ai/<feature>/<repo> layout and maps
   # sibling spec files by (org, app key).
   def test_sibling_spec_paths_outside_feature_dir

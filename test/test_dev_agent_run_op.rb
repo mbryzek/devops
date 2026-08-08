@@ -113,7 +113,7 @@ class TestDevAgentRunOp < Minitest::Test
   end
 
   # Values are session-supplied and may be credentials. The record is a file on
-  # disk nobody thinks of as holding secrets, and the echo lands in claude.log.
+  # disk nobody thinks of as holding secrets, and the echo lands in the session log.
   def test_only_the_variable_names_are_echoed_and_recorded_never_the_values
     with_session do
       out, = stub_shell(->(_cmd, _opts) { shell_result }) do

@@ -49,6 +49,43 @@ class ApiProducers
     status.success? ? out : nil
   end
 
+  # Reads MANY paths out of one git ref, in a single `git cat-file --batch`.
+  # Returns {path => contents}, omitting paths absent at that ref.
+  #
+  # `show` per path is one process per file, and the importer scan reads every spec
+  # a producer has: 106 in platform alone, ~3.5s of pure fork/exec on this fleet.
+  # This is the same read in ~0.1s. Requests are written and answers read one at a
+  # time — `cat-file --batch` flushes per request, and interleaving is what keeps a
+  # large path list from deadlocking on a full pipe buffer.
+  def self.show_many(dir, ref, paths)
+    return {} if paths.empty?
+
+    contents = {}
+    Open3.popen2("git", "-C", dir, "cat-file", "--batch", err: File::NULL) do |stdin, stdout, wait_thr|
+      stdin.binmode
+      stdout.binmode
+      begin
+        paths.each do |path|
+          stdin.puts("#{ref}:#{path}")
+          stdin.flush
+          header = stdout.gets or break
+          # "<oid> <type> <size>" for a hit; "<request> missing" (or "ambiguous") otherwise.
+          _oid, type, size = header.chomp.split(" ")
+          next if size.nil?
+          # Read the body even for a non-blob: leaving it in the pipe would desync
+          # every answer after it, which is a silent wrong answer rather than a miss.
+          body = stdout.read(size.to_i)
+          stdout.read(1) # the newline git writes after every object
+          contents[path] = body.force_encoding(Encoding::UTF_8) if type == "blob"
+        end
+      ensure
+        stdin.close unless stdin.closed?
+        wait_thr.value
+      end
+    end
+    contents
+  end
+
   # exclude: repo names whose specs this session already has locally (this repo
   # and any sibling clones), which must not be second-guessed from origin/main.
   def initialize(exclude: [], code_root: CODE_ROOT, ref: REF, repos: REPOS)
