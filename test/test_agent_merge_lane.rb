@@ -35,15 +35,22 @@ class TestAgentMergeLane < Minitest::Test
     }.merge(overrides)
   end
 
-  def check_run(name, conclusion, sha: "a" * 40, status: "COMPLETED")
+  # `detailsUrl` is GitHub's permanent run page for the check. Defaulted to one
+  # rather than left out, because that is what every real CheckRun carries.
+  def check_run(name, conclusion, sha: "a" * 40, status: "COMPLETED",
+                details_url: "https://github.com/mbryzek/platform/actions/runs/1/job/2")
     { "__typename" => "CheckRun", "name" => name, "status" => status,
-      "conclusion" => conclusion, "headSha" => sha }
+      "conclusion" => conclusion, "headSha" => sha, "detailsUrl" => details_url }
   end
 
   # Reviewable posts a StatusContext, not a CheckRun, and it names its fields
   # differently. Both shapes arrive through the same array.
-  def status_context(context, state)
-    { "__typename" => "StatusContext", "context" => context, "state" => state }
+  #
+  # `targetUrl` defaults to "" because that is what gh returns for a status
+  # nobody gave one to, and the fleet verify job gives none.
+  def status_context(context, state, target_url: "")
+    { "__typename" => "StatusContext", "context" => context, "state" => state,
+      "targetUrl" => target_url }
   end
 
   def verdict(pr, repo: "mbryzek/platform", base_status: "ahead")
@@ -455,6 +462,94 @@ class TestAgentMergeLane < Minitest::Test
   def test_secrets_are_reported
     candidate = ML.candidate("mbryzek/platform", green_pr("files" => [{ "path" => "conf/.env.production" }]))
     assert_equal true, ML.assertions(candidate)["touches_secrets"]
+  end
+
+  # ---- where the evidence is (ISS-1080) -------------------------------------
+
+  # Naming the verifier and stopping there left an auditor to go back to GitHub
+  # for the link. A CheckRun already carries it: `detailsUrl` is a permanent run
+  # page anyone can open, and it belongs on the decision.
+  def test_a_check_runs_run_page_is_recorded_as_the_evidence
+    pr = green_pr("statusCheckRollup" => [check_run("ci", "SUCCESS", details_url: "https://example.test/run/7")])
+    a = ML.assertions(ML.candidate("mbryzek/platform", pr))
+    assert_equal "https://example.test/run/7", a["verified_url"]
+  end
+
+  # The other producer's link, under the other name. Both shapes arrive through
+  # the same array and neither `detailsUrl` nor `targetUrl` is on both.
+  def test_a_commit_statuss_target_url_is_recorded_as_the_evidence
+    pr = green_pr("statusCheckRollup" => [status_context("ci", "SUCCESS", target_url: "https://example.test/build/9")])
+    a = ML.assertions(ML.candidate("mbryzek/platform", pr))
+    assert_equal "https://example.test/build/9", a["verified_url"]
+  end
+
+  # What the fleet verify job actually posts: a commit status with no
+  # `target_url` at all. The key is dropped rather than recorded as "" — an
+  # assertion whose value is an empty string reads, in a feed, as a link that
+  # broke.
+  def test_a_status_with_no_link_records_no_evidence_url
+    pr = green_pr("statusCheckRollup" => [status_context("ci", "SUCCESS")])
+    refute ML.assertions(ML.candidate("mbryzek/platform", pr)).key?("verified_url")
+  end
+
+  # A link to a run that did not verify the commit about to land is worse than
+  # no link: an auditor would follow it. `ci_stale` is the sharpest case — there
+  # IS a green run page, and it is evidence about a tree nobody is merging.
+  def test_a_stale_green_leaves_no_evidence_url
+    pr = green_pr("statusCheckRollup" => [check_run("ci", "SUCCESS", sha: "b" * 40)])
+    assert_nil ML.candidate("mbryzek/platform", pr).verified_url
+  end
+
+  def test_a_red_or_absent_check_leaves_no_evidence_url
+    red = green_pr("statusCheckRollup" => [check_run("ci", "FAILURE")])
+    assert_nil ML.verified_url(red)
+    assert_nil ML.verified_url(green_pr("statusCheckRollup" => []))
+  end
+
+  # For a fleet-verified repo the description IS the whole trail — the log it
+  # names is a local file on the runner that built the sha, and nothing else
+  # records which runner that was.
+  def test_the_commit_status_description_is_recorded_as_the_evidence
+    detail = "passed in 0.9m [Mac] /Users/x/Library/Logs/dev-agent/ci/playbook-admin-80a39f65092e/build.log"
+    a = ML.assertions(ML.candidate("mbryzek/platform", green_pr), verified_detail: detail)
+    assert_equal detail, a["verified_detail"]
+  end
+
+  # Every way of not having one collapses to the same dropped key: not asked for,
+  # asked for and unset (`gh --jq` prints the literal `null`), or asked for on a
+  # repo GitHub Actions verifies, where there is no commit status to describe.
+  def test_a_missing_description_records_no_evidence_detail
+    candidate = ML.candidate("mbryzek/platform", green_pr)
+    refute ML.assertions(candidate).key?("verified_detail")
+    refute ML.assertions(candidate, verified_detail: "  ").key?("verified_detail")
+  end
+
+  def test_the_commit_status_description_is_read_from_the_status_api
+    seen = nil
+    stub_shell(lambda { |cmd, _opts|
+      seen = cmd
+      shell_result(output: "passed in 0.9m [Mac] /tmp/build.log\n")
+    }) do
+      assert_equal "passed in 0.9m [Mac] /tmp/build.log",
+                   ML.verified_detail("playbook-admin", "a" * 40)
+    end
+    # Asked of the qualified slug even though the caller gave a bare name: a 404
+    # here would drop the evidence silently rather than fail anything.
+    assert_includes seen.join(" "), "repos/mbryzek/playbook-admin/commits/#{'a' * 40}/status"
+  end
+
+  # A CheckRun-verified repo has no `ci` commit status, so `--jq` matches nothing
+  # and prints an empty body. That is "no detail", never an empty assertion.
+  def test_no_commit_status_leaves_no_evidence_detail
+    stub_shell(->(_cmd, _opts) { shell_result(output: "") }) do
+      assert_nil ML.verified_detail("mbryzek/playbook-app", "a" * 40)
+    end
+    stub_shell(->(_cmd, _opts) { shell_result(output: "null\n") }) do
+      assert_nil ML.verified_detail("mbryzek/playbook-app", "a" * 40)
+    end
+    stub_shell(->(_cmd, _opts) { shell_result(output: "boom", exitstatus: 1) }) do
+      assert_nil ML.verified_detail("mbryzek/playbook-app", "a" * 40)
+    end
   end
 
   # ---- the lane order -------------------------------------------------------

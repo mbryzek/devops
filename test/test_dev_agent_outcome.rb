@@ -190,6 +190,87 @@ class TestDevAgentOutcome < Minitest::Test
     assert_match(/Failure 1 of 3 in a row/, classify(exit_code: 2).reason)
   end
 
+  # ---- a session the API refused to start (ISS-1129) ----
+  #
+  # ISS-986, ISS-992 and ISS-993 were driven to `needs_input` on 2026-08-08
+  # without a session ever running: the Claude API answered 429 ("You've hit your
+  # session limit"), the CLI exited 1 in under a second, and three of those in
+  # ninety seconds spent the whole give-up budget. `needs_input` is the status
+  # `dev issues claim` never offers, so all three stopped being work anyone would
+  # ever pick up — over a quota, not over anything about the issues.
+
+  REFUSED = { "message" => "You've hit your session limit · resets 1am (America/New_York)",
+              "resets_at" => Time.utc(2026, 8, 8, 5, 0, 0) }.freeze
+
+  def test_a_refused_session_returns_to_the_queue_and_is_not_an_attempt
+    result = classify(exit_code: 1, usage_limit: REFUSED)
+    assert_equal "usage_limit", result.name
+    assert_equal "open", result.status
+    # `released` — the platform's word for a hand-back nobody failed at — is what
+    # keeps `attempt_number` from counting this, and is the whole fix.
+    assert_equal "released", result.lease_outcome
+  end
+
+  # THE THING THAT WENT WRONG, pinned: three refusals in a row must not give up.
+  def test_refusals_never_accumulate_toward_giving_up
+    history = [lease(1, "released"), lease(2, "released"), lease("now", nil)]
+    assert_equal 1, attempt_number(history), "a released lease is not a failed attempt"
+    3.times do |i|
+      result = classify(exit_code: 1, usage_limit: REFUSED, attempt: i + 1)
+      assert_equal "open", result.status
+      refute_equal "gave_up", result.name
+    end
+  end
+
+  # The timeline is where a human answers "what was wrong with this issue", and
+  # for this outcome the answer is nothing. It has to say so, and say when the
+  # limit lifts, without anybody opening a log on the runner.
+  def test_the_reason_says_no_session_ran_and_when_the_limit_resets
+    reason = classify(exit_code: 1, usage_limit: REFUSED).reason
+    assert_match(/NOT a failure of this issue: no session ever ran/, reason)
+    assert_match(/429/, reason)
+    assert_match(/hit your session limit/, reason)
+    assert_match(/resets at 2026-08-08 05:00 UTC/, reason)
+    assert_match(/not counted against the give-up limit/, reason)
+    refute_match(/Failure \d of \d/, reason)
+  end
+
+  def test_a_refusal_with_no_reset_instant_still_reads_clearly
+    reason = classify(exit_code: 1, usage_limit: { "message" => "", "resets_at" => nil }).reason
+    assert_match(/no session ever ran/, reason)
+    refute_match(/resets at/, reason)
+  end
+
+  # Below every delivered artifact. A session that did its work and was refused
+  # on a LATER turn still has to report what it delivered — the refusal is only
+  # the whole story when there is nothing else.
+  def test_delivered_work_outranks_a_refusal
+    assert_equal "merged_pr", classify(pr: MERGED_PR, usage_limit: REFUSED).name
+    assert_equal "ready_pr", classify(pr: READY_PR, usage_limit: REFUSED).name
+    assert_equal "design_document", classify(plans_committed: true, usage_limit: REFUSED).name
+    # Signal 3 is knowledge only the executor has, and it stays on top: a session
+    # the tick killed is reported as killed even if the log also holds a refusal.
+    killed = classify(killed: { "reason" => "timeout" }, usage_limit: REFUSED)
+    assert_match(/KILLED by the tick/, killed.reason)
+    assert_equal "cancelled", killed.lease_outcome
+  end
+
+  # Above the arms that blame the SESSION for stopping: an exit code, a hard
+  # timeout, and a draft PR are all "you were given a turn and did not finish
+  # it", which is not what happened here.
+  def test_a_refusal_outranks_every_verdict_on_the_session_itself
+    assert_equal "usage_limit", classify(pr: DRAFT_PR, usage_limit: REFUSED).name
+    assert_equal "usage_limit", classify(exit_code: nil, usage_limit: REFUSED).name
+    assert_equal "usage_limit", classify(exit_code: 1, timed_out: true, usage_limit: REFUSED).name
+    assert_equal "usage_limit", classify(exit_code: 0, producer_filed: true, usage_limit: REFUSED).name
+  end
+
+  # A refusal is not success: nothing ran, so the workspace is kept for the
+  # retry that resumes this same slug rather than deleted as finished work.
+  def test_a_refusal_is_not_treated_as_a_completed_run
+    refute Agent::Outcome.success?(classify(exit_code: 1, usage_limit: REFUSED))
+  end
+
   # ---- the give-up count: failures IN A ROW, not leases (ISS-734) ----
   #
   # Every lease this issue ever had was counted as an attempt, so an issue with
@@ -262,6 +343,7 @@ class TestDevAgentOutcome < Minitest::Test
     [classify(pr: MERGED_PR), classify(pr: READY_PR), classify(plans_committed: true),
      classify(producer_filed: true), classify(producer_filed: false), classify(pr: DRAFT_PR),
      classify(exit_code: 1), classify(killed: { "reason" => "timeout" }),
+     classify(exit_code: 1, usage_limit: REFUSED),
      classify(exit_code: 1, attempt: 3)].each do |result|
       assert_includes valid, result.lease_outcome, "#{result.name} closes its lease with an unknown outcome"
     end
