@@ -10,8 +10,12 @@ of it before you touch anything — the comments are where a previous attempt's
 blocker was answered and where review feedback arrives.
 
 Follow `~/code/CLAUDE.md` for everything not stated here. Where this file and
-CLAUDE.md differ, this file wins for *review gates* only (see "Gates become
-artifacts"). It never relaxes a safety rule.
+CLAUDE.md differ, this file wins **only where it says so explicitly**, and it
+says so in exactly three places: the review gates in §2, your branch name in §4,
+and the pre-merge update in §6. Each of those is a rule CLAUDE.md wrote for a
+human at a keyboard, and each override is stated at the point it applies with
+the reason attached. Everywhere else CLAUDE.md stands as written. **§3 is
+overridden by nothing, including this file**: it never relaxes a safety rule.
 
 ---
 
@@ -393,6 +397,16 @@ action never happens, and no artifact substitutes for not doing it.
   assignment named**, either. A branch someone else's run opened is their work,
   and adding to it is authorship wearing a push.
 
+  **This is flat, and it includes the branch you were assigned.** CLAUDE.md's
+  when-work-is-done step 4 tells a human to rebase onto latest `origin/main` and
+  force-push before merge; you do the same work by MERGING `origin/main` in
+  instead, and push with no flags at all. §6 has the procedure, and it is the
+  override — the invariant step 4 exists for is unchanged, only the act that
+  reaches it. Do not reach for `--force-with-lease` on the grounds that this
+  branch is yours: "mine" is a judgment rather than a fact, and §4 says outright
+  that the checkout a retry opens into can carry commits you did not write
+  (ISS-771).
+
   One narrow act is sanctioned on any PR branch, and like the merge below it is a
   COMMAND rather than a permission: **`dev agent update-branch`** (ISS-769),
   which brings `main` under a pull request the merge lane verdicts
@@ -489,7 +503,8 @@ the branch the first one pushed. That is deliberate — it is how review feedbac
 and a pre-merge rebase update one PR instead of opening two — but it means the
 checkout you open into can carry commits you did not write. Follow the
 instructions in that block: check `gh pr list --head <branch> --state all` before
-you write anything, and never force-push to make the branch look fresh.
+you write anything, and never force-push to make the branch look fresh. §6 has
+the one way to bring `main` under a branch like this, and it needs no force.
 
 - Clone every repo you need **into your workspace**:
   `gh repo clone mbryzek/<repo> <workspace>/<repo>`. When the issue named its
@@ -586,15 +601,47 @@ comment either way — the comment is what a human reads.
 ## 6. Resuming
 
 If your assignment says this is a **resume**, an open PR already exists on your
-branch and the repo is cloned and rebased onto `origin/main` for you. Two things
-routinely send work back here:
+branch and the repo is cloned with the latest `origin/main` already merged into
+it for you. Two things routinely send work back here:
 
 - **Review feedback.** Mike left comments; the specific ask is in the issue
   comments below.
 - **Drift.** Other PRs merged, so the CLAUDE.md pre-merge step has to happen:
-  rebase onto latest `origin/main`, **rerun code generation** (`api` regenerates
-  apibuilder and DAO specs in one pass; plus elm/svelte builds), and fix every
-  compile, lint, and test failure the rebase surfaced.
+  bring latest `origin/main` under your branch, **rerun code generation** (`api`
+  regenerates apibuilder and DAO specs in one pass; plus elm/svelte builds), and
+  fix every compile, lint, and test failure that surfaced.
+
+### The pre-merge update is a MERGE, not a rebase
+
+This is the one place this file overrides CLAUDE.md outside §2, and it is why §6
+is executable at all:
+
+    git fetch origin && git merge origin/main
+    # rerun codegen, fix what broke, commit
+    git push
+
+An ordinary push. No `--force`, no `--force-with-lease`, nothing §3 forbids.
+
+CLAUDE.md step 4 says to rebase and "force-push the rebased branch". That is
+written for a human at a keyboard, and following it here would mean rewriting
+every commit on the branch and then reaching the PR through the one act §3
+forbids flat — so sessions were told to do work they were not permitted to
+finish, and quietly either skipped step 4 or force-pushed past §3 (ISS-771).
+**Merging loses nothing step 4 was for.** The invariant is that your branch is
+green against the current tip of `main` with codegen rerun there, and a merge
+produces the identical tree; the linear history a rebase would produce, and the
+merge commit this leaves, are both discarded by the squash when the PR lands.
+
+Two things follow:
+
+- **Conflicts here are ordinary work.** You wrote these commits, so resolving
+  them against `main` is yours to do. That is what makes this different from
+  ISS-765's conflicting PR, where the branch and the judgment both belonged to
+  someone else.
+- **This is not `dev agent update-branch`.** That command is §3's answer for a
+  branch you do *not* hold a checkout of, and it refuses anything the merge lane
+  does not verdict `needs_update` — which your own draft or under-review PR is
+  not. You have the clone, and you need it anyway to rerun codegen.
 
 Do **not** open a second PR and do not create a new branch. Push to the existing
 branch and the PR updates in place, then close the issue out with
