@@ -157,6 +157,36 @@ class TestPostDeployWork < Minitest::Test
     end
   end
 
+  # `api publish` writes generated code into whatever checkout it runs in, so
+  # aiming it at the shared ~/code/<app> checkout drops that diff where nobody
+  # is watching — the failure ISS-817 moved this work to the fleet to end, and
+  # a directory CLAUDE.md forbids working in either way. The task must send the
+  # session to a clone of its own.
+  def test_the_publish_child_clones_rather_than_using_the_shared_checkout
+    work(apps: %w[platform]).file!
+    publish = @api.forms.find { |f| f[:title].to_s.start_with?("Publish") }
+    assert_includes publish[:body], "git clone --depth 1 --no-single-branch"
+    refute_includes publish[:body], "cd ~/code/platform",
+                    "the publish task must never send a session into the shared checkout"
+  end
+
+  # `--depth` alone sets a refspec that tracks only main, and then `gh pr create`
+  # aborts with "you must first push the current branch to a remote" even when the
+  # branch IS pushed — which would strand the regen PR half of this very task.
+  # The two flags travel together or the shallow clone is a trap.
+  def test_the_shallow_clone_keeps_a_full_refspec
+    work(apps: %w[platform]).file!
+    publish = @api.forms.find { |f| f[:title].to_s.start_with?("Publish") }
+    # Only the clone COMMANDS, not the prose that explains why a bare --depth is
+    # a trap — that paragraph says `--depth N` on purpose.
+    clone_lines = publish[:body].lines.grep(/git clone/)
+    refute_empty clone_lines
+    clone_lines.each do |line|
+      assert_includes line, "--no-single-branch",
+                      "a bare --depth breaks gh pr create for the regen PR: #{line.strip}"
+    end
+  end
+
   # The severity that must not be lost in the move: a publish failure used to
   # fail the release, so the issue may not be quietly dismissed instead.
   def test_the_publish_child_forbids_dismissing_a_failed_publish
@@ -179,7 +209,8 @@ class TestPostDeployWork < Minitest::Test
   def test_a_filing_failure_raises_and_the_manual_commands_are_available
     w = work(apps: %w[platform], api: FakeApi.new(fail_on: "Post-deploy work for"))
     assert_raises(ApiError) { w.file! }
-    assert_equal ["cd ~/code/platform && api publish",
+    assert_equal ["git clone --depth 1 --no-single-branch git@github.com:mbryzek/platform.git " \
+                  "~/code/ai/publish-platform && cd ~/code/ai/publish-platform && api publish",
                   "dev features reconcile --apply",
                   "dev issues reconcile --apply"], w.manual_commands
   end
