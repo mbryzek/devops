@@ -331,13 +331,14 @@ class TestDevAgentCredentials < Minitest::Test
 
   # The failure two separate files would have produced, asserted as the state the
   # session is actually told about: a half-provisioned login must not read as a
-  # login. `resolve` hands over only the half that exists, and `check` says the
-  # other half is absent — which is what makes the prompt print "cannot be closed
-  # out here" rather than a green light backed by an email and no password.
+  # login. Only the half that exists resolves, and `check` says the other half is
+  # absent — which is what makes the prompt print "cannot be closed out here"
+  # rather than a green light backed by an email and no password.
   def test_half_a_login_reports_as_half_a_login
     with_env_repo("api_keys/court-reserve" => "CR_EMAIL=bot@example.com\n") do
       pair = [C.court_reserve("CR_EMAIL"), C.court_reserve("CR_PASSWORD")]
-      assert_equal({ "CR_EMAIL" => "bot@example.com" }, C.resolve(credentials: pair, env: NO_PROCESS_ENV))
+      assert_equal [:present, "bot@example.com", :env_repo], C.probe(pair[0], env: NO_PROCESS_ENV)
+      assert_equal [:missing, nil, nil], C.probe(pair[1], env: NO_PROCESS_ENV)
 
       email, password = C.check(credentials: pair, env: NO_PROCESS_ENV)
       assert email.present?
