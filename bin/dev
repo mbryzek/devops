@@ -57,6 +57,8 @@ require 'agent/tick'
 require 'agent/claude_config'
 require 'agent/credentials'
 require 'agent/toolchain'
+require 'newrelic'
+require 'newrelic_ingest'
 require 'agent/verify'
 
 # Cross-repo PR grouping (`dev prs group`). Split out for the same reason as
@@ -94,6 +96,7 @@ INVOCATIONS = {
   "queries top"         => 'queries [top] [--hours N | --days N] [--limit N] [--by-mean | --by-calls] [--localhost]',
   "queries show"        => 'queries show <sample-id> [--hours N | --days N] [--localhost]',
   "claude-usage top"    => 'claude-usage [top] [--days N] [--limit N] [--sort cost_usd|input_tokens|output_tokens|requests] [--localhost]',
+  "newrelic ingest"     => 'newrelic [ingest] [--json] [--account ID]',
   "slow-routes"         => 'slow-routes [--app member|admin] [--days N] [--sort -p95] [--limit N] [--localhost]',
   "deploy status"       => 'deploy [status] [--app APP]',
   "deploy all"          => 'deploy all [--app APP] [--concurrency N]',
@@ -334,6 +337,37 @@ USAGE = <<~USAGE
         `improvement` issue investigating why that feature costs what it does,
         handed straight to a Claude session, the way `dev issues create` does.
         Blank input files nothing, and nothing is offered when output is piped.
+
+    #{INVOCATIONS["newrelic ingest"]}
+        What this account ingests into NewRelic, against the 100 GB free-tier
+        ceiling. `ingest` is the default when no subcommand is given.
+
+        Prints the month to date against the free limit, the run rate over the
+        last #{NewrelicIngest::RUN_RATE_DAYS} full days, the projection to month end, the trailing
+        30-day total (which needs no billing boundary), and a breakdown by usage
+        metric and by application. --json prints the same figures raw.
+
+        The BILLING PERIOD IS THE CALENDAR MONTH IN UTC. Read casually it does
+        not look like it: `SINCE N days ago TIMESERIES 1 day` anchors its buckets
+        to the current time of day, so the reset appears to fall on the 30th or
+        31st. It does not.
+
+        The per-application table is `bytecountestimate()` and is ATTRIBUTION,
+        not billing -- it answers "which app moved", never "how much do we owe".
+        It does not reconcile to the billed figure, and the largest thing it
+        cannot attribute is k8s log forwarding, which arrives with no appName and
+        is printed on its own row rather than dropped.
+
+        Needs `NEWRELIC_USER_KEY` (env, or the env repo's api_keys/newrelic --
+        `dev agent doctor` reports whether this machine resolves it). It refuses
+        to query without one rather than reporting an empty account: NerdGraph
+        answers an unauthenticated read with an empty result set, which reads
+        exactly like a healthy account (ISS-635).
+
+        The same measurement runs once a day inside `dev agent tick`, which files
+        an issue when the projection reaches #{(NewrelicIngest::AT_RISK_FRACTION * 100).round}% of the free limit
+        (ISS-1077). Nothing watched this number before that, and a ceiling nobody
+        measures is one the fleet discovers by being throttled.
 
     #{INVOCATIONS["invariants snoozes"]}
         List active invariant snoozes.
@@ -1405,7 +1439,7 @@ end
 
 # Known commands and their subcommands, used to suggest a correction when the
 # user mistypes one (e.g. `task` -> `tasks`, `requeu` -> `requeue`).
-COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage agent prs ci].freeze
+COMMANDS = %w[auth invariants tasks deploy config docker aidirs prune browserslist depsguard schema scripts codegen dependencies issues autonomy changelog features queries claude-usage newrelic agent prs ci].freeze
 SUBCOMMANDS = {
   "auth"         => %w[status login logout ai],
   "auth ai"      => %w[status provision set clear revoke],
@@ -1428,6 +1462,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
+  "newrelic"     => %w[ingest],
   "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[scan verify preflight clean-build],
@@ -14773,6 +14808,50 @@ def agent_doctor_credentials
        "rather than guessing (ISS-570). Nothing else is blocked."
 end
 
+# ---------- newrelic (data ingest against the free tier) ----------
+
+# The key is resolved the same way a spawned session's is, so `dev newrelic
+# ingest` works identically at a human's prompt (where the variable is usually
+# exported) and inside the tick (where it comes out of the env repo). Never
+# printed, never put on a command line, and not stored on anything this returns.
+def newrelic_key
+  _status, value, _source = Agent::Credentials.probe(
+    Agent::Credentials::CREDENTIALS.find { |c| c.name == Newrelic::KEY_ENV },
+  )
+  value
+end
+
+def cmd_newrelic_ingest(args)
+  as_json = false
+  account_id = Newrelic::ACCOUNT_ID
+  i = 0
+  while i < args.length
+    case args[i]
+    when "--json" then as_json = true
+    when "--account"
+      account_id = Integer(args[i + 1] || usage_exit("--account requires a value", example: usage_for("newrelic ingest")))
+      i += 1
+    else usage_exit("Unknown flag: #{args[i]}", example: usage_for("newrelic ingest"))
+    end
+    i += 1
+  end
+
+  measurement = NewrelicIngest.measure(key: newrelic_key, account_id: account_id)
+  if as_json
+    puts JSON.pretty_generate(measurement.to_h)
+  else
+    puts ""
+    puts NewrelicIngest.text_report(measurement)
+    puts ""
+  end
+  # Non-zero when the projection is worth a decision, so this composes with
+  # anything that checks an exit code. `2` and not `1` keeps it distinguishable
+  # from the argument errors above.
+  exit 2 if measurement.actionable?
+rescue Newrelic::Error => e
+  Util.exit_with_error(e.message)
+end
+
 # ---------- prs (cross-repo pull-request groups) ----------
 
 # TWO reads per repo, not one `--state all`, because the two have different
@@ -15283,6 +15362,12 @@ when "claude-usage"
   case sub
   when "top" then cmd_claude_usage_top(argv)
   else            unknown("claude-usage subcommand", sub, SUBCOMMANDS["claude-usage"])
+  end
+when "newrelic"
+  sub = resolve_subcommand(argv, default: "ingest")
+  case sub
+  when "ingest" then cmd_newrelic_ingest(argv)
+  else               unknown("newrelic subcommand", sub, SUBCOMMANDS["newrelic"])
   end
 when "schema"
   sub = resolve_subcommand(argv, default: "lint")
