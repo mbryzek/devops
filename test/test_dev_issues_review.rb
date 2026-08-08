@@ -400,12 +400,24 @@ class TestDevIssuesReview < Minitest::Test
     # is one this CLI produces, so a change to handoff_body that this could not
     # read would be a silent regression in the one thing a handoff issue is FOR.
     commands = ["openclaw cron rm weekly-review-1", "openclaw cron rm weekly-review-2"]
-    issue = blocked_issue(body: handoff_body("No runner has operator.admin.", "396", commands))
+    issue = blocked_issue(body: handoff_body("No runner has operator.admin.", "396", commands, [], "no-op"))
     assert_equal commands, issue_review_handoff_commands(issue)
   end
 
+  # The section carries prose as well as commands since ISS-917 -- what to set
+  # before pasting, what a second run does. Neither is a command, and printing one
+  # under "Waiting on a human to run:" is exactly the prose-for-a-command failure
+  # `dev issues handoff` exists to prevent.
+  def test_only_the_indented_commands_are_read_back_not_the_prose_around_them
+    issue = blocked_issue(body: handoff_body("No runner has the token.", "396",
+                                             ['curl -H "x-api-key: $OPENCLAW_TOKEN" https://x/y'],
+                                             ["OPENCLAW_TOKEN"], "the DELETE is idempotent"))
+    assert_equal ['curl -H "x-api-key: $OPENCLAW_TOKEN" https://x/y'], issue_review_handoff_commands(issue)
+  end
+
   def test_handoff_commands_are_printed_in_the_fallback
-    issue = blocked_issue(body: handoff_body("No runner has this scope.", "396", ["openclaw cron rm weekly-review-1"]))
+    issue = blocked_issue(body: handoff_body("No runner has this scope.", "396", ["openclaw cron rm weekly-review-1"],
+                                             [], "the second rm errors harmlessly"))
     out = issue_review_fallback(issue, [])
     assert_match(/Waiting on a human to run:/, out)
     assert_match(/openclaw cron rm weekly-review-1/, out)

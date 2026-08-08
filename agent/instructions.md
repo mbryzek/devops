@@ -278,6 +278,7 @@ left there. There is no version of this you unblock by trying harder.
       --body "<why no session can run it, and what stays broken until it does>" \
       --command "<the exact line to paste>" \
       --command "<one flag per command>" \
+      --rerun "<what a second run of them does>" \
       --url "<the PR or document these commands complete>"
 
 `--command` is the artifact. Prose describing the step is precisely what has
@@ -288,6 +289,24 @@ more run the commands than the two sessions before it. That is why this command
 files at `needs_input` instead: `dev issues claim` never offers `needs_input`, so
 no agent can take it, and the daily nudge lists it every morning until a human
 clears it.
+
+**Write the command for the RECIPIENT's shell, not yours.** It is pasted cold,
+days later, by someone with no session around to interpret a confusing error, so
+two things are checked and one is on you:
+
+- **No `$VAR` you cannot see the other side of** — refused outright. ISS-864
+  handed over `$EDITOR ~/code/claude/rules/database.general.mdc`; `EDITOR` was
+  unset, zsh dropped the empty word and tried to *execute* the `.mdc`, and said
+  `permission denied` about a file whose permissions were fine the whole time.
+  Inline the value you already know. The one exception is a value that must never
+  be written into an issue — a credential — which you declare with
+  `--needs-env NAME` so the issue tells the human to set it first.
+- **`--rerun` is required and nothing verifies it.** Say what a second run does.
+  A handoff sits in the daily nudge every morning until it is cleared, so "runs it
+  twice, or is not sure whether they already ran it" is the expected interaction,
+  not an edge case. ISS-874's replacement command was a bare
+  `cat FILE >> rules.mdc`, which appends the section twice in silence. Guard it —
+  `grep -q ... || cat ...` — and say why the guard makes the second run safe.
 
 **This is not an escape hatch for work you could do and would rather not.** The
 test is whether *any* session on *any* runner could run the command at all. If the

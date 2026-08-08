@@ -4185,6 +4185,7 @@ class TestDevIssues < Minitest::Test
       "--title" => "check-invariants cron still needs deleting from openclaw",
       "--body" => "openclaw is not on the runner and the agent identity lacks operator.admin.",
       "--command" => "openclaw cron rm 0c8a3666",
+      "--rerun" => "the second rm errors 'no such cron', which is harmless",
       "--url" => "https://github.com/mbryzek/devops/pull/332",
     }.merge(overrides)
     args.reject { |_flag, value| value.nil? }.flat_map { |flag, value| [flag, value] }
@@ -4301,6 +4302,7 @@ class TestDevIssues < Minitest::Test
     assert_match(/--title is required/, out)
     assert_match(/--body is required/, out)
     assert_match(/--command is required at least once/, out)
+    assert_match(/--rerun is required/, out)
   end
 
   # One handoff routinely carries several commands (ISS-396 had two crons), and a
@@ -4359,6 +4361,143 @@ class TestDevIssues < Minitest::Test
     assert_equal 1, status
     refute_match(/is required/, out)
     assert_match(/dev auth login --app playbook/, out)
+  end
+
+  # ---- pasteable in SOMEONE ELSE'S shell (ISS-917) ----
+
+  # The ISS-874 line, verbatim. `EDITOR` was unset in the recipient's shell, zsh
+  # dropped the empty word and tried to execute the .mdc, and the failure surfaced
+  # as `permission denied` on a file whose permissions were fine — which invites a
+  # `chmod` that is both unnecessary and wrong. It validated clean before this.
+  def test_handoff_rejects_a_command_reading_a_variable_from_the_recipients_environment
+    out, status = capture_stderr_and_exit do
+      cmd_issues_handoff(handoff_args("--command" => "$EDITOR ~/code/claude/rules/database.general.mdc"))
+    end
+    assert_equal 1, status
+    assert_match(/reads \$EDITOR from the recipient's environment/, out)
+    assert_match(/Inline the value you already know/, out)
+    assert_match(/--needs-env EDITOR/, out)
+  end
+
+  def test_handoff_rejects_a_braced_variable_too
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args("--command" => 'rm "${HOME}/tmp/x"')) }
+    assert_equal 1, status
+    assert_match(/reads \$HOME/, out)
+  end
+
+  # The whole reason the scan is quote-aware rather than a bare /\$\w+/. Inside
+  # single quotes nothing expands, so this line is exactly as pasteable as any
+  # other and refusing it would teach sessions the check is noise.
+  def test_handoff_accepts_a_dollar_sign_that_the_shell_will_not_expand
+    ["awk -F, '{print $NF}' /tmp/report.csv",
+     "openclaw cron rm $(cat /tmp/cron-id)",
+     "git log --format='%h %s' | awk '{print $1}'"].each do |command|
+      out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args("--command" => command)) }
+      refute_match(/recipient's environment/, out, "#{command.inspect} was refused")
+      # Still exits 1 -- on the credential guard, which is as far as an arg-valid
+      # call gets in this suite.
+      assert_equal 1, status
+    end
+  end
+
+  # A credential is the one value that must NOT be inlined: an issue body is not a
+  # place to write one. So a variable can be declared rather than banned -- and
+  # declaring it is not a waiver, it is what puts "set this first" in front of the
+  # human, which is exactly what ISS-874 had no way to say.
+  def test_handoff_accepts_a_declared_variable_and_tells_the_human_to_set_it
+    sent = nil
+    with_stubbed_api(
+      "POST #{issues_path}" => ->(body) { sent = body; filed_handoff },
+      "PUT #{issues_path('/570/status')}" => ->(_body) { filed_handoff(status: "needs_input") },
+      "POST #{issues_path('/563/comments')}" => ->(_body) { {} },
+    ) do
+      capture_stdout do
+        cmd_issues_handoff(handoff_args("--command" => 'curl -H "x-api-key: $OPENCLAW_TOKEN" https://x/y')
+                             .concat(["--needs-env", "OPENCLAW_TOKEN"]))
+      end
+    end
+    assert_match(/\*\*Set `OPENCLAW_TOKEN` in your shell before pasting\.\*\*/, sent[:body])
+    assert_match(/drops the empty word/, sent[:body])
+  end
+
+  # A "set this first" line about a variable nothing reads teaches the human to
+  # skip the line, which is worse than not having one.
+  def test_handoff_rejects_a_declared_variable_no_command_reads
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args + ["--needs-env", "EDITOR"]) }
+    assert_equal 1, status
+    assert_match(/--needs-env EDITOR is declared but no --command reads it/, out)
+  end
+
+  def test_handoff_needs_env_takes_a_bare_name
+    ["$EDITOR", "EDITOR=vim", "not a name"].each do |bad|
+      out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args + ["--needs-env", bad]) }
+      assert_equal 1, status, "#{bad.inspect} was accepted"
+      assert_match(/--needs-env takes a bare variable NAME/, out)
+    end
+  end
+
+  # Pasted as it stands, this hangs the recipient at a continuation prompt -- the
+  # same class of failure as a newline, caught by the same scan.
+  def test_handoff_rejects_an_unclosed_quote
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args("--command" => "grep -q 'section' file")) }
+    refute_match(/unclosed quote/, out, "balanced quotes must not be flagged")
+    assert_equal 1, status
+
+    out, status = capture_stderr_and_exit { cmd_issues_handoff(handoff_args("--command" => "grep -q 'section file")) }
+    assert_equal 1, status
+    assert_match(/has an unclosed quote/, out)
+  end
+
+  # ---- the second run (ISS-917) ----
+
+  def test_handoff_rerun_hint_names_the_second_run_rather_than_asserting_safety
+    assert_match(/SECOND run/, HANDOFF_RERUN_HINT)
+    assert_match(/daily nudge/, HANDOFF_RERUN_HINT)
+  end
+
+  def test_handoff_body_carries_what_a_second_run_does
+    sent = nil
+    stub_handoff(create: ->(body) { sent = body; filed_handoff })
+    assert_match(/^Run twice: the second rm errors 'no such cron', which is harmless$/, sent[:body])
+  end
+
+  # The two notes ISS-917 adds to the "## Run these" section are prose, and the
+  # section is read back as the list of commands to hand a human (issue review's
+  # fallback). A round trip is the only thing that keeps those two in step.
+  def test_the_run_these_section_still_reads_back_as_exactly_the_commands
+    body = handoff_body("why", "563", ["openclaw cron rm a", "openclaw cron rm b"], ["OPENCLAW_TOKEN"],
+                        "the second rm is a no-op")
+    assert_equal ["openclaw cron rm a", "openclaw cron rm b"],
+                 issue_review_handoff_commands({ "body" => body })
+  end
+
+  # ---- the scan itself ----
+
+  def test_shell_expansions_reads_only_what_the_shell_would_expand
+    {
+      "$EDITOR file" => %w[EDITOR],
+      '"${HOME}/x"' => %w[HOME],
+      "echo $A$B" => %w[A B],
+      "awk '{print $NF}'" => [],
+      'echo "not $single"' => %w[single],
+      "echo \\$EDITOR" => [],
+      "echo $(date) $1 $? $@" => [],
+      "sed -i '' 's/$x/y/' f" => [],
+      %(echo "don't $HOME") => %w[HOME],
+    }.each do |command, expected|
+      assert_equal expected, shell_expansions(command)[:names], command.inspect
+    end
+  end
+
+  def test_shell_expansions_reports_whether_the_quoting_closes
+    ["grep -q 'x' f", %(echo "don't"), "echo \\'", "sed -i '' 's/a/b/' f"].each do |command|
+      assert shell_expansions(command)[:closed], "#{command.inspect} should be closed"
+    end
+    # `echo 'it's` is deliberately NOT here: both quotes close, and a shell runs
+    # it as `echo its`. Only an odd quote is open.
+    ["grep -q 'x f", %(echo "x), "cat >> f <<'EOF"].each do |command|
+      refute shell_expansions(command)[:closed], "#{command.inspect} should be open"
+    end
   end
 
   # The reverse of the same edge, which used to need a separate list query: the

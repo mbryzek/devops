@@ -119,7 +119,7 @@ INVOCATIONS = {
   "issues fix"          => 'issues fix <number> --url URL [--comment "TEXT"] [--app APP --baseline-version VERSION] [--localhost]',
   "issues duplicate"    => 'issues duplicate <number> --of NUMBER [--comment "TEXT"] [--localhost]',
   "issues workaround"   => 'issues workaround --from NUMBER --key SLUG --title "TEXT" --body "TEXT" [--repo NAME]... [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
-  "issues handoff"      => 'issues handoff --from NUMBER --key SLUG --title "TEXT" --body "TEXT" --command "CMD" [--command "CMD"]... [--url URL] [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
+  "issues handoff"      => 'issues handoff --from NUMBER --key SLUG --title "TEXT" --body "TEXT" --command "CMD" [--command "CMD"]... --rerun "TEXT" [--needs-env NAME]... [--url URL] [--category bug|improvement|feature] [--severity low|medium|high] [--localhost]',
   "issues snooze"       => 'issues snooze <number> (--days N | --wake) [--comment "TEXT"] [--localhost]',
   "issues reconcile"    => 'issues reconcile [--apply] [--localhost]',
   "autonomy decide"     => 'autonomy decide --workflow KEY --action ACTION --subject-type TYPE --subject-id ID --subject-label LABEL [--subject-url URL] --rationale TEXT --reversibility (trivial|reversible|costly|irreversible) [--assert key=value]... [--run-id ID] [--idempotency-key KEY] [--register-name NAME] [--register-description TEXT] [--localhost]',
@@ -913,7 +913,22 @@ USAGE = <<~USAGE
 
         --command is required at least once and is the artifact: the exact line to
         paste, one flag per command. Prose describing the step is what already
-        failed twice. --url names the PR or document the commands complete, and is
+        failed twice. It has to run in the RECIPIENT's shell, days later, so a
+        command reading `$EDITOR`/`$VAR` from an environment this session cannot
+        see is refused — inline the value you already know (ISS-874: `EDITOR` was
+        unset, zsh dropped the empty word and executed the bare path, and reported
+        `permission denied` on a file whose permissions were fine). A value that
+        must NOT be written into an issue — a credential — is declared instead with
+        --needs-env NAME, which renders a "set this first" line above the commands.
+
+        --rerun is required and says what a SECOND run does. A handoff sits at
+        `needs_input` and arrives in the daily nudge every morning until a human
+        clears it, so being run twice or half-run is the expected interaction:
+        guard the commands and say why that is safe. Nothing verifies this — a
+        command's re-runnability is not decidable from its text — which is why it
+        is a sentence to the human rather than a flag the tool pretends to check.
+
+        --url names the PR or document the commands complete, and is
         rendered into the close-out command the issue tells the human to run.
         --key is the dedup key, naming the PENDING STEP rather than this run, so a
         later session blocked on the same thing recurs onto the same issue instead
@@ -4472,7 +4487,9 @@ def cmd_issues_handoff(args)
   url = nil
   category = nil
   severity = nil
+  rerun = nil
   commands = []
+  needs_env = []
   leftover = []
   i = 0
   while i < rest.length
@@ -4498,6 +4515,15 @@ def cmd_issues_handoff(args)
       usage_exit("--command requires a value", example: usage_for("issues handoff")) if value.nil?
       commands << value
       i += 2
+    when "--needs-env"
+      value = rest[i + 1]
+      usage_exit("--needs-env requires a variable name", example: usage_for("issues handoff")) if value.nil?
+      needs_env << value
+      i += 2
+    when "--rerun"
+      rerun = rest[i + 1]
+      usage_exit("--rerun requires a value", example: usage_for("issues handoff")) if rerun.nil?
+      i += 2
     when "--url"
       url = rest[i + 1]
       usage_exit("--url requires a value", example: usage_for("issues handoff")) if url.nil?
@@ -4518,6 +4544,7 @@ def cmd_issues_handoff(args)
 
   category = HANDOFF_DEFAULT_CATEGORY if category.nil? || category.empty?
   problems = handoff_problems(from: from, key: key, title: title, body: body, commands: commands,
+                              needs_env: needs_env, rerun: rerun,
                               category: category, severity: severity, leftover: leftover)
   report_arg_problems("issues handoff", problems, usage_for("issues handoff"))
 
@@ -4527,7 +4554,7 @@ def cmd_issues_handoff(args)
     title: title,
     category: category,
     fingerprint: "#{HANDOFF_FINGERPRINT_PREFIX}#{key}",
-    body: handoff_body(body, from, commands),
+    body: handoff_body(body, from, commands, needs_env, rerun),
     # Never claimed. The move to needs_input below is what actually keeps agents
     # off it; this only closes the window between the create and that move.
     claim_on_create: false,
@@ -4551,7 +4578,7 @@ def cmd_issues_handoff(args)
   end
 end
 
-def handoff_problems(from:, key:, title:, body:, commands:, category:, severity:, leftover:)
+def handoff_problems(from:, key:, title:, body:, commands:, needs_env:, rerun:, category:, severity:, leftover:)
   problems = []
   problems << "unexpected argument(s): #{leftover.join(', ')}" unless leftover.empty?
   if from.nil? || from.empty?
@@ -4568,7 +4595,8 @@ def handoff_problems(from:, key:, title:, body:, commands:, category:, severity:
   if body.nil? || body.strip.empty?
     problems << "--body is required (why no session can run this, and what stays broken until it runs)"
   end
-  problems.concat(handoff_command_problems(commands))
+  problems.concat(handoff_command_problems(commands, needs_env))
+  problems << "--rerun is required: #{HANDOFF_RERUN_HINT}" if rerun.nil? || rerun.strip.empty?
   unless ISSUE_MANUAL_CATEGORIES.include?(category)
     problems << "--category must be one of: #{ISSUE_MANUAL_CATEGORIES.join(', ')}"
   end
@@ -4576,23 +4604,124 @@ def handoff_problems(from:, key:, title:, body:, commands:, category:, severity:
   problems
 end
 
+# What a second run does. Required rather than assumed, because a handoff sits at
+# `needs_input` and arrives in the daily nudge every morning until it is cleared:
+# "the human runs it twice, or is half-sure they already ran it" is the expected
+# interaction, not an edge case. ISS-874's replacement command was a bare
+# `cat FILE >> rules.mdc`, which appends the section a second time in silence; the
+# session that wrote it hand-added a `grep -q ... ||` guard because it happened to
+# be careful, and nothing in this command asked it to.
+#
+# Deliberately a SENTENCE, not a --rerun-safe boolean. A checkbox on a filing
+# command is a checkbox every session ticks; a sentence cannot be written without
+# working out the answer, and the answer is what the human staring at the nudge
+# actually needs. Deliberately not enforcement either: whether a command is
+# re-runnable is not decidable from its text, and the crude denylist it degrades
+# into (`>>`, `rm`, `git push`) is both leaky and irritating.
+HANDOFF_RERUN_HINT =
+  "say what a SECOND run of these commands does, in one line. A handoff sits in the daily nudge " \
+  "until a human clears it, so it will be run twice or half-run — guard the commands and say why " \
+  "that is safe (\"the grep guard makes the second append a no-op\", \"the second `cron rm` errors " \
+  "'no such cron', which is harmless\")".freeze
+
+# Shell expansion a pasted command performs against the RECIPIENT's environment,
+# which is the environment the filing session cannot see. Returns the variable
+# names that would expand, plus whether the line's quoting closes.
+#
+# Single-quote-aware on purpose rather than a bare /\$\w+/ scan: inside single
+# quotes nothing expands, so `awk '{print $NF}'` is literal text and rejecting it
+# would be a false positive on a perfectly pasteable line. Everything else errs
+# toward accepting — `$(...)`, `$1`, `$?` and backticks are not environment reads.
+def shell_expansions(command)
+  names = []
+  state = :bare
+  i = 0
+  while i < command.length
+    char = command[i]
+    if state == :single
+      state = :bare if char == "'"
+    elsif char == "\\"
+      i += 1 # the next character is literal, whatever it is
+    elsif char == "'" && state == :bare
+      state = :single
+    elsif char == '"'
+      state = state == :double ? :bare : :double
+    elsif char == "$" && (match = command[(i + 1)..].to_s.match(/\A\{?([A-Za-z_][A-Za-z0-9_]*)\}?/))
+      names << match[1]
+      i += match[0].length
+    end
+    i += 1
+  end
+  { names: names.uniq, closed: state == :bare }
+end
+
 # The commands are the whole artifact: a handoff that describes the step in prose
 # is the PR description that already failed twice. Each one has to be pasteable as
-# it stands, so a newline — which would silently break the block into unrunnable
-# fragments — is rejected rather than reflowed.
-def handoff_command_problems(commands)
-  return ["--command is required at least once (the exact command a human must run, verbatim)"] if commands.empty?
-
+# it stands — by a human, in THEIR shell, days later.
+#
+# A newline breaks the block into unrunnable fragments, so it is rejected rather
+# than reflowed. So is an environment variable the filing session cannot see the
+# other side of: ISS-864 handed over `$EDITOR ~/code/claude/rules/database.general.mdc`,
+# `EDITOR` was unset, zsh dropped the empty word, and the bare path was executed —
+# reported as `permission denied` (exit 126) on a file whose permissions were fine
+# the whole time. That misnaming is the expensive part: a permissions error on a
+# git-tracked file invites a `chmod` that is both unnecessary and wrong (ISS-874).
+#
+# --needs-env is the escape hatch, and it is narrow by design. Inlining the value
+# is right for `$EDITOR`, `$HOME`, `$PWD` — everything the filing session already
+# knows. It is WRONG for a credential, which must never be written into an issue
+# body, and that case is the reason a variable can be declared at all rather than
+# banned. Declaring one is not a waiver: it renders into the body as a line
+# telling the human to set it before pasting, which is precisely what ISS-874 had
+# no way to say.
+def handoff_command_problems(commands, needs_env)
   problems = []
+  problems.concat(handoff_needs_env_problems(needs_env))
+  return problems + ["--command is required at least once (the exact command a human must run, verbatim)"] if commands.empty?
+
   problems << "--command cannot be empty" if commands.any? { |c| c.strip.empty? }
   if commands.any? { |c| c.include?("\n") }
     problems << "--command must be a single line; pass --command once per command"
   end
+
+  scans = commands.reject { |c| c.strip.empty? }.map { |command| [command, shell_expansions(command)] }
+  scans.reject { |_command, scan| scan[:closed] }.each do |command, _scan|
+    problems << "--command \"#{command}\" has an unclosed quote — pasted as it stands it hangs the " \
+                "recipient's shell at a continuation prompt instead of running"
+  end
+  undeclared = scans.flat_map { |_command, scan| scan[:names] }.uniq - needs_env
+  unless undeclared.empty?
+    problems << "--command reads #{undeclared.map { |n| "$#{n}" }.join(', ')} from the recipient's " \
+                "environment, which this session cannot see. Inline the value you already know. " \
+                "($EDITOR is the one that burned us: unset in the recipient's shell, zsh dropped the " \
+                "empty word and executed the bare path, and reported `permission denied` on a file " \
+                "whose permissions were fine — ISS-874.) If the value must NOT be written into an " \
+                "issue — a credential — declare it with --needs-env #{undeclared.first} and the " \
+                "issue tells the human to set it first."
+  end
+  # A declared variable no command reads is a "set this first" instruction about
+  # nothing, which teaches the human to skip the line that matters.
+  stale = needs_env - scans.flat_map { |_command, scan| scan[:names] }
+  unless stale.empty?
+    problems << "--needs-env #{stale.join(', ')} is declared but no --command reads it"
+  end
   problems
 end
 
-def handoff_body(body, from, commands)
+def handoff_needs_env_problems(needs_env)
+  bad = needs_env.reject { |name| /\A[A-Za-z_][A-Za-z0-9_]*\z/.match?(name) }
+  return [] if bad.empty?
+
+  ["--needs-env takes a bare variable NAME, not #{bad.map(&:inspect).join(', ')} " \
+   "(--needs-env EDITOR, never --needs-env $EDITOR or KEY=VALUE — the human sets it, this only names it)"]
+end
+
+def handoff_body(body, from, commands, needs_env, rerun)
   block = commands.map { |command| "    #{command}" }.join("\n")
+  # Both notes sit at column 0, OUTSIDE the indented block, because
+  # `issue_review_handoff_commands` reads that block back as the commands to run.
+  block = "#{handoff_env_note(needs_env)}\n\n#{block}" unless needs_env.empty?
+  block = "#{block}\n\nRun twice: #{rerun.strip}"
   "#{body.strip}\n\n## Run these\n\n#{block}\n\n---\n\n" \
     "Handed over from ISS-#{from}. That session could not run the commands above, and no " \
     "autonomous session can: they need a scope, a credential, or a binary the runners do not " \
@@ -4601,6 +4730,18 @@ def handoff_body(body, from, commands)
     "nothing here can be claimed by an agent and deferred again — which is exactly what happened " \
     "when this kind of step was filed at `open` (ISS-563). It stays in the daily nudge every " \
     "morning until a human clears it."
+end
+
+# Says the quiet part the ISS-874 handoff had no way to say. An unset variable
+# does not stop a shell: zsh drops the empty word and runs whatever is left, so
+# the failure surfaces as something else entirely — there `permission denied` on
+# a file with ordinary permissions.
+def handoff_env_note(needs_env)
+  names = needs_env.map { |name| "`#{name}`" }.join(", ")
+  subject = needs_env.length == 1 ? "it is" : "they are"
+  "**Set #{names} in your shell before pasting.** These commands read #{needs_env.length == 1 ? 'it' : 'them'} " \
+    "from your environment, and if #{subject} unset the shell does not stop — it drops the empty word " \
+    "and runs what is left, which fails as something that looks unrelated (ISS-874)."
 end
 
 # Park the issue where no agent can take it. Only from `open`: a fingerprint
@@ -5818,11 +5959,17 @@ end
 # crons still firing a day later).
 ISSUE_HANDOFF_COMMANDS_SECTION = /^## Run these\s*\n(.*?)(?=^---\s*$|\z)/m
 
+# Only the INDENTED lines, which is the code block handoff_body writes. The
+# section also carries prose at column 0 — what must be set before pasting, what
+# a second run does (ISS-917) — and reading those back as commands would put a
+# sentence in front of a human under "Waiting on a human to run:".
+ISSUE_HANDOFF_COMMAND_LINE = /\A {4}(\S.*)\z/
+
 def issue_review_handoff_commands(issue)
   match = issue["body"].to_s.match(ISSUE_HANDOFF_COMMANDS_SECTION)
   return [] if match.nil?
 
-  match[1].lines.map(&:strip).reject(&:empty?)
+  match[1].lines.filter_map { |line| line.rstrip[ISSUE_HANDOFF_COMMAND_LINE, 1] }
 end
 
 # One issue's prompt loop. Returns what happened to it, which is what the
