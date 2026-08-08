@@ -790,7 +790,11 @@ USAGE = <<~USAGE
         judgment needs the code read, so the session makes it, not this CLI).
         Never across categories — those are independent pipelines and repos. Pass
         --no-spawn to just write the plans and print their
-        paths. Authenticates with your persisted playbook session — run
+        paths. Work that cannot be worked yet is listed but never offered, with the
+        reason: blocked, filed for another machine, or — the one the tracker's own
+        status cannot see — waiting on a blocker whose fix PR has not merged, which
+        `dev agent tick` defers a dispatch on for the same reason (ISS-649).
+        Authenticates with your persisted playbook session — run
         `dev auth login --app playbook` once first (the issues API requires a playbook
         admin, not the platform `dev auth login`).
 
@@ -5548,10 +5552,89 @@ def issue_print_blocked(blocked)
   puts Util.underline("blocked (#{blocked.length}) — not offered")
   blocked.each do |c|
     live = issue_blockers(c).reject { |b| ISSUE_UNBLOCKING_STATUSES.include?(b["status"]) }
-    title = c["title"].to_s.gsub(/\s+/, " ").strip
-    title = "#{title[0, 57]}..." if title.length > 60
-    puts "  #{issue_label(c)} · waiting on #{live.map { |b| issue_ref_label(b) }.join(', ')} · #{title}"
+    puts "  #{issue_label(c)} · waiting on #{live.map { |b| issue_ref_label(b) }.join(', ')} · #{issue_short_title(c)}"
   end
+  puts ""
+end
+
+# One held-out issue and the blockers whose code is not on `origin/main` yet, as
+# `Agent::Dependency.unshipped` returned them.
+IssueDependencyHold = Struct.new(:issue, :unshipped)
+
+# THE DISPATCH GATE, run where this command builds its offer (ISS-1086).
+#
+# `Agent::Tick` has asked GitHub since ISS-649 and defers a dispatch when the
+# answer is "not merged". This command asked only the server's `is_blocked`,
+# which clears on STATUS the moment a blocker reaches `fixed` — and the close-out
+# contract has every session record `fixed` when its PR is READY, which is most
+# of a working day before anything merges. So an issue whose only blocker sat at
+# `fixed` over an OPEN PR was offered here, claimed, and (spawning by default)
+# handed to a session whose only options were to re-implement the dependency or
+# stack on it. That is the ISS-649 failure entered from the CLI instead of the
+# dispatcher, and it was not hypothetical: ISS-1084 over devops#448 was deferred
+# by the dispatcher at the same moment `dev issues claim --number 1084` would
+# have started a session on it.
+#
+# HELD OUT rather than refused at claim time. This command already has exactly
+# this shape for the three other reasons work is unworkable — blocked, snoozed,
+# filed for another machine — and every one of them keeps the thing OFF the menu
+# instead of refusing the order. Gating only the issue actually picked would also
+# have to be re-explained at each of the three ways an issue gets picked
+# (`--number`, `--yes`, the interactive selection), and would still print the
+# work as claimable one line above refusing it.
+#
+# The cost is bounded by construction and is normally ZERO round trips.
+# `unshipped` touches no network for an issue with no blockers, which is nearly
+# every issue; an issue whose blockers are still live is already in the `blocked`
+# partition and never reaches here. What is left is exactly the case this exists
+# for — a blocker shipped by the tracker's reckoning — and it pays one API read
+# plus one `gh pr view` per recorded fix. Run LAST, after the blocked and
+# assigned-elsewhere partitions, so nothing unclaimable here pays even that.
+#
+# FAILS OPEN, exactly as the dispatcher does. `unshipped` answers `[]` for every
+# unknown — `gh` missing, a rate limit, an unreadable blocker, a fix that is a
+# document rather than a PR — so an unanswerable GitHub offers the work rather
+# than emptying the queue. A gate that stalled the queue whenever GitHub was
+# unreachable would be a worse failure than the one it prevents, and a silent one.
+def issue_partition_unmerged_dependencies(issues, use_localhost)
+  held = []
+  claimable = issues.reject do |c|
+    unshipped = Agent::Dependency.unshipped(c, use_localhost: use_localhost)
+    next false if unshipped.empty?
+
+    held << IssueDependencyHold.new(c, unshipped)
+    true
+  end
+  [claimable, held]
+end
+
+# The holds among `held` that `requested` names — so a by-number claim refuses with
+# the reason instead of folding the issue into "not listed above", which reads as a
+# typo. Resolved through the same parser the offer uses, so "078", "78" and
+# "ISS-078" all land here exactly as they land there.
+def issue_holds_for(held, requested)
+  named, = issue_resolve_requested(requested.join(","), held.map(&:issue))
+  by_number = held.to_h { |h| [h.issue["number"].to_s, h] }
+  named.filter_map { |c| by_number[c["number"].to_s] }
+end
+
+# Printed, not silently filtered, for the reason blocked work is: "nothing to
+# claim" and "one issue, and it is waiting on a PR somebody opened twenty minutes
+# ago" are different situations, and a bare "No open issues" says the wrong one.
+#
+# The reason lines are `Agent::Dependency.describe` — the very sentences the
+# dispatcher writes onto the timeline when it defers the same issue — so what a
+# human reads here and what a session reads there cannot become two accounts of
+# one PR.
+def issue_print_dependency_deferred(held)
+  return if held.empty?
+
+  puts Util.underline("waiting on unmerged code (#{held.length}) — not offered")
+  held.each do |h|
+    puts "  #{issue_label(h.issue)} · #{issue_short_title(h.issue)}"
+    Agent::Dependency.describe(h.unshipped).each { |reason| puts "      #{reason}" }
+  end
+  puts "  (`dev agent tick` defers these too and re-checks GitHub every time — there is nothing to do but merge the fix)"
   puts ""
 end
 
@@ -5567,9 +5650,7 @@ def issue_print_assigned_elsewhere(assigned, runners_by_id)
   assigned.each do |c|
     id = c["assigned_runner_id"].to_s
     who = runners_by_id[id] || id
-    title = c["title"].to_s.gsub(/\s+/, " ").strip
-    title = "#{title[0, 57]}..." if title.length > 60
-    puts "  #{issue_label(c)} · for #{who} · #{title}"
+    puts "  #{issue_label(c)} · for #{who} · #{issue_short_title(c)}"
   end
   puts "  (claim these from that machine, or re-point one in the admin at /admin/issues/<n>)"
   puts ""
@@ -5678,11 +5759,16 @@ def cmd_issues_claim(args)
       c["assigned_runner_id"].nil? || c["assigned_runner_id"] == claiming_runner_id
     }
     runner_names = issue_runner_names(assigned_elsewhere, use_localhost)
+    # The half of "blocked" the server cannot see: a blocker at `fixed` over a PR
+    # that has not merged (ISS-1086). Last of the three partitions, so only work
+    # this machine could otherwise claim pays the GitHub read.
+    open, dependency_held = issue_partition_unmerged_dependencies(open, use_localhost)
     present = issue_categories_present(open)
     if present.empty?
       puts category ? "No open #{category} issues to claim." : "No open issues to claim."
       puts "(Snoozed issues and epics are not offered — `dev issues list --snoozed` shows the deferred ones, soonest to wake first; `dev issues snooze <n> --wake` brings one back, and an epic is worked through its children.)"
       issue_print_blocked(blocked)
+      issue_print_dependency_deferred(dependency_held)
       issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
       return
     end
@@ -5700,6 +5786,7 @@ def cmd_issues_claim(args)
       puts ""
     end
     issue_print_blocked(blocked)
+    issue_print_dependency_deferred(dependency_held)
     issue_print_assigned_elsewhere(assigned_elsewhere, runner_names)
 
     selected, hand_picked =
@@ -5720,6 +5807,24 @@ def cmd_issues_claim(args)
                 "#{issue_label(c)} is blocked by #{live.map { |b| issue_ref_label(b) }.join(', ')} — those have to ship first."
               }.join("\n") +
               "\nDrop an edge that is not really a prerequisite with `dev issues block <n> --on <m> --remove`."
+            )
+          end
+          # And for work the dependency gate is holding (ISS-1086), which is a
+          # SEPARATE sentence rather than a fold into the one above. The server
+          # would hand this issue over — every blocker is terminal by its rule —
+          # so "those have to ship first" would name the wrong mechanism, and the
+          # thing to go and look at is a PR rather than a status.
+          named_held = issue_holds_for(dependency_held, unknown)
+          unless named_held.empty?
+            Util.exit_with_error(
+              named_held.map { |h|
+                "#{issue_label(h.issue)} is waiting on code that has not merged:\n" +
+                  Agent::Dependency.describe(h.unshipped).map { |r| "  - #{r}" }.join("\n")
+              }.join("\n") +
+              "\nA session started now could only re-implement that fix or stack on it, which is what ISS-649 " \
+              "exists to stop. `dev agent tick` defers it for the same reason and re-checks GitHub every time, " \
+              "so this clears itself the moment the fix merges.\n" \
+              "Drop an edge that is not really a prerequisite with `dev issues block <n> --on <m> --remove`."
             )
           end
           # Same refusal, same reason, for work filed for another machine (ISS-553).
