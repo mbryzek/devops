@@ -171,20 +171,56 @@ class TestK8sNewRelic < Minitest::Test
                  "spans, so turning tracing off costs nothing that ISS-1070 asked for.")
   end
 
-  # Platform sets no `distributedTracing`, so its JAVA_OPTS must render exactly
-  # as before. Asserted structurally — an unset value contributes the empty
-  # string — because the alternative is a rendered-manifest comparison that
-  # needs a pkl binary the rest of this suite deliberately never depends on.
+  # An app that says nothing about tracing must still render the JAVA_OPTS it
+  # rendered before this setting existed. Asserted structurally — an unset value
+  # contributes the empty string — because the alternative is a rendered-manifest
+  # comparison that needs a pkl binary the rest of this suite deliberately never
+  # depends on. Every app in k8s/apps/ sets it today, so nothing exercises this
+  # branch; it is what keeps adding an app a one-line change.
   def test_tracing_flag_is_emitted_only_when_an_app_sets_it
     assert_match(/local distributedTracing = read\?\("env:NEWRELIC_DISTRIBUTED_TRACING"\) \?\? ""/, TEMPLATE)
     assert_match(/if \(distributedTracing == ""\) "" else "-Dnewrelic\.config\.distributed_tracing\.enabled=/, TEMPLATE,
                  "unset must contribute the empty string, so an app that says nothing " \
                  "about tracing renders the JAVA_OPTS it rendered before this setting " \
                  "existed")
-    refute_match(/^distributedTracing/, PLATFORM,
-                 "platform deliberately says nothing here; the day it does, the " \
-                 "byte-identical claim in the template comment stops being true")
   end
+
+  # Platform is the ONLY app here with two instrumented tiers, so it is the only
+  # place a trace could cross a service boundary — and the measurement is that
+  # none does (ISS-1084). Turning tracing off is therefore the same decision
+  # acumen made, not a different one, and the evidence has to stay next to the
+  # setting: this is the assertion that fails if someone flips it back without
+  # re-measuring.
+  def test_platform_disables_distributed_tracing
+    assert_match(/^distributedTracing = false$/, PLATFORM,
+                 "platform's traces never leave one process — 97.8% of its transactions " \
+                 "are trace entry points and no trace contains more than one application, " \
+                 "because platform-web reaches platform-job through a database task queue. " \
+                 "Tracing was 40% of the account's ingest (0.87-1.52 GB/day of 2.80) " \
+                 "against a 100 GB free tier August was projected to reach 87% of.")
+    assert_match(/nr\.entryPoint/, PLATFORM,
+                 "the query that established the premise must stay next to the setting, " \
+                 "so flipping it back is a re-measurement rather than a guess")
+  end
+
+  # The two apps reach the same conclusion from the same evidence, and the day
+  # they stop agreeing is the day one of them was changed without the other
+  # being reconsidered.
+  def test_both_apps_turn_tracing_off_and_say_why
+    [["acumen", ACUMEN], ["platform", PLATFORM]].each do |app, config|
+      assert_match(/^distributedTracing = false$/, config, "#{app} must disable tracing")
+      assert_match(/never leaves the process|begins and ends inside one process/, prose(config),
+                   "#{app} must say WHY next to the setting — a bare `false` reads as a " \
+                   "cost cut, and the reason it is safe (nothing to trace into) is the " \
+                   "only thing that says when to revisit it")
+    end
+  end
+
+  # A claim in a comment wraps wherever the line ran out, so matching one against
+  # the raw file asserts where the author pressed return as much as what they
+  # said. Strips comment markers and collapses whitespace so the assertion is
+  # about the sentence.
+  def prose(config) = config.gsub(%r{^\s*//+}, " ").gsub(/\s+/, " ")
 
   def test_tracing_flag_is_inside_the_agent_branch
     flags = TEMPLATE[/local function javaAgentFlags.*$/, 0]

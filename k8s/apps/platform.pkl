@@ -13,3 +13,47 @@ appName = "platform"
 appPort = 9300
 webMemory = "4400Mi"
 javaAgent = "/opt/newrelic/newrelic.jar"
+
+// Off for the same reason acumen is, now that the premise has been MEASURED
+// rather than assumed. Distributed tracing exists to correlate one request
+// across services; the question is whether any trace in this account actually
+// does, and platform is the only place it plausibly could — it is the one
+// product here with two instrumented tiers.
+//
+// It does not. Measured on account 7724695, 2026-08-08 (ISS-1084):
+//
+//   - 1,070,884 of 1,095,515 transactions over 7 days are trace ENTRY POINTS
+//     (`nr.entryPoint IS true`) — 97.8%. A tier called by another tier would
+//     show up as a continuation, not as the start of its own trace.
+//   - `FROM (SELECT uniqueCount(appName) AS apps FROM Span FACET traceId
+//     LIMIT MAX) SELECT max(apps)` returns 1.0 across 5,000 traces. Not one
+//     contains spans from more than one application.
+//   - The account's Span keyset has no `parent.app` attribute at all, so no
+//     span has ever recorded a parent in another entity.
+//
+// That is the architecture, not a sampling artifact: platform-web serves
+// requests and platform-job drains a database task queue, and a queue does not
+// carry trace context across the hop by design. So every trace begins and ends
+// inside one process, which is exactly the case k8s/apps/acumen.pkl turned this
+// off for — decided there on the general argument, and confirmed here on the
+// numbers.
+//
+// What it costs, at 40% of the bill. TracingBytes ran 0.87-1.52 GB/day over the
+// 14 days to 2026-08-08 against a 2.80 GB/day total, and August projected
+// 87.2 GB of a 100 GB free-tier ceiling with acumen not yet reporting at all.
+// Without it the run rate is ~1.6 GB/day, or roughly half the ceiling, which is
+// what buys room for acumen's two apps and for the ~+5 GB/month the account has
+// trended at since March (51.6, 51.5, 60.5, 61.5, 73.5).
+//
+// What survives, and it is what anything here actually reads: TransactionError
+// keeps the class, message and stack trace (0.005 GB across all of platform in
+// the same window) so `daily-error-triage` is untouched; transaction traces keep
+// per-segment timing for the slowest transactions, since they are an APM
+// mechanism rather than a span one; and slow queries are tracked by
+// `dev queries top` out of platform's own database, not out of spans.
+//
+// Flip this back to true (one line, no other change) if platform grows a
+// synchronous hop between two instrumented services. Re-check the premise with
+// the maxApps query above before doing it — the finding, not the setting, is
+// what should decide.
+distributedTracing = false

@@ -44,8 +44,10 @@ local javaAgent = read?("env:JAVA_AGENT") ?? ""
 
 // Distributed tracing, only meaningful when the agent is attached. Left unset,
 // the agent uses its own default (enabled), so an app that says nothing about
-// it renders exactly the JAVA_OPTS it rendered before this setting existed —
-// which is why platform's manifest is byte-identical across this change.
+// it renders exactly the JAVA_OPTS it rendered before this setting existed.
+// Every app in k8s/apps/ now sets it explicitly, so nothing currently relies on
+// that — but the empty-string branch below is what makes adding an app a
+// one-line change rather than a decision, so it stays.
 //
 // An app sets it to false when it has nothing to trace INTO. Distributed
 // tracing correlates one request across services; on a single standalone
@@ -56,6 +58,15 @@ local javaAgent = read?("env:JAVA_AGENT") ?? ""
 // ~82% of. Errors survive it untouched, which is the signal this exists for:
 // TransactionError carries the class, message and stack trace, and cost
 // 0.005 GB across all of platform in the same window.
+//
+// "Nothing to trace INTO" turned out to include platform, which is the one
+// product here with two instrumented tiers and so the only candidate for a
+// trace that crosses a boundary. It has none: 97.8% of its transactions are
+// trace entry points and no trace contains more than one application, because
+// platform-web reaches platform-job through a database task queue and a queue
+// does not carry trace context. The queries are in k8s/apps/platform.pkl
+// (ISS-1084). Measure before assuming an app has something to trace into —
+// having two services is not the same as having one trace across them.
 //
 // Expressed as a JVM system property rather than a NEW_RELIC_* variable in the
 // git-crypt'd env repo because it is not a secret — it is deployment config,
