@@ -4199,7 +4199,7 @@ class TestDevIssues < Minitest::Test
   end
 
   def test_show_points_a_duplicate_at_its_canonical
-    section = issue_links_section(duplicate_issue)
+    section = links_section(duplicate_issue)
     assert_match(/Duplicate of ISS-427/, section)
     assert_match(/Warm session stalls/, section)
     assert_match(/reopening this issue clears the link/, section)
@@ -4678,7 +4678,7 @@ class TestDevIssues < Minitest::Test
   # The reverse of the same edge, which used to need a separate list query: the
   # canonical is carrying more reports than its own body shows.
   def test_show_lists_what_a_canonical_absorbed
-    section = issue_links_section(canonical_issue)
+    section = links_section(canonical_issue)
     assert_match(/Absorbed 1 duplicate: ISS-429/, section)
   end
 
@@ -4749,31 +4749,107 @@ class TestDevIssues < Minitest::Test
     refute_match(/blocked/, issue_summary_line(blocked_issue(blocker_status: "fixed"), 1))
   end
 
+  # The url a `fixed` blocker records as its fix, and what `gh pr view` answers
+  # about it — the two facts the section now renders from.
+  BLOCKER_PR = "https://github.com/mbryzek/devops/pull/448".freeze
+
+  def blocker_pr(state: "OPEN") = { "url" => BLOCKER_PR, "state" => state, "number" => 448 }
+
+  # `issue_links_section` with the GitHub read stubbed the way test_agent_dependency
+  # stubs the gate — the section asks the same question through the same two calls
+  # (ISS-1085). `blocker` is the blocker's own record, nil for one that cannot be
+  # read; `prs` maps a fix url to what `gh` answers, nil for a lookup that failed.
+  def links_section(issue, blocker: nil, prs: {})
+    stub_singleton(Agent::Api, :issue, ->(*, **) { blocker }) do
+      stub_singleton(Agent::Github, :pr_by_url, ->(url) { prs[url] }) do
+        issue_links_section(issue, use_localhost: false)
+      end
+    end
+  end
+
+  def fixed_blocker_record = { "fixes" => [{ "url" => BLOCKER_PR }] }
+
   def test_show_renders_blockers_with_their_status
-    section = issue_links_section(blocked_issue)
+    section = links_section(blocked_issue)
     assert_match(/BLOCKED — waiting on 1 of 1 blocker/, section)
     assert_match(/ISS-521 \(open\) Build the producer registry/, section)
     assert_match(/`dev issues claim` will refuse this issue/, section)
+    # Nothing merged is being waited on, so nothing names a merge: the blocker has
+    # not reached a shipped status and its own status is the whole reason.
+    refute_match(/dev agent tick/, section)
   end
 
   def test_show_renders_shipped_blockers_as_claimable
-    section = issue_links_section(blocked_issue(blocker_status: "fixed"))
+    section = links_section(blocked_issue(blocker_status: "fixed"),
+                            blocker: fixed_blocker_record,
+                            prs: { BLOCKER_PR => blocker_pr(state: "MERGED") })
     assert_match(/all shipped — this is claimable now/, section)
     # The shipped blocker stays listed: "why is this claimable now" is the same
     # question as "why was it not".
     assert_match(/ISS-521 \(fixed\)/, section)
   end
 
+  # THE bug (ISS-1085). `fixed` is recorded when a PR is READY, so a blocker at
+  # `fixed` over an OPEN PR is the state most of a working day is spent in — and
+  # this section used to call it claimable while `Agent::Tick` deferred the claim.
+  def test_show_refuses_to_call_a_fixed_blocker_with_an_unmerged_pr_claimable
+    section = links_section(blocked_issue(blocker_status: "fixed"),
+                            blocker: fixed_blocker_record,
+                            prs: { BLOCKER_PR => blocker_pr })
+    refute_match(/claimable now/, section)
+    assert_match(/BLOCKED — waiting on 1 of 1 blocker/, section)
+    # Named, not just counted: the PR is the thing to go and look at, and it is
+    # the same sentence the dispatcher's deferral comment writes.
+    assert_match(%r{its fix https://github\.com/mbryzek/devops/pull/448 has not merged}, section)
+    assert_match(/`dev agent tick` re-checks GitHub/, section)
+    # The SERVER would hand this over — every blocker is terminal by its rule — so
+    # saying `dev issues claim` refuses it would be the same lie pointed the other way.
+    refute_match(/`dev issues claim` will refuse/, section)
+  end
+
+  # A closed-unmerged fix never resolves itself, and the wording says so rather
+  # than reading as "not yet" — the distinction ISS-739 put into the gate.
+  def test_show_says_a_closed_unmerged_fix_will_never_ship
+    section = links_section(blocked_issue(blocker_status: "fixed"),
+                            blocker: fixed_blocker_record,
+                            prs: { BLOCKER_PR => blocker_pr(state: "CLOSED") })
+    assert_match(/CLOSED WITHOUT MERGING/, section)
+    assert_match(/no open PR will ship it/, section)
+  end
+
+  # FAILS OPEN, exactly as the gate does. An unreadable `gh` dispatches, so the
+  # display that mirrors it must say claimable — agreeing with the dispatcher is
+  # the whole fix, including where the dispatcher is guessing.
+  def test_show_reads_an_unanswerable_github_as_claimable
+    section = links_section(blocked_issue(blocker_status: "fixed"),
+                            blocker: fixed_blocker_record,
+                            prs: { BLOCKER_PR => nil })
+    assert_match(/all shipped — this is claimable now/, section)
+  end
+
+  # Both kinds of blocker at once: each mechanism gets its own sentence, because
+  # they hold the issue for different reasons and clear at different moments.
+  def test_show_names_both_holds_when_a_blocker_of_each_kind_is_present
+    issue = blocked_issue.merge(
+      "links" => [link("blocked_by", "outgoing", "521", "Build the producer registry", "open"),
+                  link("blocked_by", "outgoing", "533", "Ship the scheduler", "fixed")],
+    )
+    section = links_section(issue, blocker: fixed_blocker_record, prs: { BLOCKER_PR => blocker_pr })
+    assert_match(/BLOCKED — waiting on 2 of 2 blocker/, section)
+    assert_match(/`dev issues claim` will refuse this issue/, section)
+    assert_match(/`dev agent tick` re-checks GitHub/, section)
+  end
+
   # The other direction of the same edge. Finishing this issue releases other work,
   # which is a reason to prioritise it and is invisible from the issue's own body.
   def test_show_renders_what_an_issue_blocks
-    section = issue_links_section(blocker_issue)
+    section = links_section(blocker_issue)
     assert_match(/BLOCKS 1 issue/, section)
     assert_match(/ISS-526 \(open\) Delete the producer path/, section)
   end
 
   def test_show_renders_nothing_for_an_issue_with_no_edges
-    assert_equal "", issue_links_section(graph_issue)
+    assert_equal "", links_section(graph_issue)
   end
 
   # An epic's children split READY vs BLOCKED — the view that says what to work next.
