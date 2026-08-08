@@ -64,6 +64,13 @@ module Agent
     # immediately, which is what gives a freshly provisioned runner its answer on
     # the first tick instead of a day later.
     def toolchain_file = File.join(state_dir, "agent-toolchain.json")
+    # When this machine last measured NewRelic ingest against the free tier, and
+    # what it found (ISS-1077). A throttle in the same sense as the two above —
+    # the subject is a fleet-wide account rather than this box, and the file is
+    # here rather than on the platform because a cadence marker is a throttle and
+    # not an authority: the write that actually has to be deduplicated fleet-wide
+    # is the ISSUE, and the platform's fingerprint rule already does that.
+    def newrelic_ingest_file = File.join(state_dir, "agent-newrelic-ingest.json")
     # The last `max_concurrency` the platform told this machine about (ISS-753),
     # cached so that `Agent::Heap` can size the sbt heap without a network call
     # on the path to every build. A cache and never an authority: the tick
