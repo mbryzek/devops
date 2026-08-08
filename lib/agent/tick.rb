@@ -534,7 +534,8 @@ module Agent
       # tick rather than 30 seconds later. It takes no lease and no capacity, so
       # there is nothing for it to take from the claim behind it.
       wake_dependency_deferrals
-      claim(identity, self_runner(identity))
+      registry = fleet(identity)
+      claim(identity, self_runner(registry, identity), registry)
     rescue SessionExpired, ApiError => e
       log("work phase: platform error (#{e.message})")
     rescue StandardError => e
@@ -765,13 +766,28 @@ module Agent
     # used to consume — so nothing was lost with the copy, and the server sees
     # the machine that went dark whether or not anything else in the fleet is up.
     #
-    # Do not re-add a local copy. Add to the processor instead.
-    def self_runner(identity)
-      runners = Agent::Api.runners(token: identity.token, use_localhost: @use_localhost)
-      runners.find { |r| r["id"] == identity.runner_id }
+    # Do not re-add a local copy. Add to the processor instead. What this DOES
+    # read the other runners for, since ISS-1123, is hardware — see `fleet`.
+
+    # The whole registry, or FLEET_UNREADABLE. Read ONCE per work phase and passed
+    # down, because two things want it now: `paused` and `max_concurrency` are
+    # this machine's own row, and the verify scheduler needs the OTHER rows to
+    # tell a build no runner can serve from one another runner can (ISS-1123).
+    # Two calls would be two answers that can disagree about the same fleet.
+    def fleet(identity)
+      Agent::Api.runners(token: identity.token, use_localhost: @use_localhost)
     rescue ApiError => e
       log("could not read the fleet (#{e.message}) — claiming nothing this tick")
       FLEET_UNREADABLE
+    end
+
+    # This machine's row: nil when the read succeeded and we are simply not in the
+    # list (an unregistered runner, whose claim 422s into `handle_claim_error`),
+    # and the sentinel when there was nothing to look in. Keeping those apart is
+    # what FLEET_UNREADABLE exists for.
+    def self_runner(registry, identity)
+      return FLEET_UNREADABLE if registry == FLEET_UNREADABLE
+      registry.find { |r| r["id"] == identity.runner_id }
     end
 
     # ---- reap ----
@@ -1050,7 +1066,7 @@ module Agent
 
     # ---- claim ----
 
-    def claim(identity, runner)
+    def claim(identity, runner, registry = [])
       # `paused` is the ONLY control an operator has to stop one machine from
       # taking new work — the thing you reach for at 3am on the runner producing
       # bad PRs. So the one state it must never be confused with is "we could not
@@ -1088,7 +1104,7 @@ module Agent
       # `max_concurrency`, which is the whole simplification: there is no second
       # scheduler on this box any more, so there is nothing to reserve, nothing to
       # subtract and no way for the two to oversubscribe the machine.
-      verify(runner)
+      verify(runner, registry)
 
       # AFTER `verify`, and that ordering is the point (ISS-1129). A usage limit
       # is the Claude API refusing to start SESSIONS; a verify job is sbt and npm
@@ -1222,15 +1238,28 @@ module Agent
     #   claim    posts `pending` and reads it back, so two boxes scanning the same
     #            repo cannot both build the same sha (fleet-wide dedup, on GitHub
     #            rather than in a file on this runner).
-    def verify(runner)
+    def verify(runner, registry = [])
       reap_verify_jobs
       free = capacity(runner) - live_jobs
       return if free <= 0
       return unless Agent::Verify.scan_due?(now: @now)
 
-      scan = Agent::Verify.scan(limit: [free, Agent::Verify::ENQUEUE_CAP].min, now: @now)
+      # WHAT THIS BOX CAN GIVE A BUILD, AND WHAT THE BIGGEST BOX CAN (ISS-1123).
+      # `max_concurrency` bounds how MANY jobs run here and says nothing about
+      # how big one may be, so a platform build declaring `heap:12G` was claimable
+      # on the 24G/3-slot runner that derives 4G — and OOMed there, as a red the
+      # lane cannot tell from a failing suite. The fleet figure is what separates
+      # "somebody else's job" from "nobody's job", and it must be nil rather than
+      # wrong when the registry could not be read — FLEET_UNREADABLE reaches that
+      # nil through `fleet_gigabytes`'s own contract (it answers nil for anything
+      # that is not a list of rows) rather than through a second place here that
+      # has to know the sentinel.
+      fleet_heap = Agent::Heap.fleet_gigabytes(registry)
+      scan = Agent::Verify.scan(limit: [free, Agent::Verify::ENQUEUE_CAP].min, now: @now,
+                                heap_gb: Agent::Heap.gigabytes_here, fleet_heap_gb: fleet_heap)
       if @dry_run
         decide("verify", "would enqueue #{scan.candidates.map(&:label).join(', ')}") if scan.candidates.any?
+        report_unbuildable(scan, fleet_heap)
         return
       end
       Agent::Verify.mark_scanned(now: @now)
@@ -1239,7 +1268,71 @@ module Agent
       # fleet is keeping up" when the truth is that N pull requests are waiting on
       # a check; the next pass takes the next batch.
       decide("verify", "#{scan.dropped} more candidate(s) deferred to the next pass (cap #{Agent::Verify::ENQUEUE_CAP})") if scan.dropped.positive?
+      report_unbuildable(scan, fleet_heap)
       scan.candidates.each { |candidate| start_verify_job(candidate) }
+    end
+
+    # The two ways a candidate was not enqueued for want of MEMORY rather than of
+    # a slot, and they get opposite volumes on purpose.
+    #
+    # DEFERRED IS ONE LOG LINE, counted rather than enumerated. A heterogeneous
+    # fleet leaves the expensive builds to the big box every pass of every day;
+    # that is the design working. It is not a `decide` — a decision per pass would
+    # bury the ones that mean something — and it is not a line per candidate
+    # either: fifteen deferred platform PRs at the three-minute scan cadence is
+    # 7,000 log lines a day saying the fleet is healthy.
+    #
+    # UNSATISFIABLE FILES AN ISSUE. No runner in the fleet is built big enough (or
+    # the repo's declaration does not parse), so nothing will ever claim it: the
+    # pull request sits on `no_ci_verdict` indefinitely and the merge lane, which
+    # is right to refuse it, has nothing to say about why. That is the silent
+    # outcome this whole subsystem is shaped to refuse. It goes through
+    # `record_failure` rather than a bespoke alarm so it inherits the streak, the
+    # once-per-day fingerprint and the both-runners-file-one-issue dedup that
+    # every other unattended failure on this fleet already has — and the streak is
+    # what keeps a single blip in the registry read from filing anything.
+    def report_unbuildable(scan, fleet_heap)
+      if scan.deferred.any?
+        log("verify: #{scan.deferred.length} candidate(s) declare more heap than this machine's " \
+            "#{Agent::Heap.gigabytes_here}G and are left for a bigger runner " \
+            "(#{summarise(scan.deferred.map(&:label))})")
+      end
+      if scan.unsatisfiable.empty?
+        # A pass with nothing unsatisfiable ENDS the streak, exactly as a chore
+        # that recovered does. Without this, a repo whose declaration is fixed
+        # keeps its count and the next unrelated one escalates immediately.
+        Agent::Errors.clear(Agent::Verify::CAPABILITY_ERROR_SOURCE) unless @dry_run
+        return
+      end
+
+      named = summarise(scan.unsatisfiable.map { |c| "#{c.label} (#{c.heap_text})" })
+      best = fleet_heap ? "#{fleet_heap}G" : "unknown"
+      message = "#{named} — no runner in the fleet can build this (the largest heap any runner gives is #{best}). " \
+                "Nothing will claim it, so the pull request stays on `no_ci_verdict` until the declaration or the fleet changes."
+      decide("verify", message)
+      return if @dry_run
+
+      record_failure(
+        Agent::Verify::CAPABILITY_ERROR_SOURCE, message,
+        title: ->(_host) { "ci: a verify job declares more heap than any runner in the fleet can give" },
+        explain: "A repo's `# ci-needs: heap:<N>G` in `ci/build.sh` is larger than the heap any registered " \
+                 "runner derives (RAM / max_concurrency * #{Agent::Heap::SLOT_FRACTION}, clamped to " \
+                 "[#{Agent::Heap::MIN_GB}G, #{Agent::Heap::MAX_GB}G] — `dev agent sbt-opts --explain`). No runner " \
+                 "will claim the job, so the pull request never gets a `ci` check and the merge lane holds it " \
+                 "forever.\n\nThree fixes, in the order to consider them: lower the repo's declaration if it is " \
+                 "not measured; lower a runner's `max_concurrency` so its slots are bigger; or add a machine with " \
+                 "more RAM (docs/ci.md, \"Dedicated hardware\").",
+      )
+    end
+
+    # As many names as are useful and a count for the rest. A list that grows with
+    # the queue turns one log line into a paragraph; a bare count turns it into
+    # something nobody can act on without a second command.
+    LABEL_SUMMARY_LIMIT = 5
+
+    def summarise(labels)
+      return labels.join(", ") if labels.length <= LABEL_SUMMARY_LIMIT
+      "#{labels.first(LABEL_SUMMARY_LIMIT).join(', ')} and #{labels.length - LABEL_SUMMARY_LIMIT} more"
     end
 
     def start_verify_job(candidate)

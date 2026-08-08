@@ -3,6 +3,7 @@ require 'socket'
 require 'time'
 require 'agent/errors'
 require 'agent/escalation'
+require 'agent/heap'
 require 'agent/paths'
 require 'agent/shell'
 
@@ -132,13 +133,48 @@ module Agent
     # not held to a Docker daemon it never starts. Unknown names are ignored
     # rather than rejected — a workflow naming a need this version does not know
     # about should run, not fail closed on its own config.
+    #
+    # `heap:<N>G` is the one entry that is a QUANTITY rather than a name, and the
+    # one exempt from the ignore-what-you-do-not-know rule: see `heap_check`.
     def preflight(needs: [], now: Time.now)
       wanted = Array(needs).map(&:to_s)
       checks = [disk_check]
       checks << docker_check if wanted.include?("docker")
       checks << registry_check if wanted.include?("registry")
       checks << database_check if wanted.include?("database")
+      heap = heap_check(Agent::Heap.requirement(wanted))
+      checks << heap if heap
       Report.new(checks: checks).tap { |report| record_fault(report, now: now) }
+    end
+
+    # THE BACKSTOP FOR THE SCHEDULER, not a second implementation of it
+    # (ISS-1123). Agent::Verify already refuses to CLAIM a job this box cannot
+    # give the heap for, so in the ordinary case this never fires. It exists for
+    # the cases where the claim-time match could not be made or was not made at
+    # all: a hand-run `dev ci verify` on the small box — which is exactly how a
+    # repo's first build is confirmed, and how ISS-1099 is told to confirm
+    # platform's — and a tick whose registry read failed, where `max_concurrency`
+    # is unknown and the derived heap falls to the floor.
+    #
+    # What it buys in those cases is the WHOLE point of the issue: the failure
+    # renders as an infrastructure fault (exit 75, "fix the machine") instead of
+    # as an OOM the lane reads as a red suite. A false red on a platform PR costs
+    # a human an investigation into a scheduling mistake, and at 27 open PRs it
+    # reads as "platform's suite is flaky" rather than as a scheduler bug.
+    #
+    # nil when the build declares no heap, which is every Node and Elm suite and
+    # was every repo before this: no declaration, no check, no behaviour change.
+    def heap_check(requirement)
+      return nil if requirement.nil?
+      if requirement == :malformed
+        return Check.new(name: "heap", ok: false,
+                         detail: "the `# ci-needs:` heap token does not parse — it must read `heap:<N>G`, e.g. `heap:12G`",
+                         remedy: "fix the `# ci-needs:` line in ci/build.sh")
+      end
+      have = Agent::Heap.gigabytes_here
+      Check.new(name: "heap", ok: have >= requirement,
+                detail: "this machine gives #{have}G, the build declares heap:#{requirement}G",
+                remedy: "run it on a runner with more RAM per slot — `dev agent sbt-opts --explain` shows the arithmetic")
     end
 
     def disk_check

@@ -110,10 +110,21 @@ module Agent
     def verify_jobs_dir      = File.join(state_dir, "verify-jobs")
     def verify_job_file(key) = File.join(verify_jobs_dir, "#{key}.json")
 
-    # "does ci/build.sh exist at <sha>" — an answer that can be cached FOREVER,
-    # because a sha is immutable. Bounded in Agent::Verify; without it every scan
-    # re-asks the same question about the same unenrolled pull requests.
-    def verify_enrolment_file = File.join(state_dir, "verify-enrolment.json")
+    # What ci/build.sh says at <sha> — whether it exists at all, and what its
+    # `# ci-needs:` line declares. An answer that can be cached FOREVER, because a
+    # sha is immutable. Bounded in Agent::Verify; without it every scan re-asks the
+    # same question about the same unenrolled pull requests.
+    #
+    # A SECOND FILE RATHER THAN A SECOND SHAPE IN THE FIRST (ISS-1123).
+    # `verify-enrolment.json` held a bare boolean per sha, and pre-ISS-1123 code
+    # reads any non-nil value there as the answer — so a `{"enrolled": false}`
+    # object in that file would read as TRUTHY, and a repo with no ci/build.sh
+    # would be built, fail `:missing` and post an INFRASTRUCTURE FAULT on a real
+    # pull request. Every runner fast-forwards devops within 30 seconds and a bad
+    # merge here is reverted rather than rolled forward, so the shape has to be
+    # safe in BOTH directions. Two files are: each version reads only its own, and
+    # the cost of the changeover is one API call per in-flight sha, once.
+    def verify_declaration_file = File.join(state_dir, "verify-declarations.json")
 
     # When this machine last walked the lane looking for work, and last looked at
     # `main`. A throttle in exactly the sense maintenance_file is: the tick fires

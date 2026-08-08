@@ -158,6 +158,98 @@ class TestAgentHeap < Minitest::Test
     refute_match(/-J-Xmx|-Xmx\d/, body)
   end
 
+  # ---- what a repo declares, and who can serve it (ISS-1123) ----
+  #
+  # The other direction of the same number. The derivation above stops a slot
+  # over-requesting memory; these stop a JOB landing in a slot too small for it,
+  # which until ISS-1123 nothing did — a platform build needing 12G was claimable
+  # on the 24G/3-slot runner that gives 4G, and OOMed there as a red the merge
+  # lane cannot tell from a failing suite.
+
+  def test_a_declared_heap_is_read_out_of_the_ci_needs_list
+    assert_equal 12, Agent::Heap.requirement(%w[docker registry database heap:12G])
+    assert_equal 8, Agent::Heap.requirement(["heap:8"])
+    assert_equal 8, Agent::Heap.requirement(["HEAP: 8 gb"])
+    assert_nil Agent::Heap.requirement(%w[docker database])
+    assert_nil Agent::Heap.requirement([])
+    assert_nil Agent::Heap.requirement(nil)
+  end
+
+  # THE TYPO THAT WOULD OTHERWISE MEAN "NO MINIMUM". Every other name in
+  # `ci-needs` is ignored when it is not recognised, so that a script naming a
+  # probe a newer `dev` will have still runs. Under that rule a misspelt heap
+  # token reads as no declaration, the job lands on the small box and OOMs —
+  # reintroducing, silently, the exact failure the declaration exists to prevent.
+  # So a token that NAMES heap and does not parse is an error at both readers.
+  def test_a_malformed_heap_token_is_an_error_and_never_silence
+    ["heap=12G", "heap:twelve", "heap", "heap:12G:extra", "heap:-4G"].each do |token|
+      assert_equal :malformed, Agent::Heap.requirement([token]),
+                   "#{token.inspect} must not read as `no minimum` — that is the OOM this prevents"
+    end
+    assert_nil Agent::Heap.requirement(["heapdump"]),
+               "a word boundary is what keeps a future unrelated name from being caught by this"
+  end
+
+  # ONE NUMBER, READ BOTH WAYS. `sbt_opts` is what the build is GIVEN and
+  # `gigabytes_here` is what a job is MATCHED against; a second derivation would
+  # be a matcher that agrees with the environment on the day it is written.
+  def test_the_matched_heap_is_the_heap_the_build_is_actually_given
+    with_state_dir do
+      Agent::Heap.remember({ "max_concurrency" => 3 })
+      bytes = gb(24)
+      stub_singleton(Agent::Heap, :memory_bytes, -> { bytes }) do
+        assert_equal 4, Agent::Heap.gigabytes_here
+        assert_equal "-Xmx4G -Xss4M", Agent::Heap.sbt_opts
+      end
+    end
+  end
+
+  # A registry row's machine, by the same formula. Both facts are reported at
+  # registration and both come back on GET /agent/runners.
+  def test_another_runners_heap_is_derived_from_its_registry_row
+    assert_equal 24, Agent::Heap.runner_gigabytes("memory_bytes" => gb(64), "max_concurrency" => 1)
+    assert_equal 4, Agent::Heap.runner_gigabytes("memory_bytes" => gb(24), "max_concurrency" => 3)
+  end
+
+  # UNKNOWN IS NOT A CAPABILITY. `gigabytes` answers the floor for unknown memory,
+  # which is the right conservative answer for THIS box (it under-spends) and the
+  # wrong one for another (it would claim 4G we have not established).
+  def test_a_row_that_does_not_say_claims_nothing
+    assert_nil Agent::Heap.runner_gigabytes("max_concurrency" => 3)
+    assert_nil Agent::Heap.runner_gigabytes("memory_bytes" => gb(64))
+    assert_nil Agent::Heap.runner_gigabytes("memory_bytes" => 0, "max_concurrency" => 1)
+    assert_nil Agent::Heap.runner_gigabytes(nil)
+  end
+
+  def test_the_fleet_figure_is_the_biggest_runner_in_it
+    laptop = { "memory_bytes" => gb(64), "max_concurrency" => 1 }
+    mini = { "memory_bytes" => gb(24), "max_concurrency" => 3 }
+    assert_equal 24, Agent::Heap.fleet_gigabytes([mini, laptop])
+    assert_equal 4, Agent::Heap.fleet_gigabytes([mini])
+  end
+
+  # HARDWARE, NOT AVAILABILITY. The caller uses this to decide whether a job is
+  # unsatisfiable BY CONSTRUCTION and files an issue when it is, so a big box that
+  # is merely asleep or paused for an hour must not become an alarm. Only a
+  # retired machine is gone for good.
+  def test_a_paused_or_offline_runner_still_counts_and_a_retired_one_does_not
+    laptop = { "memory_bytes" => gb(64), "max_concurrency" => 1 }
+    mini = { "memory_bytes" => gb(24), "max_concurrency" => 3 }
+    assert_equal 24, Agent::Heap.fleet_gigabytes([mini, laptop.merge("paused" => true)])
+    assert_equal 24, Agent::Heap.fleet_gigabytes([mini, laptop.merge("is_stale" => true)])
+    assert_equal 4, Agent::Heap.fleet_gigabytes([mini, laptop.merge("retired_at" => "2026-01-01T00:00:00Z")])
+  end
+
+  # nil, never zero: a fleet nothing is known about must downgrade every
+  # unsatisfiable verdict to a deferral rather than declaring every job
+  # unbuildable. "Nobody can build this" is worth saying only about a fleet
+  # actually read.
+  def test_an_unreadable_fleet_is_unknown_rather_than_empty
+    assert_nil Agent::Heap.fleet_gigabytes(nil)
+    assert_nil Agent::Heap.fleet_gigabytes([])
+    assert_nil Agent::Heap.fleet_gigabytes([{ "hostname" => "no hardware reported" }])
+  end
+
   # ---- the profile that beats all of the above ----
 
   def test_profile_override_reports_only_a_pinned_heap
