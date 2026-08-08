@@ -13889,7 +13889,7 @@ def agent_playbooks_report(rows, lint:)
     # the checks is part of that: a clean line that does not say what it checked
     # cannot tell you a NEW defect class is not covered yet.
     if findings.empty?
-      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans."
+      puts "No findings in #{rows.length} playbook(s) — checked hardcoded homes, unpushable writes, reaped plans, absent fleet state."
     else
       puts findings.map(&:to_s)
       # One remedy per rule actually hit, not the full catalogue: a finding is

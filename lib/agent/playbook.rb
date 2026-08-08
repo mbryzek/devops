@@ -1,4 +1,5 @@
 require 'agent/api'
+require 'agent/paths'
 
 # The playbook a producer's issue POINTS AT, and how a claiming runner resolves
 # that pointer (ISS-505, ISS-523, ISS-526).
@@ -192,6 +193,57 @@ module Agent
       rows.flat_map { |row| home_paths_in(row["body"], key: row["key"]) }
     end
 
+    # ---- the absent-fleet-state detector (ISS-1060) ----
+    #
+    # The third way one playbook meets many runners, and the only one of the
+    # three whose answer is a fact about THIS machine rather than about the text.
+    #
+    # `~/.platform` (`Agent::Paths.state_dir`) is the fleet's own state
+    # directory: the session files `dev auth login` writes, the AI actor's token,
+    # and the agent's own throttles. It is a closed set — nothing outside devops
+    # puts anything there — so a playbook naming a file under it either names one
+    # the fleet provisions or names one that will never appear on any runner, and
+    # there is no third state where it shows up later.
+    #
+    # The second is ISS-1060 and it failed the way everything else in this lint
+    # fails: silently, at the point a session was already committed. §2b of
+    # `product-owner` told every run to read the operator's password out of
+    # `~/.platform/product-owner-credentials.json`. That file was on the laptop
+    # the playbook was written and verified on, and on no Mac mini. Two
+    # consecutive nightly reviews reached §2b, found nothing, and each invented a
+    # DIFFERENT substitute credential rather than stopping (ISS-1050, ISS-1060).
+    # Neither run failed. One of them spent its whole product walk signed in as
+    # the admin — seeing three admin-only feature flags no operator can see — and
+    # came within one unprompted API call of filing recommendations against a
+    # product that does not exist for the user it was reviewing for.
+    #
+    # WHY MACHINE-DEPENDENCE IS THE POINT HERE and not a wart. "Is the file on
+    # this runner" is precisely the question nobody asked, and it cannot be
+    # answered from the body. `exist` and `state_dir` are injectable for the same
+    # reason `Agent::Credentials`' `env` is: a test that leaves them defaulted is
+    # asserting something about whoever's home directory it happens to run in,
+    # not about the detector.
+    #
+    # Only the FIRST segment is checked. `~/.platform/agent-jobs/<id>/…` is a
+    # per-run path that correctly does not exist yet; the directory that holds it
+    # is the part a playbook can be wrong about.
+    STATE_PATH_RE = %r{(?:~|\$HOME|\$\{HOME\})/\.platform/([A-Za-z0-9][A-Za-z0-9._-]*)}.freeze
+
+    MissingState = Struct.new(:key, :line, :path, keyword_init: true) do
+      def rule = :missing_state
+      def to_s = "#{key}:#{line}: #{path} — #{REASONS.fetch(:missing_state)}"
+    end
+
+    # Every fleet-state file a playbook names that this runner does not have, in
+    # line order. Empty is the normal case and the one worth keeping true.
+    def missing_state_paths_in(body, key: nil, state_dir: Paths.state_dir, exist: ->(path) { File.exist?(path) })
+      body.to_s.each_line.with_index(1).flat_map do |line, number|
+        line.scan(STATE_PATH_RE).flatten.uniq
+            .reject { |name| exist.call(File.join(state_dir, name)) }
+            .map { |name| MissingState.new(key: key, line: number, path: "~/.platform/#{name}") }
+      end
+    end
+
     # ---- the unwritable-target detector (ISS-644) ----
     #
     # The sibling of the hardcoded home, pointed the other way. A hardcoded home
@@ -301,6 +353,7 @@ module Agent
     REASONS = {
       unpushable: "outside `plans/` — the push guard refuses this write from an unattended session",
       reaped: "a top-level `plans/` file with no date in its name — `dev prune plans` removes it after 14 days",
+      missing_state: "not on this runner — `~/.platform` holds only what the fleet provisions, and nothing creates this",
     }.freeze
 
     # The one-line remedy `--lint` prints once per rule it hit. Every rule a
@@ -310,6 +363,8 @@ module Agent
       home_path: "Use `~/…` — one playbook is read by every runner and they do not share a home.",
       unpushable: "Write under `plans/` — `agent/githooks/pre-push` refuses every other path in `~/code/claude`.",
       reaped: "Put long-lived state in a `plans/` SUBDIRECTORY — `dev prune plans` only reaps top-level files.",
+      missing_state: "Name a file the fleet actually provisions, or drop the step — an unattended run that " \
+                     "finds nothing there substitutes something rather than stopping.",
     }.freeze
 
     WriteTarget = Struct.new(:key, :line, :path, :rule, keyword_init: true) do
@@ -411,11 +466,19 @@ module Agent
     # Every defect the store can be checked for mechanically, per playbook and in
     # line order — what `dev agent playbooks --lint` runs and what the
     # meta-review's D4 detector calls.
-    def lint_all(rows)
+    #
+    # `state_dir`/`exist` are threaded straight through to the one detector that
+    # reads the disk rather than defaulted here, so a caller that pins them pins
+    # the whole lint. Defaulting them in this method instead would leave
+    # `missing_state_paths_in`'s own defaults live on the path every other test
+    # takes, which is the shape of the bug ISS-613 describes.
+    def lint_all(rows, state_dir: Paths.state_dir, exist: ->(path) { File.exist?(path) })
       rows.flat_map do |row|
         body = row["body"]
         key = row["key"]
-        (home_paths_in(body, key: key) + write_targets_in(body, key: key)).sort_by(&:line)
+        (home_paths_in(body, key: key) +
+          write_targets_in(body, key: key) +
+          missing_state_paths_in(body, key: key, state_dir: state_dir, exist: exist)).sort_by(&:line)
       end
     end
 
