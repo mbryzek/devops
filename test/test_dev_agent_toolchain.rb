@@ -218,9 +218,9 @@ class TestDevAgentToolchain < Minitest::Test
 
   # ---- required vs optional --------------------------------------------------
 
-  # `openclaw` is best-effort by construction (Agent::Notify swallows its
-  # absence). Failing provisioning over it would train whoever runs the doctor to
-  # ignore its exit code, which costs the required tools their alarm.
+  # `openclaw` stands in for any tool nothing on a runner hard-depends on.
+  # Failing provisioning over one would train whoever runs the doctor to ignore
+  # its exit code, which costs the required tools their alarm.
   def test_an_optional_tool_is_reported_but_does_not_fail_the_check
     with_path do |dir|
       result = T.check(tools: [tool("openclaw", required: false)], path: dir, versions: false)

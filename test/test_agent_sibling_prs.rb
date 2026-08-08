@@ -179,8 +179,7 @@ class TestAgentSiblingPrs < Minitest::Test
       overrides = { "DEV_AGENT_STATE_DIR" => File.join(root, "state"),
                     "DEV_AGENT_LOG_ROOT" => File.join(root, "logs"),
                     "DEV_AGENT_WORKSPACE_ROOT" => File.join(root, "ai"),
-                    "DEV_AGENT_CLAUDE_REPO" => File.join(root, "claude"),
-                    "DEV_AGENT_NO_NOTIFY" => "1" }
+                    "DEV_AGENT_CLAUDE_REPO" => File.join(root, "claude") }
       original = overrides.keys.to_h { |k| [k, ENV[k]] }
       overrides.each { |k, v| ENV[k] = v }
       begin
@@ -341,7 +340,7 @@ class TestAgentSiblingPrs < Minitest::Test
           comment: ->(*, **) { nil },
           record_fix: ->(_n, url, **) { seen << url },
         },
-        subject => { notify_outcome: ->(*) { nil }, release_lease: ->(*) { nil } },
+        subject => { release_lease: ->(*) { nil } },
       }
       pairs = stubs.flat_map { |obj, methods| methods.map { |name, impl| [obj, name, impl] } }
       capture_stdout do

@@ -194,7 +194,6 @@ class TestDevAgentShell < Minitest::Test
       Agent::Maintenance::CHORE_TIMEOUT_SECONDS => "one housekeeping chore",
       Agent::Maintenance::DISK_TIMEOUT_SECONDS => "df",
       Agent::Github::TIMEOUT_SECONDS => "one gh read",
-      Agent::Notify::TIMEOUT_SECONDS => "one push",
       Agent::Workspace::CLONE_TIMEOUT_SECONDS => "one clone",
       Agent::Tick::CLAUDE_DB_END_TIMEOUT_SECONDS => "claude-db end",
     }

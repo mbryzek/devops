@@ -43,7 +43,6 @@ module Agent
     def identity_file  = File.join(state_dir, "agent.identity")
     def jobs_dir       = File.join(state_dir, "agent-jobs")
     def heartbeat_file = File.join(state_dir, "agent-heartbeat")
-    def notified_file  = File.join(state_dir, "agent-notified.json")
     # A small bounded rolling log of recent failures (Agent::Errors), keyed by
     # source. Local cache only, same as everything else under state_dir: it
     # exists because `dev agent tick` is one-shot with no in-memory continuity
