@@ -21,10 +21,14 @@ require 'agent/paths'
 # day. This touches a set that is normally 0-3 rows fleet-wide, holds no lease,
 # and starts nothing.
 #
-# MERGED TO MAIN is the trigger, not deployed. That is exactly what the gate
-# reads, and building on merged-but-undeployed code is what the gate permits —
-# a wake condition stricter than the gate would leave issues parked that the
-# claim behind them would have dispatched on sight.
+# THE TRIGGER IS EXACTLY WHAT THE GATE READS, whatever that is — merged AND
+# released, since ISS-1097. Not "whichever is convenient here": a wake condition
+# LOOSER than the gate wakes an issue the claim behind it defers again on sight,
+# walking it toward the seven-attempt escalation for nothing, and a wake
+# condition STRICTER leaves parked an issue that same claim would have
+# dispatched. So there is one predicate, Agent::Dependency.cleared?, and it is
+# the inverse of the one the gate asks — changing the bar means changing both,
+# in that module, and neither this file nor Agent::Tick gets its own opinion.
 #
 # THE BACKSTOP HALF. The merge lane (Agent::MergeLane, ISS-754) is not the only
 # thing that merges in this fleet, it is only the automated one — most PRs still
@@ -90,6 +94,12 @@ module Agent
     # contain, and writes nothing under `dry_run`.
     def sweep(use_localhost:, dry_run: false, cap: CANDIDATE_CAP)
       rows = Agent::Api.snoozed_issues(use_localhost: use_localhost)
+      # One release oracle for the whole pass: deferrals cluster on the same
+      # blocking PR — that is what a shared dependency IS — so twenty issues
+      # waiting on one merge ask GitHub about it once (ISS-1097). Per-pass, never
+      # held across passes, or the pass after a release would remember the answer
+      # from before it.
+      deployed = Agent::Dependency.release_oracle
       result = Result.new(woken: [], blocked: [], skipped: [], failed: [],
                           dropped: [rows.length - cap, 0].max,
                           truncated: rows.length >= Agent::Api::ISSUES_PAGE_LIMIT)
@@ -122,7 +132,7 @@ module Agent
         # timeline stop being read.
         next if issue["snoozed_until"].to_s.empty?
 
-        unless Agent::Dependency.cleared?(issue, use_localhost: use_localhost)
+        unless Agent::Dependency.cleared?(issue, use_localhost: use_localhost, deployed: deployed)
           result.blocked << number
           next
         end
@@ -237,9 +247,10 @@ module Agent
     # this next.
     def note
       "#{Agent::Dependency::WAKE_MARKER}.\n\n" \
-        "Every issue this one is blocked by now has a fix GitHub reports as merged, so the code it " \
-        "builds on is on `origin/main` and there is nothing left to wait for. Woken here rather than " \
-        "at the end of its deferral, which could have been most of a day after the merge.\n\n" \
+        "Every issue this one is blocked by now has a fix GitHub reports as merged, AND that merge commit " \
+        "is contained in its repo's newest release — so the code this builds on is both on `origin/main` " \
+        "and in production, and there is nothing left to wait for. Woken here rather than at the end of " \
+        "its deferral, which could have been most of a day after the release.\n\n" \
         "Nothing to do: this is back in the queue and the next tick can claim it. The same check runs " \
         "again at claim time, so if this is somehow early the claim simply defers it once more."
     end

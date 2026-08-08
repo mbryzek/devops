@@ -83,16 +83,24 @@ class TestDevAgentTick < Minitest::Test
   # ---- the environment a session is spawned with ----
 
   # The credential plumbing, asserted at the tick rather than only inside
-  # Agent::Credentials: `resolve` returning the right hash is worth nothing if
-  # nothing merges it into the spawn, which is exactly the state ISS-570 found —
-  # the key sat in the env repo beside the checkout for the whole history of the
-  # fleet and no session ever received it.
+  # Agent::Credentials, because the merge is the half that has been wrong twice.
+  # ISS-570 found `resolve` returning the right hash and nothing putting it into
+  # the spawn; ISS-1037 is the same joint in the other direction — a session must
+  # now receive these names EXPLICITLY UNSET, and "unset" is not the same as
+  # "not added".
   #
-  # The value is CredentialsGuard's stand-in, not a real secret.
-  def test_a_spawned_session_is_given_the_external_api_credentials
+  # nil is what `Process.spawn` reads as "remove this variable from the child".
+  # An omitted key would leave the child inheriting whatever the runner's own
+  # shell exports, which `Agent::Credentials.probe` deliberately allows an
+  # operator to do — so the whole change would be a silent no-op on exactly the
+  # machine where someone had set it in `.zprofile`.
+  def test_a_spawned_session_is_given_no_external_api_credentials
     with_agent_home do
       env = tick.send(:child_env, "i707_abc", 707)
-      assert_equal "stub-PLAYBOOK_CLAUDE_KEY", env["PLAYBOOK_CLAUDE_KEY"]
+      Agent::Credentials::NAMES.each do |name|
+        assert_includes env.keys, name, "#{name} must be named, so the child is told to UNSET it"
+        assert_nil env[name], "#{name} must be nil — a value here is a key held for the life of the session"
+      end
       refute_includes env.keys, "ANTHROPIC_API_KEY",
                       "that variable reconfigures the `claude` CLI the session runs as"
       # ...without displacing what was already there.
