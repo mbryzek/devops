@@ -40,6 +40,27 @@ class TestApiProducers < Minitest::Test
     end
   end
 
+  # show_many is show for a whole checkout at once — the read the importer scan needs,
+  # which is every spec a producer has rather than the handful a payload names. One
+  # `cat-file --batch` instead of 106 `git show` processes (3.5s -> 0.03s on platform),
+  # so it has to keep request and answer aligned: a path that is absent must not shift
+  # the answer for the next one.
+  def test_show_many_reads_a_whole_ref_at_once_and_skips_what_is_absent
+    with_code_root do |root|
+      dir = make_producer(root, "platform", specs: {
+        "spec/club.json" => { "name" => "club" },
+        "spec/worker.json" => { "name" => "worker" },
+      })
+
+      contents = ApiProducers.show_many(dir, "origin/main", ["spec/club.json", "spec/gone.json", "spec/worker.json"])
+
+      assert_equal %w[spec/club.json spec/worker.json], contents.keys.sort
+      assert_equal "club", JSON.parse(contents["spec/club.json"])["name"]
+      assert_equal "worker", JSON.parse(contents["spec/worker.json"])["name"]
+      assert_empty ApiProducers.show_many(dir, "origin/main", [])
+    end
+  end
+
   # The whole point of reading through `git show`: ~/code/platform is Mike's own
   # checkout and is routinely dirty and on a feature branch. Neither may leak
   # into a consumer's regen.
