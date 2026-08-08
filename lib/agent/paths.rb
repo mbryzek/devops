@@ -183,6 +183,13 @@ module Agent
     # for the reason `exit_code` is: the reap DELETES the workspace, and an
     # artifact classification reads must outlive the thing it classifies.
     def ops_dir(number)     = File.join(issue_dir(number), "ops")
+    # One line per `dev agent credential exec` this run made (ISS-1037): when,
+    # which credential, and the redacted command it was handed to. Beside the ops
+    # records for the same reason they are here — the reap deletes the workspace,
+    # and "which runs touched a fleet credential" is a question that has to stay
+    # answerable after the run is gone. It was not answerable at all while every
+    # session simply held every key.
+    def credential_log(number) = File.join(issue_dir(number), "credentials.log")
 
     def job_file(number) = File.join(jobs_dir, "#{number}.json")
 

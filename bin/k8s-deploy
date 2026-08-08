@@ -55,20 +55,18 @@ Util.detail("")
 # Generate manifests
 manifest_file = "/tmp/#{args.app}-deploy-#{tag}.yaml"
 manifest = Util.step("Generating Kubernetes manifests") do
-  app_config_file = File.join(K8S_DIR, 'apps', "#{args.app}.pkl")
+  # The app config's own existence check lives in K8sAppConfig.load below, which
+  # names the apps that DO exist rather than only the path that does not.
   template_file = File.join(K8S_DIR, 'templates', 'scala-play-app.pkl')
-
-  unless File.exist?(app_config_file)
-    Util.exit_with_error("App config not found: #{app_config_file}")
-  end
 
   unless File.exist?(template_file)
     Util.exit_with_error("Template not found: #{template_file}")
   end
 
-  # Read app config to get port
-  config_output = `cd #{K8S_DIR} && pkl eval -f json apps/#{args.app}.pkl 2>/dev/null`
-  config = JSON.parse(config_output) rescue {}
+  # Read app config to get port. K8sAppConfig aborts on any failure rather than
+  # rendering a manifest from an empty hash — which silently dropped -javaagent
+  # and un-instrumented the app (see lib/k8s_app_config.rb).
+  config = K8sAppConfig.load(args.app)
   app_port = config["appPort"] || 9000
 
   # Build env vars for template (NodePort is auto-assigned by K8s)
@@ -77,6 +75,8 @@ manifest = Util.step("Generating Kubernetes manifests") do
   env_vars += " WEB_MEMORY=#{config['webMemory']}" if config['webMemory']
   env_vars += " JOB_MEMORY=#{config['jobMemory']}" if config['jobMemory']
   env_vars += " JAVA_AGENT=#{config['javaAgent']}" if config['javaAgent']
+  # Deliberately `nil?`, not truthiness: the value that matters is `false`.
+  env_vars += " NEWRELIC_DISTRIBUTED_TRACING=#{config['distributedTracing']}" unless config['distributedTracing'].nil?
 
   cmd = "cd #{K8S_DIR} && #{env_vars} pkl eval templates/scala-play-app.pkl"
   generated = `#{cmd} 2>&1`

@@ -399,12 +399,64 @@ class TestAgentMergeLane < Minitest::Test
 
   # `suite_passed_post_rebase` is the ledger's existing field name and it means
   # something different here than it did in the playbook loop: not "this session
-  # ran the suite" but "GitHub Actions did". `verified_by` is what says so, and
-  # it is the whole trust argument in one assertion.
-  def test_assertions_name_who_actually_verified
-    a = ML.assertions(ML.candidate("mbryzek/platform", green_pr))
+  # ran the suite" but "an independent party did". `verified_by` names WHICH one,
+  # and it is the whole trust argument in one assertion.
+  def test_assertions_name_an_actions_run_when_actions_posted_the_check
+    a = ML.assertions(ML.candidate("mbryzek/playbook-app", green_pr))
     assert_equal true, a["suite_passed_post_rebase"]
     assert_equal "github_actions:ci", a["verified_by"]
+  end
+
+  # THE CASE THAT WAS WRONG (ISS-1079). Since ISS-848 enrolment is `ci/build.sh`,
+  # so most of the lane is verified by the fleet verify job — which posts a COMMIT
+  # STATUS, not an Actions CheckRun. playbook-admin — the repo with the
+  # most lane traffic — has no `.github/workflows` at all, and every merge
+  # decision recorded for it asserted that GitHub Actions had verified it. The
+  # audit trail is what a human reads after a bad merge, and that one pointed at
+  # a system that has never run in the repo, whose logs therefore do not exist.
+  def test_assertions_name_the_fleet_verify_job_when_it_posted_the_check
+    pr = green_pr("statusCheckRollup" => [status_context("ci", "SUCCESS")])
+    a = ML.assertions(ML.candidate("mbryzek/playbook-admin", pr))
+    assert_equal true, a["suite_passed_post_rebase"]
+    assert_equal "fleet_verify:ci", a["verified_by"]
+  end
+
+  # Derived from the entry that produced the verdict rather than from the repo,
+  # because the two producers coexist and a per-repo table would drift out of
+  # step with whichever one actually posted on the day.
+  def test_the_verifier_is_read_from_the_check_not_from_the_repo
+    actions = green_pr("statusCheckRollup" => [check_run("ci", "SUCCESS")])
+    fleet = green_pr("statusCheckRollup" => [status_context("ci", "SUCCESS")])
+    assert_equal "github_actions:ci", ML.verified_by(actions)
+    assert_equal "fleet_verify:ci", ML.verified_by(fleet)
+  end
+
+  # Nothing green on THIS head is nothing verified, however it got that way. The
+  # key is dropped rather than filled with a placeholder, so an envelope that
+  # requires a verifier fails closed instead of reading one as permission — and
+  # `suite_passed_post_rebase` never says `true` beside a missing verifier.
+  def test_an_unverified_head_asserts_no_verifier_at_all
+    {
+      "no ci check at all" => green_pr("statusCheckRollup" => []),
+      "a red actions run" => green_pr("statusCheckRollup" => [check_run("ci", "FAILURE")]),
+      "a red commit status" => green_pr("statusCheckRollup" => [status_context("ci", "FAILURE")]),
+      "still running" => green_pr("statusCheckRollup" => [status_context("ci", "PENDING")]),
+      "green on an earlier push" =>
+        green_pr("headRefOid" => "b" * 40,
+                 "statusCheckRollup" => [check_run("ci", "SUCCESS", sha: "a" * 40)]),
+    }.each do |why, pr|
+      a = ML.assertions(ML.candidate("mbryzek/platform", pr))
+      refute a.key?("verified_by"), "#{why}: nothing verified this head, so nothing may name a verifier"
+      assert_equal false, a["suite_passed_post_rebase"], why
+    end
+  end
+
+  # The verifier travels on the Candidate because `assertions` never sees the raw
+  # PR — and it is in the run summary too, which is where a session reading the
+  # lane learns which evidence it would have to go and find.
+  def test_the_candidate_carries_the_verifier
+    pr = green_pr("statusCheckRollup" => [status_context("ci", "SUCCESS")])
+    assert_equal "fleet_verify:ci", ML.candidate("mbryzek/playbook-admin", pr).to_h["verified_by"]
   end
 
   def test_secrets_are_reported

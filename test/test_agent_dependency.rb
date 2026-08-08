@@ -73,13 +73,66 @@ class TestAgentDependency < Minitest::Test
                            blocker: fixed_blocker(URL), prs: { URL => pr(state: "MERGED") })
   end
 
-  # A reopened issue accumulates fixes: one merged round ago plus one still open
-  # is an issue whose code IS on main, and deferring on it would defer a
-  # dependent on a PR it never needed.
-  def test_any_merged_fix_clears_a_later_open_one
-    assert_empty unshipped(issue_with_blocker,
+  # ---- ISS-1105: an open fix blocks, whatever else on the list merged ----
+  #
+  # THE bug. One change spanning repos is closed out as one `--status fixed --url`
+  # plus a `dev issues fix --url` per sibling (ISS-759), so a fix list is
+  # CONCURRENT as often as it is sequential, and every url on it has to merge
+  # before the code a dependent builds on exists. Reading one merge as "shipped"
+  # dispatched ISS-1009 against an Elm contract change still sitting in an open PR.
+  def test_an_open_fix_blocks_even_when_a_sibling_fix_merged
+    result = unshipped(issue_with_blocker,
+                       blocker: fixed_blocker(URL, OTHER_URL),
+                       prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "OPEN") })
+    assert_equal 1, result.size, "the merged sibling says nothing about the open one"
+    assert_equal OTHER_URL, result.first["pr"]["url"]
+  end
+
+  # Recording order does not matter: it is the OPEN url that is named, not the
+  # last one written down.
+  def test_the_open_fix_is_named_however_the_list_is_ordered
+    result = unshipped(issue_with_blocker,
+                       blocker: fixed_blocker(OTHER_URL, URL),
+                       prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "OPEN") })
+    assert_equal OTHER_URL, result.first["pr"]["url"]
+  end
+
+  # ISS-998 as it actually happened, end to end: two recorded fixes, the platform
+  # one merged, the hoa-frontend one open. This is the state ISS-1009 was woken
+  # and dispatched on.
+  def test_the_iss998_shape_defers_rather_than_dispatching
+    platform = "https://github.com/mbryzek/platform/pull/2230"
+    frontend = "https://github.com/mbryzek/hoa-frontend/pull/107"
+    blocker = { "fixes" => [{ "url" => platform }, { "url" => frontend }] }
+    prs = { platform => pr(url: platform, state: "MERGED"), frontend => pr(url: frontend, state: "OPEN") }
+
+    result = unshipped(issue_with_blocker(number: 998), blocker: blocker, prs: prs)
+    assert_equal ["ISS-998 is `fixed`, but its fix #{frontend} has not merged"],
+                 Agent::Dependency.describe(result)
+    refute cleared?(issue_with_blocker(number: 998), blocker: blocker, prs: prs),
+           "the wake sweep is what actually fired here — it must not clear either"
+  end
+
+  # The case the old `any?` rule was written for, and the cost this change
+  # accepts: a reopened issue whose round-1 fix merged and whose round-2 fix is
+  # still open now holds its dependents. Nothing on a fix list says which ROUND a
+  # url belongs to, so the two shapes are indistinguishable and this picks the
+  # recoverable failure — a deferral, re-checked daily and escalated to a human
+  # after seven attempts — over dispatching against code that is not on main.
+  def test_a_reopened_issues_later_open_fix_now_defers_too
+    refute_empty unshipped(issue_with_blocker,
                            blocker: fixed_blocker(URL, OTHER_URL),
                            prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "OPEN") })
+  end
+
+  # A CLOSED-unmerged fix is deliberately not promoted the same way: abandoned,
+  # superseded, or rewritten under the url that did land. It still loses to a
+  # merge elsewhere on the list, because nothing about it will ever change and
+  # blocking on it has no daily merge to end it (ISS-739 keeps its scope).
+  def test_a_closed_fix_beside_a_merged_one_still_dispatches
+    assert_empty unshipped(issue_with_blocker,
+                           blocker: fixed_blocker(URL, OTHER_URL),
+                           prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "CLOSED") })
   end
 
   def test_an_open_fix_blocks_and_names_the_pr
@@ -234,11 +287,25 @@ class TestAgentDependency < Minitest::Test
     end
   end
 
-  # A merge found anywhere in the fix list is a merge, even beside a url `gh`
-  # could not read: the unreadable one is one absent piece of evidence, not a
-  # contradiction of the one that IS positive.
-  def test_a_merged_fix_beside_an_unreadable_one_still_clears
+  # EVERY recorded fix, not any (ISS-1105). This sweep is what actually woke
+  # ISS-1009: one merge among two is not the code being on main, and the note it
+  # writes says "there is nothing left to wait for".
+  def test_an_open_fix_beside_a_merged_one_does_not_clear
+    refute cleared?(issue_with_blocker, blocker: fixed_blocker(URL, OTHER_URL),
+                    prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "OPEN") })
+  end
+
+  def test_every_recorded_fix_merging_clears
     assert cleared?(issue_with_blocker, blocker: fixed_blocker(URL, OTHER_URL),
+                    prs: { URL => pr(state: "MERGED"), OTHER_URL => pr(url: OTHER_URL, state: "MERGED") })
+  end
+
+  # A url `gh` could not read now counts AGAINST waking. Under `any?` it could be
+  # ignored, because one positive merge was the whole bar; under `all?` it is a
+  # fix that has not been SHOWN to merge, and this side has always required
+  # positive evidence. Costs a day at most; the claim-time gate still fails open.
+  def test_a_merged_fix_beside_an_unreadable_one_does_not_clear
+    refute cleared?(issue_with_blocker, blocker: fixed_blocker(URL, OTHER_URL),
                     prs: { URL => pr(state: "MERGED"), OTHER_URL => nil })
   end
 
