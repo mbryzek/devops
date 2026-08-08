@@ -43,6 +43,7 @@ require 'agent/checkout'
 require 'agent/ci'
 require 'agent/gc'
 require 'agent/github'
+require 'agent/heap'
 require 'agent/maintenance'
 require 'agent/merge_lane'
 require 'agent/ops'
@@ -144,6 +145,7 @@ INVOCATIONS = {
   "agent pause"         => 'agent pause [--localhost]',
   "agent resume"        => 'agent resume [--localhost]',
   "agent runners"       => 'agent runners [--localhost]',
+  "agent sbt-opts"      => 'agent sbt-opts [--explain]',
   "agent producers"     => 'agent producers [--localhost]',
   "agent playbooks"     => 'agent playbooks [--lint] [--localhost]',
   "agent playbook"      => 'agent playbook <key> [--lint | --versions [--limit N] | --version VERSION | --write FILE [--create] [--yes]] [--localhost]',
@@ -1127,6 +1129,19 @@ USAGE = <<~USAGE
     #{INVOCATIONS["agent runners"]}
         The fleet: hostname, hardware, max concurrency, paused state, last seen.
 
+    #{INVOCATIONS["agent sbt-opts"]}
+        THE sbt heap for THIS machine, derived from its RAM and how many agent
+        slots it runs (ISS-753) rather than from a constant that was wrong on
+        both fleet machines. Prints a value to interpolate, in the same shell
+        invocation as sbt and for the same reason CONF_DB_DEV_URL is:
+
+            SBT_OPTS="$(dev agent sbt-opts)" sbt test
+
+        A leading `sbt -J-Xmx...` does NOT do this — sbt's launcher puts SBT_OPTS
+        AFTER it on the java command line, so the environment wins. `--explain`
+        shows the arithmetic, and says so out loud when this machine's login
+        profile exports an SBT_OPTS that would override it.
+
     #{INVOCATIONS["agent producers"]}
         The registry — platform rows, managed at /admin/agents — with each
         producer's schedule, last run and result, and when it is next due. Every
@@ -1378,7 +1393,7 @@ SUBCOMMANDS = {
   "features"     => %w[list retire status reconcile cancel],
   "queries"      => %w[top show],
   "claude-usage" => %w[top],
-  "agent"        => %w[tick status logs run-op pause resume runners producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
+  "agent"        => %w[tick status logs run-op pause resume runners sbt-opts producers playbooks playbook runs refresh release gc maintenance doctor merge-lane merge update-branch],
   "prs"          => %w[group],
   "ci"           => %w[scan verify preflight clean-build],
 }.freeze
@@ -13294,6 +13309,19 @@ def cmd_agent_runners(args)
   end
 end
 
+# Deliberately offline: no identity, no token, no API call (ISS-753). This is on
+# the path to every sbt invocation a session or a build makes, so a heap that
+# needed the network would be unavailable exactly when the network is. The one
+# server-owned fact it needs — max_concurrency — is cached by the tick every work
+# phase, and an unknown one resolves to Agent::Heap's floor rather than a guess.
+def cmd_agent_sbt_opts(args)
+  explain = args.delete("--explain")
+  reject_unknown_args("agent sbt-opts", args)
+  handle_errors do
+    puts explain ? Agent::Heap.explain : Agent::Heap.sbt_opts
+  end
+end
+
 def cmd_agent_producers(args)
   rest, app_filter, use_localhost = parse_common_flags(args)
   reject_unknown_args("agent producers", rest + [app_filter].compact)
@@ -13837,6 +13865,7 @@ def cmd_agent_doctor(args)
 
   claude_config = agent_doctor_claude_config
   agent_doctor_credentials
+  agent_doctor_sbt_heap
   agent_doctor_load
 
   unless missing.empty?
@@ -14176,6 +14205,23 @@ end
 # minis this actually runs on. Never fatal — an oversubscribed machine is still a
 # working machine, and this command's exit status answers "can this box run a
 # session at all", which is a different question.
+# The sbt heap this machine gives one slot, and whether its own login profile
+# would silently override it (ISS-753). Here rather than in Agent::Toolchain
+# because nothing is missing: the machine is fully provisioned and still hands
+# every build a heap sized for a different box. A profile pinning `-Xms40G` on a
+# 24G runner is exactly that, and it is invisible until something swaps.
+def agent_doctor_sbt_heap
+  puts
+  puts "sbt heap: #{Agent::Heap.sbt_opts}   (`dev agent sbt-opts --explain`)"
+  override = Agent::Heap.profile_override
+  return if override.nil?
+
+  puts "  OVERRIDDEN by this machine's login profile: SBT_OPTS=#{override.strip.inspect}"
+  puts "  A login shell re-sources it for every command, so it beats the value above and beats"
+  puts "  `sbt -J-Xmx...` too. Make the profile a default instead of an override:"
+  puts "    export SBT_OPTS=\"${SBT_OPTS:--Xmx8G -Xss4M}\""
+end
+
 def agent_doctor_load
   load = Agent::Processes.load_average
   cpus = Agent::Processes.cpu_count
@@ -14842,6 +14888,7 @@ when "agent"
   when "pause"     then cmd_agent_pause(argv)
   when "resume"    then cmd_agent_resume(argv)
   when "runners"   then cmd_agent_runners(argv)
+  when "sbt-opts"  then cmd_agent_sbt_opts(argv)
   when "producers" then cmd_agent_producers(argv)
   when "playbooks" then cmd_agent_playbooks(argv)
   when "runs"      then cmd_agent_runs(argv)

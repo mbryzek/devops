@@ -9,6 +9,7 @@ require 'agent/errors'
 require 'agent/escalation'
 require 'agent/gc'
 require 'agent/github'
+require 'agent/heap'
 require 'agent/host'
 require 'agent/jobs'
 require 'agent/maintenance'
@@ -950,6 +951,13 @@ module Agent
         log("fleet state unknown — claiming nothing")
         return
       end
+      # Cache what the registry says this machine may run at once, for
+      # `Agent::Heap` to size the sbt heap from (ISS-753). Here rather than at
+      # registration because THIS is the read that happens every work phase, so
+      # an operator's `max_concurrency` override reaches the heap within one tick
+      # instead of at the next re-registration — and a machine that has never got
+      # this far has no sessions to size a heap for.
+      Agent::Heap.remember(runner)
       if runner && runner["paused"]
         log("runner is paused — claiming nothing")
         return
@@ -1434,10 +1442,21 @@ module Agent
     # filed under, so a session cannot file one against work it is not doing, and
     # `run-op` refuses outright when the variable is absent — which is what keeps
     # the command from being run by hand on a laptop into some issue's log tree.
+    # `SBT_OPTS` is the sbt heap this machine may spend on one slot, derived by
+    # `Agent::Heap` rather than written into the instructions as a constant
+    # (ISS-753). It is set here as the DEFAULT and is not sufficient on its own:
+    # Claude's Bash tool runs a LOGIN shell, so a `~/.zprofile` that exports
+    # SBT_OPTS unconditionally overwrites it for every command the session runs.
+    # That is why agent/instructions.md tells a session to interpolate
+    # `dev agent sbt-opts` in the same shell invocation as sbt, exactly as it
+    # does with CONF_DB_DEV_URL. Setting it here still matters: it is what a
+    # session's non-login subprocesses see, and it is the value `dev agent
+    # sbt-opts` agrees with.
     def child_env(slug, number)
       {
         "DEV_AGENT_ISSUE" => number.to_s,
         "CLAUDE_SESSION_ID" => slug,
+        "SBT_OPTS" => Agent::Heap.sbt_opts,
         "GIT_CONFIG_COUNT" => "1",
         "GIT_CONFIG_KEY_0" => "core.hooksPath",
         "GIT_CONFIG_VALUE_0" => Agent::Paths.githooks_dir,

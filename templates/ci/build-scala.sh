@@ -35,9 +35,18 @@
 #   the caller, and the reset is a no-op on a database just cloned from the
 #   template.
 #
-#   THE HEAP IS THE MACHINE'S. platform needs ~12G and OOMs at sbt's default, and
-#   the right number differs per box (ISS-753). Size it against the smallest
-#   machine in the fleet that will run this, not the largest.
+#   THE HEAP IS THE MACHINE'S, AND IT IS ALREADY SET — do not put a number here.
+#   sbt's own default is 1G and platform OOMs at it, but the right ceiling
+#   differs per box, so the fleet derives it from the runner's RAM and slot count
+#   and exports `SBT_OPTS` into this script's environment (Agent::Heap, ISS-753).
+#   `dev ci verify` by hand sets the same value, so a build behaves identically
+#   either way, and `dev agent sbt-opts --explain` shows the arithmetic.
+#
+#   DO NOT "fix" this with `sbt -J-Xmx...`. sbt's launcher builds
+#   `java $JAVA_OPTS $SBT_OPTS ... -jar sbt-launch.jar` and folds `-J` args into
+#   the JAVA_OPTS half, so the environment wins and the flag is silently ignored.
+#   Measured on a runner: a `-J-Xmx12G` build ran at the 40G heap an inherited
+#   SBT_OPTS asked for.
 #
 # ci-needs: docker, registry, database
 set -euo pipefail
@@ -61,4 +70,4 @@ claude-db reset --app "$APP"
 # CHANGE ME — the repo's own suite. Run only the subprojects the PR affects,
 # failing OPEN to the full build whenever the mapping cannot resolve a changed
 # path (ISS-762).
-sbt -J-Xmx12G test
+sbt test
