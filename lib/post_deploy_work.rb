@@ -199,7 +199,13 @@ class PostDeployWork
     Task.new(
       title: "Publish #{app.name} apibuilder specs and PR the generated churn",
       repos: [app.name],
-      commands: ["cd ~/code/#{app.name} && api publish"],
+      # A RUNNABLE line, because this is also what `manual_commands` hands a human
+      # when the filing itself failed — prose here is a command nobody can paste.
+      # It clones rather than naming ~/code/#{app.name} for the same reason the
+      # body does: `api publish` writes generated code into the checkout it runs
+      # in, and the shared one is where that diff goes unnoticed (ISS-817).
+      commands: ["git clone --depth 1 --no-single-branch git@github.com:mbryzek/#{app.name}.git " \
+                 "~/code/ai/publish-#{app.name} && cd ~/code/ai/publish-#{app.name} && api publish"],
       body: <<~BODY,
         #{app.name} released at #{released_at}. Publish its apibuilder specs.
 
@@ -212,12 +218,29 @@ class PostDeployWork
         the longer this sits the more of the registry describes code that is not deployed yet.
         Neither direction is worth a workaround — just run it.
 
-        FROM `main`, in the `#{app.name}` checkout this session was given. `api publish` is the only
-        path that writes the registry and it is guarded accordingly: it refuses to run from any
-        branch but `main`, refuses a dirty working tree, and requires HEAD to be merged into
-        origin/main. The executor put this checkout on your issue branch, so switch first:
+        FROM `main`, in a SHALLOW CLONE YOU MAKE — not the `#{app.name}` checkout the executor put
+        on your issue branch, and never `~/code/#{app.name}`:
 
-            git checkout main && git pull --ff-only origin main
+            git clone --depth 1 --no-single-branch git@github.com:mbryzek/#{app.name}.git \\
+              ~/code/ai/<your-feature-dir>/#{app.name}
+
+        Its own clone, because `api publish` DOWNLOADS generated code into whatever checkout it ran
+        in (see below). Pointed at a shared checkout it leaves that diff sitting in a directory
+        nobody is watching, which is the failure ISS-817 moved this work to the fleet to end.
+        Reusing the issue-branch checkout instead means checking out `main` — throwing away the
+        branch the executor prepared — and then checking it back out to carry the generated churn
+        across, a dance that exists only to work around not having cloned.
+
+        SHALLOW because publish reads one commit and nothing about history, and a full clone of a
+        repo this size is minutes of wall-clock on every release. `--no-single-branch` is
+        load-bearing: a bare `--depth N` sets a refspec that tracks only main, and then
+        `git status -sb` shows no upstream, `origin/<branch>..HEAD` is an unknown revision, and
+        `gh pr create` aborts with "you must first push the current branch to a remote" even when
+        the branch IS pushed. Keep both flags together or neither.
+
+        `api publish` is the only path that writes the registry and it is guarded accordingly: it
+        refuses to run from any branch but `main`, refuses a dirty working tree, and requires HEAD
+        to be merged into origin/main. A fresh shallow clone of `main` satisfies all three.
 
         Then run it through the ops close-out contract:
 
@@ -229,15 +252,23 @@ class PostDeployWork
         (`nohup ... > /tmp/api-publish.log 2>&1 &`) and poll the log rather than letting your own
         tool-call timeout kill it half-run.
 
+        A `Net::WriteTimeout` while submitting the batch is transient and RETRYABLE. It fires
+        inside `create_batch`, before a batch exists — the log's last line is "Submitting batch"
+        with no "Batch bat-... created" after it — so nothing was half-published and re-running is
+        safe. Confirmed 2026-08-08 under ISS-992: first attempt timed out, retry published all 107
+        applications cleanly.
+
         `api publish` does TWO things: it uploads the specs, and it downloads the generated code
         back into the checkout it ran in. That second half is the reason this is a fleet job at all
         (ISS-817) — on a laptop the generated diff simply sat in `~/code/#{app.name}` uncommitted
-        forever. So when the run finishes:
+        forever, and it is why the clone above is not optional. So when the run finishes:
 
-        - `git status`. If anything under `generated/` changed, move those changes onto your issue
-          branch (`git checkout <the branch the executor gave you>` carries them across), commit,
-          open a draft PR titled `ISS-<this issue number>: regenerate #{app.name} after publishing
-          released specs`, and mark it ready.
+        - `git status` in the clone. If anything under `generated/` changed, create a branch there
+          using THE SAME NAME THE EXECUTOR ASSIGNED YOU, commit, open a draft PR titled
+          `ISS-<this issue number>: regenerate #{app.name} after publishing released specs`, and
+          mark it ready. The assigned name matters: outcome classification looks the PR up on that
+          branch first, and while it does fall back to scanning for the `ISS-<n>: ` title prefix,
+          a branch it can match exactly is one fewer thing between your work and being credited.
         - If nothing changed, there is nothing to PR and the `run-op` record is the whole artifact.
           Do not manufacture a PR to look productive.
 
