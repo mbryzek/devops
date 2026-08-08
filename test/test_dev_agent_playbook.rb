@@ -339,7 +339,7 @@ class TestDevAgentPlaybook < Minitest::Test
     assert_match(/No findings in 1 playbook\(s\)/, out)
     # And it names the checks: a clean line that does not say WHAT it checked
     # cannot tell you that a defect class you just thought of is not covered.
-    assert_match(/hardcoded homes, unpushable writes, reaped plans/, out)
+    assert_match(/hardcoded homes, unpushable writes, reaped plans, absent fleet state/, out)
   end
 
   def test_the_lint_names_the_key_the_line_and_the_path
@@ -500,6 +500,78 @@ class TestDevAgentPlaybook < Minitest::Test
                  targets("Append it (to ~/code/claude/ledger.md), then push.")
   end
 
+  # ---- the absent-fleet-state detector (ISS-1060) ----
+  #
+  # `~/.platform` is a closed set — the fleet provisions it and nothing else
+  # writes there — so a playbook naming a file under it is either naming one that
+  # is provisioned or one that will never appear. The second is unrunnable on
+  # every runner and says nothing about it while a session works around it.
+  #
+  # Every test here pins BOTH seams. Leaving either defaulted would assert about
+  # whatever home directory the suite happens to run in, and on the agent runners
+  # specifically that is the one machine where the answer is not the fixture's.
+
+  # `exist` answers for a fixed set, so these tests describe a runner rather than
+  # this one.
+  PROVISIONED = %w[devops devops_ai devops_acumen agent-jobs].freeze
+
+  def lint(rows, provisioned: PROVISIONED)
+    Agent::Playbook.lint_all(
+      rows, state_dir: "/state", exist: ->(path) { provisioned.include?(File.basename(path)) }
+    )
+  end
+
+  def state_findings(body, key: "pb", provisioned: PROVISIONED)
+    Agent::Playbook.missing_state_paths_in(
+      body, key: key,
+      state_dir: "/state",
+      exist: ->(path) { provisioned.include?(File.basename(path)) }
+    )
+  end
+
+  # The real defect, verbatim from the playbook line this issue was filed against.
+  def test_the_credentials_file_that_filed_this_issue_is_a_finding
+    body = "Log in as the operator.\n" \
+           "Credentials are in `~/.platform/product-owner-credentials.json` (mode 600). Read them from that\nfile.\n"
+    findings = state_findings(body, key: "product-owner")
+
+    assert_equal 1, findings.length
+    assert_equal 2, findings.first.line
+    assert_equal "~/.platform/product-owner-credentials.json", findings.first.path
+    assert_equal :missing_state, findings.first.rule
+    assert_equal "product-owner:2: ~/.platform/product-owner-credentials.json — " \
+                 "#{Agent::Playbook::REASONS[:missing_state]}", findings.first.to_s
+  end
+
+  # The line RIGHT BELOW it in the same playbook, which is correct and must stay
+  # clean — the detector's value is entirely in telling these two apart.
+  def test_a_file_the_fleet_provisions_is_not_a_finding
+    assert_empty state_findings("      Authorization: Basic base64(\"$(cat ~/.platform/devops_ai):\")")
+    assert_empty state_findings("Send `$(cat $HOME/.platform/devops_acumen)` as the `acumen_session_id` header.")
+    assert_empty state_findings("Read `${HOME}/.platform/devops`.")
+  end
+
+  # A per-run path under a provisioned DIRECTORY correctly does not exist yet, and
+  # a detector that flagged it would fire on every playbook that names one.
+  def test_only_the_first_segment_under_the_state_dir_is_checked
+    assert_empty state_findings("The job lives at `~/.platform/agent-jobs/<id>/status.json`.")
+    assert_equal ["~/.platform/agent-frobs"],
+                 state_findings("Read `~/.platform/agent-frobs/<id>/status.json`.").map(&:path)
+  end
+
+  # An absolute `/Users/…/.platform/x` is already a finding under the
+  # hardcoded-home rule, which is the defect that path actually has: it is wrong
+  # on the other runner whether or not the file is there on this one.
+  def test_the_absolute_form_is_left_to_the_hardcoded_home_rule
+    assert_empty state_findings("Read /Users/mbryzek/.platform/nope.json")
+    assert_equal [:home_path], Agent::Playbook.home_paths_in("Read /Users/mbryzek/.platform/nope.json").map(&:rule)
+  end
+
+  # One line naming the same missing file twice is one defect.
+  def test_a_repeated_path_on_one_line_is_one_finding
+    assert_equal 1, state_findings("cat ~/.platform/nope.json || echo ~/.platform/nope.json").length
+  end
+
   # ---- 3. handwritten_status: the briefing's data directory (ISS-1022) ----
   #
   # The third way an instruction reaches a place the session cannot legitimately
@@ -559,15 +631,26 @@ class TestDevAgentPlaybook < Minitest::Test
     ]
     # Both detectors fire on that second line, and they are two distinct defects:
     # the path is wrong on every runner but this one AND unwritable on all of them.
-    assert_equal %i[home_path unpushable], Agent::Playbook.lint_all(rows).map(&:rule)
+    assert_equal %i[home_path unpushable], lint(rows).map(&:rule)
+  end
+
+  # The seams reach the disk-reading detector through `lint_all`, which is the
+  # only entry point `dev agent playbooks --lint` and the meta-review's D4 use.
+  def test_the_store_lint_reports_absent_fleet_state_too
+    rows = [{ "key" => "pb", "body" => "Read `~/.platform/devops_ai`, then `~/.platform/nope.json`.\n" }]
+    findings = lint(rows)
+    assert_equal [:missing_state], findings.map(&:rule)
+    assert_equal ["~/.platform/nope.json"], findings.map(&:path)
   end
 
   # Every rule a finding can carry has a remedy, so a detector cannot ship without
   # saying what to do instead — and `REMEDIES.fetch` in the reporter would raise
   # rather than print a bare finding.
   def test_every_rule_has_a_remedy
-    rules = [Agent::Playbook::HomePath, Agent::Playbook::WriteTarget]
-             .flat_map { |s| s == Agent::Playbook::HomePath ? [:home_path] : Agent::Playbook::REASONS.keys }
+    # `HomePath`'s rule is fixed and every other struct's is one of `REASONS`'
+    # keys, so this is the whole set a finding can carry.
+    rules = [:home_path, *Agent::Playbook::REASONS.keys].uniq
+    assert_includes rules, Agent::Playbook::MissingState.new(key: "k", line: 1, path: "p").rule
     rules.each { |rule| assert Agent::Playbook::REMEDIES.key?(rule), "no remedy for #{rule}" }
   end
 
