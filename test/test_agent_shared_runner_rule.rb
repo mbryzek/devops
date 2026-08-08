@@ -284,7 +284,10 @@ class TestAgentSharedRunnerRule < Minitest::Test
     seen = nil
     original = Agent::Shell.method(:capture)
     Agent::Shell.define_singleton_method(:capture) do |*argv, **opts|
-      seen = argv if argv.first == "ps"
+      # Matched on the BASENAME: ISS-1033 made this call an absolute `/bin/ps`,
+      # and a literal "ps" comparison would silently stop watching the very call
+      # it exists to watch.
+      seen = argv if File.basename(argv.first.to_s) == "ps"
       original.call(*argv, **opts)
     end
     yield
