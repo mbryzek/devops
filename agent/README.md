@@ -11,7 +11,7 @@ look. Everything here exists to drain the open issue queue.
 | File | What it is |
 |---|---|
 | `instructions.md` | Part 1 of every session's prompt. Outcome protocol (including the close-out contract: before it closes out, a session files what it WORKED AROUND and hands over what only a HUMAN can run), the relaxed review gates, and the safety rules that are *not* relaxed. Reviewed like code. It is also why a playbook never restates any of that — reaching every session, including the next playbook's, is what this file is for. |
-| `githooks/pre-push` | Enforces "an autonomous session may only write to `plans/` in `~/code/claude`". Injected into every session via `core.hooksPath`. |
+| `githooks/pre-push` | Enforces "an autonomous session may push documents (`plans/`, `product/`, `design/`, `docs/`) to `~/code/claude`'s main; instructions and code have to arrive as a PR a human merges". Injected into every session via `core.hooksPath`. |
 
 ## The commands
 

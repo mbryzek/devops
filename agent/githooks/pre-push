@@ -6,19 +6,60 @@
 # so this hook runs for EVERY git push the session makes, in every repo, whether
 # or not that repo has hooks of its own.
 #
-# It enforces exactly one rule: a push to ~/code/claude may only touch plans/.
+# It enforces exactly one rule, and the rule is about REVIEW, not about paths:
 #
-# ~/code/claude is the standing exception to "never push to main" — its house
-# rule is commit-to-main — and for an autonomous session that exception is
-# narrowed rather than removed. The rest of that repo is CLAUDE.md, skills and
-# rules: instructions every future session loads and obeys, which makes it the
-# one place a prompt-injected session could persist itself. No autonomous job
-# has a reason to touch it, and the prompt saying so is necessary but not
-# sufficient.
+#   an autonomous session may push a DOCUMENT to ~/code/claude's main; anything
+#   else in that repo has to arrive on a branch, as a pull request a human merges.
+#
+# WHY THIS SHAPE. ~/code/claude is the standing exception to "never push to main"
+# — its house rule is commit-to-main — which makes it the ONE place in the whole
+# system where an autonomous write takes effect with nobody looking. Every other
+# repo's writes land behind a human merge. That asymmetry, not the repo's
+# contents, is what needs guarding: CLAUDE.md, the rules, the skills, the agent
+# definitions and settings.json are instructions and configuration every future
+# session loads and obeys, so an unreviewed write to one of them is the one way a
+# prompt-injected session could persist itself past its own run.
+#
+# A pull request removes the asymmetry entirely. `claude` is not in
+# Agent::MergeLane::LANE_REPOS and carries no `ci` check, so no autonomous merge
+# loop can land a PR there — it waits for Mike, exactly like a platform PR. That
+# is why the branch case below is a blanket allow rather than a second path list:
+# a pushed branch is inert, and the review happens at the merge.
+#
+# WHAT CHANGED AND WHY (ISS-1061). This hook used to refuse every path outside
+# `plans/` on every ref. That was safe and too blunt in a way that had a running
+# cost: ISS-1049 did the whole analysis of two false passages in
+# product/playbook.md, wrote the exact replacement text, and then could not apply
+# a one-file documentation fix — it handed four commands to Mike to paste. Doc
+# corrections are the bulk of what this repo receives, and routing every one of
+# them through a human is the friction, not the safety. Mike authorised the
+# widening on ISS-1061. The instruction surface stayed behind review because that
+# is where the actual threat lives.
+#
+# THE GUARD IS NOT SELF-AMENDABLE, and that is the property that makes the rest
+# of it worth anything. This file lives in `devops`, not in `claude`, so no push
+# to the guarded repo can reach it — and `devops` is in
+# Agent::MergeLane::SELF_DEPLOYING_REPOS, which classifies every one of its PRs
+# `irreversible` and leaves it for a human. A session can propose a change to what
+# sessions are allowed to write. It cannot make one.
 #
 # Every other repo passes through untouched. This hook must never be the reason
 # a legitimate push fails.
 set -e
+
+# Directories whose contents are DOCUMENTS: read deliberately by a session that
+# was pointed at one, never loaded as standing instruction and never executed.
+#
+#   plans/    session notes, designs, handoffs — the original allowance
+#   product/  the per-app product briefs the product-owner review reads
+#   design/   mockups and design tokens
+#   docs/     long-form documentation
+#
+# Everything else in the repo is instruction or code: CLAUDE.md, rules/, skills/,
+# agents/, tools/, bin/, lib/, spec/, athena/, integrations/, settings*.json and
+# the root grab-bag of scripts. Adding a directory here is a deliberate act and
+# means asserting that nothing in it is ever loaded as an instruction.
+doc_dirs='plans product design docs'
 
 guarded_repo="${DEV_AGENT_CLAUDE_REPO:-$HOME/code/claude}"
 toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -29,25 +70,62 @@ resolve() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
 [ -n "$toplevel" ] || exit 0
 [ "$(resolve "$toplevel")" = "$(resolve "$guarded_repo")" ] || exit 0
 
+# True when a path's first segment is one of the document directories. The
+# segment must match whole: `plansomething/x.md` is not `plans/`.
+is_document() {
+  first="${1%%/*}"
+  [ "$first" != "$1" ] || return 1        # a root-level file has no directory
+  for dir in $doc_dirs; do
+    [ "$first" = "$dir" ] && return 0
+  done
+  return 1
+}
+
 zero='0000000000000000000000000000000000000000'
 status=0
 
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+while read -r _local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue          # a branch deletion touches no files
 
+  # The whole rule. A push to any ref other than main lands on a branch that
+  # nothing loads and that only a human can merge, so it is none of this hook's
+  # business. Only main is unreviewed.
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master|main|master) ;;
+    *) continue ;;
+  esac
+
   if [ "$remote_sha" = "$zero" ]; then
-    range="$local_sha"                             # new ref: diff against its own root
-    files="$(git diff-tree --no-commit-id --name-only -r "$range" 2>/dev/null || true)"
+    # New ref: diff against its own root. `--root` is what makes an initial
+    # commit list its files at all — without it `diff-tree` prints nothing for a
+    # parentless commit, and the guard waves the whole push through.
+    range="$local_sha"
+    files="$(git diff-tree --root --no-commit-id --name-only -r "$range" 2>/dev/null || true)"
   else
     files="$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)"
   fi
 
-  offending="$(printf '%s\n' "$files" | grep -v '^$' | grep -v '^plans/' || true)"
+  # Newline-delimited, because a path may contain a space and `for x in $files`
+  # would split it into two paths — one of which would then look like a document.
+  offending="$(printf '%s\n' "$files" | while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    is_document "$file" || printf '%s\n' "$file"
+  done)"
+
   if [ -n "$offending" ]; then
-    echo "pre-push: REFUSED. An autonomous session may only write to plans/ in $guarded_repo." >&2
+    echo "pre-push: REFUSED. An autonomous session may push only documents to main in $guarded_repo." >&2
+    echo "Writable on main:" >&2
+    for dir in $doc_dirs; do echo "  $dir/" >&2; done
     echo "Offending paths:" >&2
-    printf '  %s\n' $offending >&2
-    echo "CLAUDE.md, skills and rules are instructions future sessions obey — they are not agent-writable." >&2
+    printf '%s\n' "$offending" | sed 's/^/  /' >&2
+    echo >&2
+    echo "CLAUDE.md, rules/, skills/, agents/, tools/ and settings*.json are instructions and" >&2
+    echo "configuration every future session loads and obeys, so they do not land unreviewed." >&2
+    echo "They are NOT off limits — open a pull request instead:" >&2
+    echo "  1. clone the repo into your workspace (never switch branches in $guarded_repo," >&2
+    echo "     whose working tree every session on this runner reads through ~/code/.claude)" >&2
+    echo "  2. commit to your assigned branch and push it — this hook allows any path there" >&2
+    echo "  3. gh pr create --draft, then gh pr ready; a human merges it" >&2
     status=1
   fi
 done
