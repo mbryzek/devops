@@ -14484,7 +14484,12 @@ def cmd_agent_merge(args)
   # Asked ONLY when a spec actually changed: it is a clone plus a hermetic diff,
   # and 43 of the 49 open PRs on 2026-08-06 touched no spec at all.
   spec_diff = Agent::MergeLane.spec_touched?(candidate.changed_paths) ? Agent::MergeLane.spec_diff(repo, candidate.number) : nil
-  asserts = Agent::MergeLane.assertions(candidate, base_sha: base, spec_diff: spec_diff)
+  # Asked HERE rather than on every Candidate the lane builds: it is one request,
+  # and the only decision that needs it is the one about to be recorded (ISS-1080).
+  asserts = Agent::MergeLane.assertions(
+    candidate, base_sha: base, spec_diff: spec_diff,
+    verified_detail: Agent::MergeLane.verified_detail(repo, candidate.head_sha),
+  )
   reversibility = Agent::MergeLane.reversibility(candidate.changed_paths, repo: repo,
                                                  spec_diff: spec_diff || :unknown)
   puts "  reversibility: #{reversibility}"
@@ -14509,7 +14514,26 @@ def agent_merge_rationale(candidate, reversibility, asserts)
     "#{asserts['diff_lines']} changed line(s). #{spec}`#{Agent::MergeLane::CI_CHECK}` passed on " \
     "#{Agent::MergeLane.short(candidate.head_sha)}, which is the exact commit that will be squashed, and " \
     "that commit contains the current tip of main (#{Agent::MergeLane.short(asserts['base_sha'])}). " \
-    "Verified by GitHub Actions rather than asserted by this session."
+    "Verified by GitHub Actions rather than asserted by this session.#{agent_merge_evidence(asserts)}"
+end
+
+# WHERE that verification can be read back, appended to the rationale so the
+# audit path starts and ends in the decision (ISS-1080).
+#
+# The rationale is prose a human reads in the feed, and until now it named the
+# verifier and stopped — leaving an auditor to go back to GitHub for the link,
+# and for a fleet-verified repo to go on from there to whichever runner built the
+# sha. Both facts are already on the decision as assertions; this is the same
+# two, in the sentence that is actually read.
+#
+# Empty when neither exists, rather than a sentence saying nothing is known: a
+# rationale that has to hedge about its own evidence is worse than one that
+# simply does not mention it.
+def agent_merge_evidence(asserts)
+  parts = []
+  parts << asserts["verified_url"] if asserts["verified_url"]
+  parts << asserts["verified_detail"] if asserts["verified_detail"]
+  parts.empty? ? "" : " Evidence: #{parts.join(' — ')}"
 end
 
 def agent_merge_decide_and_merge(repo, candidate, asserts, reversibility, run_id:, use_localhost:)
