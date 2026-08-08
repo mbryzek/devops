@@ -45,6 +45,7 @@ require 'agent/dependency_wake'
 require 'agent/gc'
 require 'agent/github'
 require 'agent/heap'
+require 'agent/login_shell'
 require 'agent/maintenance'
 require 'agent/merge_lane'
 require 'agent/ops'
@@ -14302,6 +14303,7 @@ def cmd_agent_doctor(args)
 
   claude_config = agent_doctor_claude_config
   agent_doctor_credentials
+  agent_doctor_login_shell
   agent_doctor_sbt_heap
   agent_doctor_load
 
@@ -14683,6 +14685,48 @@ end
 # because nothing is missing: the machine is fully provisioned and still hands
 # every build a heap sized for a different box. A profile pinning `-Xms40G` on a
 # 24G runner is exactly that, and it is invisible until something swaps.
+# What a bare command name means on this machine (ISS-1033).
+#
+# Here rather than in Agent::Toolchain for the same reason the heap section
+# below is: nothing is missing. Every tool resolves, every version is supported,
+# and a session still gets a different program than the one it typed. The
+# toolchain answers "is it installed"; this answers "is it what it says".
+#
+# Never fatal, and it files nothing. A `ps` alias does not stop this box running
+# sessions, and the listing is mostly harmless (`ls -F`) with one line in it that
+# cost a transcript — a section that failed provisioning over the harmless ones
+# would be routed around, taking the one that matters with it.
+def agent_doctor_login_shell
+  shadowing = Agent::LoginShell.shadowing
+  puts
+  if shadowing.nil?
+    puts "Login-shell aliases: unknown (this machine's `/bin/zsh -lc` would not answer)"
+    return
+  end
+
+  puts "Login-shell aliases that shadow a real binary (what a bare command name means here):"
+  if shadowing.empty?
+    puts "  ok   none — a bare command name on this machine is the binary"
+    return
+  end
+
+  name_width = shadowing.map { |a| a.name.length }.max
+  body_width = shadowing.map { |a| a.expansion.inspect.length }.max
+  shadowing.each do |a|
+    puts "  ALIAS #{a.name.ljust(name_width)}  #{a.expansion.inspect.ljust(body_width)}  (shadows #{a.path})"
+  end
+  puts "  A LOGIN shell defines these, and zsh expands aliases in NON-interactive shells too — so"
+  puts "  they are live in every session's Bash tool AND in `/bin/zsh -lc`, which is how launchd"
+  puts "  runs the tick and how `dev agent run-op -- /bin/zsh -lc '<line>'` runs an operation."
+  puts "  Two shapes to look for, both measured on this fleet (ISS-1033/ISS-961):"
+  puts "    - flags an alias PREPENDS may not be narrowable back — `ps -ax` makes a later"
+  puts "      `-p <pid>` a no-op, so `ps -p <pid>` prints every process on the box;"
+  puts "    - a flag that needs a tty fails OPEN — `rm -i` on a session's tty-less shell"
+  puts "      deletes nothing and still exits 0."
+  puts "  Sessions: spell the absolute path (`/bin/ps`, `/bin/rm`) when exact behaviour matters."
+  puts "  This machine: delete the line from whichever profile defines it (`~/.alias` on this fleet)."
+end
+
 def agent_doctor_sbt_heap
   puts
   puts "sbt heap: #{Agent::Heap.sbt_opts}   (`dev agent sbt-opts --explain`)"
