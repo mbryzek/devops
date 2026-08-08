@@ -200,6 +200,22 @@ class TestDevAgentCredentials < Minitest::Test
     refute_includes section, SECRET
   end
 
+  # ISS-961. "Never print, echo, commit or paste it" was the whole warning, and a
+  # session that obeyed all four still leaked both fleet credentials: inlining a
+  # value into a shell command is none of those verbs, and a sibling session's
+  # `pgrep -fl` printed it. The correct form has to be stated where the usage
+  # example is, because that is the line that puts a command on the screen.
+  def test_the_prompt_says_a_credential_must_never_be_inlined_into_a_command
+    section = Agent::Prompt.credentials_section(
+      with_probe(:present, SECRET, :env_repo) { C.check(credentials: [credential]) },
+    )
+    assert_match(/never write the value into a command line/i, section)
+    assert_includes section, "pass `$PLAYBOOK_CLAUDE_KEY`",
+                    "the safe form must name the variable it applies to"
+    assert_match(/ps.*shows every\s+argument|argument of every one of their processes/m, section,
+                 "the session must be told WHY, or it reads as one more prohibition to weigh")
+  end
+
   # The whole point of the issue: a session must learn the gap while planning,
   # not discover it after writing code it cannot test — and must be told the
   # specific thing to do about it rather than quietly designing against the docs.

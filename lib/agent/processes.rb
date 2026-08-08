@@ -1,5 +1,6 @@
 require 'etc'
 require 'set'
+require 'agent/redact'
 require 'agent/shell'
 
 # The processes an agent session leaves behind, and the two facts about this
@@ -104,13 +105,33 @@ module Agent
       []
     end
 
+    # `command` is REDACTED on the way in, so `Entry#command` is never a secret
+    # carrier anywhere downstream (ISS-961).
+    #
+    # A command line is public on these runners: `ps -U <uid>` shows every
+    # argument of every process the agent user owns, to every other process it
+    # owns, and three agent sessions share one Mac mini. `PS_FORMAT` above asks
+    # for `command=` precisely so this module can read those lines — which makes
+    # every Entry a copy of whatever credential a sibling session inlined into a
+    # command, held in a public struct field.
+    #
+    # Nothing prints one today. That is the reason to do it here rather than at
+    # the eventual call site: the obvious next improvement to the sweep is to SAY
+    # which processes it reaped, and the person writing that line should not have
+    # to know this hazard exists. Redacting at the boundary means they cannot
+    # leak, whatever they print.
+    #
+    # `Agent::Redact` is shape-preserving, so TOOL_SHELL, CLAUDE_SESSION and the
+    # whole `leaked?` predicate below still see the structure they match on —
+    # asserted in test_dev_agent_redact.rb, because a sweep that silently stopped
+    # matching would report a buried runner as a clean one.
     def parse(output)
       output.to_s.lines.filter_map do |line|
         pid, ppid, pgid, etime, time, command = line.strip.split(/\s+/, 6)
         next if command.nil? || pid !~ /\A\d+\z/
         Entry.new(pid: pid.to_i, ppid: ppid.to_i, pgid: pgid.to_i,
                   elapsed_seconds: duration(etime), cpu_seconds: duration(time),
-                  command: command)
+                  command: Agent::Redact.command(command))
       end
     end
 

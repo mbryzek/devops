@@ -174,6 +174,16 @@ module Agent
                    "`#{f.credential.usage_example}`."
           lines << "  **Never print, echo, commit, or paste it** into a PR, an issue comment, a plan or a " \
                    "test fixture."
+          # ISS-961. The line above is what a session obeys and it was not
+          # enough, because inlining a value into a command reads as none of
+          # those four verbs — and `usage_example` right above it is a shell
+          # command, which is the moment the question actually arises. Stated per
+          # credential, with the variable's own name in it, so the correct form
+          # is the thing on screen at the point of use.
+          lines << "  **And never write the value into a command line — pass `$#{f.name}`, never what it " \
+                   "resolves to.** Several sessions share this runner as one user, and `ps` shows every " \
+                   "argument of every one of their processes to all the others; a key you inline is readable " \
+                   "by all of them for as long as the command runs (hours, for anything backgrounded). See §4."
         else
           lines << "- `#{f.name}` — **NOT available on this runner** (#{f.explanation})."
           lines << "  Anything in your assignment that asks you to verify behaviour against the live API " \

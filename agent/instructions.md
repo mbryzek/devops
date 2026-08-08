@@ -560,6 +560,32 @@ the one way to bring `main` under a branch like this, and it needs no force.
   plainly in the PR which part is unverified, and file it with `dev issues
   workaround`. Either way a credential is never yours to print, echo, commit, or
   paste into a PR, an issue comment, a plan or a test fixture.
+- **This runner is SHARED, and a command line is PUBLIC.** Several agent sessions
+  run on one Mac mini as the same user, and `ps -U <uid>` shows every argument of
+  every one of their processes to all the others. Two rules follow, and neither is
+  covered by "never print a credential" — in the incident below the session
+  printed nothing, echoed nothing and pasted nothing:
+    - **Never write a resolved credential INTO a command. Always `$NAME`, never
+      the value.** Your Bash tool keeps the literal text of your command in its
+      own argv for as long as the call runs, so a key you type out is readable by
+      every sibling session for that whole time. `$NAME` keeps it off THAT line —
+      but the shell still expands it, and a child that receives it as an argument
+      (`curl -H "x-api-key: $PLAYBOOK_CLAUDE_KEY"`) carries the value in its OWN
+      argv while it runs. For a one-second curl that window is acceptable and the
+      usage examples in your assignment block are fine as written. For anything
+      LONG-RUNNING it is not: never let a credential ride on a backgrounded or
+      long-lived command — `npm run dev`, a dev server, a watch loop — where it
+      sits in a listing for hours. Prefer stdin when the tool will take it.
+    - **When you poll for a background process, ask for pids — never command
+      lines.** `pgrep -f <pattern>` and `pgrep -q <pattern>` answer "is it still
+      running". `pgrep -fl` and `ps auxww` answer the same question by printing
+      every OTHER session's command lines into your transcript. Best of all, poll
+      the log you redirected to, which is what §1 and §7 already tell you to do.
+
+  That is ISS-961: a session polling its own detached `api publish` with a routine
+  `pgrep -fl api` captured two sibling sessions' `PLAYBOOK_CLAUDE_KEY` and
+  `NEWRELIC_USER_KEY` in plaintext. The pattern matched partly ON the key, because
+  `sk-ant-api03-...` contains the string `api` it was searching for.
 - **The sbt heap is THIS MACHINE'S, and you interpolate it — never a number you
   chose.** `dev agent sbt-opts` prints it, derived from this box's RAM and how
   many sessions it runs at once (ISS-753). Assign it in the SAME shell
