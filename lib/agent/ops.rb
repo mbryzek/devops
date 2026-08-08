@@ -71,7 +71,7 @@ module Agent
     DEFAULT_TIMEOUT_SECONDS = 3600
 
     # How much of the operation's output is kept on the record. The record is a
-    # post-mortem aid, not a log — claude.log already has every byte — so this
+    # post-mortem aid, not a log — the session log already has every byte — so this
     # is bounded to keep one chatty operation from filling the issue tree.
     OUTPUT_TAIL_BYTES = 8_000
 
@@ -237,7 +237,7 @@ module Agent
     # Every operation THIS attempt ran, oldest first.
     #
     # `since` is the job's `started_at`, and it is the whole safety of the arm.
-    # The issue directory outlives an attempt — claude.log is appended across
+    # The issue directory outlives an attempt — the session log is appended across
     # them on purpose — so an attempt that ran the operation and then crashed
     # leaves a successful record behind. Without this filter the NEXT attempt,
     # which did nothing at all, would read that record and classify itself

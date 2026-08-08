@@ -18,7 +18,7 @@ look. Everything here exists to drain the open issue queue.
 ```
 dev agent tick [--dry-run]        one shot; launchd runs it every 30s
 dev agent status                  this machine: identity, live jobs, last tick
-dev agent logs <issue> [--follow] tail one session's claude.log
+dev agent logs <issue> [--follow] [--raw]  render one session's live output
 dev agent pause | resume          kill switch — drains, claims nothing new
 dev agent runners                 the fleet: capabilities, concurrency, last seen
 dev agent producers               the platform's registry: schedule, last run, next due
@@ -91,7 +91,8 @@ One root, `~/Library/Logs/dev-agent/`. Nothing writes anywhere else.
 tick/YYYY-MM-DD.log        one line per decision: phase, claims, reaps, timings
 issues/ISS-<n>/
   prompt.md                exactly what was fed to the session on stdin
-  claude.log               the session's full stdout
+  stream.jsonl             every event the session emitted, as it emitted it
+                           (stream-json + stderr); read it via `dev agent logs`
   exit_code                the wrapper's record of how it exited
   meta.json                issue, pid, slug, branch, timeout_at, outcome
 ```

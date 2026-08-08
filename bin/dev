@@ -49,6 +49,7 @@ require 'agent/merge_lane'
 require 'agent/ops'
 require 'agent/paths'
 require 'agent/shell'
+require 'agent/stream'
 require 'agent/workspace'
 require 'agent/processes'
 require 'agent/tick'
@@ -140,7 +141,7 @@ INVOCATIONS = {
   "changelog status"    => 'changelog status [--localhost]',
   "agent tick"          => 'agent tick [--dry-run] [--localhost]',
   "agent status"        => 'agent [status] [--localhost]',
-  "agent logs"          => 'agent logs <issue> [--follow]',
+  "agent logs"          => 'agent logs <issue> [--follow] [--raw]',
   "agent run-op"        => 'agent run-op <operation> [--timeout SECONDS] [--env KEY=VALUE]... -- <command> [args...]',
   "agent pause"         => 'agent pause [--localhost]',
   "agent resume"        => 'agent resume [--localhost]',
@@ -1111,8 +1112,10 @@ USAGE = <<~USAGE
         ran. `status` is the default when no subcommand is given.
 
     #{INVOCATIONS["agent logs"]}
-        The session log for one issue (~/Library/Logs/dev-agent/issues/ISS-<n>/).
-        --follow tails it.
+        The session log for one issue (~/Library/Logs/dev-agent/issues/ISS-<n>/),
+        rendered from the stream the session writes: tool calls, its own text,
+        and how it ended. --follow keeps rendering as the session runs. --raw
+        prints the underlying JSONL instead, for debugging the rendering itself.
 
     #{INVOCATIONS["agent run-op"]}
         How an autonomous session RUNS an operation — `dev features reconcile
@@ -2254,8 +2257,20 @@ end
 # A nil prompt returns the argv WITHOUT one, for the caller that feeds the prompt
 # on stdin instead (`dev agent tick` — a dispatcher prompt carries a whole issue
 # thread, and an argv is the wrong place for it).
-def headless_claude_argv(prompt = nil)
+#
+# `stream:` is for a session somebody will WATCH (ISS-949). Plain `--print`
+# buffers: it writes nothing at all until the process exits, so a healthy
+# four-hour dispatcher session shows `(no output yet)` in `dev agent status` for
+# four hours and is indistinguishable from a wedged one. `stream-json` emits
+# events as they happen, at the cost of the log being JSONL — `Agent::Stream`
+# renders it back. `--verbose` is not optional: the CLI rejects
+# `--output-format stream-json` without it.
+#
+# Off by default, because the one-shot callers (invariants, codegen) redirect
+# into somewhere a human reads raw and nobody watches them mid-flight.
+def headless_claude_argv(prompt = nil, stream: false)
   argv = ["claude", "--print", "--dangerously-skip-permissions", "--model", INTERACTIVE_CLAUDE_MODEL]
+  argv += ["--output-format", "stream-json", "--verbose"] if stream
   prompt.nil? ? argv : argv + [prompt]
 end
 
@@ -13313,7 +13328,7 @@ def cmd_agent_tick(args)
   dry_run, use_localhost = agent_flag_only("agent tick", args, "--dry-run")
   handle_errors do
     Agent::Tick.new(use_localhost: use_localhost,
-                    claude_argv: headless_claude_argv,
+                    claude_argv: headless_claude_argv(stream: true),
                     dry_run: dry_run,
                     verbose: $stdout.tty? || dry_run).run
   end
@@ -13348,10 +13363,22 @@ end
 def agent_job_line(job)
   number = job["issue"]
   elapsed = ((Time.now - Time.parse(job["started_at"])) / 60).round
-  log = Agent::Paths.claude_log(number)
-  last = File.file?(log) ? File.readlines(log).last&.strip : nil
+  last = Agent::Stream.last_line(agent_session_log(number))
   "  ISS-#{number}  #{agent_job_state(job)}  #{elapsed}m  branch #{job['branch']}\n" \
     "      #{last ? last[0, 140] : '(no output yet)'}"
+end
+
+# The log to READ for an issue: the stream this session is writing, or the
+# pre-ISS-949 `claude.log` when that is all there is. The fallback is not
+# compatibility for its own sake — it is the attempt that was already running
+# when its runner fast-forwarded onto the streaming code. Without it that
+# session goes dark for its remaining hours, which is the exact failure this
+# change exists to remove.
+def agent_session_log(number)
+  stream = Agent::Paths.session_log(number)
+  return stream if File.file?(stream)
+  legacy = Agent::Paths.legacy_claude_log(number)
+  File.file?(legacy) ? legacy : stream
 end
 
 # A dead job whose VERDICT is already on the record is not simply unreaped: the
@@ -13370,11 +13397,24 @@ def cmd_agent_logs(args)
   rest, app_filter, _use_localhost = parse_common_flags(args)
   reject_unknown_args("agent logs", [app_filter].compact) if app_filter
   follow = rest.include?("--follow")
-  number = agent_issue_number!("agent logs", rest - ["--follow"])
+  raw = rest.include?("--raw")
+  number = agent_issue_number!("agent logs", rest - ["--follow", "--raw"])
 
-  log = Agent::Paths.claude_log(number)
+  log = agent_session_log(number)
   Util.exit_with_error("No session log for ISS-#{number} (#{log})") unless File.file?(log)
-  exec(*(follow ? ["tail", "-f", log] : ["tail", "-n", "200", log]))
+
+  # Rendered rather than `exec tail`, because the file is JSONL now (ISS-949)
+  # and a raw tail of it is six `thinking_tokens` objects per turn. `--raw` is
+  # the escape hatch for when the rendering is what you are debugging.
+  Agent::Stream.render_file(log, raw: raw).each { |line| puts line }
+  return unless follow
+
+  $stdout.flush
+  begin
+    Agent::Stream.follow(log, raw: raw)
+  rescue Interrupt
+    nil # ^C on a follow is how it ends, not an error
+  end
 end
 
 # `dev agent run-op <name> -- <command>` — the ops close-out contract (ISS-815).
@@ -13459,7 +13499,7 @@ end
 
 def cmd_agent_run_op_apply(number, operation, argv, timeout, env = {})
   # The echo shows the variable NAMES, not their values, for the reason
-  # Agent::Ops::Record.env_keys does: this line lands in claude.log verbatim.
+  # Agent::Ops::Record.env_keys does: this line lands in the session log verbatim.
   setting = env.empty? ? "" : " (with #{env.keys.sort.join(', ')} set)"
   puts "Running #{operation} for ISS-#{number}: #{argv.join(' ')}#{setting}"
   record, visible = Agent::Ops.run(number: number, operation: operation, argv: argv, timeout: timeout, env: env)

@@ -15,7 +15,7 @@
 #
 # Signal 3 is knowledge only the executor has. When the tick kills a session it
 # destroys the very artifacts the other signals read: no exit code gets written,
-# claude.log stops mid-sentence. Re-deriving "what happened" from what a kill
+# the session log stops mid-sentence. Re-deriving "what happened" from what a kill
 # prevented from being written is how a killed session came to be reported as
 # having completed with nothing to do (ISS-364). The killer records what it did
 # on the job record and classification reads it back.
