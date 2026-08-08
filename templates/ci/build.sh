@@ -32,6 +32,22 @@
 #      held to one in the same commit. Names: docker, registry, database.
 #      Omit the line entirely for a build that needs nothing but disk.
 #
+#      `heap:<N>G` is the fifth entry and the only one that is a NUMBER, and it
+#      is read one step earlier than the rest — by the SCHEDULER, before this box
+#      claims the job at all (ISS-1123). The fleet is heterogeneous: the 64G
+#      laptop at concurrency 1 gives a build 24G and the 24G mini at concurrency
+#      3 gives it 4G, and a suite that needs 12G claimed by the mini does not
+#      fail, it OOMs — which the merge lane cannot tell from a red suite, so it
+#      parks the pull request and somebody investigates a scheduling mistake.
+#      Declare it and the job only ever lands somewhere it fits.
+#
+#      DECLARE A MEASURED NUMBER, NOT A COMFORTABLE ONE. Every gigabyte here
+#      narrows the set of machines that can build this repo, and a repo that
+#      declares more than any runner gives is one no runner ever claims (the
+#      fleet files an issue rather than letting it sit, but the PR is stuck
+#      until somebody acts on it). Omit the line if the build is an npm or Elm
+#      one: those need nothing beyond the JVM-less default.
+#
 # ci-needs:
 set -euo pipefail
 

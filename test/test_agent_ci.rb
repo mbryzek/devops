@@ -81,6 +81,66 @@ class TestAgentCi < Minitest::Test
     end
   end
 
+  # ---- the heap declaration (ISS-1123) --------------------------------------
+  #
+  # THE BACKSTOP, not a second scheduler. Agent::Verify already refuses to CLAIM
+  # a job this box cannot give the heap for, so in the ordinary case this never
+  # fires. It exists for the two cases the claim-time match cannot cover: a
+  # hand-run `dev ci verify` on the small box — which is exactly how a repo's
+  # first build is confirmed — and a tick whose registry read failed, leaving the
+  # derived heap at the floor.
+  #
+  # What it buys there is the whole issue: the failure renders as an
+  # INFRASTRUCTURE FAULT (exit 75, "fix the machine") instead of as an OOM the
+  # merge lane reads as a red suite and a human investigates.
+  def test_a_build_declaring_more_heap_than_this_box_gives_is_an_infrastructure_fault
+    with_state_dir do
+      with_probes(disk: :ok) do
+        stub_singleton(Agent::Heap, :gigabytes_here, -> { 4 }) do
+          report = Agent::Ci.preflight(needs: ["heap:12G"])
+          refute report.ok?
+          assert_equal %w[heap], report.faults.map(&:name)
+          assert_match(/gives 4G, the build declares heap:12G/, report.summary)
+        end
+      end
+    end
+  end
+
+  def test_a_declaration_this_box_satisfies_passes
+    with_state_dir do
+      with_probes(disk: :ok) do
+        stub_singleton(Agent::Heap, :gigabytes_here, -> { 24 }) do
+          assert Agent::Ci.preflight(needs: ["heap:12G"]).ok?
+        end
+      end
+    end
+  end
+
+  # No declaration, no check — which is every npm and Elm build, and was every
+  # repo in the fleet before this.
+  def test_a_build_that_declares_no_heap_is_not_checked_for_one
+    with_state_dir do
+      with_probes(disk: :ok) do
+        assert_equal %w[disk], Agent::Ci.preflight(needs: %w[quantum]).checks.map(&:name)
+      end
+    end
+  end
+
+  # THE ONE EXCEPTION TO "an unknown need is ignored", and the reason it has to
+  # be one: under that rule a misspelt heap token reads as no minimum, the job
+  # runs on a box too small for it and OOMs — silently reintroducing the exact
+  # failure the declaration exists to prevent.
+  def test_a_malformed_heap_token_is_a_fault_rather_than_an_ignored_name
+    with_state_dir do
+      with_probes(disk: :ok) do
+        report = Agent::Ci.preflight(needs: ["heap=12G"])
+        refute report.ok?
+        assert_equal %w[heap], report.faults.map(&:name)
+        assert_match(/does not parse/, report.summary)
+      end
+    end
+  end
+
   def test_a_failing_probe_makes_the_report_a_fault_and_names_the_remedy
     with_state_dir do
       with_probes(disk: :ok, registry: :fail) do

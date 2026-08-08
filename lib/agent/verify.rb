@@ -1,3 +1,4 @@
+require 'base64'
 require 'json'
 require 'securerandom'
 require 'shellwords'
@@ -76,13 +77,20 @@ module Agent
     # What the build script may declare it needs from the machine, as a comment
     # the script itself carries:
     #
-    #     # ci-needs: docker, registry, database
+    #     # ci-needs: docker, registry, database, heap:12G
     #
     # In the script rather than in a registry here for the same reason enrolment
     # is: the repo says what its own build touches, at the sha being built, so a
     # suite that stops needing Docker stops being held to a Docker daemon in the
     # same commit. Absent means "nothing beyond disk", which is right for a Node
     # unit suite and wrong for nothing.
+    #
+    # `heap:<N>G` (ISS-1123) is the entry that is read HERE rather than by the
+    # preflight, and it is the reason this is read at SCAN time and not only
+    # after a checkout: the other names answer "is this box fit to build at all",
+    # which can be asked once the job has landed, while heap answers "should this
+    # box have taken the job", which is worthless after it has. See
+    # `classify_capability`.
     NEEDS_DIRECTIVE = /^\s*#\s*ci-needs:\s*(.+)$/.freeze
 
     # The check name, taken from the lane rather than restated: this module and
@@ -173,15 +181,49 @@ module Agent
     # different repairs, and a streak that mixed them would name neither.
     ERROR_SOURCE = "ci_verify".freeze
 
+    # Agent::Errors source for a candidate NO runner in the fleet can build
+    # (ISS-1123). Its own source, and not ERROR_SOURCE, because it is the one
+    # failure here that is not about this machine: nothing on this box is broken,
+    # nothing on this box can be fixed, and a streak that mixed it with jobs that
+    # died mid-flight would name neither repair.
+    CAPABILITY_ERROR_SOURCE = "ci_capability".freeze
+
     # One unit of work. `pr` is nil for the cold build on `main`, which is the
     # only candidate with no pull request behind it.
-    Candidate = Struct.new(:repo, :pr, :sha, :event, keyword_init: true) do
+    #
+    # `needs` is the repo's own `# ci-needs:` list, read at THIS sha, and empty
+    # for a repo that declares nothing.
+    Candidate = Struct.new(:repo, :pr, :sha, :event, :needs, keyword_init: true) do
       def key = Agent::Verify.key(repo, sha)
       def clean? = Agent::Ci.clean_build?(event: event)
+      def heap_gb = Agent::Heap.requirement(needs)
       def label
         name = Agent::MergeLane.bare(repo)
         pr ? "#{name}##{pr}" : "#{name}@#{Agent::Verify.short(sha)}"
       end
+
+      # How this candidate's heap demand reads in a log line or an issue body.
+      def heap_text
+        case heap_gb
+        when nil        then "no declared heap"
+        when :malformed then "an unreadable `# ci-needs:` heap token"
+        else "heap:#{heap_gb}G"
+        end
+      end
+    end
+
+    # WHAT A REPO SAYS ABOUT ITS OWN BUILD AT ONE SHA — both halves in one
+    # answer, because they come from one file and one API call.
+    #
+    # Before ISS-1123 the scan asked only "does ci/build.sh exist at this sha",
+    # and read the `# ci-needs:` line later, off the checkout. That was right
+    # while every need was a probe the box could run once the job had landed; it
+    # is wrong for heap, which decides whether the job should land here at all.
+    # So the same request now brings back the file rather than its blob sha, and
+    # the answer cached per sha is the whole declaration instead of a boolean.
+    Declaration = Struct.new(:enrolled, :needs, keyword_init: true) do
+      def enrolled? = !!enrolled
+      def to_json_value = { "enrolled" => enrolled?, "needs" => Array(needs) }
     end
 
     module_function
@@ -247,38 +289,68 @@ module Agent
       result.ok? ? result.output : nil
     end
 
-    # Does `ci/build.sh` exist at this exact commit?
+    # Does `ci/build.sh` exist at this exact commit, and what does it declare?
     #
     # Cached, permanently, because the answer for a given sha can never change —
     # see ENROLMENT_CACHE_LIMIT. A LOOKUP THAT FAILED IS NOT CACHED and is not
     # read as "no": a `gh` blip must cost one skipped pass, never an enrolment
-    # silently withdrawn for the life of a sha.
-    def enrolled?(repo, sha)
+    # silently withdrawn for the life of a sha. nil is that "unknown".
+    #
+    # `.content` rather than `.sha` (ISS-1123): the same one request now answers
+    # both questions, because the declaration has to be known BEFORE the claim
+    # and the checkout that used to supply it happens after. GitHub base64-encodes
+    # it; a body that will not decode is read as enrolled with nothing declared,
+    # which is exactly the behaviour every repo had before this and never a
+    # withdrawn enrolment.
+    #
+    # The cache moved to its own file with the shape change — see
+    # Agent::Paths.verify_declaration_file for why that is not fussiness.
+    def declaration(repo, sha)
       slug = Agent::MergeLane.qualify(repo)
-      cached = enrolment_cache["#{slug}@#{sha}"]
+      cached = cached_declaration("#{slug}@#{sha}")
       return cached unless cached.nil?
 
-      result = capture(["gh", "api", "repos/#{slug}/contents/#{BUILD_SCRIPT}?ref=#{sha}", "--jq", ".sha"])
+      result = capture(["gh", "api", "repos/#{slug}/contents/#{BUILD_SCRIPT}?ref=#{sha}", "--jq", ".content"])
       # A 404 is a definite NO — `gh api` exits non-zero on it, so the exit status
       # alone cannot tell an absent file from an unreachable API. The body can:
       # GitHub answers a missing path with a "Not Found" document.
-      return remember_enrolment(slug, sha, true) if result.ok?
-      return remember_enrolment(slug, sha, false) if result.output.to_s.include?("Not Found")
+      return remember_declaration(slug, sha, Declaration.new(enrolled: true, needs: parse_needs(decode(result.output)))) if result.ok?
+      return remember_declaration(slug, sha, Declaration.new(enrolled: false, needs: [])) if result.output.to_s.include?("Not Found")
       nil
     end
 
-    def enrolment_cache
-      @enrolment_cache ||= Agent::Paths.read_json(Agent::Paths.verify_enrolment_file) || {}
+    # The predicate the rest of the world asks for, kept as its own name because
+    # "is this repo in the lane's CI" is a question worth being able to ask
+    # without caring what the build declares.
+    def enrolled?(repo, sha) = declaration(repo, sha)&.enrolled?
+
+    def decode(body)
+      Base64.decode64(body.to_s)
+    rescue StandardError
+      ""
     end
 
-    def remember_enrolment(slug, sha, answer)
-      cache = enrolment_cache
-      cache["#{slug}@#{sha}"] = answer
+    def declaration_cache
+      @declaration_cache ||= Agent::Paths.read_json(Agent::Paths.verify_declaration_file) || {}
+    end
+
+    # nil for "not cached". Anything that is not the shape this version writes is
+    # a miss rather than a guess: a cache is an optimisation, and one API call is
+    # cheaper than a wrong answer that lasts the life of a sha.
+    def cached_declaration(cache_key)
+      value = declaration_cache[cache_key]
+      return nil unless value.is_a?(Hash)
+      Declaration.new(enrolled: !!value["enrolled"], needs: Array(value["needs"]))
+    end
+
+    def remember_declaration(slug, sha, answer)
+      cache = declaration_cache
+      cache["#{slug}@#{sha}"] = answer.to_json_value
       # Ruby hashes preserve insertion order, so dropping from the front drops the
       # oldest answers — which are the shas least likely to be asked about again.
       cache.shift while cache.length > ENROLMENT_CACHE_LIMIT
-      @enrolment_cache = cache
-      Agent::Paths.write_json(Agent::Paths.verify_enrolment_file, cache)
+      @declaration_cache = cache
+      Agent::Paths.write_json(Agent::Paths.verify_declaration_file, cache)
       answer
     rescue StandardError
       # The cache is an optimisation. A state dir it cannot write costs API calls,
@@ -424,9 +496,27 @@ module Agent
     # 45 PRs are waiting. `included_main` is returned for the same reason the
     # marking is left to the caller: `dev ci scan` must be able to show a human
     # what the fleet would do WITHOUT consuming the fleet's next scan window.
-    Scan = Struct.new(:candidates, :dropped, :included_main, keyword_init: true)
+    #
+    # `deferred` and `unsatisfiable` are the two ways a candidate is not this
+    # box's to build (ISS-1123), and they are returned separately because they
+    # are opposite facts about the fleet. Deferred is the system working — a
+    # bigger runner takes it on its own next pass and nobody needs to know.
+    # Unsatisfiable is a job NO runner can ever claim, which without a word from
+    # here is a pull request that sits at `no_ci_verdict` forever with nothing
+    # anywhere saying why.
+    Scan = Struct.new(:candidates, :dropped, :included_main, :deferred, :unsatisfiable,
+                      keyword_init: true) do
+      def deferred = self[:deferred] || []
+      def unsatisfiable = self[:unsatisfiable] || []
+    end
 
-    def scan(limit: ENQUEUE_CAP, now: Time.now, include_main: nil)
+    # `heap_gb` is what THIS machine gives a build and `fleet_heap_gb` the most
+    # any machine in the fleet does. The second is nil when the caller could not
+    # find out, and a nil there is quiet by construction: a candidate this box
+    # cannot take is merely deferred, because "nobody can build this" is a claim
+    # worth making only against a fleet we have actually read.
+    def scan(limit: ENQUEUE_CAP, now: Time.now, include_main: nil,
+             heap_gb: Agent::Heap.gigabytes_here, fleet_heap_gb: nil)
       include_main = main_due?(now: now) if include_main.nil?
       eligible = repos.flat_map { |repo| pr_candidates(repo, now: now) }
       eligible += repos.filter_map { |repo| main_candidate(repo, now: now) } if include_main
@@ -434,9 +524,47 @@ module Agent
       # every PR that would not be built anyway — and the answer is cached per
       # sha, so a repo that is not enrolled costs one API call per new commit
       # rather than one per scan.
-      enrolled = interleave(eligible.select { |c| enrolled?(c.repo, c.sha) })
-      Scan.new(candidates: enrolled.first(limit), dropped: [enrolled.length - limit, 0].max,
-               included_main: include_main)
+      enrolled = eligible.filter_map { |c| declared(c) }
+      fits = enrolled.group_by { |c| classify_capability(c, heap_gb: heap_gb, fleet_heap_gb: fleet_heap_gb) }
+      buildable = interleave(fits.fetch(:buildable, []))
+      Scan.new(candidates: buildable.first(limit), dropped: [buildable.length - limit, 0].max,
+               included_main: include_main, deferred: fits.fetch(:deferred, []),
+               unsatisfiable: fits.fetch(:unsatisfiable, []))
+    end
+
+    # The candidate with its declaration attached, or nil when the repo is not
+    # enrolled at this sha or the lookup could not be made.
+    def declared(candidate)
+      answer = declaration(candidate.repo, candidate.sha)
+      return nil unless answer&.enrolled?
+      candidate.needs = answer.needs
+      candidate
+    end
+
+    # CAN THIS BOX RUN THIS BUILD — the matching the heap formula never did.
+    #
+    # `Agent::Heap` sizes a slot so it cannot over-request memory; nothing sized
+    # the JOB against the slot, so a platform build declaring 12G lands on the
+    # 24G/3-slot runner, gets 4G, and OOMs. The lane cannot tell an OOM from a
+    # red suite, so it parks the PR and a human investigates a scheduling
+    # mistake — 27 open platform PRs' worth of manufactured work that reads as
+    # "the suite is flaky".
+    #
+    #   :buildable      no declaration (every Node and Elm suite, and every repo
+    #                   before ISS-1123), or one this box satisfies.
+    #   :deferred       a bigger runner's job. Silent by design: this is the
+    #                   normal, healthy state of a heterogeneous fleet, and one
+    #                   log line per pass per PR would drown the decisions that
+    #                   matter.
+    #   :unsatisfiable  no runner in the fleet is BUILT big enough, or the
+    #                   declaration does not parse. Both are permanent until
+    #                   somebody changes something, so both are loud.
+    def classify_capability(candidate, heap_gb:, fleet_heap_gb:)
+      want = candidate.heap_gb
+      return :unsatisfiable if want == :malformed
+      return :buildable if want.nil? || want <= heap_gb.to_i
+      return :unsatisfiable if fleet_heap_gb && want > fleet_heap_gb
+      :deferred
     end
 
     # ROUND-ROBIN ACROSS REPOS, oldest pull request first within each.
@@ -734,13 +862,22 @@ module Agent
     def needs(dir)
       path = File.join(dir, BUILD_SCRIPT)
       return [] unless File.file?(path)
-      File.read(path).lines.each do |line|
+      parse_needs(File.read(path))
+    rescue StandardError
+      []
+    end
+
+    # ONE PARSE, TWO READERS. The scan reads the script over the contents API
+    # before claiming; the job reads it off the checkout before building. They
+    # must agree about what the repo declared, or a job is scheduled against one
+    # requirement and preflighted against another — so the split is where the
+    # TEXT comes from and nothing else.
+    def parse_needs(text)
+      text.to_s.lines.each do |line|
         match = NEEDS_DIRECTIVE.match(line)
         next unless match
         return match[1].split(",").map(&:strip).reject(&:empty?)
       end
-      []
-    rescue StandardError
       []
     end
 

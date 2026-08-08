@@ -39,7 +39,7 @@ class TestAgentVerify < Minitest::Test
         ENV["DEV_AGENT_STATE_DIR"] = File.join(root, "state")
         ENV["DEV_AGENT_LOG_ROOT"] = File.join(root, "logs")
         FileUtils.mkdir_p(ENV["DEV_AGENT_STATE_DIR"])
-        Agent::Verify.instance_variable_set(:@enrolment_cache, nil)
+        Agent::Verify.instance_variable_set(:@declaration_cache, nil)
         # DevTestSupport::VerifyGuard neuters `scan` and `claim` for the whole
         # suite, so that no test can walk the real lane or post a real commit
         # status. This is the one file whose subject they are, so it asks for them
@@ -48,7 +48,7 @@ class TestAgentVerify < Minitest::Test
         with_real_verify { yield root }
       ensure
         ENV["DEV_AGENT_STATE_DIR"], ENV["DEV_AGENT_LOG_ROOT"] = previous
-        Agent::Verify.instance_variable_set(:@enrolment_cache, nil)
+        Agent::Verify.instance_variable_set(:@declaration_cache, nil)
       end
     end
   end
@@ -194,7 +194,8 @@ class TestAgentVerify < Minitest::Test
         next busy if repo.to_s.include?("playbook-admin")
         repo.to_s.include?("rallyd") ? quiet : []
       }) do
-        stub_singleton(Agent::Verify, :enrolled?, ->(_repo, _sha) { true }) do
+        enrolled = Agent::Verify::Declaration.new(enrolled: true, needs: [])
+        stub_singleton(Agent::Verify, :declaration, ->(_repo, _sha) { enrolled }) do
           numbers = Agent::Verify.scan(limit: 2, include_main: false).candidates.map(&:pr)
           assert_includes numbers, 99, "the quiet repo must not be starved by the busy one"
         end
@@ -229,6 +230,58 @@ class TestAgentVerify < Minitest::Test
     end
   end
 
+  # THE CACHE OUTLIVES A ROLLBACK, IN BOTH DIRECTIONS. `verify-enrolment.json`
+  # held a bare boolean per sha and pre-ISS-1123 code reads any non-nil value
+  # there as the answer — so a `{"enrolled": false}` object left in THAT file
+  # would read as truthy on a reverted devops, and a repo with no ci/build.sh
+  # would be built, fail `:missing`, and post an INFRASTRUCTURE FAULT on a real
+  # pull request. Every runner fast-forwards devops within 30 seconds and a bad
+  # merge here is reverted rather than rolled forward, so the two shapes have to
+  # live in two files.
+  def test_the_declaration_cache_never_writes_into_the_old_enrolment_file
+    with_state_dir do
+      stub_shell(->(_cmd, _opts) { shell_result(output: Base64.encode64("# ci-needs: heap:12G\n")) }) do
+        assert_equal ["heap:12G"], Agent::Verify.declaration("mbryzek/a", "a" * 40).needs
+      end
+      old = File.join(ENV.fetch("DEV_AGENT_STATE_DIR"), "verify-enrolment.json")
+      refute_equal old, Agent::Paths.verify_declaration_file
+      refute File.exist?(old),
+             "a reverted devops must find its own cache untouched, not objects it reads as truthy"
+    end
+  end
+
+  # Anything that is not the shape this version writes is a MISS rather than a
+  # guess: one API call is cheaper than a wrong answer that lasts the life of an
+  # immutable sha.
+  def test_an_unrecognised_cache_entry_is_re_asked
+    with_state_dir do
+      Agent::Paths.write_json(Agent::Paths.verify_declaration_file, { "mbryzek/a@#{'a' * 40}" => true })
+      Agent::Verify.instance_variable_set(:@declaration_cache, nil)
+      asked = 0
+      stub_shell(lambda { |_cmd, _opts|
+        asked += 1
+        shell_result(output: Base64.encode64("# ci-needs: heap:12G\n"))
+      }) do
+        assert_equal ["heap:12G"], Agent::Verify.declaration("mbryzek/a", "a" * 40).needs
+      end
+      assert_equal 1, asked
+    end
+  end
+
+  # ONE PARSE, TWO READERS: the scan reads the script over the contents API before
+  # claiming, the job reads it off the checkout before building. If they could
+  # disagree, a job would be scheduled against one requirement and preflighted
+  # against another.
+  def test_the_scan_and_the_build_read_the_same_declaration
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "ci"))
+      script = "#!/usr/bin/env bash\n# ci-needs: docker, registry, database, heap:12G\nsbt test\n"
+      File.write(File.join(dir, Agent::Verify::BUILD_SCRIPT), script)
+      assert_equal Agent::Verify.parse_needs(script), Agent::Verify.needs(dir)
+      assert_equal 12, Agent::Heap.requirement(Agent::Verify.needs(dir))
+    end
+  end
+
   # A LOOKUP THAT FAILED IS NOT AN ANSWER. A `gh` blip must cost one skipped pass,
   # never an enrolment silently withdrawn for the life of a sha — which, because
   # the cache is permanent, it would be.
@@ -237,7 +290,120 @@ class TestAgentVerify < Minitest::Test
       stub_shell(->(_cmd, _opts) { shell_result(output: "connection reset", exitstatus: 1) }) do
         assert_nil Agent::Verify.enrolled?("mbryzek/x", "a" * 40)
       end
-      refute_includes Agent::Verify.enrolment_cache.keys, "mbryzek/x@#{'a' * 40}"
+      refute_includes Agent::Verify.declaration_cache.keys, "mbryzek/x@#{'a' * 40}"
+    end
+  end
+
+  # ---- job-to-runner matching (ISS-1123) ------------------------------------
+  #
+  # `max_concurrency` bounds how MANY jobs a box runs and said nothing about how
+  # BIG one may be. On the 24G/3-slot runner the derived heap is 4G, so a platform
+  # build whose recorded baseline is 12G was claimable there and OOMed — and the
+  # merge lane cannot tell an OOM from a failing suite, so it parked the pull
+  # request and a human investigated a scheduling mistake.
+
+  # The declaration comes back in the SAME lookup as enrolment, which is what
+  # makes it available before the claim. Reading it off the checkout, where the
+  # other `ci-needs` names are read, is one step too late: by then the job has
+  # landed on the box that cannot run it.
+  def test_the_scan_reads_what_the_build_declares_at_the_sha
+    with_state_dir do
+      script = "#!/usr/bin/env bash\n# ci-needs: docker, database, heap:12G\nsbt test\n"
+      stub_shell(->(_cmd, _opts) { shell_result(output: Base64.encode64(script)) }) do
+        answer = Agent::Verify.declaration("mbryzek/platform", "a" * 40)
+        assert answer.enrolled?
+        assert_equal %w[docker database heap:12G], answer.needs
+      end
+    end
+  end
+
+  # The whole point, in one assertion: a box that cannot give the heap does not
+  # take the job.
+  def test_a_build_declaring_more_heap_than_this_box_gives_is_not_claimed_here
+    with_state_dir do
+      with_scan([base_pr("number" => 1)], enrolled: true, needs: ["heap:12G"]) do
+        scan = Agent::Verify.scan(include_main: false, heap_gb: 4, fleet_heap_gb: 24)
+        assert_empty scan.candidates, "4G of heap must not claim a build that declares 12G"
+        assert_equal [1], scan.deferred.map(&:pr)
+        assert_empty scan.unsatisfiable, "the 64G box can run it — that is a deferral, not an alarm"
+      end
+    end
+  end
+
+  def test_a_build_this_box_can_serve_is_claimed_here
+    with_state_dir do
+      with_scan([base_pr("number" => 1)], enrolled: true, needs: ["heap:12G"]) do
+        scan = Agent::Verify.scan(include_main: false, heap_gb: 24, fleet_heap_gb: 24)
+        assert_equal [1], scan.candidates.map(&:pr)
+        assert_empty scan.deferred
+      end
+    end
+  end
+
+  # NO DECLARATION IS NO MINIMUM, which is every npm and Elm suite and was every
+  # repo in the fleet before this. The matching must not quietly become an
+  # opt-out that grounds the builds nobody has annotated yet.
+  def test_a_build_that_declares_nothing_runs_anywhere
+    with_state_dir do
+      with_scan([base_pr("number" => 1)], enrolled: true, needs: %w[docker database]) do
+        scan = Agent::Verify.scan(include_main: false, heap_gb: Agent::Heap::MIN_GB, fleet_heap_gb: 24)
+        assert_equal [1], scan.candidates.map(&:pr)
+      end
+    end
+  end
+
+  # A JOB NOBODY CAN CLAIM MUST NOT BE SILENT. Deferring it forever leaves the
+  # pull request on `no_ci_verdict` with nothing anywhere saying why — the exact
+  # silence the rest of this module is shaped to refuse.
+  def test_a_build_no_runner_can_serve_is_separated_from_one_merely_deferred
+    with_state_dir do
+      with_scan([base_pr("number" => 1)], enrolled: true, needs: ["heap:64G"]) do
+        scan = Agent::Verify.scan(include_main: false, heap_gb: 4, fleet_heap_gb: 24)
+        assert_empty scan.candidates
+        assert_empty scan.deferred
+        assert_equal [1], scan.unsatisfiable.map(&:pr)
+      end
+    end
+  end
+
+  # ...and a malformed declaration is unsatisfiable for the same reason: it is
+  # permanent until somebody edits the repo, and treating it as "no minimum"
+  # would land the job on the small box, which is the OOM this prevents.
+  def test_a_malformed_declaration_is_loud_rather_than_ignored
+    with_state_dir do
+      with_scan([base_pr("number" => 1)], enrolled: true, needs: ["heap=12G"]) do
+        scan = Agent::Verify.scan(include_main: false, heap_gb: 24, fleet_heap_gb: 24)
+        assert_empty scan.candidates
+        assert_equal [1], scan.unsatisfiable.map(&:pr)
+        assert_match(/unreadable/, scan.unsatisfiable.first.heap_text)
+      end
+    end
+  end
+
+  # A FLEET NOBODY COULD READ IS NOT AN EMPTY FLEET. The registry read fails on a
+  # blip, and an alarm that fires from it would file an issue about a PR the big
+  # box will pick up thirty seconds later.
+  def test_an_unknown_fleet_downgrades_every_alarm_to_a_deferral
+    with_state_dir do
+      with_scan([base_pr("number" => 1)], enrolled: true, needs: ["heap:64G"]) do
+        scan = Agent::Verify.scan(include_main: false, heap_gb: 4, fleet_heap_gb: nil)
+        assert_empty scan.unsatisfiable
+        assert_equal [1], scan.deferred.map(&:pr)
+      end
+    end
+  end
+
+  # The cap counts what this box would BUILD. Counting deferrals in it would let
+  # one repo the mini cannot serve fill the pass and starve the ones it can.
+  def test_the_cap_counts_buildable_candidates_and_not_deferred_ones
+    with_state_dir do
+      prs = (1..6).map { |n| base_pr("number" => n, "headRefOid" => format("%040d", n)) }
+      with_scan(prs, enrolled: true, needs: ["heap:12G"]) do
+        scan = Agent::Verify.scan(limit: 4, include_main: false, heap_gb: 4, fleet_heap_gb: 24)
+        assert_empty scan.candidates
+        assert_equal 0, scan.dropped, "nothing was dropped for want of a slot — none of it was ours"
+        assert_equal 6, scan.deferred.length
+      end
     end
   end
 
@@ -440,6 +606,79 @@ class TestAgentVerify < Minitest::Test
     end
   end
 
+  # ...and one number bounds how MANY jobs run here, never how big one may be.
+  # That is the gap ISS-1123 closes, and this is the tick end of it: the scan is
+  # handed what this box can give and what the fleet's biggest box can, so that
+  # "somebody else's job" and "nobody's job" are different answers.
+  def test_the_tick_sizes_the_scan_by_memory_as_well_as_by_slots
+    with_state_dir do
+      Agent::Heap.remember({ "max_concurrency" => 3 })
+      tick = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: true, now: Time.now)
+      seen = nil
+      stub_singleton(Agent::Verify, :scan, lambda { |**opts|
+        seen = opts
+        Agent::Verify::Scan.new(candidates: [], dropped: 0, included_main: false)
+      }) do
+        tick.send(:verify, { "max_concurrency" => 3 },
+                  [{ "memory_bytes" => 64 * (1024**3), "max_concurrency" => 1 }])
+      end
+      assert_equal Agent::Heap.gigabytes_here, seen[:heap_gb]
+      assert_equal 24, seen[:fleet_heap_gb], "the 64G/1-slot laptop is what makes a 12G build satisfiable at all"
+    end
+  end
+
+  # A REGISTRY READ THAT FAILED IS NOT AN EMPTY FLEET. `fleet_heap_gb` must come
+  # back nil there, which downgrades every unsatisfiable verdict to a deferral —
+  # otherwise one blip files an issue about pull requests the big box picks up on
+  # its next pass.
+  def test_an_unreadable_fleet_leaves_the_scan_with_no_fleet_figure
+    with_state_dir do
+      tick = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: true, now: Time.now)
+      seen = nil
+      stub_singleton(Agent::Verify, :scan, lambda { |**opts|
+        seen = opts
+        Agent::Verify::Scan.new(candidates: [], dropped: 0, included_main: false)
+      }) do
+        tick.send(:verify, { "max_concurrency" => 3 }, Agent::Tick::FLEET_UNREADABLE)
+      end
+      assert_nil seen[:fleet_heap_gb]
+    end
+  end
+
+  # THE LOUD END. A job no runner can claim would otherwise leave its pull request
+  # on `no_ci_verdict` forever with nothing in the system saying why — the same
+  # silence the reap exists to remove, arriving through the scheduler instead of
+  # through a dead worker. It goes onto the streak every other unattended failure
+  # on this fleet uses, so it escalates into a filed issue rather than a log line.
+  def test_a_job_no_runner_can_build_is_recorded_for_escalation
+    with_state_dir do
+      tick = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: false, now: Time.now)
+      stuck = Agent::Verify::Candidate.new(repo: "mbryzek/platform", pr: 7, sha: "a" * 40,
+                                           event: "pull_request", needs: ["heap:64G"])
+      scan = Agent::Verify::Scan.new(candidates: [], dropped: 0, included_main: false,
+                                     deferred: [], unsatisfiable: [stuck])
+      tick.send(:report_unbuildable, scan, 24)
+
+      assert_equal 1, Agent::Errors.count(Agent::Verify::CAPABILITY_ERROR_SOURCE)
+      said = tick.decisions.flatten.join(" ")
+      assert_match(/platform#7/, said)
+      assert_match(/no runner in the fleet can build this/, said)
+    end
+  end
+
+  # ...and a pass with nothing unsatisfiable CLEARS the streak, which is what
+  # makes "three in a row" mean in a row. Without it, a repo whose declaration was
+  # fixed keeps its count and the next unrelated one escalates immediately.
+  def test_a_clean_pass_clears_the_capability_streak
+    with_state_dir do
+      tick = Agent::Tick.new(use_localhost: false, claude_argv: ["claude"], dry_run: false, now: Time.now)
+      Agent::Errors.record(Agent::Verify::CAPABILITY_ERROR_SOURCE, "an earlier pass")
+      tick.send(:report_unbuildable,
+                Agent::Verify::Scan.new(candidates: [], dropped: 0, included_main: false), nil)
+      assert_equal 0, Agent::Errors.count(Agent::Verify::CAPABILITY_ERROR_SOURCE)
+    end
+  end
+
   # ---- helpers --------------------------------------------------------------
 
   def base_pr(overrides = {})
@@ -458,9 +697,13 @@ class TestAgentVerify < Minitest::Test
     stub_shell(->(_cmd, _opts) { shell_result(output: body) }, &block)
   end
 
-  def with_scan(prs, enrolled:, &block)
+  # `needs` is what the repo's `# ci-needs:` line says at this sha — the scan
+  # reads it in the same lookup as enrolment (ISS-1123), so a stub of one has to
+  # answer the other.
+  def with_scan(prs, enrolled:, needs: [], &block)
+    answer = Agent::Verify::Declaration.new(enrolled: enrolled, needs: needs)
     stub_singleton(Agent::MergeLane, :open_prs, ->(repo) { repo.to_s.include?("playbook-admin") ? prs : [] }) do
-      stub_singleton(Agent::Verify, :enrolled?, ->(_repo, _sha) { enrolled }, &block)
+      stub_singleton(Agent::Verify, :declaration, ->(_repo, _sha) { answer }, &block)
     end
   end
 

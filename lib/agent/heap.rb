@@ -15,6 +15,21 @@ module Agent
   #
   #   heap = clamp(RAM / max_concurrency * 0.6, MIN_GB, MAX_GB)
   #
+  # AND THE OTHER HALF OF IT (ISS-1123). That formula stops a slot from
+  # OVER-REQUESTING memory. It says nothing about whether the slot is big enough
+  # for the job about to land in it, and until ISS-1123 nothing did: the 24G
+  # runner at concurrency 3 derives 4G, and a platform verify job claimed there
+  # OOMs against a suite whose recorded baseline is 12G. The lane cannot tell an
+  # OOM from a real test failure, so it parks the PR and a human investigates a
+  # scheduling mistake dressed as a flaky suite.
+  #
+  # So the number below is now read in BOTH directions. It is what a build is
+  # given (`sbt_opts`, exported into every verify job's environment), and it is
+  # what a build is MATCHED against (`gigabytes_here` and `requirement`, read by
+  # Agent::Verify at claim time and by Agent::Ci at preflight). Those two must be
+  # the same number or the matching is a fiction, which is why there is one
+  # method and `sbt_opts` interpolates it rather than re-deriving it.
+  #
   # RAM / max_concurrency is the PER-SLOT BUDGET, and it is the same accounting
   # the platform sizes `max_concurrency` with (`InternalAgentRunnersDao.derive
   # MaxConcurrency`: roughly 8G per concurrent session). 0.6 of it goes to the
@@ -85,7 +100,52 @@ module Agent
     # the page cache sbt depends on.
     PINS_HEAP = /-Xm[sx]\s*\d/.freeze
 
+    # HOW A REPO DECLARES THE HEAP ITS BUILD NEEDS (ISS-1123), as one more entry
+    # in the `# ci-needs:` line its `ci/build.sh` already carries:
+    #
+    #     # ci-needs: docker, registry, database, heap:12G
+    #
+    # In that list rather than in a directive of its own because it is the same
+    # sentence — what this build needs from the machine it lands on — and because
+    # every reader of it (Agent::Verify at claim time, Agent::Ci at preflight,
+    # `dev ci preflight --needs`) then has one thing to parse and one place to
+    # keep in step. It is a QUANTITY among names, which is the only thing that
+    # makes it unlike its neighbours, and the parsing below is what carries that.
+    #
+    # THE PARSE LIVES HERE, in the module that owns the arithmetic, and not in
+    # Agent::Verify which owns the directive: Agent::Ci needs it too, and
+    # Agent::Verify already requires Agent::Ci.
+    # The prefix is `heap` on a WORD BOUNDARY and not `heap:`, so that `heap=12G`
+    # and a bare `heap` are recognised as this entry and rejected, rather than
+    # sailing past as names a newer `dev` might know. `\b` is what keeps a future
+    # `heapdump` from being caught by it.
+    NEED_PREFIX = /\Aheap\b/i.freeze
+    NEED = /\Aheap:\s*(\d+)\s*(?:gb?)?\z/i.freeze
+
     module_function
+
+    # What a `# ci-needs:` list says about heap: nil for no declaration (which is
+    # right for every npm and Elm build, and was the whole fleet until ISS-1123),
+    # an Integer of gigabytes, or `:malformed`.
+    #
+    # `:malformed` IS NOT `nil`, and that distinction is the point. Every other
+    # name in `ci-needs` is ignored when this version does not recognise it, so
+    # that a script naming a probe a newer `dev` will have still runs — and under
+    # that rule `heap=12G`, or `heap:twelve`, would silently mean "no minimum",
+    # which lands the job on the 4G box and OOMs it: the one thing this feature
+    # exists to prevent, reintroduced by a typo. So a token that names `heap` and
+    # does not parse is an error both readers refuse loudly, and a token that does
+    # not name `heap` is somebody else's to ignore.
+    #
+    # `12`, `12G`, `12g` and `12GB` all parse. Leniency about the unit costs
+    # nothing — there is one unit — and every rejected spelling is a pull request
+    # that stops being built until somebody notices.
+    def requirement(needs)
+      token = Array(needs).map(&:to_s).find { |n| NEED_PREFIX.match?(n.strip) }
+      return nil if token.nil?
+      match = NEED.match(token.strip)
+      match ? match[1].to_i : :malformed
+    end
 
     # ---- the derivation (pure, and the only place the arithmetic lives) ----
 
@@ -132,13 +192,58 @@ module Agent
       nil
     end
 
-    def sbt_opts
+    # THE HEAP THIS MACHINE GIVES A BUILD, as a number rather than as a flag.
+    #
+    # One method, read two ways, and they must never diverge: `sbt_opts` below
+    # interpolates it so that this IS what sbt is handed, and the scheduler
+    # compares a job's declared `heap:` against it so that "can this box run this
+    # build" is asked about the ceiling the build will actually get. A second
+    # derivation of the same thing would be a matcher that agrees with the
+    # environment on the day it is written and quietly stops.
+    def gigabytes_here
       known = concurrency
-      return "-Xmx#{MIN_GB}G #{STACK}" if known.nil?
-      opts(memory_bytes: memory_bytes, concurrency: known)
+      return MIN_GB if known.nil?
+      gigabytes(memory_bytes: memory_bytes, concurrency: known)
     end
 
+    def sbt_opts = "-Xmx#{gigabytes_here}G #{STACK}"
+
     def env = { "SBT_OPTS" => sbt_opts }
+
+    # ---- the rest of the fleet (ISS-1123) ----
+
+    # The heap ANOTHER machine would give a build, from its registry row —
+    # `memory_bytes` and `max_concurrency` are both reported by
+    # `Agent::Host.registration_payload` and both come back on GET /agent/runners.
+    #
+    # nil when either is missing, and that is deliberate rather than defensive.
+    # `gigabytes` answers MIN_GB for unknown memory, which is the right
+    # conservative answer for THIS machine (it under-requests) and the wrong one
+    # for another (it would claim a capability we have not established). The only
+    # caller below turns a fleet of nils into "we do not know", which is the one
+    # answer that never raises a false alarm.
+    def runner_gigabytes(row)
+      return nil unless row.is_a?(Hash)
+      bytes = row["memory_bytes"].to_i
+      slots = row["max_concurrency"].to_i
+      return nil unless bytes.positive? && slots.positive?
+      gigabytes(memory_bytes: bytes, concurrency: slots)
+    end
+
+    # The largest heap any machine in the fleet could give a build, or nil when
+    # nothing in the list says.
+    #
+    # THIS IS A QUESTION ABOUT HARDWARE, NOT ABOUT AVAILABILITY, so a paused or
+    # offline runner still counts and only a RETIRED one is dropped. The caller
+    # uses it to decide whether a job is unsatisfiable BY CONSTRUCTION — no box
+    # in this fleet is built big enough — and that must not become an alarm every
+    # time the big machine is asleep or an operator has paused it for an hour.
+    def fleet_gigabytes(runners)
+      return nil unless runners.is_a?(Array)
+      runners.reject { |r| r.is_a?(Hash) && r["retired_at"] }
+             .filter_map { |r| runner_gigabytes(r) }
+             .max
+    end
 
     # ---- what the machine's own profile does to all of the above ----
 
@@ -180,6 +285,10 @@ module Agent
         lines << "  heap               #{(SLOT_FRACTION * 100).round}% of the slot, " \
                  "clamped to [#{MIN_GB}G, #{MAX_GB}G]"
       end
+      # The scheduling half (ISS-1123), said here because this is where somebody
+      # comes to find out why a repo's builds never land on their box.
+      lines << "  verify jobs        this machine accepts builds declaring up to " \
+               "`# ci-needs: heap:#{gigabytes_here}G`; a repo asking for more is left to a bigger runner"
       override = profile_override
       if override
         lines += ["",

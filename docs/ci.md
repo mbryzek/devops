@@ -167,6 +167,78 @@ ISS-848 accepted, and the trigger for revisiting it is queue age — see below.
 `dev agent pause` covers both kinds of work, because both claim through the same
 tick. That is the one lever that takes a bad machine out of the pool.
 
+### Job-to-runner matching (ISS-1123)
+
+One number bounds how **many** jobs a box runs. Nothing bounded how **big** one
+could be, and the fleet is not homogeneous:
+
+| runner | RAM | `max_concurrency` | heap per slot |
+|---|---|---|---|
+| Michaels-MacBook-Pro.local | 64G | 1 | 24G (clamped) |
+| Mac (M4 mini) | 24G | 3 | **4G** |
+
+`Agent::Heap` derives that per-slot heap so a slot cannot *over-request* memory.
+It never asked the other question. A platform verify job — recorded baseline 12G
+— was claimable on the mini, which gives it 4G, and **OOMs**.
+
+**The cost is a false red, not a slow build.** The lane cannot tell an OOM from a
+failing test: it parks the PR, and `:ci_failed` is deliberately left to a human to
+judge. Across 27 open platform PRs that is a great deal of manufactured
+investigation, and it reads as "platform's suite is flaky" rather than as a
+scheduler bug.
+
+So a build declares its minimum and the scan only claims what this box can serve:
+
+- **The declaration** is `heap:<N>G` in the repo's own `# ci-needs:` line, read at
+  the sha being built like every other directive — so the commit that makes a
+  suite cheaper is the commit that stops holding it to a big machine. Absent means
+  no minimum, which is right for every npm and Elm build and was every repo before
+  this.
+- **The match** is against `Agent::Heap.gigabytes_here` — the *same* number
+  exported as `SBT_OPTS` into the build. One method, so the admission test and the
+  ceiling the build actually gets cannot drift apart.
+- **Deferral is silent.** A job this box cannot serve is left for a bigger runner
+  and logged, not announced. That is the steady state of a heterogeneous fleet.
+- **Unsatisfiable is loud.** When no registered runner is built big enough — or the
+  declaration does not parse — nothing will *ever* claim the job, and the PR would
+  sit on `:no_ci_verdict` indefinitely with nothing saying why. The tick records it
+  under `ci_capability` and `Agent::Escalation` files an issue on the third
+  consecutive pass, the same path a dead Docker daemon takes. A pass with nothing
+  unsatisfiable clears the streak.
+
+Two deliberate restraints on that alarm, both about **not** crying wolf:
+
+- The fleet figure counts a **paused or offline** runner and skips only a retired
+  one. The question is whether any machine is *built* big enough, not whether it is
+  awake — otherwise the big box going to sleep files an issue.
+- A registry read that **failed** yields nil, and a nil fleet figure downgrades
+  every unsatisfiable job to a deferral. "Nobody can build this" is a claim worth
+  making only against a fleet actually read.
+
+**The backstop.** `dev ci preflight` re-checks the declaration against this box, so
+a job that lands anyway — a hand-run `dev ci verify` on the small machine, or a
+tick whose registry read failed and whose derived heap fell to the floor — fails as
+an **infrastructure fault (exit 75)** naming the shortfall, never as a red suite.
+That is the property the whole issue is about: the failure has to be legible as
+the machine's, not the branch's.
+
+`dev ci scan` shows all three columns, and `dev agent sbt-opts --explain` prints
+what this box would accept.
+
+**What this deliberately does not fix.** A single `max_concurrency` still cannot
+say "this box can run 3 Elm builds *or* 1 platform build", so the mini is sized
+for cheap work and cannot do the expensive kind at any time, and the laptop is
+sized for the expensive kind and wastes ~40G whenever it is doing something
+cheap. Matching makes that *safe*; it does not make it efficient, and it hardens
+the funnel — every expensive build now goes to the one machine that can take one.
+
+The lever for that is a **setting, not code**: `max_concurrency` is per-runner and
+overridable, and dropping the mini to 1 gives it `24G / 1 * 0.6 = 14G` — enough
+for platform. Reach for that before building anything. Sizing the claim by a
+declared cost against a memory budget, rather than by a slot count, is written up
+in `~/code/claude/plans/ci-heterogeneous-capacity.md` along with why it is not
+worth doing yet and what would change that.
+
 ### Dedicated hardware
 
 A Mac mini is **$599 one-time against ~$168/mo** for an equivalent cloud box. It
@@ -299,13 +371,20 @@ and any of them can be added to.
 A repo says what its build needs in the build script itself:
 
 ```
-# ci-needs: docker, registry, database
+# ci-needs: docker, registry, database, heap:12G
 ```
 
 Read at the sha being built, so a suite that stops needing Docker stops being held
 to a Docker daemon in the same commit. Unknown names are ignored rather than
 rejected — a script naming a probe a newer `dev` will have should run on today's
 runner, not fail closed on its own configuration.
+
+`heap:<N>G` is the exception to both halves of that sentence: it is read *before*
+the claim rather than at preflight, and a token that starts `heap:` and does not
+parse is an **error** rather than something ignored. See
+[Job-to-runner matching](#job-to-runner-matching-iss-1123) below — under the
+ignore-what-you-do-not-know rule, `heap=12G` would silently mean "no minimum",
+which is exactly the failure the declaration exists to prevent.
 
 ### How an infrastructure fault is made distinguishable
 

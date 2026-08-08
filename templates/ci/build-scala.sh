@@ -48,7 +48,20 @@
 #   Measured on a runner: a `-J-Xmx12G` build ran at the 40G heap an inherited
 #   SBT_OPTS asked for.
 #
-# ci-needs: docker, registry, database
+#   WHAT YOU DO SAY IS THE MINIMUM THIS SUITE NEEDS — `heap:<N>G` in the
+#   `ci-needs` line below (ISS-1123). That is not the ceiling; it is the
+#   scheduler's admission test, read before a runner claims the job. Without it
+#   a suite needing 12G is claimable on the 24G/3-slot mini, which gives 4G, and
+#   OOMs — a red the merge lane cannot tell from a failing test, on a pull
+#   request that did nothing wrong.
+#
+#   MEASURE IT, CHANGE IT, DO NOT COPY IT. 12G is PLATFORM's recorded baseline
+#   and a number every gigabyte of which narrows the set of machines that can
+#   build this repo. For a smaller Scala suite, run it under a smaller
+#   `SBT_OPTS` and declare what it actually took; `dev agent sbt-opts --explain`
+#   prints what a given box would give it.
+#
+# ci-needs: docker, registry, database, heap:12G
 set -euo pipefail
 
 APP=platform   # CHANGE ME
